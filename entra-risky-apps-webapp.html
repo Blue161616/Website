@@ -50,7 +50,6 @@
   .appid { color:var(--muted); font-family:ui-monospace,Consolas,monospace; font-size:12px; }
   .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; margin:0 4px 2px 0; }
   .badge-delegated { background:rgba(245,158,11,0.18); color:var(--warn); }
-  .badge-assignment { background:rgba(56,189,248,0.15); color:var(--accent); }
   .badge-msft      { background:rgba(148,163,184,0.18); color:var(--muted); }
   .badge-disabled  { background:rgba(239,68,68,0.18); color:var(--danger); }
   .detail { color:var(--muted); font-size:12px; line-height:1.5; max-width:520px; }
@@ -79,27 +78,20 @@
   <h2>Setup</h2>
   <div class="setup-grid">
     <div>
-      <label>Tenant ID (GUID or domain, e.g. contoso.onmicrosoft.com)</label>
-      <input id="cfg-tenant" placeholder="common" spellcheck="false">
-    </div>
-    <div>
-      <label>Client (Application) ID of your SPA registration</label>
-      <input id="cfg-client" placeholder="00000000-0000-0000-0000-000000000000" spellcheck="false">
-    </div>
-    <div>
-      <label>Redirect URI (this page's URL)</label>
-      <input id="cfg-redirect" spellcheck="false">
+      <label>Your tenant ID (GUID or domain, e.g. contoso.onmicrosoft.com)</label>
+      <input id="cfg-tenant" placeholder="contoso.onmicrosoft.com" spellcheck="false">
     </div>
   </div>
   <div class="setup-hint">
-    <strong>One-time setup (takes ~2 minutes):</strong><br>
-    1. In <a href="https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade" target="_blank" rel="noopener" style="color:var(--accent)">Entra &rarr; App registrations</a>, click <em>New registration</em>. Any name works.<br>
-    2. Supported account types: <em>Accounts in this organizational directory only</em>.<br>
-    3. Redirect URI: pick <strong>Single-page application (SPA)</strong> and paste the "Redirect URI" value above (defaults to this page's URL — host this HTML somewhere, or use <code>http://localhost:port/…</code> and serve it via a tiny local server).<br>
-    4. After creation, go to <em>API permissions</em> &rarr; <em>Add a permission</em> &rarr; Microsoft Graph &rarr; <em>Delegated</em> &rarr; add <code>Directory.Read.All</code>. Click <em>Grant admin consent</em>.<br>
-    5. Copy the <em>Application (client) ID</em> from the Overview page into the field above. Sign in — Global Reader on your account is sufficient at runtime.
+    <strong>One-time setup (takes ~30 seconds):</strong> no app registration needed.<br>
+    1. Enter your tenant ID or domain above.<br>
+    2. Click <em>Admin-consent this app</em>. You'll be redirected to Microsoft's admin consent page to approve the <code>Directory.Read.All</code> delegated permission for this tool in your tenant. <strong>A Global Administrator (or Privileged Role Administrator) account is required for this step.</strong><br>
+    3. After consent, click <em>Sign in and audit</em>. Any user with at least Global Reader can then run the audit.<br>
+    <br>
+    The tool is a multi-tenant SPA hosted at <code>blue16.nl</code>. It runs entirely in your browser, read-only, and never sends data anywhere except Microsoft Graph.
   </div>
-  <div style="margin-top:16px; display:flex; gap:10px;">
+  <div style="margin-top:16px; display:flex; gap:10px; flex-wrap:wrap;">
+    <button id="btn-consent">Admin-consent this app</button>
     <button id="btn-signin">Sign in and audit</button>
     <button id="btn-signout" class="ghost" style="display:none">Sign out</button>
   </div>
@@ -142,7 +134,7 @@
 <div id="empty" class="state" style="display:none">No matching applications found.</div>
 
 <footer>
-  Runs entirely in your browser. Uses MSAL.js against Microsoft Graph with your delegated permissions. Read-only.<br>
+  Runs entirely in your browser. Uses MSAL.js against Microsoft Graph with delegated <code>Directory.Read.All</code> granted via admin consent. Read-only.<br>
   Definition: enterprise apps (servicePrincipalType = Application) where appRoleAssignmentRequired = false AND at least one oauth2PermissionGrant with consentType = AllPrincipals.
 </footer>
 
@@ -161,31 +153,57 @@
   'use strict';
 
   // -------------------- State --------------------
+  // Hardcoded: this SPA is registered once in blue16.nl's tenant as multi-tenant.
+  // Replace APP_CLIENT_ID below with the Application (client) ID of that registration.
+  // The registration must have:
+  //   - Supported account types: multi-tenant (AzureADMultipleOrgs)
+  //   - Platform: Single-page application
+  //   - Redirect URI: https://blue16.nl/entra-risky-apps-webapp.html
+  //   - Delegated Microsoft Graph permission: Directory.Read.All
+  var APP_CLIENT_ID = '00000000-0000-0000-0000-000000000000';
+  var REDIRECT_URI  = 'https://blue16.nl/entra-risky-apps-webapp.html';
+
   var msalInstance = null;
   var account = null;
   var cache = { servicePrincipals: null, grants: null, results: null };
   var sortState = { key:'displayName', dir:1 };
 
-  // Default redirect to current page URL
-  document.getElementById('cfg-redirect').value = window.location.origin + window.location.pathname;
-
-  // Restore any previously-saved config from this browser
+  // Restore any previously-saved tenant from this browser
   try {
     var saved = JSON.parse(localStorage.getItem('entraRiskyAppsCfg') || '{}');
-    if (saved.tenant)   document.getElementById('cfg-tenant').value   = saved.tenant;
-    if (saved.clientId) document.getElementById('cfg-client').value   = saved.clientId;
-    if (saved.redirect) document.getElementById('cfg-redirect').value = saved.redirect;
+    if (saved.tenant) document.getElementById('cfg-tenant').value = saved.tenant;
   } catch(e) { /* ignore */ }
 
   function persistConfig(){
     try {
       localStorage.setItem('entraRiskyAppsCfg', JSON.stringify({
-        tenant:   document.getElementById('cfg-tenant').value.trim(),
-        clientId: document.getElementById('cfg-client').value.trim(),
-        redirect: document.getElementById('cfg-redirect').value.trim()
+        tenant: document.getElementById('cfg-tenant').value.trim()
       }));
     } catch(e) {}
   }
+
+  // Handle return from admin-consent redirect (Microsoft appends ?admin_consent=True&tenant=...)
+  (function handleConsentReturn(){
+    var params = new URLSearchParams(window.location.search);
+    if (params.has('admin_consent')) {
+      var ok = params.get('admin_consent') === 'True';
+      var tenant = params.get('tenant');
+      var errDesc = params.get('error_description');
+      if (tenant) {
+        document.getElementById('cfg-tenant').value = tenant;
+        try { localStorage.setItem('entraRiskyAppsCfg', JSON.stringify({ tenant: tenant })); } catch(e) {}
+      }
+      // Strip consent params from the URL so a refresh doesn't re-trigger anything
+      var clean = window.location.origin + window.location.pathname;
+      window.history.replaceState({}, document.title, clean);
+      if (ok) {
+        var box = document.getElementById('err-box');
+        box.innerHTML = '<div class="err" style="color:var(--ok); background:rgba(16,185,129,0.08); border-color:rgba(16,185,129,0.3);">Admin consent granted for tenant <code>' + tenant + '</code>. Click <em>Sign in and audit</em> to continue.</div>';
+      } else if (errDesc) {
+        document.getElementById('err-box').innerHTML = '<div class="err">Admin consent failed: ' + errDesc + '</div>';
+      }
+    }
+  })();
 
   var el = function(id){ return document.getElementById(id); };
   function show(id, how){ el(id).style.display = how == null ? '' : how; }
@@ -210,14 +228,14 @@
   function getConfig(){
     return {
       tenant: el('cfg-tenant').value.trim() || 'organizations',
-      clientId: el('cfg-client').value.trim(),
-      redirectUri: el('cfg-redirect').value.trim()
+      clientId: APP_CLIENT_ID,
+      redirectUri: REDIRECT_URI
     };
   }
 
   function buildMsal(){
     var c = getConfig();
-    if(!c.clientId) throw new Error('Client ID is required');
+    if(!c.clientId || c.clientId.indexOf('0000') === 0) throw new Error('This page has not been configured yet — APP_CLIENT_ID is unset.');
     return new msal.PublicClientApplication({
       auth: {
         clientId: c.clientId,
@@ -226,6 +244,21 @@
       },
       cache: { cacheLocation: 'sessionStorage', storeAuthStateInCookie: false }
     });
+  }
+
+  function startAdminConsent(){
+    clearError();
+    persistConfig();
+    var tenant = el('cfg-tenant').value.trim();
+    if(!tenant){
+      showError(new Error('Enter your tenant ID or domain first (e.g. contoso.onmicrosoft.com).'));
+      return;
+    }
+    var url = 'https://login.microsoftonline.com/' + encodeURIComponent(tenant) + '/adminconsent'
+      + '?client_id=' + encodeURIComponent(APP_CLIENT_ID)
+      + '&redirect_uri=' + encodeURIComponent(REDIRECT_URI)
+      + '&state=' + encodeURIComponent(tenant);
+    window.location.href = url;
   }
 
   async function signIn(){
@@ -419,8 +452,7 @@
     var rows = filtered();
     var body = el('rows');
     body.innerHTML = rows.map(function(r){
-      var badges = '<span class="badge badge-assignment">Assignment: Not required</span>';
-      badges += '<span class="badge badge-delegated">Delegated</span>';
+      var badges = '<span class="badge badge-delegated">Delegated</span>';
       if(r.isFirstPartyMicrosoft) badges += '<span class="badge badge-msft">Microsoft</span>';
       if(r.accountEnabled === false) badges += '<span class="badge badge-disabled">Disabled</span>';
       var created = r.createdDateTime ? new Date(r.createdDateTime).toISOString().slice(0,10) : '';
@@ -461,6 +493,7 @@
   }
 
   // -------------------- Wire up --------------------
+  el('btn-consent').addEventListener('click', startAdminConsent);
   el('btn-signin').addEventListener('click', signIn);
   el('btn-signout').addEventListener('click', signOut);
   el('btn-refresh').addEventListener('click', runAudit);
