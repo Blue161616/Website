@@ -90,6 +90,22 @@
   .add-uri-row input:focus { outline:none; border-color:var(--accent); }
   .write-warn { background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.25); color:var(--warn); padding:10px 14px; border-radius:6px; font-size:12px; line-height:1.5; margin-bottom:18px; }
   .modal-not-found { color:var(--muted); font-size:13px; text-align:center; padding:32px 0; line-height:1.7; }
+  /* Risk badges */
+  .risk-critical { background:rgba(239,68,68,0.18); color:var(--danger); }
+  .risk-high      { background:rgba(249,115,22,0.18); color:#f97316; }
+  .risk-medium    { background:rgba(245,158,11,0.18); color:var(--warn); }
+  .risk-low       { background:rgba(16,185,129,0.18); color:var(--ok); }
+  /* Per-scope risk colouring inside permission cells */
+  .sc4 { color:var(--danger); font-weight:700; }
+  .sc3 { color:#f97316; font-weight:600; }
+  .sc2 { color:var(--warn); }
+  /* Credential pills */
+  .cred-pill { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; font-weight:600; margin:0 3px 2px 0; background:rgba(148,163,184,0.15); color:var(--muted); }
+  .cred-pill.expiring { background:rgba(245,158,11,0.15); color:var(--warn); }
+  .cred-pill.expired  { background:rgba(239,68,68,0.15); color:var(--danger); }
+  /* Owners line */
+  .owners-list { font-size:11px; color:var(--muted); margin-top:4px; line-height:1.6; }
+  .owners-list strong { color:var(--text); }
 </style>
 </head>
 <body>
@@ -135,6 +151,12 @@
     <option value="">All publishers</option>
     <option value="yes">Microsoft first-party only</option>
   </select>
+  <select id="f-risk">
+    <option value="">All risk levels</option>
+    <option value="4">Critical only</option>
+    <option value="3">High and above</option>
+    <option value="2">Medium and above</option>
+  </select>
   <button class="ghost" id="btn-csv">Export CSV</button>
   <button class="ghost" id="btn-refresh">Refresh</button>
   <div class="stats">
@@ -154,9 +176,11 @@
   <thead>
     <tr>
       <th data-sort="displayName">Application</th>
+      <th data-sort="riskScore">Risk</th>
       <th>Flags</th>
       <th data-sort="appRoleAssignmentRequired">Assignment</th>
       <th>Delegated permissions (tenant-wide)</th>
+      <th>App permissions</th>
       <th data-sort="publisherName">Publisher</th>
       <th data-sort="createdDateTime">Created</th>
     </tr>
@@ -381,6 +405,17 @@
     return res.json();
   }
 
+  async function graphBatch(requests, token){
+    var res = await fetch('https://graph.microsoft.com/v1.0/$batch', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ requests: requests })
+    });
+    if(!res.ok){ var t = await res.text(); throw new Error('Batch ' + res.status + ': ' + t); }
+    var data = await res.json();
+    return data.responses || [];
+  }
+
   async function graphGetAllPages(url, token, onProgress){
     var out = [];
     var next = url;
@@ -405,7 +440,7 @@
     setMsg('Fetching service principals…', '0');
     var spUrl = 'https://graph.microsoft.com/v1.0/servicePrincipals'
       + '?$filter=' + encodeURIComponent("servicePrincipalType eq 'Application'")
-      + '&$select=' + encodeURIComponent('id,appId,displayName,appRoleAssignmentRequired,servicePrincipalType,appOwnerOrganizationId,signInAudience,publisherName,accountEnabled,createdDateTime')
+      + '&$select=' + encodeURIComponent('id,appId,displayName,appRoleAssignmentRequired,servicePrincipalType,appOwnerOrganizationId,signInAudience,publisherName,accountEnabled,createdDateTime,passwordCredentials,keyCredentials')
       + '&$top=999'
       + '&$count=true';
     var sps = await graphGetAllPages(spUrl, token, function(n){ setMsg('Fetching service principals…', n + ' so far'); });
@@ -438,15 +473,19 @@
     var resourceIds = Object.keys(needed);
     setMsg('Resolving resource APIs…', '0 / ' + resourceIds.length);
     var resourceNames = {};
+    var resourceSPCache = {}; // id -> { displayName, appRoles[] }
     // Batch via $filter with or-chains (max ~15 per call to stay under URL limits)
     var batchSize = 15;
     for(var i=0; i<resourceIds.length; i+=batchSize){
       var slice = resourceIds.slice(i, i+batchSize);
       var filter = slice.map(function(id){ return "id eq '" + id + "'"; }).join(' or ');
-      var url = 'https://graph.microsoft.com/v1.0/servicePrincipals?$filter=' + encodeURIComponent(filter) + '&$select=id,displayName';
+      var url = 'https://graph.microsoft.com/v1.0/servicePrincipals?$filter=' + encodeURIComponent(filter) + '&$select=id,displayName,appRoles';
       try {
         var page = await graphGet(url, token);
-        (page.value || []).forEach(function(sp){ resourceNames[sp.id] = sp.displayName; });
+        (page.value || []).forEach(function(sp){
+          resourceNames[sp.id] = sp.displayName;
+          resourceSPCache[sp.id] = { displayName: sp.displayName, appRoles: sp.appRoles || [] };
+        });
       } catch(e){ /* ignore; will show as (unknown) */ }
       setMsg('Resolving resource APIs…', Math.min(i+batchSize, resourceIds.length) + ' / ' + resourceIds.length);
     }
@@ -473,35 +512,101 @@
         isFirstPartyMicrosoft: sp.appOwnerOrganizationId === MS_TENANT,
         createdDateTime: sp.createdDateTime,
         delegatedDetail: detail,
+        passwordCreds: sp.passwordCredentials || [],
+        keyCreds: sp.keyCredentials || [],
         portalUrl: 'https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/Overview/appId/' + sp.appId
       });
     });
 
-    // 5) Fetch application objects (registered in this tenant) to get SPA/Web redirect URIs.
+    // 4.5) Batch-fetch appRoleAssignments (application permissions) for each result via $batch.
+    setMsg('Fetching application permissions…', '0 / ' + results.length);
+    var appRolesBySpId = {};
+    var BATCH_MAX = 20;
+    for(var bi=0; bi<results.length; bi+=BATCH_MAX){
+      var bSlice = results.slice(bi, bi+BATCH_MAX);
+      var bRequests = bSlice.map(function(r){
+        return { id: r.id, method: 'GET', url: '/servicePrincipals/' + r.id + '/appRoleAssignments' };
+      });
+      try {
+        var bResponses = await graphBatch(bRequests, token);
+        bResponses.forEach(function(resp){
+          appRolesBySpId[resp.id] = (resp.status === 200 && resp.body && resp.body.value) ? resp.body.value : [];
+        });
+      } catch(e){ /* ignore */ }
+      setMsg('Fetching application permissions…', Math.min(bi+BATCH_MAX, results.length) + ' / ' + results.length);
+    }
+
+    // Fetch any resource SPs referenced by appRoleAssignments that aren't already in our cache.
+    var missingResSet = {};
+    results.forEach(function(r){
+      (appRolesBySpId[r.id]||[]).forEach(function(a){ if(!resourceSPCache[a.resourceId]) missingResSet[a.resourceId] = true; });
+    });
+    var missingResIds = Object.keys(missingResSet);
+    for(var mi=0; mi<missingResIds.length; mi+=batchSize){
+      var mSlice = missingResIds.slice(mi, mi+batchSize);
+      var mFilter = mSlice.map(function(id){ return "id eq '" + id + "'"; }).join(' or ');
+      var mUrl = 'https://graph.microsoft.com/v1.0/servicePrincipals?$filter=' + encodeURIComponent(mFilter) + '&$select=id,displayName,appRoles';
+      try {
+        var mPage = await graphGet(mUrl, token);
+        (mPage.value||[]).forEach(function(sp){
+          resourceSPCache[sp.id] = { displayName: sp.displayName, appRoles: sp.appRoles || [] };
+        });
+      } catch(e){}
+    }
+
+    // Build role lookup: "resourceId_appRoleId" -> { resourceName, roleName, roleValue }
+    var appRoleLookup = {};
+    Object.keys(resourceSPCache).forEach(function(spId){
+      var sp = resourceSPCache[spId];
+      (sp.appRoles||[]).forEach(function(role){
+        appRoleLookup[spId + '_' + role.id] = { resourceName: sp.displayName, roleName: role.displayName, roleValue: role.value || '' };
+      });
+    });
+
+    // Attach resolved appPermissions to each result.
+    results.forEach(function(r){
+      r.appPermissions = (appRolesBySpId[r.id]||[]).map(function(a){
+        if(a.appRoleId === '00000000-0000-0000-0000-000000000000')
+          return { resourceName: a.resourceDisplayName || '(unknown)', roleName: 'Default access', roleValue: '' };
+        var info = appRoleLookup[a.resourceId + '_' + a.appRoleId];
+        return info
+          ? { resourceName: info.resourceName, roleName: info.roleName, roleValue: info.roleValue }
+          : { resourceName: a.resourceDisplayName || '(unknown)', roleName: '(unknown)', roleValue: '' };
+      });
+    });
+
+    // 5) Fetch application objects (registered in this tenant) to get SPA/Web redirect URIs and owners.
     //    Apps registered in other tenants simply won't appear in the response — that's fine.
-    setMsg('Fetching redirect URIs…', '0 / ' + results.length);
+    setMsg('Fetching redirect URIs & owners…', '0 / ' + results.length);
     var appIdToUris = {};
     var batchSize2 = 15;
     for(var j=0; j<results.length; j+=batchSize2){
       var slice2 = results.slice(j, j+batchSize2);
       var filter2 = slice2.map(function(r){ return "appId eq '" + r.appId + "'"; }).join(' or ');
-      var uriUrl = 'https://graph.microsoft.com/v1.0/applications?$filter=' + encodeURIComponent(filter2) + '&$select=appId,spa,web';
+      var uriUrl = 'https://graph.microsoft.com/v1.0/applications?$filter=' + encodeURIComponent(filter2)
+        + '&$select=appId,spa,web'
+        + '&$expand=owners($select=id,displayName,userPrincipalName)';
       try {
         var uriPage = await graphGet(uriUrl, token);
         (uriPage.value || []).forEach(function(app){
           appIdToUris[app.appId] = {
             spa: (app.spa && app.spa.redirectUris) ? app.spa.redirectUris : [],
-            web: (app.web && app.web.redirectUris) ? app.web.redirectUris : []
+            web: (app.web && app.web.redirectUris) ? app.web.redirectUris : [],
+            owners: (app.owners||[]).map(function(o){ return { displayName: o.displayName, upn: o.userPrincipalName }; })
           };
         });
       } catch(e){ /* ignore — app may live in another tenant */ }
-      setMsg('Fetching redirect URIs…', Math.min(j+batchSize2, results.length) + ' / ' + results.length);
+      setMsg('Fetching redirect URIs & owners…', Math.min(j+batchSize2, results.length) + ' / ' + results.length);
     }
     results.forEach(function(r){
-      var u = appIdToUris[r.appId] || { spa: [], web: [] };
+      var u = appIdToUris[r.appId] || { spa: [], web: [], owners: [] };
       r.spaUris = u.spa;
       r.webUris = u.web;
+      r.owners = u.owners || [];
     });
+
+    // Compute risk score for each result now that all data is assembled.
+    results.forEach(function(r){ r.riskScore = computeRisk(r); });
 
     cache.results = results;
     clearMsg();
@@ -509,22 +614,69 @@
     render();
   }
 
+  // -------------------- Risk scoring --------------------
+  var RISK_SCORES = {
+    // Critical = 4
+    'RoleManagement.ReadWrite.Directory':4,'RoleManagement.ReadWrite.All':4,'Directory.ReadWrite.All':4,
+    'AppRoleAssignment.ReadWrite.All':4,'Policy.ReadWrite.All':4,'PrivilegedAccess.ReadWrite.AzureAD':4,
+    'Exchange.ManageAsApp':4,'full_access_as_app':4,'Sites.FullControl.All':4,'EWS.AccessAsUser.All':4,
+    // High = 3
+    'Mail.ReadWrite':3,'Mail.ReadWrite.All':3,'Mail.Send':3,'Mail.Send.All':3,
+    'Files.ReadWrite.All':3,'User.ReadWrite.All':3,'Group.ReadWrite.All':3,
+    'Application.ReadWrite.All':3,'Application.ReadWrite.OwnedBy':3,
+    'Calendars.ReadWrite':3,'Contacts.ReadWrite':3,'MailboxSettings.ReadWrite':3,
+    'TeamSettings.ReadWrite.All':3,'Channel.Delete.All':3,'Chat.ReadWrite.All':3,
+    'OnlineMeetings.ReadWrite.All':3,'ServicePrincipalEndpoint.ReadWrite.All':3,'Tasks.ReadWrite.All':3,
+    // Medium = 2
+    'Mail.Read':2,'Mail.Read.All':2,'Files.Read.All':2,'User.Read.All':2,
+    'Group.Read.All':2,'Directory.Read.All':2,'Contacts.Read':2,'People.Read.All':2,
+    'AuditLog.Read.All':2,'Reports.Read.All':2,'Chat.Read.All':2,'ChannelMessage.Read.All':2,
+    'Sites.Read.All':2,'Notes.Read.All':2,'SecurityEvents.Read.All':2,'IdentityRiskEvent.Read.All':2,
+    'TeamMember.Read.All':2,'DeviceManagementApps.Read.All':2
+  };
+  var RISK_LABELS = ['','Low','Medium','High','Critical'];
+  var RISK_BADGE  = ['','risk-low','risk-medium','risk-high','risk-critical'];
+
+  function scoreScope(s){ return RISK_SCORES[s] || 1; }
+
+  function computeRisk(r){
+    var max = 1;
+    (r.delegatedDetail||[]).forEach(function(d){
+      (d.scopes||'').split(', ').forEach(function(s){ if(s) max = Math.max(max, scoreScope(s)); });
+    });
+    (r.appPermissions||[]).forEach(function(p){
+      max = Math.max(max, scoreScope(p.roleValue || ''));
+    });
+    return max;
+  }
+
+  function scopeHtml(scopeStr){
+    return (scopeStr||'').split(', ').filter(Boolean).map(function(s){
+      var sc = scoreScope(s);
+      var cls = sc >= 4 ? 'sc4' : sc >= 3 ? 'sc3' : sc >= 2 ? 'sc2' : '';
+      return cls ? '<span class="' + cls + '">' + escHtml(s) + '</span>' : escHtml(s);
+    }).join(', ');
+  }
+
   // -------------------- Render --------------------
   function filtered(){
     var q = el('q').value.toLowerCase().trim();
     var fMsft = el('f-msft').value;
+    var fRisk = el('f-risk').value;
     var rows = (cache.results || []).slice();
     if(q){
       rows = rows.filter(function(r){
         var permText = (r.delegatedDetail||[]).map(function(d){ return d.resourceName + ' ' + d.scopes; }).join(' ');
-        var hay = [r.displayName, r.appId, r.publisherName, permText].filter(Boolean).join(' ').toLowerCase();
+        var appPermText = (r.appPermissions||[]).map(function(p){ return p.resourceName + ' ' + p.roleValue; }).join(' ');
+        var hay = [r.displayName, r.appId, r.publisherName, permText, appPermText, RISK_LABELS[r.riskScore||1]].filter(Boolean).join(' ').toLowerCase();
         return hay.indexOf(q) !== -1;
       });
     }
     if(fMsft === 'yes') rows = rows.filter(function(r){ return r.isFirstPartyMicrosoft; });
     if(fMsft === 'no')  rows = rows.filter(function(r){ return !r.isFirstPartyMicrosoft; });
+    if(fRisk) rows = rows.filter(function(r){ return (r.riskScore||1) >= parseInt(fRisk, 10); });
     rows.sort(function(a,b){
-      var av = a[sortState.key] || '', bv = b[sortState.key] || '';
+      var av = a[sortState.key] != null ? a[sortState.key] : '', bv = b[sortState.key] != null ? b[sortState.key] : '';
       return String(av).localeCompare(String(bv)) * sortState.dir;
     });
     return rows;
@@ -538,21 +690,76 @@
       if(r.isFirstPartyMicrosoft) badges += '<span class="badge badge-msft">Microsoft</span>';
       if(r.accountEnabled === false) badges += '<span class="badge badge-disabled">Disabled</span>';
       var created = r.createdDateTime ? new Date(r.createdDateTime).toISOString().slice(0,10) : '';
+
+      // Risk badge
+      var rs = r.riskScore || 1;
+      var riskBadge = '<span class="badge ' + RISK_BADGE[rs] + '">' + RISK_LABELS[rs] + '</span>';
+
+      // Delegated permissions with scope colouring
       var permsHtml = (r.delegatedDetail||[]).map(function(d){
-        return '<div><span class="res">' + escHtml(d.resourceName) + ':</span> ' + escHtml(d.scopes || '(no scopes)') + '</div>';
+        return '<div><span class="res">' + escHtml(d.resourceName) + ':</span> ' + scopeHtml(d.scopes) + '</div>';
       }).join('');
+
+      // Application permissions with scope colouring
+      var appPermsHtml = '';
+      if(r.appPermissions && r.appPermissions.length){
+        var byRes = {};
+        r.appPermissions.forEach(function(p){ (byRes[p.resourceName] = byRes[p.resourceName]||[]).push(p); });
+        appPermsHtml = Object.keys(byRes).map(function(rn){
+          var vals = byRes[rn].map(function(p){
+            var v = p.roleValue || p.roleName;
+            var sc = scoreScope(p.roleValue||'');
+            var cls = sc>=4?'sc4':sc>=3?'sc3':sc>=2?'sc2':'';
+            return cls ? '<span class="'+cls+'">'+escHtml(v)+'</span>' : escHtml(v);
+          }).join(', ');
+          return '<div><span class="res">'+escHtml(rn)+':</span> '+vals+'</div>';
+        }).join('');
+      } else {
+        appPermsHtml = '<span style="color:var(--muted);font-size:12px">—</span>';
+      }
+
+      // Credentials pills
+      var now = Date.now();
+      var credsHtml = '';
+      if(r.passwordCreds && r.passwordCreds.length){
+        var expd=0, expr=0;
+        r.passwordCreds.forEach(function(c){ if(c.endDateTime){ var t=new Date(c.endDateTime).getTime(); if(t<now) expd++; else if(t-now<90*86400000) expr++; } });
+        var cc = expd?'expired':expr?'expiring':'';
+        credsHtml += '<span class="cred-pill '+cc+'">' + r.passwordCreds.length + ' secret'+(r.passwordCreds.length>1?'s':'')+(expd?' ('+expd+' expired)':expr?' (expiring)':'')+'</span>';
+      }
+      if(r.keyCreds && r.keyCreds.length){
+        var kexpd=0, kexpr=0;
+        r.keyCreds.forEach(function(c){ if(c.endDateTime){ var t=new Date(c.endDateTime).getTime(); if(t<now) kexpd++; else if(t-now<90*86400000) kexpr++; } });
+        var kc = kexpd?'expired':kexpr?'expiring':'';
+        credsHtml += '<span class="cred-pill '+kc+'">' + r.keyCreds.length + ' cert'+(r.keyCreds.length>1?'s':'')+(kexpd?' ('+kexpd+' expired)':kexpr?' (expiring)':'')+'</span>';
+      }
+
+      // Owners
+      var ownersHtml = '';
+      if(r.owners && r.owners.length){
+        ownersHtml = '<div class="owners-list">Owner'+(r.owners.length>1?'s':'')+': '+
+          r.owners.map(function(o){ return '<strong>'+escHtml(o.displayName||o.upn||'?')+'</strong>'; }).join(', ')+'</div>';
+      }
+
       var assignBadge = r.appRoleAssignmentRequired
         ? '<span class="badge badge-assign-yes">Required</span>'
         : '<span class="badge badge-assign-no">Not required</span>';
+
       return '<tr>' +
-        '<td><div class="name"><a href="' + escHtml(r.portalUrl) + '" target="_blank" rel="noopener">' + escHtml(r.displayName) + '</a></div><div class="appid">' + escHtml(r.appId) + '</div>' +
-        ((r.spaUris && r.spaUris.length) ? '<div style="margin-top:5px;font-size:11px;line-height:1.6"><span style="color:var(--accent);font-weight:600">SPA</span> ' + r.spaUris.map(escHtml).join('<br>') + '</div>' : '') +
-        ((r.webUris && r.webUris.length) ? '<div style="margin-top:3px;font-size:11px;line-height:1.6"><span style="color:var(--accent);font-weight:600">WEB</span> ' + r.webUris.map(escHtml).join('<br>') + '</div>' : '') +
-        (((r.spaUris && r.spaUris.length) || (r.webUris && r.webUris.length)) ? '<button class="ghost" style="margin-top:6px;padding:3px 9px;font-size:11px;" data-manage-appid="' + escHtml(r.appId) + '">Manage URIs</button>' : '') +
+        '<td>' +
+          '<div class="name"><a href="' + escHtml(r.portalUrl) + '" target="_blank" rel="noopener">' + escHtml(r.displayName) + '</a></div>' +
+          '<div class="appid">' + escHtml(r.appId) + '</div>' +
+          (credsHtml ? '<div style="margin-top:5px">' + credsHtml + '</div>' : '') +
+          ownersHtml +
+          ((r.spaUris&&r.spaUris.length) ? '<div style="margin-top:5px;font-size:11px;line-height:1.6"><span style="color:var(--accent);font-weight:600">SPA</span> '+r.spaUris.map(escHtml).join('<br>')+'</div>' : '') +
+          ((r.webUris&&r.webUris.length) ? '<div style="margin-top:3px;font-size:11px;line-height:1.6"><span style="color:var(--accent);font-weight:600">WEB</span> '+r.webUris.map(escHtml).join('<br>')+'</div>' : '') +
+          (((r.spaUris&&r.spaUris.length)||(r.webUris&&r.webUris.length)) ? '<button class="ghost" style="margin-top:6px;padding:3px 9px;font-size:11px;" data-manage-appid="'+escHtml(r.appId)+'">Manage URIs</button>' : '') +
         '</td>' +
+        '<td>' + riskBadge + '</td>' +
         '<td>' + badges + '</td>' +
         '<td>' + assignBadge + '</td>' +
         '<td><div class="detail">' + permsHtml + '</div></td>' +
+        '<td><div class="detail">' + appPermsHtml + '</div></td>' +
         '<td>' + escHtml(r.publisherName || '—') + '</td>' +
         '<td>' + escHtml(created) + '</td>' +
       '</tr>';
@@ -564,11 +771,15 @@
 
   function exportCsv(){
     var rows = filtered();
-    var cols = ['displayName','appId','id','accountEnabled','appRoleAssignmentRequired','publisherName','isFirstPartyMicrosoft','createdDateTime','delegatedPermissions','portalUrl'];
+    var cols = ['displayName','appId','id','riskLevel','accountEnabled','appRoleAssignmentRequired','publisherName','isFirstPartyMicrosoft','createdDateTime','delegatedPermissions','appPermissions','secrets','certs','owners','portalUrl'];
     var lines = [cols.join(',')];
     rows.forEach(function(r){
       var perms = (r.delegatedDetail||[]).map(function(d){ return d.resourceName + ': ' + d.scopes; }).join(' | ');
-      var row = [r.displayName, r.appId, r.id, r.accountEnabled, r.appRoleAssignmentRequired, r.publisherName, r.isFirstPartyMicrosoft, r.createdDateTime, perms, r.portalUrl];
+      var appPerms = (r.appPermissions||[]).map(function(p){ return p.resourceName + ': ' + (p.roleValue||p.roleName); }).join(' | ');
+      var secrets = (r.passwordCreds||[]).map(function(c){ return (c.displayName||'secret') + (c.endDateTime?' exp:'+c.endDateTime.slice(0,10):''); }).join(' | ');
+      var certs = (r.keyCreds||[]).map(function(c){ return (c.displayName||'cert') + (c.endDateTime?' exp:'+c.endDateTime.slice(0,10):''); }).join(' | ');
+      var owners = (r.owners||[]).map(function(o){ return o.displayName||o.upn||'?'; }).join(' | ');
+      var row = [r.displayName, r.appId, r.id, RISK_LABELS[r.riskScore||1], r.accountEnabled, r.appRoleAssignmentRequired, r.publisherName, r.isFirstPartyMicrosoft, r.createdDateTime, perms, appPerms, secrets, certs, owners, r.portalUrl];
       lines.push(row.map(function(v){
         if(v==null) v='';
         v = String(v).replace(/"/g,'""');
@@ -720,6 +931,7 @@
   el('btn-csv').addEventListener('click', exportCsv);
   el('q').addEventListener('input', render);
   el('f-msft').addEventListener('change', render);
+  el('f-risk').addEventListener('change', render);
   document.querySelectorAll('th[data-sort]').forEach(function(th){
     th.addEventListener('click', function(){
       var key = th.getAttribute('data-sort');
