@@ -168,7 +168,7 @@
       <th data-sort="displayName">Application</th>
       <th data-sort="accessLevel">Access Level</th>
       <th>Recon Capabilities</th>
-      <th>Granted permissions (AllPrincipals)</th>
+      <th>Permissions</th>
       <th data-sort="publisherName">Publisher</th>
       <th data-sort="createdDateTime">Created</th>
     </tr>
@@ -392,22 +392,45 @@
       token, function(n){ setMsg('Fetching admin-consent grants…', n + ' so far'); }
     );
 
+    setMsg('Fetching user-specific delegated grants…', '0');
+    var principalGrants = await graphGetAllPages(
+      'https://graph.microsoft.com/v1.0/oauth2PermissionGrants'
+      + '?$filter=' + encodeURIComponent("consentType eq 'Principal'") + '&$top=999',
+      token, function(n){ setMsg('Fetching user-specific delegated grants…', n + ' so far'); }
+    );
+
     var grantsByClient = {};
     grants.forEach(function(g){ (grantsByClient[g.clientId] = grantsByClient[g.clientId]||[]).push(g); });
 
-    // Resolve resource SP display names
+    // Group Principal grants: clientId -> resourceId -> { scopeSet, principalIds }
+    var principalGrantsByClient = {};
+    principalGrants.forEach(function(g){
+      if(!principalGrantsByClient[g.clientId]) principalGrantsByClient[g.clientId] = {};
+      var byRes = principalGrantsByClient[g.clientId];
+      if(!byRes[g.resourceId]) byRes[g.resourceId] = { scopeSet:{}, principalIds:{} };
+      (g.scope||'').split(/\s+/).filter(Boolean).forEach(function(s){ byRes[g.resourceId].scopeSet[s] = true; });
+      if(g.principalId) byRes[g.resourceId].principalIds[g.principalId] = true;
+    });
+
+    // Collect all unique resourceIds from both grant types
     var needed = {};
     Object.keys(grantsByClient).forEach(function(cid){ grantsByClient[cid].forEach(function(g){ needed[g.resourceId] = true; }); });
+    Object.keys(principalGrantsByClient).forEach(function(cid){ Object.keys(principalGrantsByClient[cid]).forEach(function(r){ needed[r] = true; }); });
+
     var resourceIds = Object.keys(needed);
     setMsg('Resolving resource APIs…', '0 / ' + resourceIds.length);
     var resourceNames = {};
+    var resourceSPCache = {};
     var batchSize = 15;
     for(var i=0; i<resourceIds.length; i+=batchSize){
       var slice = resourceIds.slice(i, i+batchSize);
       var filter = slice.map(function(id){ return "id eq '" + id + "'"; }).join(' or ');
       try {
-        var page = await graphGet('https://graph.microsoft.com/v1.0/servicePrincipals?$filter=' + encodeURIComponent(filter) + '&$select=id,displayName', token);
-        (page.value||[]).forEach(function(sp){ resourceNames[sp.id] = sp.displayName; });
+        var page = await graphGet('https://graph.microsoft.com/v1.0/servicePrincipals?$filter=' + encodeURIComponent(filter) + '&$select=id,displayName,appRoles', token);
+        (page.value||[]).forEach(function(sp){
+          resourceNames[sp.id] = sp.displayName;
+          resourceSPCache[sp.id] = { displayName: sp.displayName, appRoles: sp.appRoles||[] };
+        });
       } catch(e){}
       setMsg('Resolving resource APIs…', Math.min(i+batchSize, resourceIds.length) + ' / ' + resourceIds.length);
     }
@@ -422,8 +445,19 @@
       spGrants.forEach(function(g){
         var scopes = (g.scope||'').split(/\s+/).filter(Boolean).sort();
         allScopes = allScopes.concat(scopes);
-        if(scopes.length) delegatedDetail.push({ resourceName: resourceNames[g.resourceId]||'(unknown)', scopes: scopes.join(', ') });
+        if(scopes.length) delegatedDetail.push({ resourceName: resourceNames[g.resourceId]||'(unknown)', scopes: scopes.join(', '), consentType: 'AllPrincipals' });
       });
+      // Append user-specific (Principal) grants
+      var princByRes = principalGrantsByClient[sp.id];
+      if(princByRes){
+        Object.keys(princByRes).forEach(function(resId){
+          var entry = princByRes[resId];
+          var scopes = Object.keys(entry.scopeSet).sort();
+          var count  = Object.keys(entry.principalIds).length;
+          allScopes = allScopes.concat(scopes);
+          delegatedDetail.push({ resourceName: resourceNames[resId]||'(unknown)', scopes: scopes.join(', '), consentType: 'Principal', principalCount: count });
+        });
+      }
 
       var caps   = computeReconCaps(allScopes);
       var maxSev = caps.reduce(function(m,c){ return Math.max(m, c.cap.sev); }, 0);
@@ -436,6 +470,52 @@
         createdDateTime: sp.createdDateTime,
         delegatedDetail: delegatedDetail, caps: caps, accessLevel: maxSev,
         portalUrl: 'https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/Overview/appId/' + sp.appId
+      });
+    });
+
+    // Batch-fetch appRoleAssignments (application permissions) for each result
+    setMsg('Fetching application permissions…', '0 / ' + results.length);
+    var appRolesBySpId = {};
+    var BATCH_MAX = 20;
+    for(var bi=0; bi<results.length; bi+=BATCH_MAX){
+      var bSlice = results.slice(bi, bi+BATCH_MAX);
+      var bRequests = bSlice.map(function(r){ return { id: r.id, method:'GET', url:'/servicePrincipals/'+r.id+'/appRoleAssignments' }; });
+      try {
+        var bResponses = await graphBatch(bRequests, token);
+        bResponses.forEach(function(resp){ appRolesBySpId[resp.id] = (resp.status===200 && resp.body && resp.body.value) ? resp.body.value : []; });
+      } catch(e){}
+      setMsg('Fetching application permissions…', Math.min(bi+BATCH_MAX, results.length) + ' / ' + results.length);
+    }
+
+    // Resolve any resource SPs for app role assignments not already cached
+    var missingResSet = {};
+    results.forEach(function(r){ (appRolesBySpId[r.id]||[]).forEach(function(a){ if(!resourceSPCache[a.resourceId]) missingResSet[a.resourceId]=true; }); });
+    var missingResIds = Object.keys(missingResSet);
+    for(var mi=0; mi<missingResIds.length; mi+=batchSize){
+      var mSlice = missingResIds.slice(mi, mi+batchSize);
+      var mFilter = mSlice.map(function(id){ return "id eq '"+id+"'"; }).join(' or ');
+      try {
+        var mPage = await graphGet('https://graph.microsoft.com/v1.0/servicePrincipals?$filter='+encodeURIComponent(mFilter)+'&$select=id,displayName,appRoles', token);
+        (mPage.value||[]).forEach(function(sp){ resourceSPCache[sp.id]={ displayName:sp.displayName, appRoles:sp.appRoles||[] }; });
+      } catch(e){}
+    }
+
+    // Build role lookup: "resourceId_appRoleId" -> { resourceName, roleName, roleValue }
+    var appRoleLookup = {};
+    Object.keys(resourceSPCache).forEach(function(spId){
+      (resourceSPCache[spId].appRoles||[]).forEach(function(role){
+        appRoleLookup[spId+'_'+role.id] = { resourceName:resourceSPCache[spId].displayName, roleName:role.displayName, roleValue:role.value||'' };
+      });
+    });
+
+    // Attach appPermissions to each result
+    results.forEach(function(r){
+      r.appPermissions = (appRolesBySpId[r.id]||[]).map(function(a){
+        if(a.appRoleId==='00000000-0000-0000-0000-000000000000')
+          return { resourceName:a.resourceDisplayName||'(unknown)', roleName:'Default access', roleValue:'' };
+        var info = appRoleLookup[a.resourceId+'_'+a.appRoleId];
+        return info ? { resourceName:info.resourceName, roleName:info.roleName, roleValue:info.roleValue }
+                    : { resourceName:a.resourceDisplayName||'(unknown)', roleName:'(unknown)', roleValue:'' };
       });
     });
 
@@ -495,8 +575,19 @@
           }).join('')
         : '<span style="color:var(--muted);font-size:12px">No recognized capabilities</span>';
       var permsHtml = r.delegatedDetail.map(function(d){
-        return '<div><span class="res">' + escHtml(d.resourceName) + ':</span> ' + escHtml(d.scopes) + '</div>';
+        var typeBadge = d.consentType === 'AllPrincipals'
+          ? '<span style="font-size:10px;padding:1px 5px;border-radius:4px;background:rgba(239,68,68,0.12);color:#ef4444;font-weight:600;margin-right:5px;white-space:nowrap">All users</span>'
+          : '<span style="font-size:10px;padding:1px 5px;border-radius:4px;background:rgba(148,163,184,0.12);color:#94a3b8;font-weight:600;margin-right:5px;white-space:nowrap">'+(d.principalCount||'?')+' user'+(d.principalCount!==1?'s':'')+'</span>';
+        return '<div>'+typeBadge+'<span class="res">'+escHtml(d.resourceName)+':</span> '+escHtml(d.scopes)+'</div>';
       }).join('');
+      if(r.appPermissions && r.appPermissions.length){
+        var byRes = {};
+        r.appPermissions.forEach(function(p){ (byRes[p.resourceName]=byRes[p.resourceName]||[]).push(p); });
+        permsHtml += Object.keys(byRes).map(function(rn){
+          var vals = byRes[rn].map(function(p){ return escHtml(p.roleValue||p.roleName); }).join(', ');
+          return '<div><span style="font-size:10px;padding:1px 5px;border-radius:4px;background:rgba(56,189,248,0.12);color:#38bdf8;font-weight:600;margin-right:5px;white-space:nowrap">App role</span><span class="res">'+escHtml(rn)+':</span> '+vals+'</div>';
+        }).join('');
+      }
       return '<tr>'
         + '<td><div class="app-name"><a href="' + escHtml(r.portalUrl) + '" target="_blank" rel="noopener">' + escHtml(r.displayName) + '</a></div><div class="appid">' + escHtml(r.appId) + '</div></td>'
         + '<td>' + sevBadge + '</td>'
