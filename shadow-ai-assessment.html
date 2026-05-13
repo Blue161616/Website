@@ -382,6 +382,7 @@ const GRAPH_SCOPES = [
   'https://graph.microsoft.com/IdentityRiskyUser.Read.All',
   'https://graph.microsoft.com/SecurityAlert.Read.All',
   'https://graph.microsoft.com/RoleManagement.Read.All',
+  'https://graph.microsoft.com/IdentityRiskyServicePrincipal.Read.All',
 ];
 
 // Known AI app patterns for detection (case-insensitive)
@@ -669,6 +670,24 @@ async function fetchSecurityAlerts() {
     STATE.data.secAlerts = d.value || [];
   } catch (e) { STATE.data.secAlerts = []; STATE.data.secAlertsError = e.message; }
   return STATE.data.secAlerts;
+}
+
+async function fetchRiskyAgents() {
+  if (STATE.data.riskyAgents) return STATE.data.riskyAgents;
+  try {
+    const items = await ggetAll(`${GRAPH}/identityProtection/riskyServicePrincipals?$top=100&$select=id,appId,displayName,riskLevel,riskState,riskLastUpdatedDateTime,isEnabled`, 3);
+    STATE.data.riskyAgents = items;
+  } catch (e) {
+    try {
+      // fall back to beta if v1.0 not yet available in tenant
+      const items = await ggetAll(`${GRAPH_BETA}/identityProtection/riskyServicePrincipals?$top=100&$select=id,appId,displayName,riskLevel,riskState,riskLastUpdatedDateTime,isEnabled`, 3);
+      STATE.data.riskyAgents = items;
+    } catch (e2) {
+      STATE.data.riskyAgents = [];
+      STATE.data.riskyAgentsError = e2.message;
+    }
+  }
+  return STATE.data.riskyAgents;
 }
 
 async function fetchGrantPolicies() {
@@ -1283,8 +1302,8 @@ async function loadAgents() {
 async function loadDataRisk() {
   const el = document.getElementById('risk-content');
   try {
-    const [sps, grants, signIns, riskyUsers] = await Promise.all([
-      fetchServicePrincipals(), fetchOAuth2Grants(), fetchSignIns(), fetchRiskyUsers()
+    const [sps, grants, signIns, riskyUsers, riskyAgents] = await Promise.all([
+      fetchServicePrincipals(), fetchOAuth2Grants(), fetchSignIns(), fetchRiskyUsers(), fetchRiskyAgents()
     ]);
     const aiApps = sps.filter(isAiApp);
     const aiSignIns = signIns.filter(s => AI_KEYWORDS.some(k => (s.appDisplayName||'').toLowerCase().includes(k)));
@@ -1302,6 +1321,8 @@ async function loadDataRisk() {
 
     el.innerHTML = `
       ${STATE.data.riskyUsersError ? permWarn('IdentityRiskyUser.Read.All', STATE.data.riskyUsersError) : ''}
+      ${STATE.data.riskyAgentsError ? permWarn('IdentityRiskyServicePrincipal.Read.All', STATE.data.riskyAgentsError) : ''}
+
       <div class="kpi-row">
         <div class="kpi-card critical">
           <div class="kpi-label">Risky Sign-ins to AI Apps</div>
@@ -1315,17 +1336,39 @@ async function loadDataRisk() {
           <div class="kpi-delta">Identity Protection (P2)</div>
           <div class="kpi-icon">👤</div>
         </div>
+        <div class="kpi-card critical">
+          <div class="kpi-label">Risky Agents</div>
+          <div class="kpi-value text-critical">${riskyAgents.filter(a=>a.riskLevel&&a.riskLevel!=='none').length}${STATE.data.riskyAgentsError?'*':''}</div>
+          <div class="kpi-delta">${riskyAgents.filter(a=>a.riskLevel==='high').length} high · ${riskyAgents.filter(a=>a.riskLevel==='medium').length} medium${STATE.data.riskyAgentsError?' · *requires P2':''}</div>
+          <div class="kpi-icon">⚡</div>
+        </div>
         <div class="kpi-card medium">
           <div class="kpi-label">AI Apps with Mailbox Access</div>
           <div class="kpi-value text-medium">${aiApps.filter(sp=>getScopesForSp(sp.id,grants).includes('Mail.Read')||getScopesForSp(sp.id,grants).includes('Mail.ReadWrite')).length}</div>
           <div class="kpi-delta">Mail.Read / Mail.ReadWrite granted</div>
           <div class="kpi-icon">📧</div>
         </div>
-        <div class="kpi-card info">
-          <div class="kpi-label">AI Apps with File Access</div>
-          <div class="kpi-value text-blue">${aiApps.filter(sp=>getScopesForSp(sp.id,grants).includes('Files.Read')||getScopesForSp(sp.id,grants).includes('Files.ReadWrite.All')).length}</div>
-          <div class="kpi-delta">Files.Read / Files.ReadWrite.All</div>
-          <div class="kpi-icon">📁</div>
+      </div>
+
+      <!-- Risky Agents table -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">⚡ Risky Agents — Identity Protection (Preview)</div>
+          <span class="data-source source-live">● identityProtection/riskyServicePrincipals</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Agent / Service Principal</th><th>App ID</th><th>Risk Level</th><th>Risk State</th><th>Last Updated</th><th>Enabled</th></tr></thead>
+            <tbody>${riskyAgents.length ? riskyAgents.map(a => `<tr>
+              <td><strong>${esc(a.displayName||'—')}</strong></td>
+              <td class="mono text-muted">${esc((a.appId||'').slice(0,18))}…</td>
+              <td>${riskBadge(a.riskLevel||'medium')}</td>
+              <td><span class="badge ${a.riskState==='confirmedCompromised'?'badge-critical':a.riskState==='atRisk'?'badge-high':'badge-medium'}">${esc(a.riskState||'—')}</span></td>
+              <td class="mono text-muted">${a.riskLastUpdatedDateTime?new Date(a.riskLastUpdatedDateTime).toLocaleString():'—'}</td>
+              <td>${a.isEnabled===false?'<span class="text-critical">🚫 Disabled</span>':'<span class="text-low">✅ Enabled</span>'}</td>
+            </tr>`).join('') : `<tr><td colspan="6" class="empty-state text-muted">${STATE.data.riskyAgentsError?'Requires IdentityRiskyServicePrincipal.Read.All + Entra P2':'No risky agents detected'}</td></tr>`}
+            </tbody>
+          </table>
         </div>
       </div>
 
