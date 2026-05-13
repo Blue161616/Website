@@ -261,7 +261,7 @@
       <strong>Required delegated permissions (admin consent):</strong><br>
       <code>Application.Read.All</code> &nbsp;<code>AuditLog.Read.All</code> &nbsp;<code>User.Read.All</code><br>
       <code>Policy.Read.All</code> &nbsp;<code>Organization.Read.All</code> &nbsp;<code>IdentityRiskyUser.Read.All</code><br>
-      <code>SecurityEvents.Read.All</code> &nbsp;<code>RoleManagement.Read.All</code><br><br>
+      <code>SecurityAlert.Read.All</code> &nbsp;<code>RoleManagement.Read.All</code> &nbsp;<code>IdentityRiskyServicePrincipal.Read.All</code><br><br>
       Set platform to <strong>SPA</strong>, supported account types to <strong>multi-tenant</strong>.
     </div>
   </div>
@@ -1053,77 +1053,239 @@ async function loadDashboard() {
   }
 }
 
+// ── MDCA Cloud Discovery ───────────────────────────────────────────────────
+
+function getMcasUrl() {
+  return (localStorage.getItem('mcasUrl') || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
+}
+
+function saveMcasUrl() {
+  const val = (document.getElementById('mcas-url-input')?.value || '').trim()
+    .replace(/^https?:\/\//, '').replace(/\/$/, '');
+  if (!val) return;
+  localStorage.setItem('mcasUrl', val);
+  STATE.data.mcasApps = null;
+  STATE.data.mcasError = null;
+  STATE.loaded.delete('shadow-apps');
+  document.getElementById('shadow-content').innerHTML =
+    '<div class="section-loading"><span class="spinner"></span>Connecting to Defender for Cloud Apps…</div>';
+  loadShadowApps();
+}
+
+async function getMcasToken() {
+  const app = await getMsal();
+  const url = getMcasUrl();
+  // MDCA accepts tokens scoped to its portal URL or the generic cloudappsecurity scope
+  const scopes = [`https://${url}/.default`];
+  try {
+    const r = await app.acquireTokenSilent({ scopes, account: STATE.account });
+    return r.accessToken;
+  } catch {
+    const r = await app.acquireTokenPopup({ scopes });
+    return r.accessToken;
+  }
+}
+
+async function fetchMcasGenAiApps() {
+  if (STATE.data.mcasApps) return STATE.data.mcasApps;
+  const mcasUrl = getMcasUrl();
+  try {
+    const token = await getMcasToken();
+    let all = [], skip = 0, hasNext = true;
+    while (hasNext && skip < 1000) {
+      const r = await fetch(
+        `https://${mcasUrl}/api/v1/discovery/discovered_apps/?enriched=true&limit=100&skip=${skip}&sortField=usersCount&sortDirection=desc`,
+        { headers: { Authorization: 'Bearer ' + token } }
+      );
+      if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + r.statusText + ': ' + t.slice(0, 250)); }
+      const d = await r.json();
+      const page = Array.isArray(d) ? d : (d.data || d.value || []);
+      all = all.concat(page);
+      hasNext = !!d.hasNext && page.length === 100;
+      skip += 100;
+    }
+    // Filter for Generative AI category — MDCA uses category string "Generative AI"
+    const genAi = all.filter(a =>
+      /generative.?ai|genai/i.test(a.appInfo?.category || a.category || '') ||
+      (a.tags || []).some(t => /generative.?ai|genai/i.test(t))
+    );
+    STATE.data.mcasApps = genAi.length ? genAi : all; // fall back to all if category missing
+    STATE.data.mcasFilteredToGenAi = genAi.length > 0;
+    STATE.data.mcasTotal = all.length;
+  } catch (e) {
+    STATE.data.mcasApps = [];
+    STATE.data.mcasError = e.message;
+  }
+  return STATE.data.mcasApps;
+}
+
+function mcasRiskColor(score) {
+  if (score == null) return 'var(--text-dim)';
+  if (score >= 7) return 'var(--risk-critical)';
+  if (score >= 5) return 'var(--risk-medium)';
+  return 'var(--risk-low)';
+}
+
+function mcasSanctionBadge(app) {
+  const tags = (app.tags || []).map(t => (t||'').toLowerCase());
+  const sanctioned = app.sanctioned === true || tags.includes('sanctioned');
+  const unsanctioned = app.sanctioned === false || tags.includes('unsanctioned');
+  if (sanctioned)   return '<span class="badge badge-low">✅ Sanctioned</span>';
+  if (unsanctioned) return '<span class="badge badge-critical">🚫 Unsanctioned</span>';
+  return '<span class="badge badge-medium">⚠️ Unreviewed</span>';
+}
+
+function fmtBytes(b) {
+  if (!b) return '—';
+  if (b >= 1e9) return (b/1e9).toFixed(1) + ' GB';
+  if (b >= 1e6) return (b/1e6).toFixed(1) + ' MB';
+  if (b >= 1e3) return (b/1e3).toFixed(1) + ' KB';
+  return b + ' B';
+}
+
 // ── SHADOW APPS ────────────────────────────────────────────────────────────
 
 async function loadShadowApps() {
   const el = document.getElementById('shadow-content');
+  const mcasUrl = getMcasUrl();
+
+  // Show setup panel if MDCA URL not configured
+  if (!mcasUrl) {
+    el.innerHTML = `
+      <div style="max-width:580px;margin:40px auto">
+        <div class="card">
+          <div class="card-header"><div class="card-title">🔧 Connect Defender for Cloud Apps</div></div>
+          <div class="card-body">
+            <p style="font-size:13px;color:var(--text-muted);margin-bottom:18px">
+              This section pulls <strong>Generative AI</strong> app discovery data directly from
+              Microsoft Defender for Cloud Apps Cloud Discovery. Enter your tenant's MDCA portal URL to connect.
+            </p>
+            <div style="margin-bottom:8px">
+              <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:6px">MDCA Portal URL</label>
+              <input id="mcas-url-input" type="text"
+                placeholder="yourcompany.eu.portal.cloudappsecurity.com"
+                style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);padding:9px 12px;border-radius:6px;font-size:13px;font-family:ui-monospace,Consolas,monospace;outline:none" />
+            </div>
+            <p style="font-size:11px;color:var(--text-dim);margin-bottom:18px;line-height:1.6">
+              Find your URL in <strong>Microsoft Defender XDR → Settings → Cloud Apps → About</strong>.<br>
+              Common formats: <code style="background:var(--bg-hover);padding:1px 5px;border-radius:3px">contoso.eu.portal.cloudappsecurity.com</code>
+              or <code style="background:var(--bg-hover);padding:1px 5px;border-radius:3px">contoso.portal.cloudappsecurity.com</code>
+            </p>
+            <button class="btn btn-primary" onclick="saveMcasUrl()">Connect →</button>
+          </div>
+        </div>
+      </div>`;
+    return;
+  }
+
   try {
-    const [sps, grants] = await Promise.all([fetchServicePrincipals(), fetchOAuth2Grants()]);
-    const aiApps = sps.filter(isAiApp).sort((a,b) => {
-      const ra = {critical:4,high:3,medium:2,low:1}[riskScore(a,grants)];
-      const rb = {critical:4,high:3,medium:2,low:1}[riskScore(b,grants)];
-      return rb - ra;
-    });
+    const apps = await fetchMcasGenAiApps();
+
+    if (STATE.data.mcasError) {
+      el.innerHTML = `
+        <div class="perm-warn">
+          ❌ Could not connect to <code>${esc(mcasUrl)}</code> — ${esc(STATE.data.mcasError.slice(0,200))}<br><br>
+          <button class="btn btn-ghost" style="margin-top:8px" onclick="localStorage.removeItem('mcasUrl');STATE.loaded.delete('shadow-apps');loadShadowApps()">← Change URL</button>
+        </div>`;
+      return;
+    }
+
+    const unsanctioned = apps.filter(a => a.sanctioned === false || (a.tags||[]).map(t=>(t||'').toLowerCase()).includes('unsanctioned'));
+    const highRisk     = apps.filter(a => (a.score ?? a.appInfo?.score ?? 0) >= 7);
+    const totalUsers   = apps.reduce((s,a) => s + (a.users ?? a.usersCount ?? 0), 0);
+    const sorted       = [...apps].sort((a,b) => (b.score ?? b.appInfo?.score ?? 0) - (a.score ?? a.appInfo?.score ?? 0));
 
     el.innerHTML = `
-      ${STATE.data.spError ? permWarn('Application.Read.All', STATE.data.spError) : ''}
-      <div class="section-header">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
         <div>
-          <div class="section-title">Shadow AI Application Inventory</div>
-          <div class="section-sub">Enterprise apps and OAuth clients detected via service principals &amp; permission grants</div>
+          <div class="section-title">Generative AI — Discovered Apps</div>
+          <div class="section-sub">Source: Defender for Cloud Apps Cloud Discovery · <span class="mono">${esc(mcasUrl)}</span>
+            ${STATE.data.mcasFilteredToGenAi ? ' · filtered to Generative AI category' : ' · all categories (Generative AI filter returned no results — showing all)'}
+          </div>
         </div>
-        <span class="data-source source-live">● Live from Graph</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="data-source source-live">● Live from MDCA</span>
+          <button class="btn btn-ghost" style="font-size:11px" onclick="localStorage.removeItem('mcasUrl');STATE.loaded.delete('shadow-apps');loadShadowApps()">⚙ Change URL</button>
+        </div>
       </div>
-      ${aiApps.length === 0 ? '<div class="empty-state">No AI-related service principals detected. Check Application.Read.All permission.</div>' : ''}
-      <div class="card">
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Application</th><th>Publisher</th><th>Category</th><th>Risk</th><th>OAuth Grants</th><th>High-Risk Scopes</th><th>Status</th><th>Created</th></tr></thead>
-            <tbody>${aiApps.map(sp => {
-              const model = detectModel(sp.displayName || '');
-              const r = riskScore(sp, grants);
-              const hrs = highRiskScopesFor(sp.id, grants);
-              const grantCount = grants.filter(g => g.clientId === sp.id).length;
-              const created = sp.createdDateTime ? new Date(sp.createdDateTime).toLocaleDateString() : '—';
-              return `<tr>
-                <td><strong>${esc(sp.displayName)}</strong><br><span class="mono text-muted">${esc(sp.appId.slice(0,18))}…</span></td>
-                <td class="text-muted">${esc(sp.publisherName||'—')}</td>
-                <td><span class="badge badge-info">${esc(model.model)}</span></td>
-                <td>${riskBadge(r)}</td>
-                <td style="font-weight:600">${grantCount}</td>
-                <td style="font-size:11px">${hrs.length ? `<span class="text-critical">${hrs.slice(0,4).map(esc).join('<br>')}</span>` : '<span class="text-muted">—</span>'}</td>
-                <td>${sp.accountEnabled ? statusBadge('unblocked') : statusBadge('disabled')}</td>
-                <td class="text-muted mono">${created}</td>
-              </tr>`;
-            }).join('')}
-            </tbody>
-          </table>
+
+      <div class="kpi-row">
+        <div class="kpi-card critical">
+          <div class="kpi-label">Generative AI Apps</div>
+          <div class="kpi-value text-critical">${apps.length}</div>
+          <div class="kpi-delta">of ${STATE.data.mcasTotal||'?'} total discovered apps</div>
+          <div class="kpi-icon">🤖</div>
+        </div>
+        <div class="kpi-card high">
+          <div class="kpi-label">Unsanctioned</div>
+          <div class="kpi-value text-high">${unsanctioned.length}</div>
+          <div class="kpi-delta">Not approved for business use</div>
+          <div class="kpi-icon">🚫</div>
+        </div>
+        <div class="kpi-card medium">
+          <div class="kpi-label">High Risk (score ≥ 7)</div>
+          <div class="kpi-value text-medium">${highRisk.length}</div>
+          <div class="kpi-delta">MDCA risk score out of 10</div>
+          <div class="kpi-icon">⚠️</div>
+        </div>
+        <div class="kpi-card info">
+          <div class="kpi-label">Total Users</div>
+          <div class="kpi-value text-blue">${totalUsers.toLocaleString()}</div>
+          <div class="kpi-delta">Across all discovered GenAI apps</div>
+          <div class="kpi-icon">👥</div>
         </div>
       </div>
 
       <div class="card">
-        <div class="card-header"><div class="card-title">Tenant-wide OAuth2 Grants to AI Apps</div></div>
+        <div class="card-header">
+          <div class="card-title">App Inventory</div>
+          <span style="font-size:11px;color:var(--text-muted)">${sorted.length} apps · sorted by risk score</span>
+        </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>AI App (Client)</th><th>Scopes Granted</th><th>Consent Type</th><th>High Risk?</th></tr></thead>
-            <tbody>${grants.filter(g => aiApps.some(a => a.id === g.clientId)).map(g => {
-              const sp = aiApps.find(a => a.id === g.clientId);
-              const scopes = (g.scope || '').split(' ').filter(Boolean);
-              const hrs = HIGH_RISK_SCOPES.filter(s => scopes.includes(s));
+            <thead>
+              <tr>
+                <th>App Name</th>
+                <th>Risk Score</th>
+                <th>Sanction Status</th>
+                <th>Users</th>
+                <th>Upload</th>
+                <th>Download</th>
+                <th>Domains</th>
+                <th>Last Seen</th>
+              </tr>
+            </thead>
+            <tbody>${sorted.map(a => {
+              const score = a.score ?? a.appInfo?.score ?? null;
+              const users = a.users ?? a.usersCount ?? 0;
+              const upload = a.upload ?? a.trafficUpload ?? 0;
+              const download = a.download ?? a.trafficDownload ?? 0;
+              const domains = (a.domains || []).slice(0,2).join(', ') || (a.appInfo?.domains||[]).slice(0,2).join(', ') || '—';
+              const last = a.lastUsed ?? a.lastSeen;
               return `<tr>
-                <td><strong>${esc(sp?.displayName||g.clientId)}</strong></td>
-                <td style="font-size:11px;max-width:320px;word-break:break-word">${scopes.map(s => `<span class="badge ${HIGH_RISK_SCOPES.includes(s)?'badge-critical':'badge-info'}">${esc(s)}</span>`).join(' ')}</td>
-                <td><span class="badge ${g.consentType==='AllPrincipals'?'badge-critical':'badge-medium'}">${esc(g.consentType||'—')}</span></td>
-                <td>${hrs.length ? `<span class="text-critical">⚠️ ${hrs.length} high-risk scope(s)</span>` : '<span class="text-low">✅ Clean</span>'}</td>
+                <td>
+                  <strong>${esc(a.name || a.appInfo?.name || '—')}</strong>
+                  ${a.category || a.appInfo?.category ? `<br><span class="badge badge-purple" style="font-size:10px">${esc(a.category||a.appInfo?.category)}</span>` : ''}
+                </td>
+                <td>
+                  <span style="font-size:22px;font-weight:800;color:${mcasRiskColor(score)}">${score != null ? score.toFixed(1) : '—'}</span>
+                  <span style="font-size:10px;color:var(--text-dim)">/10</span>
+                </td>
+                <td>${mcasSanctionBadge(a)}</td>
+                <td style="font-weight:600">${users.toLocaleString()}</td>
+                <td class="text-muted">${fmtBytes(upload)}</td>
+                <td class="text-muted">${fmtBytes(download)}</td>
+                <td class="mono text-muted" style="font-size:11px">${esc(domains)}</td>
+                <td class="mono text-muted">${last ? new Date(last).toLocaleDateString() : '—'}</td>
               </tr>`;
-            }).join('') || '<tr><td colspan="4" class="empty-state text-muted">No OAuth grants to AI apps found</td></tr>'}
+            }).join('') || '<tr><td colspan="8" class="empty-state text-muted">No Generative AI apps discovered yet</td></tr>'}
             </tbody>
           </table>
         </div>
       </div>
     `;
   } catch (e) {
-    el.innerHTML = permWarn('Application.Read.All', e.message);
+    el.innerHTML = `<div class="perm-warn">❌ ${esc(e.message)}</div>`;
   }
 }
 
