@@ -380,7 +380,7 @@ const GRAPH_SCOPES = [
   'https://graph.microsoft.com/Policy.Read.All',
   'https://graph.microsoft.com/Organization.Read.All',
   'https://graph.microsoft.com/IdentityRiskyUser.Read.All',
-  'https://graph.microsoft.com/SecurityEvents.Read.All',
+  'https://graph.microsoft.com/SecurityAlert.Read.All',
   'https://graph.microsoft.com/RoleManagement.Read.All',
 ];
 
@@ -593,14 +593,33 @@ async function fetchServicePrincipals() {
 async function fetchOAuth2Grants() {
   if (STATE.data.grants) return STATE.data.grants;
   try {
+    // Requires Cloud Application Administrator role — try tenant-wide first
     const items = await ggetAll(`${GRAPH}/oauth2PermissionGrants?$top=500`, 6);
     STATE.data.grants = items;
   } catch (e) {
-    STATE.data.grants = [];
-    // 403 = caller lacks Cloud Application Administrator role or higher
-    STATE.data.grantsError = e.message.includes('403')
-      ? '403: Requires Cloud Application Administrator role on the signed-in account (admin consent alone is not enough)'
-      : e.message;
+    if (!e.message.includes('403')) {
+      STATE.data.grants = [];
+      STATE.data.grantsError = e.message;
+      return STATE.data.grants;
+    }
+    // 403 fallback: fetch grants per detected AI service principal instead.
+    // /servicePrincipals/{id}/oauth2PermissionGrants works with Application.Read.All alone.
+    try {
+      const sps = await fetchServicePrincipals();
+      const aiSps = sps.filter(isAiApp).slice(0, 40);
+      const grants = [];
+      await Promise.all(aiSps.map(async sp => {
+        try {
+          const d = await gget(`${GRAPH}/servicePrincipals/${sp.id}/oauth2PermissionGrants`);
+          if (d.value) grants.push(...d.value);
+        } catch { /* skip apps with no grants */ }
+      }));
+      STATE.data.grants = grants;
+      STATE.data.grantsNote = `Tenant-wide endpoint denied (needs Cloud App Admin). Showing grants scoped to ${aiSps.length} detected AI service principals.`;
+    } catch (e2) {
+      STATE.data.grants = [];
+      STATE.data.grantsError = e2.message;
+    }
   }
   return STATE.data.grants;
 }
