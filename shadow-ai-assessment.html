@@ -261,7 +261,8 @@
       <strong>Required delegated permissions (admin consent):</strong><br>
       <code>Application.Read.All</code> &nbsp;<code>AuditLog.Read.All</code> &nbsp;<code>User.Read.All</code><br>
       <code>Policy.Read.All</code> &nbsp;<code>Organization.Read.All</code> &nbsp;<code>IdentityRiskyUser.Read.All</code><br>
-      <code>SecurityAlert.Read.All</code> &nbsp;<code>RoleManagement.Read.All</code> &nbsp;<code>IdentityRiskyServicePrincipal.Read.All</code><br><br>
+      <code>SecurityAlert.Read.All</code> &nbsp;<code>RoleManagement.Read.All</code> &nbsp;<code>IdentityRiskyServicePrincipal.Read.All</code><br>
+      + <code>Microsoft Defender API → user_impersonation</code> (for Cloud Discovery)<br><br>
       Set platform to <strong>SPA</strong>, supported account types to <strong>multi-tenant</strong>.
     </div>
   </div>
@@ -371,6 +372,8 @@
 
 const GRAPH = 'https://graph.microsoft.com/v1.0';
 const GRAPH_BETA = 'https://graph.microsoft.com/beta';
+const DEFENDER_BASE = 'https://api.security.microsoft.com';
+const DEFENDER_SCOPES = ['https://api.security.microsoft.com/user_impersonation'];
 
 const GRAPH_SCOPES = [
   'https://graph.microsoft.com/User.Read',
@@ -477,10 +480,11 @@ async function getMsal() {
 function adminConsent() {
   const cid = getClientId();
   if (!cid) { showLoginError('Enter a Client ID first.'); return; }
-  const scopes = GRAPH_SCOPES.slice(1).map(s => s.replace('https://graph.microsoft.com/','')).join(' ');
+  const graphScopes = GRAPH_SCOPES.slice(1).map(s => s.replace('https://graph.microsoft.com/','')).join(' ');
+  const allScopes = graphScopes + ' ' + DEFENDER_SCOPES.join(' ');
   const url = 'https://login.microsoftonline.com/common/adminconsent'
     + '?client_id=' + encodeURIComponent(cid)
-    + '&scope=' + encodeURIComponent(scopes)
+    + '&scope=' + encodeURIComponent(allScopes)
     + '&redirect_uri=' + encodeURIComponent(getRedirectUri());
   window.location.href = url;
 }
@@ -1053,85 +1057,66 @@ async function loadDashboard() {
   }
 }
 
-// ── MDCA Cloud Discovery ───────────────────────────────────────────────────
+// ── Microsoft Defender XDR — Cloud Discovery ──────────────────────────────
 
-function getMcasUrl() {
-  return (localStorage.getItem('mcasUrl') || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
-}
-
-function saveMcasUrl() {
-  const val = (document.getElementById('mcas-url-input')?.value || '').trim()
-    .replace(/^https?:\/\//, '').replace(/\/$/, '');
-  if (!val) return;
-  localStorage.setItem('mcasUrl', val);
-  STATE.data.mcasApps = null;
-  STATE.data.mcasError = null;
-  STATE.loaded.delete('shadow-apps');
-  document.getElementById('shadow-content').innerHTML =
-    '<div class="section-loading"><span class="spinner"></span>Connecting to Defender for Cloud Apps…</div>';
-  loadShadowApps();
-}
-
-async function getMcasToken() {
+async function getDefenderToken() {
   const app = await getMsal();
-  const url = getMcasUrl();
-  // MDCA accepts tokens scoped to its portal URL or the generic cloudappsecurity scope
-  const scopes = [`https://${url}/.default`];
   try {
-    const r = await app.acquireTokenSilent({ scopes, account: STATE.account });
+    const r = await app.acquireTokenSilent({ scopes: DEFENDER_SCOPES, account: STATE.account });
     return r.accessToken;
   } catch {
-    const r = await app.acquireTokenPopup({ scopes });
+    const r = await app.acquireTokenPopup({ scopes: DEFENDER_SCOPES });
     return r.accessToken;
   }
 }
 
-async function fetchMcasGenAiApps() {
-  if (STATE.data.mcasApps) return STATE.data.mcasApps;
-  const mcasUrl = getMcasUrl();
+async function fetchDefenderGenAiApps() {
+  if (STATE.data.defenderApps !== undefined) return STATE.data.defenderApps;
   try {
-    const token = await getMcasToken();
+    const token = await getDefenderToken();
     let all = [], skip = 0, hasNext = true;
-    while (hasNext && skip < 1000) {
+    while (hasNext && skip < 2000) {
       const r = await fetch(
-        `https://${mcasUrl}/api/v1/discovery/discovered_apps/?enriched=true&limit=100&skip=${skip}&sortField=usersCount&sortDirection=desc`,
+        `${DEFENDER_BASE}/api/v1/discovery/discovered_apps/?enriched=true&limit=100&skip=${skip}&sortField=usersCount&sortDirection=desc`,
         { headers: { Authorization: 'Bearer ' + token } }
       );
-      if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + r.statusText + ': ' + t.slice(0, 250)); }
+      if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + r.statusText + ': ' + t.slice(0, 300)); }
       const d = await r.json();
       const page = Array.isArray(d) ? d : (d.data || d.value || []);
       all = all.concat(page);
       hasNext = !!d.hasNext && page.length === 100;
       skip += 100;
     }
-    // Filter for Generative AI category — MDCA uses category string "Generative AI"
+    STATE.data.defenderTotal = all.length;
+    // Filter for Generative AI category
     const genAi = all.filter(a =>
       /generative.?ai|genai/i.test(a.appInfo?.category || a.category || '') ||
       (a.tags || []).some(t => /generative.?ai|genai/i.test(t))
     );
-    STATE.data.mcasApps = genAi.length ? genAi : all; // fall back to all if category missing
-    STATE.data.mcasFilteredToGenAi = genAi.length > 0;
-    STATE.data.mcasTotal = all.length;
+    STATE.data.defenderApps = genAi.length ? genAi : all;
+    STATE.data.defenderFilteredToGenAi = genAi.length > 0;
   } catch (e) {
-    STATE.data.mcasApps = [];
-    STATE.data.mcasError = e.message;
+    STATE.data.defenderApps = [];
+    STATE.data.defenderError = e.message;
   }
-  return STATE.data.mcasApps;
+  return STATE.data.defenderApps;
 }
 
-function mcasRiskColor(score) {
+function defenderRiskColor(score) {
   if (score == null) return 'var(--text-dim)';
-  if (score >= 7) return 'var(--risk-critical)';
-  if (score >= 5) return 'var(--risk-medium)';
+  if (score <= 3)  return 'var(--risk-critical)'; // Defender scores: low number = high risk
+  if (score <= 6)  return 'var(--risk-medium)';
   return 'var(--risk-low)';
 }
 
-function mcasSanctionBadge(app) {
-  const tags = (app.tags || []).map(t => (t||'').toLowerCase());
-  const sanctioned = app.sanctioned === true || tags.includes('sanctioned');
-  const unsanctioned = app.sanctioned === false || tags.includes('unsanctioned');
-  if (sanctioned)   return '<span class="badge badge-low">✅ Sanctioned</span>';
-  if (unsanctioned) return '<span class="badge badge-critical">🚫 Unsanctioned</span>';
+function defenderSanctionBadge(app) {
+  // New portal uses "status" field: "sanctioned", "unsanctioned", "monitored", "blocked"
+  const status = (app.status || '').toLowerCase();
+  const tags   = (app.tags  || []).map(t => (t||'').toLowerCase());
+  if (status === 'sanctioned'   || tags.includes('sanctioned'))   return '<span class="badge badge-low">✅ Sanctioned</span>';
+  if (status === 'unsanctioned' || tags.includes('unsanctioned')) return '<span class="badge badge-critical">🚫 Unsanctioned</span>';
+  if (status === 'blocked')                                        return '<span class="badge badge-critical">🚫 Blocked</span>';
+  if (status === 'monitored')                                      return '<span class="badge badge-medium">👁 Monitored</span>';
   return '<span class="badge badge-medium">⚠️ Unreviewed</span>';
 }
 
@@ -1147,91 +1132,83 @@ function fmtBytes(b) {
 
 async function loadShadowApps() {
   const el = document.getElementById('shadow-content');
-  const mcasUrl = getMcasUrl();
-
-  // Show setup panel if MDCA URL not configured
-  if (!mcasUrl) {
-    el.innerHTML = `
-      <div style="max-width:580px;margin:40px auto">
-        <div class="card">
-          <div class="card-header"><div class="card-title">🔧 Connect Defender for Cloud Apps</div></div>
-          <div class="card-body">
-            <p style="font-size:13px;color:var(--text-muted);margin-bottom:18px">
-              This section pulls <strong>Generative AI</strong> app discovery data directly from
-              Microsoft Defender for Cloud Apps Cloud Discovery. Enter your tenant's MDCA portal URL to connect.
-            </p>
-            <div style="margin-bottom:8px">
-              <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:6px">MDCA Portal URL</label>
-              <input id="mcas-url-input" type="text"
-                placeholder="yourcompany.eu.portal.cloudappsecurity.com"
-                style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);padding:9px 12px;border-radius:6px;font-size:13px;font-family:ui-monospace,Consolas,monospace;outline:none" />
-            </div>
-            <p style="font-size:11px;color:var(--text-dim);margin-bottom:18px;line-height:1.6">
-              Find your URL in <strong>Microsoft Defender XDR → Settings → Cloud Apps → About</strong>.<br>
-              Common formats: <code style="background:var(--bg-hover);padding:1px 5px;border-radius:3px">contoso.eu.portal.cloudappsecurity.com</code>
-              or <code style="background:var(--bg-hover);padding:1px 5px;border-radius:3px">contoso.portal.cloudappsecurity.com</code>
-            </p>
-            <button class="btn btn-primary" onclick="saveMcasUrl()">Connect →</button>
-          </div>
-        </div>
-      </div>`;
-    return;
-  }
-
+  el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Connecting to Microsoft Defender XDR…</div>';
   try {
-    const apps = await fetchMcasGenAiApps();
+    const apps = await fetchDefenderGenAiApps();
 
-    if (STATE.data.mcasError) {
+    if (STATE.data.defenderError) {
       el.innerHTML = `
         <div class="perm-warn">
-          ❌ Could not connect to <code>${esc(mcasUrl)}</code> — ${esc(STATE.data.mcasError.slice(0,200))}<br><br>
-          <button class="btn btn-ghost" style="margin-top:8px" onclick="localStorage.removeItem('mcasUrl');STATE.loaded.delete('shadow-apps');loadShadowApps()">← Change URL</button>
+          ❌ Defender XDR API error — ${esc(STATE.data.defenderError.slice(0,250))}<br><br>
+          <strong>Ensure the app registration has <code>user_impersonation</code> permission for
+          <code>Microsoft Defender API</code> and admin consent has been granted.</strong><br><br>
+          <button class="btn btn-ghost" style="margin-top:8px"
+            onclick="delete STATE.data.defenderApps;delete STATE.data.defenderError;STATE.loaded.delete('shadow-apps');loadShadowApps()">
+            ↺ Retry
+          </button>
         </div>`;
       return;
     }
 
-    const unsanctioned = apps.filter(a => a.sanctioned === false || (a.tags||[]).map(t=>(t||'').toLowerCase()).includes('unsanctioned'));
-    const highRisk     = apps.filter(a => (a.score ?? a.appInfo?.score ?? 0) >= 7);
-    const totalUsers   = apps.reduce((s,a) => s + (a.users ?? a.usersCount ?? 0), 0);
-    const sorted       = [...apps].sort((a,b) => (b.score ?? b.appInfo?.score ?? 0) - (a.score ?? a.appInfo?.score ?? 0));
+    // Defender risk score: 1–10 where LOW number = HIGH risk (opposite of MDCA legacy)
+    // Detect direction from data; if all scores ≤ 10 treat as Defender-style (low=bad)
+    const getScore  = a => a.score ?? a.appInfo?.score ?? null;
+    const getStatus = a => (a.status || '').toLowerCase();
+
+    const unsanctioned = apps.filter(a => {
+      const s = getStatus(a);
+      return s === 'unsanctioned' || s === 'blocked' ||
+             (a.tags||[]).map(t=>(t||'').toLowerCase()).includes('unsanctioned');
+    });
+    // Low score = high risk in new Defender portal (score ≤ 4 is high risk)
+    const highRisk   = apps.filter(a => { const s = getScore(a); return s != null && s <= 4; });
+    const totalUsers = apps.reduce((s,a) => s + (a.users ?? a.usersCount ?? 0), 0);
+    const totalTx    = apps.reduce((s,a) => s + (a.trafficTotal ?? a.upload ?? 0) + (a.download ?? 0), 0);
+    // Sort: unsanctioned first, then by ascending score (riskiest first)
+    const sorted = [...apps].sort((a,b) => {
+      const sa = getStatus(a) === 'unsanctioned' ? -1 : 0;
+      const sb = getStatus(b) === 'unsanctioned' ? -1 : 0;
+      if (sa !== sb) return sa - sb;
+      return (getScore(a) ?? 99) - (getScore(b) ?? 99);
+    });
 
     el.innerHTML = `
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
         <div>
           <div class="section-title">Generative AI — Discovered Apps</div>
-          <div class="section-sub">Source: Defender for Cloud Apps Cloud Discovery · <span class="mono">${esc(mcasUrl)}</span>
-            ${STATE.data.mcasFilteredToGenAi ? ' · filtered to Generative AI category' : ' · all categories (Generative AI filter returned no results — showing all)'}
+          <div class="section-sub">
+            Source: Microsoft Defender XDR · Cloud Discovery ·
+            ${STATE.data.defenderFilteredToGenAi
+              ? `filtered to Generative AI category (${STATE.data.defenderTotal} total apps scanned)`
+              : `all categories shown (Generative AI filter matched nothing — showing all ${STATE.data.defenderTotal} apps)`}
           </div>
         </div>
-        <div style="display:flex;gap:8px;align-items:center">
-          <span class="data-source source-live">● Live from MDCA</span>
-          <button class="btn btn-ghost" style="font-size:11px" onclick="localStorage.removeItem('mcasUrl');STATE.loaded.delete('shadow-apps');loadShadowApps()">⚙ Change URL</button>
-        </div>
+        <span class="data-source source-live">● Live · api.security.microsoft.com</span>
       </div>
 
       <div class="kpi-row">
-        <div class="kpi-card critical">
+        <div class="kpi-card info">
           <div class="kpi-label">Generative AI Apps</div>
-          <div class="kpi-value text-critical">${apps.length}</div>
-          <div class="kpi-delta">of ${STATE.data.mcasTotal||'?'} total discovered apps</div>
+          <div class="kpi-value text-blue">${apps.length}</div>
+          <div class="kpi-delta">Discovered in last 30 days</div>
           <div class="kpi-icon">🤖</div>
         </div>
-        <div class="kpi-card high">
+        <div class="kpi-card critical">
           <div class="kpi-label">Unsanctioned</div>
-          <div class="kpi-value text-high">${unsanctioned.length}</div>
+          <div class="kpi-value text-critical">${unsanctioned.length}</div>
           <div class="kpi-delta">Not approved for business use</div>
           <div class="kpi-icon">🚫</div>
         </div>
-        <div class="kpi-card medium">
-          <div class="kpi-label">High Risk (score ≥ 7)</div>
-          <div class="kpi-value text-medium">${highRisk.length}</div>
-          <div class="kpi-delta">MDCA risk score out of 10</div>
+        <div class="kpi-card high">
+          <div class="kpi-label">High Risk (score ≤ 4)</div>
+          <div class="kpi-value text-high">${highRisk.length}</div>
+          <div class="kpi-delta">Defender risk score out of 10</div>
           <div class="kpi-icon">⚠️</div>
         </div>
-        <div class="kpi-card info">
+        <div class="kpi-card medium">
           <div class="kpi-label">Total Users</div>
-          <div class="kpi-value text-blue">${totalUsers.toLocaleString()}</div>
-          <div class="kpi-delta">Across all discovered GenAI apps</div>
+          <div class="kpi-value text-medium">${totalUsers.toLocaleString()}</div>
+          <div class="kpi-delta">Across all GenAI apps</div>
           <div class="kpi-icon">👥</div>
         </div>
       </div>
@@ -1239,46 +1216,52 @@ async function loadShadowApps() {
       <div class="card">
         <div class="card-header">
           <div class="card-title">App Inventory</div>
-          <span style="font-size:11px;color:var(--text-muted)">${sorted.length} apps · sorted by risk score</span>
+          <span style="font-size:11px;color:var(--text-muted)">${sorted.length} apps · unsanctioned first, then by risk score</span>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>App Name</th>
+                <th>App</th>
+                <th>Status</th>
                 <th>Risk Score</th>
-                <th>Sanction Status</th>
                 <th>Users</th>
+                <th>Traffic</th>
                 <th>Upload</th>
-                <th>Download</th>
-                <th>Domains</th>
+                <th>Transactions</th>
+                <th>Devices</th>
                 <th>Last Seen</th>
               </tr>
             </thead>
             <tbody>${sorted.map(a => {
-              const score = a.score ?? a.appInfo?.score ?? null;
-              const users = a.users ?? a.usersCount ?? 0;
-              const upload = a.upload ?? a.trafficUpload ?? 0;
-              const download = a.download ?? a.trafficDownload ?? 0;
-              const domains = (a.domains || []).slice(0,2).join(', ') || (a.appInfo?.domains||[]).slice(0,2).join(', ') || '—';
-              const last = a.lastUsed ?? a.lastSeen;
+              const score   = getScore(a);
+              const users   = a.users   ?? a.usersCount   ?? 0;
+              const traffic = a.trafficTotal ?? 0;
+              const upload  = a.upload  ?? a.trafficUpload ?? 0;
+              const tx      = a.transactions ?? a.transactionsCount ?? 0;
+              const devices = a.devices ?? a.devicesCount ?? 0;
+              const last    = a.lastUsed ?? a.lastSeen;
+              const name    = a.name    ?? a.appInfo?.name ?? '—';
               return `<tr>
                 <td>
-                  <strong>${esc(a.name || a.appInfo?.name || '—')}</strong>
-                  ${a.category || a.appInfo?.category ? `<br><span class="badge badge-purple" style="font-size:10px">${esc(a.category||a.appInfo?.category)}</span>` : ''}
+                  <strong>${esc(name)}</strong>
+                  ${a.category || a.appInfo?.category
+                    ? `<br><span class="badge badge-purple" style="font-size:10px">${esc(a.category||a.appInfo?.category)}</span>`
+                    : ''}
                 </td>
+                <td>${defenderSanctionBadge(a)}</td>
                 <td>
-                  <span style="font-size:22px;font-weight:800;color:${mcasRiskColor(score)}">${score != null ? score.toFixed(1) : '—'}</span>
+                  <span style="font-size:22px;font-weight:800;color:${defenderRiskColor(score)}">${score != null ? score : '—'}</span>
                   <span style="font-size:10px;color:var(--text-dim)">/10</span>
                 </td>
-                <td>${mcasSanctionBadge(a)}</td>
                 <td style="font-weight:600">${users.toLocaleString()}</td>
+                <td class="text-muted">${fmtBytes(traffic)}</td>
                 <td class="text-muted">${fmtBytes(upload)}</td>
-                <td class="text-muted">${fmtBytes(download)}</td>
-                <td class="mono text-muted" style="font-size:11px">${esc(domains)}</td>
+                <td class="text-muted">${tx ? tx.toLocaleString() : '—'}</td>
+                <td class="text-muted">${devices ? devices.toLocaleString() : '—'}</td>
                 <td class="mono text-muted">${last ? new Date(last).toLocaleDateString() : '—'}</td>
               </tr>`;
-            }).join('') || '<tr><td colspan="8" class="empty-state text-muted">No Generative AI apps discovered yet</td></tr>'}
+            }).join('') || '<tr><td colspan="9" class="empty-state text-muted">No Generative AI apps discovered yet</td></tr>'}
             </tbody>
           </table>
         </div>
