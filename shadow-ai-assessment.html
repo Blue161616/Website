@@ -385,6 +385,7 @@ const GRAPH_SCOPES = [
   'https://graph.microsoft.com/SecurityAlert.Read.All',
   'https://graph.microsoft.com/RoleManagement.Read.All',
   'https://graph.microsoft.com/IdentityRiskyServicePrincipal.Read.All',
+  'https://graph.microsoft.com/CloudApp-Discovery.Read.All',
 ];
 
 // Known AI app patterns for detection (case-insensitive)
@@ -1162,6 +1163,44 @@ function updateDashShadowKpi() {
   if (deltaEl) deltaEl.textContent = `from MCAS · ${apps.filter(a => a.type === 0).length} unsanctioned`;
 }
 
+async function fetchMcasAppsFromGraph() {
+  const streamsResp = await gget(`${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams`);
+  const streams = streamsResp.value || [];
+  if (!streams.length) throw new Error('No cloud discovery streams found. Ensure Defender for Cloud Apps is connected and receiving data.');
+
+  const appMap = {};
+  await Promise.all(streams.map(async stream => {
+    try {
+      const resp = await gget(
+        `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${stream.id}/microsoft.graph.security.aggregatedAppsDetails(period=duration'P30D')?$top=500`
+      );
+      (resp.value || []).forEach(a => {
+        const key = a.appId ?? a.id ?? a.displayName;
+        if (!appMap[key]) appMap[key] = {
+          name:                 a.displayName ?? a.appName,
+          appId:                a.appId,
+          category:             a.category,
+          revised_score_total:  a.riskScore ?? null,
+          usersCount:           a.userCount ?? a.usersCount ?? 0,
+          trafficTotalBytes:    a.trafficInBytes ?? a.totalNetworkTrafficInBytes ?? 0,
+          trafficUploadedBytes: a.uploadNetworkTrafficInBytes ?? 0,
+          trafficTotalEvents:   a.transactionCount ?? 0,
+          machineNamesCount:    a.deviceCount ?? 0,
+          ipAddressesCount:     a.ipAddressCount ?? 0,
+          lastSeen:             a.lastSeenDateTime,
+          type:                 a.isSanctioned === true ? 1 : a.isSanctioned === false ? 0 : 3,
+          tags:                 [],
+          _source:              'graph',
+        };
+      });
+    } catch { /* skip streams that error */ }
+  }));
+
+  const all = Object.values(appMap);
+  if (!all.length) throw new Error('Streams found but no discovered apps returned. Check that cloud discovery data is flowing.');
+  return all;
+}
+
 function mcasSortBy(key) {
   if (STATE.mcasSortKey === key) {
     STATE.mcasSortDir = STATE.mcasSortDir === 'asc' ? 'desc' : 'asc';
@@ -1303,11 +1342,25 @@ async function loadShadowApps() {
     return;
   }
 
-  const cfg = getMcasConfig();
+  // Try Graph API first (CloudApp-Discovery.Read.All — no CORS, no token needed)
+  el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Loading discovered apps via Microsoft Graph…</div>';
+  try {
+    const all = await fetchMcasAppsFromGraph();
+    STATE.data.mcasTotal = all.length;
+    const genAi = all.filter(a => /generative.?ai|genai/i.test(a.category || ''));
+    STATE.data.mcasApps = genAi.length ? genAi : all;
+    STATE.data.mcasFilteredToGenAi = genAi.length > 0;
+    STATE.data.mcasUrl = 'Microsoft Graph (CloudApp-Discovery.Read.All)';
+    updateDashShadowKpi();
+    renderMcasApps(el, STATE.data.mcasApps, STATE.data.mcasUrl);
+    return;
+  } catch (graphErr) {
+    console.warn('Graph cloud discovery failed, falling back to manual config:', graphErr.message);
+  }
 
-  // If no config yet, auto-detect URL as a best-guess pre-fill
+  // Fallback: MCAS API token or file import
+  const cfg = getMcasConfig();
   if (!cfg.url || !cfg.token) {
-    el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Detecting Defender for Cloud Apps URL…</div>';
     let guessUrl = cfg.url;
     if (!guessUrl) {
       try { guessUrl = await detectMcasUrl(); } catch { /* ignore */ }
@@ -1318,7 +1371,6 @@ async function loadShadowApps() {
 
   STATE.data.mcasUrl = cfg.url;
   el.innerHTML = `<div class="section-loading"><span class="spinner"></span>Connecting to <span class="mono">${esc(cfg.url)}</span>…</div>`;
-
   try {
     const all = await fetchMcasAppsFromUrl(cfg.url, cfg.token);
     STATE.data.mcasTotal = all.length;
