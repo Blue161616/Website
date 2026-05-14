@@ -869,6 +869,17 @@ async function loadDashboard() {
     const [sps, grants, signIns, users, riskyUsers, caP] = await Promise.all([
       fetchServicePrincipals(), fetchOAuth2Grants(), fetchSignIns(),
       fetchUsers(), fetchRiskyUsers(), fetchCAPolicies(),
+      // Fetch cloud discovery in parallel so the shadow KPI is correct on first load.
+      // Runs silently — failure just means we fall back to SP-based count.
+      STATE.data.mcasApps === undefined
+        ? fetchMcasAppsFromGraph().then(all => {
+            const genAi = all.filter(a => /generative.?ai|genai/i.test(a.category || ''));
+            STATE.data.mcasApps = genAi.length ? genAi : all;
+            STATE.data.mcasTotal = all.length;
+            STATE.data.mcasFilteredToGenAi = genAi.length > 0;
+            STATE.data.mcasUrl = 'Microsoft Graph (CloudApp-Discovery.Read.All)';
+          }).catch(() => {})
+        : Promise.resolve(),
     ]);
 
     const aiApps = sps.filter(isAiApp);
@@ -1700,8 +1711,12 @@ function getAgentType(sp) {
   const altNames  = sp.alternativeNames || [];
   const tmplId    = (sp.applicationTemplateId || '').toLowerCase();
 
-  // Tags: Entra marks agent identities with specific tag values
-  const isAgentIdentityTag = tags.some(t => t === 'isagentidentity' || t === 'agentidentity' || t === 'copilot-studio-agent');
+  // Tags: Entra marks agent identities with specific tag values (lowercased for comparison)
+  const isAgentIdentityTag   = tags.some(t => t === 'isagentidentity' || t === 'agentidentity' || t === 'copilot-studio-agent');
+  // "AgentIdentityBlueprint"  → the blueprint definition SP (shows as "Agent identity blueprint" in portal)
+  const isAgentBlueprintTag  = tags.some(t => t === 'agentidentityblueprint');
+  // "AgentBlueprintPrincipal" → a service identity SP linked to a blueprint
+  const isAgentPrincipalTag  = tags.some(t => t === 'agentblueprintprincipal');
 
   // alternativeNames: Copilot Studio stores the blueprint app ID here (GUID format)
   const blueprintAppId = altNames.find(n => /^[0-9a-f-]{36}$/i.test(n) && n !== sp.appId);
@@ -1717,6 +1732,16 @@ function getAgentType(sp) {
     const match = name.match(/Project-[^-]+-(.+?)-AgentIdentityBlueprint/i) ||
                   name.match(/^(.+?)-AgentIdentityBlueprint/i);
     return { type: 'ai-foundry', label: 'Azure AI Foundry', blueprintName: match?.[1] ?? name, blueprintAppId };
+  }
+
+  // Entra tag "AgentIdentityBlueprint" = blueprint template SP (any display name)
+  if (isAgentBlueprintTag) {
+    return { type: 'blueprint', label: 'Agent Blueprint', blueprintName: name, blueprintAppId };
+  }
+
+  // Entra tag "AgentBlueprintPrincipal" = also a blueprint SP
+  if (isAgentPrincipalTag) {
+    return { type: 'blueprint', label: 'Agent Blueprint', blueprintName: name, blueprintAppId };
   }
 
   // Copilot Studio: suffix in name or publisher
@@ -1735,7 +1760,7 @@ function getAgentType(sp) {
     return { type: 'copilot-studio', label: 'Agent Identity', blueprintName: blueprintFromText || name, blueprintAppId };
   }
 
-  // Blueprint keyword in name
+  // Blueprint keyword in name (fallback)
   if (/blueprint/i.test(name)) {
     return { type: 'blueprint', label: 'Blueprint', blueprintName: name, blueprintAppId: null };
   }
@@ -1743,22 +1768,101 @@ function getAgentType(sp) {
   return { type: 'classic', label: 'Classic', blueprintName: null, blueprintAppId: null };
 }
 
+const AGENT_WRITE_SCOPES = ['Mail.Send','Mail.ReadWrite','Files.ReadWrite.All','Calendars.ReadWrite',
+  'Sites.ReadWrite.All','User.ReadWrite.All','Directory.ReadWrite.All'];
+const AGENT_KEYWORDS = ['agent','bot','automation','pipeline','workflow','copilot','assistant','automat'];
+
+const RISK_ORDER = { critical:3, high:2, medium:1, low:0 };
+
+function renderAgentsTable() {
+  const tbody = document.getElementById('agents-tbody');
+  if (!tbody) return;
+  const { agentSps, agentGrants } = STATE.data;
+  if (!agentSps || !agentGrants) return;
+
+  const key = STATE.agentSortKey || 'risk';
+  const dir = STATE.agentSortDir || 'desc';
+
+  const rows = agentSps.map(sp => {
+    const r   = riskScore(sp, agentGrants);
+    const ws  = AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants).includes(s));
+    const ct  = agentGrants.find(g => g.clientId === sp.id)?.consentType || '—';
+    const ai  = getAgentType(sp);
+    return { sp, r, ws, ct, ai };
+  });
+
+  const sorted = [...rows].sort((a, b) => {
+    let av, bv;
+    if (key === 'name')    { av = (a.sp.displayName||'').toLowerCase(); bv = (b.sp.displayName||'').toLowerCase(); }
+    else if (key === 'type')  { av = a.ai.type; bv = b.ai.type; }
+    else if (key === 'blueprint') { av = (a.ai.blueprintName||'').toLowerCase(); bv = (b.ai.blueprintName||'').toLowerCase(); }
+    else if (key === 'risk')  { av = RISK_ORDER[a.r]??-1; bv = RISK_ORDER[b.r]??-1; }
+    else if (key === 'write') { av = a.ws.length; bv = b.ws.length; }
+    else if (key === 'consent') { av = a.ct; bv = b.ct; }
+    else if (key === 'status') { av = a.sp.accountEnabled?1:0; bv = b.sp.accountEnabled?1:0; }
+    else { av = 0; bv = 0; }
+    if (av < bv) return dir === 'asc' ? -1 : 1;
+    if (av > bv) return dir === 'asc' ?  1 : -1;
+    return 0;
+  });
+
+  tbody.innerHTML = sorted.map(({ sp, r, ws, ct, ai }) => {
+    const typeBadgeClass = ai.type === 'ai-foundry' ? 'badge-info'
+      : ai.type === 'copilot-studio' ? 'badge-purple'
+      : ai.type === 'blueprint' ? 'badge-medium'
+      : 'badge-ghost';
+    const typeIcon = ai.type === 'ai-foundry' ? '🏭'
+      : ai.type === 'copilot-studio' ? '🤖'
+      : ai.type === 'blueprint' ? '📋'
+      : '⚙️';
+    return `<tr>
+      <td><strong>${esc(sp.displayName)}</strong><br><span class="mono text-muted" style="font-size:10px">${esc(sp.appId.slice(0,18))}…</span></td>
+      <td><span class="badge ${typeBadgeClass}">${typeIcon} ${esc(ai.label)}</span></td>
+      <td class="text-muted" style="font-size:12px">${ai.blueprintName ? esc(ai.blueprintName) : '<span style="opacity:0.4">—</span>'}</td>
+      <td>${riskBadge(r)}</td>
+      <td>${ws.length ? ws.map(s=>`<span class="badge badge-critical">${esc(s)}</span>`).join(' ') : '<span class="text-muted">—</span>'}</td>
+      <td><span class="badge ${ct==='AllPrincipals'?'badge-critical':'badge-medium'}">${esc(ct)}</span></td>
+      <td>${sp.accountEnabled ? statusBadge('unblocked') : statusBadge('disabled')}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="7" class="empty-state text-muted">No agent-like service principals detected</td></tr>';
+
+  // Update sort indicators on headers
+  document.querySelectorAll('#agents-table th[data-sort]').forEach(th => {
+    const k = th.dataset.sort;
+    th.querySelector('.sort-icon').textContent = k !== key ? '⇅' : dir === 'asc' ? '↑' : '↓';
+    th.style.color = k === key ? 'var(--text-primary)' : '';
+  });
+}
+
+function sortAgentsTable(key) {
+  if (STATE.agentSortKey === key) {
+    STATE.agentSortDir = STATE.agentSortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    STATE.agentSortKey = key;
+    STATE.agentSortDir = (key === 'name' || key === 'type' || key === 'blueprint') ? 'asc' : 'desc';
+  }
+  renderAgentsTable();
+}
+
 async function loadAgents() {
   const el = document.getElementById('agents-content');
   try {
     const [sps, grants] = await Promise.all([fetchServicePrincipals(), fetchOAuth2Grants()]);
-    // Detect potential AI agents: service principals with AI keywords + broad write scopes OR automation tags
-    const WRITE_SCOPES = ['Mail.Send','Mail.ReadWrite','Files.ReadWrite.All','Calendars.ReadWrite',
-      'Sites.ReadWrite.All','User.ReadWrite.All','Directory.ReadWrite.All'];
-    const AGENT_KEYWORDS = ['agent','bot','automation','pipeline','workflow','copilot','assistant','automat'];
     const agentSps = sps.filter(sp => {
       const name = (sp.displayName||'').toLowerCase();
       const isAgent = AGENT_KEYWORDS.some(k => name.includes(k));
       const isAi = isAiApp(sp);
       const hasWriteScopes = grants.some(g => g.clientId === sp.id &&
-        WRITE_SCOPES.some(s => (g.scope||'').includes(s)));
+        AGENT_WRITE_SCOPES.some(s => (g.scope||'').includes(s)));
       return (isAgent || (isAi && hasWriteScopes));
     });
+    STATE.data.agentSps   = agentSps;
+    STATE.data.agentGrants = grants;
+    if (!STATE.agentSortKey) { STATE.agentSortKey = 'risk'; STATE.agentSortDir = 'desc'; }
+
+    const thStyle = 'cursor:pointer;user-select:none;white-space:nowrap';
+    const th = (label, key) =>
+      `<th data-sort="${key}" style="${thStyle}" onclick="sortAgentsTable('${key}')">${label} <span class="sort-icon">⇅</span></th>`;
 
     el.innerHTML = `
       <div class="section-header">
@@ -1771,7 +1875,7 @@ async function loadAgents() {
       <div class="kpi-row-3">
         <div class="kpi-card critical">
           <div class="kpi-label">Agents with Write Access</div>
-          <div class="kpi-value text-critical">${agentSps.filter(sp=>grants.some(g=>g.clientId===sp.id&&WRITE_SCOPES.some(s=>(g.scope||'').includes(s)))).length}</div>
+          <div class="kpi-value text-critical">${agentSps.filter(sp=>grants.some(g=>g.clientId===sp.id&&AGENT_WRITE_SCOPES.some(s=>(g.scope||'').includes(s)))).length}</div>
           <div class="kpi-icon">✍️</div>
         </div>
         <div class="kpi-card medium">
@@ -1787,36 +1891,22 @@ async function loadAgents() {
       </div>
       <div class="card">
         <div class="table-wrap">
-          <table>
-            <thead><tr><th>Agent / App</th><th>Type</th><th>Blueprint</th><th>Risk</th><th>Write Scopes</th><th>Consent Scope</th><th>Status</th></tr></thead>
-            <tbody>${agentSps.map(sp => {
-              const r = riskScore(sp, grants);
-              const ws = WRITE_SCOPES.filter(s => getScopesForSp(sp.id, grants).includes(s));
-              const ct = grants.find(g=>g.clientId===sp.id)?.consentType || '—';
-              const agentInfo = getAgentType(sp);
-              const typeBadgeClass = agentInfo.type === 'ai-foundry' ? 'badge-info'
-                : agentInfo.type === 'copilot-studio' ? 'badge-purple'
-                : agentInfo.type === 'blueprint' ? 'badge-medium'
-                : 'badge-ghost';
-              const typeIcon = agentInfo.type === 'ai-foundry' ? '🏭'
-                : agentInfo.type === 'copilot-studio' ? '🤖'
-                : agentInfo.type === 'blueprint' ? '📋'
-                : '⚙️';
-              return `<tr>
-                <td><strong>${esc(sp.displayName)}</strong><br><span class="mono text-muted" style="font-size:10px">${esc(sp.appId.slice(0,18))}…</span></td>
-                <td><span class="badge ${typeBadgeClass}">${typeIcon} ${esc(agentInfo.label)}</span></td>
-                <td class="text-muted" style="font-size:12px">${agentInfo.blueprintName ? esc(agentInfo.blueprintName) : '<span style="opacity:0.4">—</span>'}</td>
-                <td>${riskBadge(r)}</td>
-                <td>${ws.length?ws.map(s=>`<span class="badge badge-critical">${esc(s)}</span>`).join(' '):'<span class="text-muted">—</span>'}</td>
-                <td><span class="badge ${ct==='AllPrincipals'?'badge-critical':'badge-medium'}">${esc(ct)}</span></td>
-                <td>${sp.accountEnabled?statusBadge('unblocked'):statusBadge('disabled')}</td>
-              </tr>`;
-            }).join('') || '<tr><td colspan="7" class="empty-state text-muted">No agent-like service principals detected</td></tr>'}
-            </tbody>
+          <table id="agents-table">
+            <thead><tr>
+              ${th('Agent / App','name')}
+              ${th('Type','type')}
+              ${th('Blueprint','blueprint')}
+              ${th('Risk','risk')}
+              ${th('Write Scopes','write')}
+              ${th('Consent Scope','consent')}
+              ${th('Status','status')}
+            </tr></thead>
+            <tbody id="agents-tbody"></tbody>
           </table>
         </div>
       </div>
     `;
+    renderAgentsTable();
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
   }
