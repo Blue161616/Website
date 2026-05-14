@@ -1992,19 +1992,20 @@ function renderAllAgentTables() {
 async function fetchBlueprintSps() {
   if (STATE.data.blueprintSps) return STATE.data.blueprintSps;
   try {
-    const fields = 'id,displayName,appId,publisherName,accountEnabled,tags,createdDateTime,servicePrincipalType,notes,description,alternativeNames,applicationTemplateId';
-    const BETA = 'https://graph.microsoft.com/beta';
-
-    // Layer 1: dedicated endpoint (requires AgentIdentityBlueprint.Read.All)
-    // Layer 2: tag-based SP queries covering all known blueprint tag variants
-    // Layer 3: reverse-discover via agent identity alternativeNames (finds blueprints with ANY tag or none)
+    const spFields = 'id,displayName,appId,publisherName,accountEnabled,tags,createdDateTime,servicePrincipalType,notes,description,alternativeNames,applicationTemplateId';
+    const appFields = 'id,displayName,appId,publisherName,tags,createdDateTime,notes,description,alternativeNames,applicationTemplateId';
     const BP_TAGS = ['AgentIdentityBlueprint', 'AgentBlueprintPrincipal', 'AgentIdentityBlueprintPrincipal'];
-    const [allSps, dedicatedResp, principalsResp, ...tagResps] = await Promise.all([
+
+    // Layer 1: v1.0 GA endpoint — OData type cast on applications collection (requires AgentIdentityBlueprint.Read.All)
+    //   GET /v1.0/applications/microsoft.graph.agentIdentityBlueprint
+    //   Returns application objects; cross-referenced to SPs below via appId.
+    // Layer 2: tag-based SP queries (fallback / supplement)
+    // Layer 3: reverse-discover via agent identity alternativeNames
+    const [allSps, blueprintAppsResp, ...tagResps] = await Promise.all([
       fetchServicePrincipals(),
-      gget(`${BETA}/agentIdentityBlueprints?$top=999`).catch(() => ({ value: [] })),
-      gget(`${BETA}/agentIdentityBlueprintPrincipals?$top=999`).catch(() => ({ value: [] })),
+      gget(`${GRAPH}/applications/microsoft.graph.agentIdentityBlueprint?$top=999&$select=${appFields}`).catch(() => ({ value: [] })),
       ...BP_TAGS.map(tag =>
-        gget(`${GRAPH}/servicePrincipals?$filter=tags/any(t:t eq '${tag}')&$top=500&$select=${fields}&$count=true`, true)
+        gget(`${GRAPH}/servicePrincipals?$filter=tags/any(t:t eq '${tag}')&$top=500&$select=${spFields}&$count=true`, true)
           .catch(() => ({ value: [] }))
       ),
     ]);
@@ -2016,15 +2017,22 @@ async function fetchBlueprintSps() {
 
     const add = sp => { if (sp?.id && !seen.has(sp.id)) { seen.add(sp.id); results.push(sp); } };
 
-    // Layer 1: dedicated endpoints
-    (dedicatedResp.value || []).forEach(add);
-    (principalsResp.value || []).forEach(add);
+    // Layer 1: for each blueprint application object, find its enterprise application (SP) by appId
+    (blueprintAppsResp.value || []).forEach(app => {
+      const sp = spByAppId.get(app.appId);
+      if (sp) {
+        add(sp);
+      } else {
+        // SP not in cached list — add the app object itself shaped as an SP-like record
+        add({ ...app, servicePrincipalType: 'Application', accountEnabled: true });
+      }
+    });
 
     // Layer 2: tag queries
     tagResps.flatMap(r => r.value || []).forEach(add);
 
     // Layer 3: walk every ServiceIdentity SP's alternativeNames to find parent blueprints
-    // that weren't caught by layers 1 or 2 (no tags, wrong tags, endpoint unavailable)
+    // catches blueprints with no tags and not in the v1.0 list
     allSps
       .filter(sp => sp.servicePrincipalType === 'ServiceIdentity')
       .forEach(sp => {
