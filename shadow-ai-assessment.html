@@ -1081,7 +1081,7 @@ async function fetchMcasAppsFromUrl(mcasUrl, apiToken) {
   let all = [], skip = 0, hasNext = true;
   while (hasNext && skip < 2000) {
     const r = await fetch(
-      `https://${mcasUrl}/api/v1/discovery/discovered_apps/?enriched=true&limit=100&skip=${skip}&sortField=usersCount&sortDirection=desc`,
+      `https://${mcasUrl}/api/v1/discovery/discovered_apps/?enriched=true&limit=100&skip=${skip}&sortField=users&sortDirection=desc`,
       { headers: { Authorization: 'Token ' + apiToken } }   // MCAS uses "Token", not "Bearer"
     );
     if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + r.statusText + ': ' + t.slice(0, 300)); }
@@ -1101,14 +1101,42 @@ function mcasRiskColor(score) {
   return 'var(--risk-low)';
 }
 
+// Tags may be strings OR objects like {id, name, isEditable}
+function mcasTagNames(app) {
+  return (app.tags || []).map(t =>
+    (typeof t === 'string' ? t : (t.name || t.label || '')).toLowerCase()
+  );
+}
+
 function mcasSanctionBadge(app) {
   const status = (app.status || '').toLowerCase();
-  const tags = (app.tags || []).map(t => (t||'').toLowerCase());
-  if (app.sanctioned === true  || status === 'sanctioned'   || tags.includes('sanctioned'))   return '<span class="badge badge-low">✅ Sanctioned</span>';
-  if (app.sanctioned === false || status === 'unsanctioned' || tags.includes('unsanctioned')) return '<span class="badge badge-critical">🚫 Unsanctioned</span>';
-  if (status === 'blocked')   return '<span class="badge badge-critical">🚫 Blocked</span>';
-  if (status === 'monitored') return '<span class="badge badge-medium">👁 Monitored</span>';
+  const tags = mcasTagNames(app);
+  if (app.sanctioned === true  || status === 'sanctioned'   || tags.some(t => t.includes('sanction') && !t.includes('un')))
+    return '<span class="badge badge-low">✅ Sanctioned</span>';
+  if (app.sanctioned === false || status === 'unsanctioned' || tags.some(t => t.includes('unsanction')))
+    return '<span class="badge badge-critical">🚫 Unsanctioned</span>';
+  if (status === 'blocked'   || tags.includes('blocked'))
+    return '<span class="badge badge-critical">🚫 Blocked</span>';
+  if (status === 'monitored' || tags.includes('monitored'))
+    return '<span class="badge badge-medium">👁 Monitored</span>';
   return '<span class="badge badge-medium">⚠️ Unreviewed</span>';
+}
+
+const MCAS_CAT_MAP = {
+  SAASDB_CATEGORY_GENERATIVE_AI: 'Generative AI',
+  SAASDB_CATEGORY_COLLABORATION: 'Collaboration',
+  SAASDB_CATEGORY_CLOUD_STORAGE: 'Cloud Storage',
+  SAASDB_CATEGORY_CODING_AND_DEVELOPMENT: 'Development',
+  SAASDB_CATEGORY_PROJECT_MANAGEMENT: 'Project Mgmt',
+  SAASDB_CATEGORY_SECURITY: 'Security',
+  SAASDB_CATEGORY_MARKETING: 'Marketing',
+  SAASDB_CATEGORY_HR: 'HR',
+  SAASDB_CATEGORY_CRM: 'CRM',
+  SAASDB_CATEGORY_CONTENT_MANAGEMENT: 'Content Mgmt',
+};
+function fmtCategory(raw) {
+  if (!raw) return '';
+  return MCAS_CAT_MAP[raw] || raw.replace(/^SAASDB_CATEGORY_/i,'').replace(/_/g,' ');
 }
 
 function fmtBytes(b) {
@@ -1126,7 +1154,7 @@ $headers = @{ Authorization = "Token ${token||'<YOUR-API-TOKEN>'}" }
 $url = "https://${url||'<YOUR-MCAS-URL>'}/api/v1/discovery/discovered_apps"
 $all = @(); $skip = 0
 do {
-  $r = Invoke-RestMethod "$url/?enriched=true&limit=100&skip=$skip&sortField=usersCount&sortDirection=desc" -Headers $headers
+  $r = Invoke-RestMethod "$url/?enriched=true&limit=100&skip=$skip&sortField=users&sortDirection=desc" -Headers $headers
   $all += $r.data ?? $r
   $skip += 100
 } while ($r.hasNext -and $skip -lt 2000)
@@ -1285,21 +1313,30 @@ async function loadShadowApps() {
 
 function renderMcasApps(el, apps, mcasUrl) {
   const getScore  = a => a.score ?? a.appInfo?.score ?? null;
-  const getStatus = a => (a.status || '').toLowerCase();
 
-  const unsanctioned = apps.filter(a => {
-    const s = getStatus(a);
-    return s === 'unsanctioned' || s === 'blocked' ||
-           (a.tags||[]).map(t=>(t||'').toLowerCase()).includes('unsanctioned');
-  });
-  const highRisk   = apps.filter(a => { const s = getScore(a); return s != null && s <= 4; });
-  const totalUsers = apps.reduce((s,a) => s + (a.users ?? a.usersCount ?? 0), 0);
+  // Unified sanctioned check using the robust tag helper
+  const isUnsanctioned = a => {
+    const status = (a.status || '').toLowerCase();
+    const tags = mcasTagNames(a);
+    return a.sanctioned === false || status === 'unsanctioned' || status === 'blocked' ||
+           tags.some(t => t.includes('unsanction') || t === 'blocked');
+  };
+  const isSanctioned = a => {
+    const status = (a.status || '').toLowerCase();
+    const tags = mcasTagNames(a);
+    return a.sanctioned === true || status === 'sanctioned' ||
+           tags.some(t => t.includes('sanction') && !t.includes('un'));
+  };
+
+  const unsanctioned = apps.filter(isUnsanctioned);
+  const highRisk     = apps.filter(a => { const s = getScore(a); return s != null && s <= 4; });
+  const totalUsers   = apps.reduce((s,a) => s + (a.users ?? a.usersCount ?? a.userCount ?? 0), 0);
 
   const sorted = [...apps].sort((a,b) => {
-    const sa = getStatus(a) === 'unsanctioned' ? -1 : 0;
-    const sb = getStatus(b) === 'unsanctioned' ? -1 : 0;
+    const sa = isUnsanctioned(a) ? -2 : isSanctioned(a) ? 0 : -1;
+    const sb = isUnsanctioned(b) ? -2 : isSanctioned(b) ? 0 : -1;
     if (sa !== sb) return sa - sb;
-    return (getScore(a) ?? 99) - (getScore(b) ?? 99);
+    return (getScore(b) ?? -1) - (getScore(a) ?? -1); // highest risk score first within group? No — lower score = riskier
   });
 
   el.innerHTML = `
@@ -1371,19 +1408,20 @@ function renderMcasApps(el, apps, mcasUrl) {
           </thead>
           <tbody>${sorted.map(a => {
             const score   = getScore(a);
-            const users   = a.users   ?? a.usersCount   ?? 0;
-            const upload  = a.upload  ?? a.trafficUpload ?? 0;
-            const download = a.download ?? a.trafficDownload ?? 0;
-            const tx      = a.transactions ?? a.transactionsCount ?? 0;
-            const devices = a.devices ?? a.devicesCount ?? 0;
+            // MCAS API field names vary slightly between versions
+            const users   = a.users   ?? a.usersCount   ?? a.userCount   ?? 0;
+            const upload  = a.upload  ?? a.uploadedInBytes ?? a.trafficUpload ?? 0;
+            const download = a.download ?? a.downloadedInBytes ?? a.trafficDownload ?? 0;
+            const tx      = a.transactions ?? a.transactionCount ?? a.transactionsCount ?? 0;
+            const devices = a.devices ?? a.machinesCount ?? a.devicesCount ?? 0;
             const last    = a.lastUsed ?? a.lastSeen;
             const name    = a.name ?? a.appInfo?.name ?? '—';
+            const rawCat  = a.category ?? a.appInfo?.category ?? '';
+            const cat     = fmtCategory(rawCat);
             return `<tr>
               <td>
                 <strong>${esc(name)}</strong>
-                ${a.category || a.appInfo?.category
-                  ? `<br><span class="badge badge-purple" style="font-size:10px">${esc(a.category||a.appInfo?.category)}</span>`
-                  : ''}
+                ${cat ? `<br><span class="badge badge-purple" style="font-size:10px">${esc(cat)}</span>` : ''}
               </td>
               <td>${mcasSanctionBadge(a)}</td>
               <td>
