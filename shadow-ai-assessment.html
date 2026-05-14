@@ -1055,40 +1055,34 @@ async function loadDashboard() {
   }
 }
 
-// ── MCAS Cloud Discovery (auto-detected URL) ──────────────────────────────
+// ── MCAS Cloud Discovery (API token auth) ─────────────────────────────────
+// MCAS portal URL OAuth (resource/.default) fails if the MCAS service principal
+// is not installed in the tenant. API tokens from MDCA Settings → API tokens
+// always work and use the Authorization: Token header.
 
-const EU_COUNTRY_CODES = new Set(['AT','BE','BG','CH','CY','CZ','DE','DK','EE','ES','FI','FR','GB','GR','HR','HU','IE','IT','LT','LU','LV','MT','NL','NO','PL','PT','RO','SE','SI','SK']);
+function getMcasConfig() {
+  return {
+    url:   (localStorage.getItem('mcasUrl')   || '').replace(/^https?:\/\//,'').replace(/\/$/,''),
+    token: localStorage.getItem('mcasApiToken') || '',
+  };
+}
 
 async function detectMcasUrl() {
+  // Best-guess from onmicrosoft.com subdomain — region may be wrong, user can correct
   const org = await fetchOrg();
   const domains = org.verifiedDomains || [];
   const omsDomain = domains.find(d => d.name?.endsWith('.onmicrosoft.com') && !d.name.includes('.mail.'));
   if (!omsDomain) return null;
   const sub = omsDomain.name.replace('.onmicrosoft.com', '');
-  const country = (org.countryLetterCode || '').toUpperCase();
-  const region = EU_COUNTRY_CODES.has(country) ? 'eu.' : '';
-  return `${sub}.${region}portal.cloudappsecurity.com`;
+  return `${sub}.portal.cloudappsecurity.com`; // neutral — user verifies from About page
 }
 
-async function getMcasToken(mcasUrl) {
-  const app = await getMsal();
-  const scopes = [`https://${mcasUrl}/.default`];
-  try {
-    const r = await app.acquireTokenSilent({ scopes, account: STATE.account });
-    return r.accessToken;
-  } catch {
-    const r = await app.acquireTokenPopup({ scopes });
-    return r.accessToken;
-  }
-}
-
-async function fetchMcasAppsFromUrl(mcasUrl) {
-  const token = await getMcasToken(mcasUrl);
+async function fetchMcasAppsFromUrl(mcasUrl, apiToken) {
   let all = [], skip = 0, hasNext = true;
   while (hasNext && skip < 2000) {
     const r = await fetch(
       `https://${mcasUrl}/api/v1/discovery/discovered_apps/?enriched=true&limit=100&skip=${skip}&sortField=usersCount&sortDirection=desc`,
-      { headers: { Authorization: 'Bearer ' + token } }
+      { headers: { Authorization: 'Token ' + apiToken } }   // MCAS uses "Token", not "Bearer"
     );
     if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + r.statusText + ': ' + t.slice(0, 300)); }
     const d = await r.json();
@@ -1127,34 +1121,54 @@ function fmtBytes(b) {
 
 // ── SHADOW APPS ────────────────────────────────────────────────────────────
 
-function showMcasSetup(el, err, prefill) {
+function showMcasSetup(el, err, prefillUrl, prefillToken) {
   el.innerHTML = `
-    <div style="max-width:580px;margin:40px auto">
+    <div style="max-width:620px;margin:40px auto">
       <div class="card">
         <div class="card-header"><div class="card-title">🔧 Connect Defender for Cloud Apps</div></div>
         <div class="card-body">
-          ${err ? `<div class="perm-warn" style="margin-bottom:16px">⚠️ Auto-connect failed: ${esc(err.slice(0,220))}</div>` : ''}
-          <p style="font-size:13px;color:var(--text-muted);margin-bottom:18px">
-            Enter your MDCA portal URL. Find it in
-            <strong>Defender XDR → Settings → Cloud Apps → About</strong>.
-          </p>
-          <input id="mcas-url-input" type="text"
-            value="${esc(prefill||'')}"
-            placeholder="blue1600.eu.portal.cloudappsecurity.com"
-            style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);
-              color:var(--text-primary);padding:9px 12px;border-radius:6px;font-size:13px;
-              font-family:ui-monospace,Consolas,monospace;outline:none;margin-bottom:14px" />
-          <button class="btn btn-primary" onclick="saveMcasUrl()">Connect →</button>
+          ${err ? `<div class="perm-warn" style="margin-bottom:16px">⚠️ ${esc(err.slice(0,280))}</div>` : ''}
+
+          <div style="margin-bottom:16px">
+            <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:6px">
+              API URL <span style="color:var(--text-dim);font-weight:400;text-transform:none">— from Defender XDR → Settings → Cloud Apps → About</span>
+            </label>
+            <input id="mcas-url-input" type="text"
+              value="${esc(prefillUrl||'')}"
+              placeholder="blue1600.us.portal.cloudappsecurity.com"
+              style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);
+                color:var(--text-primary);padding:9px 12px;border-radius:6px;font-size:13px;
+                font-family:ui-monospace,Consolas,monospace;outline:none" />
+          </div>
+
+          <div style="margin-bottom:20px">
+            <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:6px">
+              API Token <span style="color:var(--text-dim);font-weight:400;text-transform:none">— from Defender XDR → Settings → Cloud Apps → API tokens → New token</span>
+            </label>
+            <input id="mcas-token-input" type="password"
+              value="${esc(prefillToken||'')}"
+              placeholder="Paste your MDCA API token here"
+              style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);
+                color:var(--text-primary);padding:9px 12px;border-radius:6px;font-size:13px;
+                font-family:ui-monospace,Consolas,monospace;outline:none" />
+            <div style="font-size:11px;color:var(--text-dim);margin-top:6px;line-height:1.5">
+              The token is stored in your browser's <code style="background:var(--bg-hover);padding:1px 4px;border-radius:3px">localStorage</code> and never sent to any server other than your MDCA endpoint.
+            </div>
+          </div>
+
+          <button class="btn btn-primary" onclick="saveMcasConfig()">Connect →</button>
         </div>
       </div>
     </div>`;
 }
 
-function saveMcasUrl() {
-  const val = (document.getElementById('mcas-url-input')?.value || '').trim()
+function saveMcasConfig() {
+  const url = (document.getElementById('mcas-url-input')?.value || '').trim()
     .replace(/^https?:\/\//, '').replace(/\/$/, '');
-  if (!val) return;
-  localStorage.setItem('mcasUrl', val);
+  const token = (document.getElementById('mcas-token-input')?.value || '').trim();
+  if (!url || !token) return;
+  localStorage.setItem('mcasUrl', url);
+  localStorage.setItem('mcasApiToken', token);
   STATE.data.mcasApps = undefined;
   STATE.loaded.delete('shadow-apps');
   loadShadowApps();
@@ -1168,24 +1182,24 @@ async function loadShadowApps() {
     return;
   }
 
-  el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Auto-detecting Defender for Cloud Apps URL…</div>';
+  const cfg = getMcasConfig();
 
-  let mcasUrl = localStorage.getItem('mcasUrl');
-  if (!mcasUrl) {
-    try { mcasUrl = await detectMcasUrl(); } catch { /* ignore */ }
-  }
-
-  if (!mcasUrl) {
-    showMcasSetup(el, null, '');
+  // If no config yet, auto-detect URL as a best-guess pre-fill
+  if (!cfg.url || !cfg.token) {
+    el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Detecting Defender for Cloud Apps URL…</div>';
+    let guessUrl = cfg.url;
+    if (!guessUrl) {
+      try { guessUrl = await detectMcasUrl(); } catch { /* ignore */ }
+    }
+    showMcasSetup(el, null, guessUrl, cfg.token);
     return;
   }
 
-  STATE.data.mcasUrl = mcasUrl;
-  el.innerHTML = `<div class="section-loading"><span class="spinner"></span>Connecting to <span class="mono">${esc(mcasUrl)}</span>…</div>`;
+  STATE.data.mcasUrl = cfg.url;
+  el.innerHTML = `<div class="section-loading"><span class="spinner"></span>Connecting to <span class="mono">${esc(cfg.url)}</span>…</div>`;
 
   try {
-    const all = await fetchMcasAppsFromUrl(mcasUrl);
-    localStorage.setItem('mcasUrl', mcasUrl);
+    const all = await fetchMcasAppsFromUrl(cfg.url, cfg.token);
     STATE.data.mcasTotal = all.length;
     const genAi = all.filter(a =>
       /generative.?ai|genai/i.test(a.appInfo?.category || a.category || '') ||
@@ -1193,10 +1207,10 @@ async function loadShadowApps() {
     );
     STATE.data.mcasApps = genAi.length ? genAi : all;
     STATE.data.mcasFilteredToGenAi = genAi.length > 0;
-    renderMcasApps(el, STATE.data.mcasApps, mcasUrl);
+    renderMcasApps(el, STATE.data.mcasApps, cfg.url);
   } catch (e) {
     STATE.data.mcasApps = undefined;
-    showMcasSetup(el, e.message, mcasUrl);
+    showMcasSetup(el, e.message, cfg.url, cfg.token);
   }
 }
 
@@ -1233,8 +1247,8 @@ function renderMcasApps(el, apps, mcasUrl) {
       <div style="display:flex;gap:8px;align-items:center">
         <span class="data-source source-live">● Live from MDCA</span>
         <button class="btn btn-ghost" style="font-size:11px"
-          onclick="localStorage.removeItem('mcasUrl');STATE.data.mcasApps=undefined;STATE.loaded.delete('shadow-apps');loadShadowApps()">
-          ⚙ Change URL
+          onclick="localStorage.removeItem('mcasUrl');localStorage.removeItem('mcasApiToken');STATE.data.mcasApps=undefined;STATE.loaded.delete('shadow-apps');loadShadowApps()">
+          ⚙ Change
         </button>
       </div>
     </div>
