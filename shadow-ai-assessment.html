@@ -2031,15 +2031,26 @@ async function fetchBlueprintSps() {
     const appFields = 'id,displayName,appId,publisherName,tags,createdDateTime,notes,description,alternativeNames,applicationTemplateId';
     const BP_TAGS = ['AgentIdentityBlueprint', 'AgentBlueprintPrincipal', 'AgentIdentityBlueprintPrincipal'];
 
-    // Layer 1: v1.0 GA endpoints (requires AgentIdentityBlueprint.Read.All / AgentIdentity.Read.All)
-    //   Blueprints → /v1.0/applications/microsoft.graph.agentIdentityBlueprint (application objects)
-    //   Identities → /v1.0/servicePrincipals/microsoft.graph.agentIdentity (used for Layer 3 reverse-lookup)
-    // Layer 2: tag-based SP queries (fallback / supplement)
+    // Layer 1: v1.0 GA endpoint — GET /applications/microsoft.graph.agentIdentityBlueprint
+    //   Returns all blueprint application objects (requires AgentIdentityBlueprint.Read.All)
+    //   Uses ggetAll to follow @odata.nextLink pages
+    // Layer 2: tag-based SP queries (fallback when Layer 1 scope is missing)
     // Layer 3: reverse-discover via agent identity alternativeNames
-    const [allSps, agentIdentities, blueprintAppsResp, ...tagResps] = await Promise.all([
+    let blueprintAppsItems = [];
+    try {
+      blueprintAppsItems = await ggetAll(
+        `${GRAPH}/applications/microsoft.graph.agentIdentityBlueprint?$top=999&$select=${appFields}`,
+        20
+      );
+      STATE.data.blueprintScopeOk = true;
+    } catch (e) {
+      STATE.data.blueprintScopeError = e.message;
+      STATE.data.blueprintScopeOk = false;
+    }
+
+    const [allSps, agentIdentities, ...tagResps] = await Promise.all([
       fetchServicePrincipals(),
       fetchAgentIdentitySps(),
-      gget(`${GRAPH}/applications/microsoft.graph.agentIdentityBlueprint?$top=999&$select=${appFields}`).catch(() => ({ value: [] })),
       ...BP_TAGS.map(tag =>
         gget(`${GRAPH}/servicePrincipals?$filter=tags/any(t:t eq '${tag}')&$top=500&$select=${spFields}&$count=true`, true)
           .catch(() => ({ value: [] }))
@@ -2054,7 +2065,7 @@ async function fetchBlueprintSps() {
     const add = sp => { if (sp?.id && !seen.has(sp.id)) { seen.add(sp.id); results.push(sp); } };
 
     // Layer 1: for each blueprint application object, find its enterprise application (SP) by appId
-    (blueprintAppsResp.value || []).forEach(app => {
+    blueprintAppsItems.forEach(app => {
       const sp = spByAppId.get(app.appId);
       if (sp) {
         add(sp);
@@ -2224,10 +2235,11 @@ async function loadAgents() {
       </div>
 
       <!-- Agent Blueprints -->
+      ${STATE.data.blueprintScopeOk === false ? permWarn('AgentIdentityBlueprint.Read.All', STATE.data.blueprintScopeError) : ''}
       <div class="card" id="section-blueprints" style="margin-bottom:16px">
         <div class="card-header">
-          <div class="card-title">📋 Agent Blueprints (${bpSps.length})</div>
-          <span class="text-muted" style="font-size:11px">Templates that define shared identity &amp; access for agent identities</span>
+          <div class="card-title">📋 Agent Blueprints (${bpSps.length}${STATE.data.blueprintScopeOk === false ? ' ⚠️' : ''})</div>
+          <span class="text-muted" style="font-size:11px">Templates that define shared identity &amp; access for agent identities${STATE.data.blueprintScopeOk === false ? ' · GA endpoint unavailable — showing tag-based results only' : ''}</span>
         </div>
         <div class="table-wrap">
           <table id="blueprint-table">
