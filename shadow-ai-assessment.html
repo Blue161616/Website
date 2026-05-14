@@ -657,6 +657,27 @@ async function fetchRiskyUsers() {
   return STATE.data.riskyUsers;
 }
 
+async function fetchAdminRoles() {
+  if (STATE.data.adminRoles) return STATE.data.adminRoles;
+  try {
+    // Fetch all activated directory roles, then get members for each
+    const rolesResp = await gget(`${GRAPH}/directoryRoles?$select=id,displayName,roleTemplateId`);
+    const roles = rolesResp.value || [];
+    const adminRoleMap = {}; // userId -> Set of role display names
+    await Promise.all(roles.map(async role => {
+      try {
+        const membResp = await gget(`${GRAPH}/directoryRoles/${role.id}/members?$select=id,userPrincipalName`);
+        (membResp.value || []).forEach(m => {
+          if (!adminRoleMap[m.userPrincipalName]) adminRoleMap[m.userPrincipalName] = new Set();
+          adminRoleMap[m.userPrincipalName].add(role.displayName);
+        });
+      } catch { /* skip roles without members */ }
+    }));
+    STATE.data.adminRoles = adminRoleMap;
+  } catch (e) { STATE.data.adminRoles = {}; STATE.data.adminRolesError = e.message; }
+  return STATE.data.adminRoles;
+}
+
 async function fetchCAPolicies() {
   if (STATE.data.caPolicies) return STATE.data.caPolicies;
   try {
@@ -2045,7 +2066,7 @@ async function loadCompliance() {
 async function loadUsers() {
   const el = document.getElementById('users-content');
   try {
-    const [users, signIns, riskyUsers] = await Promise.all([fetchUsers(), fetchSignIns(), fetchRiskyUsers()]);
+    const [users, signIns, riskyUsers, adminRoles] = await Promise.all([fetchUsers(), fetchSignIns(), fetchRiskyUsers(), fetchAdminRoles()]);
     const aiSignIns = signIns.filter(s => AI_KEYWORDS.some(k => (s.appDisplayName||'').toLowerCase().includes(k)));
     // Count AI apps per user
     const userAiApps = {};
@@ -2136,10 +2157,13 @@ async function loadUsers() {
               const isAgentUpn = /agentuser/i.test(u.userPrincipalName||'');
               const isAgentUser = !!u.agentId || !!agentMatch || isAgentUpn;
               const agentService = agentMatch ? agentMatch[1].replace(/([A-Z])/g,' $1').trim() : null;
+              const userRoles = adminRoles[u.userPrincipalName];
+              const isGlobalAdmin = userRoles?.has('Global Administrator');
+              const otherAdminRoles = userRoles ? [...userRoles].filter(r => r !== 'Global Administrator') : [];
               return `<tr>
                 <td>
                   <div class="user-cell">
-                    <div class="user-avatar" style="${isAgentUser?'background:var(--accent-purple)':''}">${isAgentUser?'🤖':esc(initials)}</div>
+                    <div class="user-avatar" style="${isAgentUser?'background:var(--accent-purple)':isGlobalAdmin?'background:var(--accent-red)':''}">${isAgentUser?'🤖':esc(initials)}</div>
                     <div>
                       <div class="user-name">${esc(u.displayName||u.userPrincipalName)}</div>
                       <div class="user-email">${esc(u.userPrincipalName)}</div>
@@ -2150,7 +2174,7 @@ async function loadUsers() {
                 <td>${isAgentUser
                   ? `<span class="badge badge-purple">🤖 Agent User</span>${agentService?`<br><span style="font-size:10px;color:var(--text-muted)">${esc(agentService)}</span>`:''}`
                   : `<span class="badge ${u.userType==='Guest'?'badge-purple':'badge-info'}">${esc(u.userType||'Member')}</span>`
-                }</td>
+                }${isGlobalAdmin ? `<br><span class="badge badge-critical" style="margin-top:3px">🔑 Global Admin</span>` : ''}${otherAdminRoles.length ? `<br><span style="font-size:10px;color:var(--text-muted)" title="${esc(otherAdminRoles.join(', '))}">${otherAdminRoles.length} other role(s)</span>` : ''}</td>
                 <td>${aiAppCount ? `<strong>${aiAppCount}</strong> <span class="text-muted">${esc(aiAppList)}${aiAppCount>3?'…':''}</span>` : '<span class="text-muted">—</span>'}</td>
                 <td>${riskBadge(riskLevel(u))}</td>
                 <td>${(() => {
@@ -2265,10 +2289,15 @@ async function loadPolicies() {
         <div class="card-header"><div class="card-title">Conditional Access Policies (${caP.length})</div></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Policy Name</th><th>State</th><th>Users Included</th><th>Apps</th><th>Grant Controls</th><th>Created</th></tr></thead>
+            <thead><tr><th>Policy Name</th><th>State</th><th>Users Included</th><th>Users Excluded</th><th>Apps</th><th>Grant Controls</th><th>Created</th></tr></thead>
             <tbody>${caP.map(p => {
               const incUsers = (p.conditions?.users?.includeUsers||[]).join(', ') ||
                 (p.conditions?.users?.includeGroups?.length ? p.conditions.users.includeGroups.length+' group(s)' : 'All');
+              const excUsersList = p.conditions?.users?.excludeUsers || [];
+              const excGroupsList = p.conditions?.users?.excludeGroups || [];
+              const excUsers = excUsersList.length || excGroupsList.length
+                ? [excUsersList.length ? excUsersList.join(', ') : null, excGroupsList.length ? excGroupsList.length+' group(s)' : null].filter(Boolean).join(', ')
+                : '—';
               const incApps = (p.conditions?.applications?.includeApplications||[]).length > 0
                 ? (p.conditions.applications.includeApplications.includes('All') ? 'All apps' : p.conditions.applications.includeApplications.length + ' app(s)')
                 : '—';
@@ -2277,11 +2306,12 @@ async function loadPolicies() {
                 <td><strong>${esc(p.displayName)}</strong></td>
                 <td>${statusBadge(stateMap[p.state]||'inactive')}</td>
                 <td class="text-muted">${esc(incUsers.slice(0,40))}</td>
+                <td class="text-muted">${esc(excUsers.slice(0,40))}</td>
                 <td class="text-muted">${esc(incApps)}</td>
                 <td class="mono text-muted">${esc(controls||'—')}</td>
                 <td class="mono text-muted">${p.createdDateTime?new Date(p.createdDateTime).toLocaleDateString():'—'}</td>
               </tr>`;
-            }).join('') || '<tr><td colspan="6" class="empty-state text-muted">No CA policies found</td></tr>'}
+            }).join('') || '<tr><td colspan="7" class="empty-state text-muted">No CA policies found</td></tr>'}
             </tbody>
           </table>
         </div>
