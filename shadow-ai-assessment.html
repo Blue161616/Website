@@ -1990,13 +1990,35 @@ async function fetchBlueprintSps() {
   if (STATE.data.blueprintSps) return STATE.data.blueprintSps;
   try {
     const fields = 'id,displayName,appId,publisherName,accountEnabled,tags,createdDateTime,servicePrincipalType,notes,description,alternativeNames,applicationTemplateId';
-    // Query both blueprint tag values explicitly — catches blueprints with arbitrary display names
-    const [r1, r2] = await Promise.all([
+    const BETA = 'https://graph.microsoft.com/beta';
+    // 1. Entra's native agent blueprint endpoint (most complete source)
+    // 2+3. Tag-based SP queries as fallback/supplement
+    const [agentsResp, r1, r2] = await Promise.all([
+      gget(`${BETA}/agents?$top=999`).catch(() => ({ value: [] })),
       gget(`${GRAPH}/servicePrincipals?$filter=tags/any(t:t eq 'AgentIdentityBlueprint')&$top=500&$select=${fields}&$count=true`, true).catch(() => ({ value: [] })),
       gget(`${GRAPH}/servicePrincipals?$filter=tags/any(t:t eq 'AgentBlueprintPrincipal')&$top=500&$select=${fields}&$count=true`, true).catch(() => ({ value: [] })),
     ]);
+
     const seen = new Set();
-    STATE.data.blueprintSps = [...(r1.value||[]), ...(r2.value||[])].filter(sp => !seen.has(sp.id) && seen.add(sp.id));
+    const results = [...(r1.value||[]), ...(r2.value||[])].filter(sp => !seen.has(sp.id) && seen.add(sp.id));
+
+    // Merge /beta/agents results — fetch SP details for any blueprint IDs not already captured
+    const agentItems = agentsResp.value || [];
+    const missingIds = agentItems.map(a => a.id).filter(id => id && !seen.has(id));
+    if (missingIds.length > 0) {
+      const CHUNK = 15;
+      const chunks = [];
+      for (let i = 0; i < missingIds.length; i += CHUNK) chunks.push(missingIds.slice(i, i + CHUNK));
+      const extras = (await Promise.all(
+        chunks.map(chunk =>
+          gget(`${GRAPH}/servicePrincipals?$filter=${chunk.map(id => `id eq '${id}'`).join(' or ')}&$select=${fields}`, true)
+            .catch(() => ({ value: [] }))
+        )
+      )).flatMap(r => r.value || []);
+      extras.forEach(sp => { if (!seen.has(sp.id)) { seen.add(sp.id); results.push(sp); } });
+    }
+
+    STATE.data.blueprintSps = results;
   } catch { STATE.data.blueprintSps = []; }
   return STATE.data.blueprintSps;
 }
@@ -2025,11 +2047,11 @@ async function loadAgents() {
       return (isAgent || (isAi && hasWriteScopes) || isAgentBlueprint || isServiceIdentity);
     });
 
-    // Build blueprint ↔ agent identity relationship from ALL SPs.
+    // Build blueprint ↔ agent identity relationship from ALL SPs (including explicit blueprints).
     // Agent identity SPs store their parent blueprint's appId in alternativeNames.
     if (!STATE.data.agentLinkedAgents) {
       const blueprintByAppId = {}, blueprintById = {};
-      sps.forEach(sp => {
+      allSps.forEach(sp => {
         const tags = (sp.tags || []).map(t => t.toLowerCase());
         if (tags.some(t => t === 'agentidentityblueprint' || t === 'agentblueprintprincipal')) {
           blueprintByAppId[sp.appId] = sp;
@@ -2038,7 +2060,7 @@ async function loadAgents() {
       });
       const linkedAgents         = {};  // blueprintSp.id → [agent display names]
       const agentParentBlueprint = {};  // agentSp.id    → { blueprintSpId, blueprintName }
-      sps.forEach(sp => {
+      allSps.forEach(sp => {
         if (sp.servicePrincipalType !== 'ServiceIdentity') return;
         (sp.alternativeNames || []).forEach(altId => {
           const bp = blueprintByAppId[altId] || blueprintById[altId];
