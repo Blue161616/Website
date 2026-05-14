@@ -2622,6 +2622,64 @@ async function loadAlerts() {
 
 // ── POLICIES ──────────────────────────────────────────────────────────────
 
+const CA_STATE_ORDER = { enabled: 2, enabledForReportingButNotEnforced: 1, disabled: 0 };
+
+function renderPoliciesTable() {
+  const tbody = document.getElementById('ca-policies-tbody');
+  if (!tbody) return;
+  const { caP, policyResolve } = STATE.data;
+  if (!caP || !policyResolve) return;
+
+  const key = STATE.caPolicySortKey || 'created';
+  const dir = STATE.caPolicySortDir || 'desc';
+  const stateMap = { enabled:'enabled', disabled:'disabled', enabledForReportingButNotEnforced:'reportOnly' };
+
+  const rows = caP.map(p => {
+    const incDisplay = policyResolve(p.conditions?.users?.includeUsers, p.conditions?.users?.includeGroups);
+    const excUserIds  = p.conditions?.users?.excludeUsers  || [];
+    const excGroupIds = p.conditions?.users?.excludeGroups || [];
+    const excDisplay  = excUserIds.length || excGroupIds.length ? policyResolve(excUserIds, excGroupIds) : '—';
+    const appIds = p.conditions?.applications?.includeApplications || [];
+    const incApps = appIds.length > 0 ? (appIds.includes('All') ? 'All apps' : appIds.length + ' app(s)') : '—';
+    const appSort = appIds.includes('All') ? 9999 : appIds.length;
+    const controls = (p.grantControls?.builtInControls||[]).join(', ') || '—';
+    return { p, incDisplay, excDisplay, incApps, appSort, controls };
+  });
+
+  const sorted = [...rows].sort((a, b) => {
+    let av, bv;
+    if (key === 'name')     { av = (a.p.displayName||'').toLowerCase(); bv = (b.p.displayName||'').toLowerCase(); }
+    else if (key === 'state')    { av = CA_STATE_ORDER[a.p.state]??-1;  bv = CA_STATE_ORDER[b.p.state]??-1; }
+    else if (key === 'inc')      { av = a.incDisplay.toLowerCase(); bv = b.incDisplay.toLowerCase(); }
+    else if (key === 'exc')      { av = a.excDisplay.toLowerCase(); bv = b.excDisplay.toLowerCase(); }
+    else if (key === 'apps')     { av = a.appSort; bv = b.appSort; }
+    else if (key === 'controls') { av = a.controls.toLowerCase(); bv = b.controls.toLowerCase(); }
+    else if (key === 'created')  { av = a.p.createdDateTime||''; bv = b.p.createdDateTime||''; }
+    else { av = 0; bv = 0; }
+    if (av < bv) return dir === 'asc' ? -1 : 1;
+    if (av > bv) return dir === 'asc' ?  1 : -1;
+    return 0;
+  });
+
+  tbody.innerHTML = sorted.map(({ p, incDisplay, excDisplay, incApps, controls }) => `<tr>
+    <td><strong>${esc(p.displayName)}</strong></td>
+    <td>${statusBadge(stateMap[p.state]||'inactive')}</td>
+    <td class="text-muted" title="${esc(incDisplay)}">${esc(incDisplay)}</td>
+    <td class="text-muted" title="${esc(excDisplay)}">${esc(excDisplay)}</td>
+    <td class="text-muted">${esc(incApps)}</td>
+    <td class="mono text-muted">${esc(controls)}</td>
+    <td class="mono text-muted">${p.createdDateTime ? new Date(p.createdDateTime).toLocaleDateString() : '—'}</td>
+  </tr>`).join('') || '<tr><td colspan="7" class="empty-state text-muted">No CA policies found</td></tr>';
+
+  applySortIndicators('ca-policies-table', key, dir);
+}
+
+function sortPoliciesTable(key) {
+  if (STATE.caPolicySortKey === key) { STATE.caPolicySortDir = STATE.caPolicySortDir === 'asc' ? 'desc' : 'asc'; }
+  else { STATE.caPolicySortKey = key; STATE.caPolicySortDir = (key === 'name' || key === 'inc' || key === 'exc' || key === 'controls') ? 'asc' : 'desc'; }
+  renderPoliciesTable();
+}
+
 async function loadPolicies() {
   const el = document.getElementById('policies-content');
   try {
@@ -2630,28 +2688,27 @@ async function loadPolicies() {
     ]);
     const authPolicy = STATE.data.authPolicy || {};
     const secDefaults = STATE.data.secDefaults || {};
-    const stateMap = { enabled:'enabled', disabled:'disabled', enabledForReportingButNotEnforced:'reportOnly' };
 
     const userById  = Object.fromEntries(users.map(u => [u.id, u.displayName || u.userPrincipalName]));
     const groupById = Object.fromEntries(groups.map(g => [g.id, g.displayName]));
-    const SPECIAL = {
-      All: 'All', None: 'None',
-      GuestsOrExternalUsers: 'Guests / External',
-      AllAgentIdUsers: 'All Agent ID Users',
-    };
+    const SPECIAL = { All:'All', None:'None', GuestsOrExternalUsers:'Guests / External', AllAgentIdUsers:'All Agent ID Users' };
     const resolveId = id => SPECIAL[id] || userById[id] || groupById[id] || (id.length > 12 ? id.slice(0,8)+'…' : id);
-    const resolveList = (ids, fallback='—') => {
-      if (!ids || !ids.length) return fallback;
+    const resolveList = (ids) => {
+      if (!ids?.length) return null;
       const names = ids.map(resolveId);
-      if (names.length <= 3) return names.join(', ');
-      return names.slice(0,2).join(', ') + ` +${names.length - 2} more`;
+      return names.length <= 3 ? names.join(', ') : names.slice(0,2).join(', ') + ` +${names.length-2} more`;
     };
-    const resolveUsersCell = (incUserIds, incGroupIds) => {
-      const parts = [];
-      if (incUserIds?.length) parts.push(resolveList(incUserIds));
-      if (incGroupIds?.length) parts.push(resolveList(incGroupIds));
+    const resolveUsersCell = (userIds, groupIds) => {
+      const parts = [resolveList(userIds), resolveList(groupIds)].filter(Boolean);
       return parts.join('; ') || 'All';
     };
+
+    // Store for renderPoliciesTable
+    STATE.data.caP = caP;
+    STATE.data.policyResolve = resolveUsersCell;
+    if (!STATE.caPolicySortKey) { STATE.caPolicySortKey = 'created'; STATE.caPolicySortDir = 'desc'; }
+
+    const th = (label, key) => makeSortableTh(label, key, 'sortPoliciesTable');
 
     el.innerHTML = `
       <div class="section-header">
@@ -2661,30 +2718,17 @@ async function loadPolicies() {
       <div class="card">
         <div class="card-header"><div class="card-title">Conditional Access Policies (${caP.length})</div></div>
         <div class="table-wrap">
-          <table>
-            <thead><tr><th>Policy Name</th><th>State</th><th>Users Included</th><th>Users Excluded</th><th>Apps</th><th>Grant Controls</th><th>Created</th></tr></thead>
-            <tbody>${caP.map(p => {
-              const incDisplay = resolveUsersCell(p.conditions?.users?.includeUsers, p.conditions?.users?.includeGroups);
-              const excUserIds  = p.conditions?.users?.excludeUsers  || [];
-              const excGroupIds = p.conditions?.users?.excludeGroups || [];
-              const excDisplay  = excUserIds.length || excGroupIds.length
-                ? resolveUsersCell(excUserIds, excGroupIds)
-                : '—';
-              const incApps = (p.conditions?.applications?.includeApplications||[]).length > 0
-                ? (p.conditions.applications.includeApplications.includes('All') ? 'All apps' : p.conditions.applications.includeApplications.length + ' app(s)')
-                : '—';
-              const controls = (p.grantControls?.builtInControls||[]).join(', ') || (p.grantControls?.operator==='OR'?'OR':'—');
-              return `<tr>
-                <td><strong>${esc(p.displayName)}</strong></td>
-                <td>${statusBadge(stateMap[p.state]||'inactive')}</td>
-                <td class="text-muted" title="${esc(resolveUsersCell(p.conditions?.users?.includeUsers, p.conditions?.users?.includeGroups))}">${esc(incDisplay)}</td>
-                <td class="text-muted" title="${esc(excDisplay)}">${esc(excDisplay)}</td>
-                <td class="text-muted">${esc(incApps)}</td>
-                <td class="mono text-muted">${esc(controls||'—')}</td>
-                <td class="mono text-muted">${p.createdDateTime?new Date(p.createdDateTime).toLocaleDateString():'—'}</td>
-              </tr>`;
-            }).join('') || '<tr><td colspan="7" class="empty-state text-muted">No CA policies found</td></tr>'}
-            </tbody>
+          <table id="ca-policies-table">
+            <thead><tr>
+              ${th('Policy Name','name')}
+              ${th('State','state')}
+              ${th('Users Included','inc')}
+              ${th('Users Excluded','exc')}
+              ${th('Apps','apps')}
+              ${th('Grant Controls','controls')}
+              ${th('Created','created')}
+            </tr></thead>
+            <tbody id="ca-policies-tbody"></tbody>
           </table>
         </div>
       </div>
@@ -2722,6 +2766,7 @@ async function loadPolicies() {
         </div>
       </div>
     `;
+    renderPoliciesTable();
   } catch (e) {
     el.innerHTML = permWarn('Policy.Read.All', e.message);
   }
