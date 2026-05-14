@@ -1776,159 +1776,214 @@ const RISK_ORDER = { critical:3, high:2, medium:1, low:0 };
 
 async function fetchAgentOwnersSponsors(agentSps) {
   if (STATE.data.agentOwnersSponsors) return STATE.data.agentOwnersSponsors;
-
   const result = {};
-  // linkedAgents: blueprintSpId → [{ id, displayName }]
-  // agentParentBlueprint: agentSpId → { blueprintSpId, blueprintName }
-  const linkedAgents = {};
-  const agentParentBlueprint = {};
-
-  const blueprintSps = agentSps.filter(sp => getAgentType(sp).type === 'blueprint');
-
   await Promise.all(agentSps.map(async sp => {
-    const isBp = blueprintSps.includes(sp);
-    const [ownersResp, sponsorsResp, linkedResp] = await Promise.all([
+    const [ownersResp, sponsorsResp] = await Promise.all([
       gget(`${GRAPH}/servicePrincipals/${sp.id}/owners?$select=displayName,userPrincipalName`).catch(() => ({ value: [] })),
       gget(`${GRAPH_BETA}/servicePrincipals/${sp.id}/sponsors?$select=displayName,userPrincipalName`).catch(() => ({ value: [] })),
-      isBp
-        ? gget(`${GRAPH_BETA}/servicePrincipals/${sp.id}/linkedAgentIdentities?$select=id,displayName,appId`).catch(() => ({ value: [] }))
-        : Promise.resolve({ value: [] }),
     ]);
-
     result[sp.id] = {
       owners:   (ownersResp.value  || []).map(u => u.displayName || u.userPrincipalName || u.id),
       sponsors: (sponsorsResp.value || []).map(u => u.displayName || u.userPrincipalName || u.id),
     };
-
-    if (isBp) {
-      const agents = linkedResp.value || [];
-      linkedAgents[sp.id] = agents.map(a => a.displayName || a.id);
-      agents.forEach(a => {
-        agentParentBlueprint[a.id] = { blueprintSpId: sp.id, blueprintName: sp.displayName };
-      });
-    }
   }));
-
-  STATE.data.agentOwnersSponsors    = result;
-  STATE.data.agentLinkedAgents      = linkedAgents;
-  STATE.data.agentParentBlueprint   = agentParentBlueprint;
+  STATE.data.agentOwnersSponsors = result;
   return result;
 }
 
-function renderAgentsTable() {
-  const tbody = document.getElementById('agents-tbody');
-  if (!tbody) return;
-  const { agentSps, agentGrants, agentOwnersSponsors } = STATE.data;
-  if (!agentSps || !agentGrants) return;
+// ── Agent table helpers ────────────────────────────────────────────────────
 
-  const key = STATE.agentSortKey || 'risk';
-  const dir = STATE.agentSortDir || 'desc';
+function agentOwnerCell(meta, loading) {
+  if (loading) return '<span class="text-muted" style="font-size:11px">…</span>';
+  const owners   = meta?.owners   || [];
+  const sponsors = meta?.sponsors || [];
+  if (!owners.length && !sponsors.length) return '<span style="opacity:.4">—</span>';
+  return [
+    ...owners.map(n   => `<span style="font-size:11px;display:block">👤 ${esc(n)}</span>`),
+    ...sponsors.map(n => `<span style="font-size:11px;display:block">⭐ ${esc(n)}</span>`),
+  ].join('');
+}
 
-  // Use API-fetched linked agent data (populated after background fetch completes)
-  const linkedAgents        = STATE.data.agentLinkedAgents    || {};
-  const agentParentBlueprint = STATE.data.agentParentBlueprint || {};
+function agentSpCell(sp) {
+  return `<strong>${esc(sp.displayName)}</strong><br><span class="mono text-muted" style="font-size:10px">${esc(sp.appId.slice(0,18))}…</span>`;
+}
 
-  const rows = agentSps.map(sp => {
-    const r   = riskScore(sp, agentGrants);
-    const ws  = AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants).includes(s));
-    const ct  = agentGrants.find(g => g.clientId === sp.id)?.consentType || '—';
-    const ai  = getAgentType(sp);
-    const meta = agentOwnersSponsors?.[sp.id];
-    return { sp, r, ws, ct, ai, meta };
-  });
-
-  const sorted = [...rows].sort((a, b) => {
-    let av, bv;
-    if (key === 'name')      { av = (a.sp.displayName||'').toLowerCase(); bv = (b.sp.displayName||'').toLowerCase(); }
-    else if (key === 'type')      { av = a.ai.type; bv = b.ai.type; }
-    else if (key === 'blueprint') { av = (a.ai.blueprintName||'').toLowerCase(); bv = (b.ai.blueprintName||'').toLowerCase(); }
-    else if (key === 'risk')      { av = RISK_ORDER[a.r]??-1; bv = RISK_ORDER[b.r]??-1; }
-    else if (key === 'write')     { av = a.ws.length; bv = b.ws.length; }
-    else if (key === 'consent')   { av = a.ct; bv = b.ct; }
-    else if (key === 'status')    { av = a.sp.accountEnabled?1:0; bv = b.sp.accountEnabled?1:0; }
-    else if (key === 'owners')    { av = (a.meta?.owners?.length||0) + (a.meta?.sponsors?.length||0); bv = (b.meta?.owners?.length||0) + (b.meta?.sponsors?.length||0); }
-    else { av = 0; bv = 0; }
-    if (av < bv) return dir === 'asc' ? -1 : 1;
-    if (av > bv) return dir === 'asc' ?  1 : -1;
-    return 0;
-  });
-
-  tbody.innerHTML = sorted.map(({ sp, r, ws, ct, ai, meta }) => {
-    const typeBadgeClass = ai.type === 'ai-foundry' ? 'badge-info'
-      : ai.type === 'copilot-studio' ? 'badge-purple'
-      : ai.type === 'blueprint' ? 'badge-medium'
-      : 'badge-ghost';
-    const typeIcon = ai.type === 'ai-foundry' ? '🏭'
-      : ai.type === 'copilot-studio' ? '🤖'
-      : ai.type === 'blueprint' ? '📋'
-      : '⚙️';
-
-    const loadingOwners = !agentOwnersSponsors;
-    const owners   = meta?.owners   || [];
-    const sponsors = meta?.sponsors || [];
-    const ownerCell = loadingOwners
-      ? '<span class="text-muted" style="font-size:11px">…</span>'
-      : (owners.length || sponsors.length)
-        ? [
-            ...owners.map(n   => `<span style="font-size:11px;display:block"><span class="text-muted">👤</span> ${esc(n)}</span>`),
-            ...sponsors.map(n => `<span style="font-size:11px;display:block"><span class="text-muted">⭐</span> ${esc(n)}</span>`),
-          ].join('')
-        : '<span class="text-muted" style="opacity:.4">—</span>';
-
-    // Blueprint column: for blueprint SPs show linked agents; for agent identities show parent blueprint
-    const loadingBlueprint = agentOwnersSponsors && !STATE.data.agentLinkedAgents;
-    let blueprintCell;
-    if (ai.type === 'blueprint') {
-      const linked = linkedAgents[sp.id] || [];
-      if (loadingBlueprint) {
-        blueprintCell = '<span class="text-muted" style="font-size:11px">…</span>';
-      } else if (linked.length) {
-        blueprintCell = `<span style="font-size:12px;color:var(--text-muted)">${linked.length} linked agent${linked.length > 1 ? 's' : ''}</span>`
-          + `<br><span style="font-size:10px;color:var(--text-dim)" title="${esc(linked.join(', '))}">${esc(linked.slice(0,2).join(', '))}${linked.length > 2 ? ` +${linked.length - 2} more` : ''}</span>`;
-      } else {
-        blueprintCell = '<span style="opacity:.4;font-size:12px">No linked agents</span>';
-      }
-    } else if (ai.type !== 'classic') {
-      const parent = agentParentBlueprint[sp.id];
-      if (loadingBlueprint) {
-        blueprintCell = '<span class="text-muted" style="font-size:11px">…</span>';
-      } else if (parent) {
-        blueprintCell = `<span style="font-size:12px;color:var(--text-muted)">📋 ${esc(parent.blueprintName)}</span>`;
-      } else {
-        blueprintCell = '<span style="opacity:.4">—</span>';
-      }
-    } else {
-      blueprintCell = '<span style="opacity:.4">—</span>';
-    }
-
-    return `<tr>
-      <td><strong>${esc(sp.displayName)}</strong><br><span class="mono text-muted" style="font-size:10px">${esc(sp.appId.slice(0,18))}…</span></td>
-      <td><span class="badge ${typeBadgeClass}">${typeIcon} ${esc(ai.label)}</span></td>
-      <td style="font-size:12px">${blueprintCell}</td>
-      <td>${riskBadge(r)}</td>
-      <td>${ws.length ? ws.map(s=>`<span class="badge badge-critical">${esc(s)}</span>`).join(' ') : '<span class="text-muted">—</span>'}</td>
-      <td><span class="badge ${ct==='AllPrincipals'?'badge-critical':'badge-medium'}">${esc(ct)}</span></td>
-      <td>${ownerCell}</td>
-      <td>${sp.accountEnabled ? statusBadge('unblocked') : statusBadge('disabled')}</td>
-    </tr>`;
-  }).join('') || '<tr><td colspan="8" class="empty-state text-muted">No agent-like service principals detected</td></tr>';
-
-  // Update sort indicators on headers
-  document.querySelectorAll('#agents-table th[data-sort]').forEach(th => {
+function applySortIndicators(tableId, key, dir) {
+  document.querySelectorAll(`#${tableId} th[data-sort]`).forEach(th => {
     const k = th.dataset.sort;
     th.querySelector('.sort-icon').textContent = k !== key ? '⇅' : dir === 'asc' ? '↑' : '↓';
     th.style.color = k === key ? 'var(--text-primary)' : '';
   });
 }
 
-function sortAgentsTable(key) {
-  if (STATE.agentSortKey === key) {
-    STATE.agentSortDir = STATE.agentSortDir === 'asc' ? 'desc' : 'asc';
-  } else {
-    STATE.agentSortKey = key;
-    STATE.agentSortDir = (key === 'name' || key === 'type' || key === 'blueprint') ? 'asc' : 'desc';
-  }
-  renderAgentsTable();
+function makeSortableTh(label, key, sortFn) {
+  return `<th data-sort="${key}" style="cursor:pointer;user-select:none;white-space:nowrap" onclick="${sortFn}('${key}')">${label} <span class="sort-icon">⇅</span></th>`;
+}
+
+function sortRows(rows, key, dir, getVal) {
+  return [...rows].sort((a, b) => {
+    const av = getVal(a, key), bv = getVal(b, key);
+    if (av < bv) return dir === 'asc' ? -1 : 1;
+    if (av > bv) return dir === 'asc' ?  1 : -1;
+    return 0;
+  });
+}
+
+// ── Blueprint table ────────────────────────────────────────────────────────
+
+function renderBlueprintTable() {
+  const tbody = document.getElementById('blueprint-tbody');
+  if (!tbody) return;
+  const { agentSps, agentGrants, agentOwnersSponsors, agentLinkedAgents } = STATE.data;
+  if (!agentSps) return;
+
+  const loading   = !agentOwnersSponsors;
+  const linked    = agentLinkedAgents || {};
+  const key = STATE.bpSortKey || 'linked';
+  const dir = STATE.bpSortDir || 'desc';
+
+  const bpSps = agentSps.filter(sp => getAgentType(sp).type === 'blueprint');
+
+  const getVal = (sp, k) => {
+    if (k === 'name')    return (sp.displayName||'').toLowerCase();
+    if (k === 'linked')  return (linked[sp.id]||[]).length;
+    if (k === 'owners')  return (agentOwnersSponsors?.[sp.id]?.owners?.length||0) + (agentOwnersSponsors?.[sp.id]?.sponsors?.length||0);
+    if (k === 'status')  return sp.accountEnabled ? 1 : 0;
+    if (k === 'created') return sp.createdDateTime || '';
+    return 0;
+  };
+
+  const sorted = sortRows(bpSps, key, dir, getVal);
+
+  tbody.innerHTML = sorted.map(sp => {
+    const agents = linked[sp.id] || [];
+    const linkedCell = agents.length
+      ? `<span style="font-size:12px">${agents.length} agent${agents.length>1?'s':''}</span><br><span style="font-size:10px;color:var(--text-dim)" title="${esc(agents.join(', '))}">${esc(agents.slice(0,2).join(', '))}${agents.length>2?` +${agents.length-2} more`:''}</span>`
+      : `<span style="opacity:.4;font-size:12px">None</span>`;
+    return `<tr>
+      <td>${agentSpCell(sp)}</td>
+      <td>${linkedCell}</td>
+      <td>${agentOwnerCell(agentOwnersSponsors?.[sp.id], loading)}</td>
+      <td>${sp.accountEnabled ? statusBadge('unblocked') : statusBadge('disabled')}</td>
+      <td class="mono text-muted" style="font-size:11px">${sp.createdDateTime ? new Date(sp.createdDateTime).toLocaleDateString() : '—'}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="5" class="empty-state text-muted">No agent blueprints found</td></tr>';
+
+  applySortIndicators('blueprint-table', key, dir);
+}
+
+function sortBlueprintTable(key) {
+  if (STATE.bpSortKey === key) { STATE.bpSortDir = STATE.bpSortDir === 'asc' ? 'desc' : 'asc'; }
+  else { STATE.bpSortKey = key; STATE.bpSortDir = key === 'name' ? 'asc' : 'desc'; }
+  renderBlueprintTable();
+}
+
+// ── Agent Identity table ───────────────────────────────────────────────────
+
+function renderIdentityTable() {
+  const tbody = document.getElementById('identity-tbody');
+  if (!tbody) return;
+  const { agentSps, agentGrants, agentOwnersSponsors, agentParentBlueprint } = STATE.data;
+  if (!agentSps) return;
+
+  const loading = !agentOwnersSponsors;
+  const parentMap = agentParentBlueprint || {};
+  const key = STATE.idSortKey || 'risk';
+  const dir = STATE.idSortDir || 'desc';
+
+  const idSps = agentSps.filter(sp => sp.servicePrincipalType === 'ServiceIdentity' || (() => { const t = getAgentType(sp).type; return t === 'copilot-studio' || t === 'ai-foundry'; })());
+
+  const getVal = (sp, k) => {
+    if (k === 'name')      return (sp.displayName||'').toLowerCase();
+    if (k === 'blueprint') return (parentMap[sp.id]?.blueprintName||'').toLowerCase();
+    if (k === 'risk')      return RISK_ORDER[riskScore(sp, agentGrants||[])] ?? -1;
+    if (k === 'write')     return AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants||[]).includes(s)).length;
+    if (k === 'consent')   return agentGrants?.find(g=>g.clientId===sp.id)?.consentType || '';
+    if (k === 'owners')    return (agentOwnersSponsors?.[sp.id]?.owners?.length||0) + (agentOwnersSponsors?.[sp.id]?.sponsors?.length||0);
+    if (k === 'status')    return sp.accountEnabled ? 1 : 0;
+    return 0;
+  };
+
+  const sorted = sortRows(idSps, key, dir, getVal);
+
+  tbody.innerHTML = sorted.map(sp => {
+    const r   = riskScore(sp, agentGrants||[]);
+    const ws  = AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants||[]).includes(s));
+    const ct  = agentGrants?.find(g=>g.clientId===sp.id)?.consentType || '—';
+    const parent = parentMap[sp.id];
+    const parentCell = parent
+      ? `<span style="font-size:12px">📋 ${esc(parent.blueprintName)}</span>`
+      : `<span style="opacity:.4">—</span>`;
+    return `<tr>
+      <td>${agentSpCell(sp)}</td>
+      <td>${parentCell}</td>
+      <td>${riskBadge(r)}</td>
+      <td>${ws.length ? ws.map(s=>`<span class="badge badge-critical" style="font-size:10px">${esc(s)}</span>`).join(' ') : '<span style="opacity:.4">—</span>'}</td>
+      <td><span class="badge ${ct==='AllPrincipals'?'badge-critical':'badge-medium'}">${esc(ct)}</span></td>
+      <td>${agentOwnerCell(agentOwnersSponsors?.[sp.id], loading)}</td>
+      <td>${sp.accountEnabled ? statusBadge('unblocked') : statusBadge('disabled')}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="7" class="empty-state text-muted">No agent identities found</td></tr>';
+
+  applySortIndicators('identity-table', key, dir);
+}
+
+function sortIdentityTable(key) {
+  if (STATE.idSortKey === key) { STATE.idSortDir = STATE.idSortDir === 'asc' ? 'desc' : 'asc'; }
+  else { STATE.idSortKey = key; STATE.idSortDir = (key === 'name' || key === 'blueprint') ? 'asc' : 'desc'; }
+  renderIdentityTable();
+}
+
+// ── Classic Agents table ───────────────────────────────────────────────────
+
+function renderClassicTable() {
+  const tbody = document.getElementById('classic-tbody');
+  if (!tbody) return;
+  const { agentSps, agentGrants } = STATE.data;
+  if (!agentSps) return;
+
+  const key = STATE.clSortKey || 'risk';
+  const dir = STATE.clSortDir || 'desc';
+
+  const clSps = agentSps.filter(sp => getAgentType(sp).type === 'classic');
+
+  const getVal = (sp, k) => {
+    if (k === 'name')    return (sp.displayName||'').toLowerCase();
+    if (k === 'risk')    return RISK_ORDER[riskScore(sp, agentGrants||[])] ?? -1;
+    if (k === 'write')   return AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants||[]).includes(s)).length;
+    if (k === 'consent') return agentGrants?.find(g=>g.clientId===sp.id)?.consentType || '';
+    if (k === 'status')  return sp.accountEnabled ? 1 : 0;
+    return 0;
+  };
+
+  const sorted = sortRows(clSps, key, dir, getVal);
+
+  tbody.innerHTML = sorted.map(sp => {
+    const r  = riskScore(sp, agentGrants||[]);
+    const ws = AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants||[]).includes(s));
+    const ct = agentGrants?.find(g=>g.clientId===sp.id)?.consentType || '—';
+    return `<tr>
+      <td>${agentSpCell(sp)}</td>
+      <td>${riskBadge(r)}</td>
+      <td>${ws.length ? ws.map(s=>`<span class="badge badge-critical" style="font-size:10px">${esc(s)}</span>`).join(' ') : '<span style="opacity:.4">—</span>'}</td>
+      <td><span class="badge ${ct==='AllPrincipals'?'badge-critical':'badge-medium'}">${esc(ct)}</span></td>
+      <td>${sp.accountEnabled ? statusBadge('unblocked') : statusBadge('disabled')}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="5" class="empty-state text-muted">No classic agents found</td></tr>';
+
+  applySortIndicators('classic-table', key, dir);
+}
+
+function sortClassicTable(key) {
+  if (STATE.clSortKey === key) { STATE.clSortDir = STATE.clSortDir === 'asc' ? 'desc' : 'asc'; }
+  else { STATE.clSortKey = key; STATE.clSortDir = key === 'name' ? 'asc' : 'desc'; }
+  renderClassicTable();
+}
+
+function renderAllAgentTables() {
+  renderBlueprintTable();
+  renderIdentityTable();
+  renderClassicTable();
 }
 
 async function loadAgents() {
@@ -1937,66 +1992,149 @@ async function loadAgents() {
     const [sps, grants] = await Promise.all([fetchServicePrincipals(), fetchOAuth2Grants()]);
     const agentSps = sps.filter(sp => {
       const name = (sp.displayName||'').toLowerCase();
+      const tags = (sp.tags || []).map(t => t.toLowerCase());
       const isAgent = AGENT_KEYWORDS.some(k => name.includes(k));
       const isAi = isAiApp(sp);
       const hasWriteScopes = grants.some(g => g.clientId === sp.id &&
         AGENT_WRITE_SCOPES.some(s => (g.scope||'').includes(s)));
-      return (isAgent || (isAi && hasWriteScopes));
+      const isAgentBlueprint  = tags.some(t => t === 'agentidentityblueprint' || t === 'agentblueprintprincipal');
+      const isServiceIdentity = sp.servicePrincipalType === 'ServiceIdentity';
+      return (isAgent || (isAi && hasWriteScopes) || isAgentBlueprint || isServiceIdentity);
     });
+
+    // Build blueprint ↔ agent identity relationship from ALL SPs.
+    // Agent identity SPs store their parent blueprint's appId in alternativeNames.
+    if (!STATE.data.agentLinkedAgents) {
+      const blueprintByAppId = {}, blueprintById = {};
+      sps.forEach(sp => {
+        const tags = (sp.tags || []).map(t => t.toLowerCase());
+        if (tags.some(t => t === 'agentidentityblueprint' || t === 'agentblueprintprincipal')) {
+          blueprintByAppId[sp.appId] = sp;
+          blueprintById[sp.id]       = sp;
+        }
+      });
+      const linkedAgents         = {};  // blueprintSp.id → [agent display names]
+      const agentParentBlueprint = {};  // agentSp.id    → { blueprintSpId, blueprintName }
+      sps.forEach(sp => {
+        if (sp.servicePrincipalType !== 'ServiceIdentity') return;
+        (sp.alternativeNames || []).forEach(altId => {
+          const bp = blueprintByAppId[altId] || blueprintById[altId];
+          if (!bp) return;
+          if (!linkedAgents[bp.id]) linkedAgents[bp.id] = [];
+          linkedAgents[bp.id].push(sp.displayName || sp.id);
+          agentParentBlueprint[sp.id] = { blueprintSpId: bp.id, blueprintName: bp.displayName };
+        });
+      });
+      STATE.data.agentLinkedAgents    = linkedAgents;
+      STATE.data.agentParentBlueprint = agentParentBlueprint;
+    }
+
     STATE.data.agentSps   = agentSps;
     STATE.data.agentGrants = grants;
-    if (!STATE.agentSortKey) { STATE.agentSortKey = 'risk'; STATE.agentSortDir = 'desc'; }
+    const bpSps = agentSps.filter(sp => getAgentType(sp).type === 'blueprint');
+    const idSps = agentSps.filter(sp => sp.servicePrincipalType === 'ServiceIdentity' || (() => { const t = getAgentType(sp).type; return t === 'copilot-studio' || t === 'ai-foundry'; })());
+    const clSps = agentSps.filter(sp => getAgentType(sp).type === 'classic');
+    const writeCount = agentSps.filter(sp => grants.some(g => g.clientId===sp.id && AGENT_WRITE_SCOPES.some(s=>(g.scope||'').includes(s)))).length;
+    const tenantWide = grants.filter(g => g.consentType==='AllPrincipals' && agentSps.some(a=>a.id===g.clientId)).length;
 
-    const thStyle = 'cursor:pointer;user-select:none;white-space:nowrap';
-    const th = (label, key) =>
-      `<th data-sort="${key}" style="${thStyle}" onclick="sortAgentsTable('${key}')">${label} <span class="sort-icon">⇅</span></th>`;
+    const th = (label, key, sortFn) => makeSortableTh(label, key, sortFn);
 
     el.innerHTML = `
       <div class="section-header">
         <div>
           <div class="section-title">AI Agent Inventory</div>
-          <div class="section-sub">Service principals exhibiting agent-like characteristics: AI + write permissions or automation keywords</div>
+          <div class="section-sub">Blueprints, modern agent identities, and classic automation service principals</div>
         </div>
         <span class="data-source source-derived">⚡ Derived from service principals</span>
       </div>
-      <div class="kpi-row-3">
-        <div class="kpi-card critical">
-          <div class="kpi-label">Agents with Write Access</div>
-          <div class="kpi-value text-critical">${agentSps.filter(sp=>grants.some(g=>g.clientId===sp.id&&AGENT_WRITE_SCOPES.some(s=>(g.scope||'').includes(s)))).length}</div>
-          <div class="kpi-icon">✍️</div>
-        </div>
+      <div class="kpi-row" style="grid-template-columns:repeat(4,1fr)">
         <div class="kpi-card medium">
-          <div class="kpi-label">Automation Apps Detected</div>
-          <div class="kpi-value text-medium">${agentSps.length}</div>
-          <div class="kpi-icon">⚡</div>
+          <div class="kpi-label">Agent Blueprints</div>
+          <div class="kpi-value text-medium">${bpSps.length}</div>
+          <div class="kpi-icon">📋</div>
         </div>
         <div class="kpi-card info">
-          <div class="kpi-label">Tenant-wide Grants</div>
-          <div class="kpi-value text-blue">${grants.filter(g=>g.consentType==='AllPrincipals'&&agentSps.some(a=>a.id===g.clientId)).length}</div>
-          <div class="kpi-icon">🔗</div>
+          <div class="kpi-label">Agent Identities</div>
+          <div class="kpi-value text-blue">${idSps.length}</div>
+          <div class="kpi-icon">🤖</div>
+        </div>
+        <div class="kpi-card low">
+          <div class="kpi-label">Classic Agents</div>
+          <div class="kpi-value text-low">${clSps.length}</div>
+          <div class="kpi-icon">⚙️</div>
+        </div>
+        <div class="kpi-card critical">
+          <div class="kpi-label">With Write Access</div>
+          <div class="kpi-value text-critical">${writeCount}</div>
+          <div class="kpi-icon">✍️</div>
         </div>
       </div>
-      <div class="card">
+
+      <!-- Agent Blueprints -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">📋 Agent Blueprints (${bpSps.length})</div>
+          <span class="text-muted" style="font-size:11px">Templates that define shared identity &amp; access for agent identities</span>
+        </div>
         <div class="table-wrap">
-          <table id="agents-table">
+          <table id="blueprint-table">
             <thead><tr>
-              ${th('Agent / App','name')}
-              ${th('Type','type')}
-              ${th('Blueprint','blueprint')}
-              ${th('Risk','risk')}
-              ${th('Write Scopes','write')}
-              ${th('Consent Scope','consent')}
-              ${th('Owners / Sponsors','owners')}
-              ${th('Status','status')}
+              ${th('Blueprint Name','name','sortBlueprintTable')}
+              ${th('Linked Identities','linked','sortBlueprintTable')}
+              ${th('Owners / Sponsors','owners','sortBlueprintTable')}
+              ${th('Status','status','sortBlueprintTable')}
+              ${th('Created','created','sortBlueprintTable')}
             </tr></thead>
-            <tbody id="agents-tbody"></tbody>
+            <tbody id="blueprint-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Agent Identities -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">🤖 Agent Identities (${idSps.length})</div>
+          <span class="text-muted" style="font-size:11px">Modern agents created from a blueprint (Copilot Studio, AI Foundry, ServiceIdentity)</span>
+        </div>
+        <div class="table-wrap">
+          <table id="identity-table">
+            <thead><tr>
+              ${th('Agent Name','name','sortIdentityTable')}
+              ${th('Parent Blueprint','blueprint','sortIdentityTable')}
+              ${th('Risk','risk','sortIdentityTable')}
+              ${th('Write Scopes','write','sortIdentityTable')}
+              ${th('Consent Scope','consent','sortIdentityTable')}
+              ${th('Owners / Sponsors','owners','sortIdentityTable')}
+              ${th('Status','status','sortIdentityTable')}
+            </tr></thead>
+            <tbody id="identity-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Classic Agents -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">⚙️ Classic Agents (${clSps.length})</div>
+          <span class="text-muted" style="font-size:11px">Service principals with agent-like names or AI write scopes — no blueprint attached</span>
+        </div>
+        <div class="table-wrap">
+          <table id="classic-table">
+            <thead><tr>
+              ${th('Agent / App','name','sortClassicTable')}
+              ${th('Risk','risk','sortClassicTable')}
+              ${th('Write Scopes','write','sortClassicTable')}
+              ${th('Consent Scope','consent','sortClassicTable')}
+              ${th('Status','status','sortClassicTable')}
+            </tr></thead>
+            <tbody id="classic-tbody"></tbody>
           </table>
         </div>
       </div>
     `;
-    renderAgentsTable();
-    // Fetch owners/sponsors in background — re-render table when done
-    fetchAgentOwnersSponsors(agentSps).then(() => renderAgentsTable());
+    renderAllAgentTables();
+    // Owners/sponsors load in background — re-render all tables when done
+    fetchAgentOwnersSponsors(agentSps).then(() => renderAllAgentTables());
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
   }
