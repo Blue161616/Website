@@ -262,7 +262,7 @@
       <code>Application.Read.All</code> &nbsp;<code>AuditLog.Read.All</code> &nbsp;<code>User.Read.All</code><br>
       <code>Policy.Read.All</code> &nbsp;<code>Organization.Read.All</code> &nbsp;<code>IdentityRiskyUser.Read.All</code><br>
       <code>SecurityAlert.Read.All</code> &nbsp;<code>RoleManagement.Read.All</code> &nbsp;<code>IdentityRiskyServicePrincipal.Read.All</code><br>
-      <code>AgentIdentityBlueprint.Read.All</code> &nbsp;<code>AgentIdentity.Read.All</code><br>
+      <code>AgentIdentityBlueprint.Read.All</code> &nbsp;<code>AgentIdentity.Read.All</code> &nbsp;<code>AgentIdentityBlueprintPrincipal.Read.All</code><br>
       <br>
       Set platform to <strong>SPA</strong>, supported account types to <strong>multi-tenant</strong>.
     </div>
@@ -389,6 +389,7 @@ const GRAPH_SCOPES = [
   'https://graph.microsoft.com/CloudApp-Discovery.Read.All',
   'https://graph.microsoft.com/AgentIdentityBlueprint.Read.All',
   'https://graph.microsoft.com/AgentIdentity.Read.All',
+  'https://graph.microsoft.com/AgentIdentityBlueprintPrincipal.Read.All',
 ];
 
 // Known AI app patterns for detection (case-insensitive)
@@ -1994,11 +1995,14 @@ async function fetchBlueprintSps() {
     const fields = 'id,displayName,appId,publisherName,accountEnabled,tags,createdDateTime,servicePrincipalType,notes,description,alternativeNames,applicationTemplateId';
     const BETA = 'https://graph.microsoft.com/beta';
 
-    // Primary: dedicated AgentIdentityBlueprint endpoint (requires AgentIdentityBlueprint.Read.All)
-    // Fallback: tag-based SP queries covering all known blueprint tag variants
+    // Layer 1: dedicated endpoint (requires AgentIdentityBlueprint.Read.All)
+    // Layer 2: tag-based SP queries covering all known blueprint tag variants
+    // Layer 3: reverse-discover via agent identity alternativeNames (finds blueprints with ANY tag or none)
     const BP_TAGS = ['AgentIdentityBlueprint', 'AgentBlueprintPrincipal', 'AgentIdentityBlueprintPrincipal'];
-    const [dedicatedResp, ...tagResps] = await Promise.all([
+    const [allSps, dedicatedResp, principalsResp, ...tagResps] = await Promise.all([
+      fetchServicePrincipals(),
       gget(`${BETA}/agentIdentityBlueprints?$top=999`).catch(() => ({ value: [] })),
+      gget(`${BETA}/agentIdentityBlueprintPrincipals?$top=999`).catch(() => ({ value: [] })),
       ...BP_TAGS.map(tag =>
         gget(`${GRAPH}/servicePrincipals?$filter=tags/any(t:t eq '${tag}')&$top=500&$select=${fields}&$count=true`, true)
           .catch(() => ({ value: [] }))
@@ -2007,16 +2011,27 @@ async function fetchBlueprintSps() {
 
     const seen = new Set();
     const results = [];
+    const spByAppId = new Map(allSps.map(sp => [sp.appId, sp]));
+    const spById    = new Map(allSps.map(sp => [sp.id,    sp]));
 
-    // Dedicated endpoint returns full SP-like objects — add them first
-    (dedicatedResp.value || []).forEach(sp => {
-      if (sp.id && !seen.has(sp.id)) { seen.add(sp.id); results.push(sp); }
-    });
+    const add = sp => { if (sp?.id && !seen.has(sp.id)) { seen.add(sp.id); results.push(sp); } };
 
-    // Tag-based results fill in anything the dedicated endpoint missed
-    tagResps.flatMap(r => r.value || []).forEach(sp => {
-      if (sp.id && !seen.has(sp.id)) { seen.add(sp.id); results.push(sp); }
-    });
+    // Layer 1: dedicated endpoints
+    (dedicatedResp.value || []).forEach(add);
+    (principalsResp.value || []).forEach(add);
+
+    // Layer 2: tag queries
+    tagResps.flatMap(r => r.value || []).forEach(add);
+
+    // Layer 3: walk every ServiceIdentity SP's alternativeNames to find parent blueprints
+    // that weren't caught by layers 1 or 2 (no tags, wrong tags, endpoint unavailable)
+    allSps
+      .filter(sp => sp.servicePrincipalType === 'ServiceIdentity')
+      .forEach(sp => {
+        (sp.alternativeNames || []).forEach(altId => {
+          add(spByAppId.get(altId) || spById.get(altId));
+        });
+      });
 
     STATE.data.blueprintSps = results;
   } catch { STATE.data.blueprintSps = []; }
