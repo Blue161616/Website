@@ -1774,10 +1774,27 @@ const AGENT_KEYWORDS = ['agent','bot','automation','pipeline','workflow','copilo
 
 const RISK_ORDER = { critical:3, high:2, medium:1, low:0 };
 
+async function fetchAgentOwnersSponsors(agentSps) {
+  if (STATE.data.agentOwnersSponsors) return STATE.data.agentOwnersSponsors;
+  const result = {};
+  await Promise.all(agentSps.map(async sp => {
+    const [ownersResp, sponsorsResp] = await Promise.all([
+      gget(`${GRAPH}/servicePrincipals/${sp.id}/owners?$select=displayName,userPrincipalName`).catch(() => ({ value: [] })),
+      gget(`${GRAPH_BETA}/servicePrincipals/${sp.id}/sponsors?$select=displayName,userPrincipalName`).catch(() => ({ value: [] })),
+    ]);
+    result[sp.id] = {
+      owners:   (ownersResp.value  || []).map(u => u.displayName || u.userPrincipalName || u.id),
+      sponsors: (sponsorsResp.value || []).map(u => u.displayName || u.userPrincipalName || u.id),
+    };
+  }));
+  STATE.data.agentOwnersSponsors = result;
+  return result;
+}
+
 function renderAgentsTable() {
   const tbody = document.getElementById('agents-tbody');
   if (!tbody) return;
-  const { agentSps, agentGrants } = STATE.data;
+  const { agentSps, agentGrants, agentOwnersSponsors } = STATE.data;
   if (!agentSps || !agentGrants) return;
 
   const key = STATE.agentSortKey || 'risk';
@@ -1788,25 +1805,27 @@ function renderAgentsTable() {
     const ws  = AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants).includes(s));
     const ct  = agentGrants.find(g => g.clientId === sp.id)?.consentType || '—';
     const ai  = getAgentType(sp);
-    return { sp, r, ws, ct, ai };
+    const meta = agentOwnersSponsors?.[sp.id];
+    return { sp, r, ws, ct, ai, meta };
   });
 
   const sorted = [...rows].sort((a, b) => {
     let av, bv;
-    if (key === 'name')    { av = (a.sp.displayName||'').toLowerCase(); bv = (b.sp.displayName||'').toLowerCase(); }
-    else if (key === 'type')  { av = a.ai.type; bv = b.ai.type; }
+    if (key === 'name')      { av = (a.sp.displayName||'').toLowerCase(); bv = (b.sp.displayName||'').toLowerCase(); }
+    else if (key === 'type')      { av = a.ai.type; bv = b.ai.type; }
     else if (key === 'blueprint') { av = (a.ai.blueprintName||'').toLowerCase(); bv = (b.ai.blueprintName||'').toLowerCase(); }
-    else if (key === 'risk')  { av = RISK_ORDER[a.r]??-1; bv = RISK_ORDER[b.r]??-1; }
-    else if (key === 'write') { av = a.ws.length; bv = b.ws.length; }
-    else if (key === 'consent') { av = a.ct; bv = b.ct; }
-    else if (key === 'status') { av = a.sp.accountEnabled?1:0; bv = b.sp.accountEnabled?1:0; }
+    else if (key === 'risk')      { av = RISK_ORDER[a.r]??-1; bv = RISK_ORDER[b.r]??-1; }
+    else if (key === 'write')     { av = a.ws.length; bv = b.ws.length; }
+    else if (key === 'consent')   { av = a.ct; bv = b.ct; }
+    else if (key === 'status')    { av = a.sp.accountEnabled?1:0; bv = b.sp.accountEnabled?1:0; }
+    else if (key === 'owners')    { av = (a.meta?.owners?.length||0) + (a.meta?.sponsors?.length||0); bv = (b.meta?.owners?.length||0) + (b.meta?.sponsors?.length||0); }
     else { av = 0; bv = 0; }
     if (av < bv) return dir === 'asc' ? -1 : 1;
     if (av > bv) return dir === 'asc' ?  1 : -1;
     return 0;
   });
 
-  tbody.innerHTML = sorted.map(({ sp, r, ws, ct, ai }) => {
+  tbody.innerHTML = sorted.map(({ sp, r, ws, ct, ai, meta }) => {
     const typeBadgeClass = ai.type === 'ai-foundry' ? 'badge-info'
       : ai.type === 'copilot-studio' ? 'badge-purple'
       : ai.type === 'blueprint' ? 'badge-medium'
@@ -1815,6 +1834,19 @@ function renderAgentsTable() {
       : ai.type === 'copilot-studio' ? '🤖'
       : ai.type === 'blueprint' ? '📋'
       : '⚙️';
+
+    const loading = !agentOwnersSponsors;
+    const owners   = meta?.owners   || [];
+    const sponsors = meta?.sponsors || [];
+    const ownerCell = loading
+      ? '<span class="text-muted" style="font-size:11px">…</span>'
+      : (owners.length || sponsors.length)
+        ? [
+            ...owners.map(n   => `<span style="font-size:11px;display:block"><span class="text-muted">👤</span> ${esc(n)}</span>`),
+            ...sponsors.map(n => `<span style="font-size:11px;display:block"><span class="text-muted">⭐</span> ${esc(n)}</span>`),
+          ].join('')
+        : '<span class="text-muted" style="opacity:.4">—</span>';
+
     return `<tr>
       <td><strong>${esc(sp.displayName)}</strong><br><span class="mono text-muted" style="font-size:10px">${esc(sp.appId.slice(0,18))}…</span></td>
       <td><span class="badge ${typeBadgeClass}">${typeIcon} ${esc(ai.label)}</span></td>
@@ -1822,9 +1854,10 @@ function renderAgentsTable() {
       <td>${riskBadge(r)}</td>
       <td>${ws.length ? ws.map(s=>`<span class="badge badge-critical">${esc(s)}</span>`).join(' ') : '<span class="text-muted">—</span>'}</td>
       <td><span class="badge ${ct==='AllPrincipals'?'badge-critical':'badge-medium'}">${esc(ct)}</span></td>
+      <td>${ownerCell}</td>
       <td>${sp.accountEnabled ? statusBadge('unblocked') : statusBadge('disabled')}</td>
     </tr>`;
-  }).join('') || '<tr><td colspan="7" class="empty-state text-muted">No agent-like service principals detected</td></tr>';
+  }).join('') || '<tr><td colspan="8" class="empty-state text-muted">No agent-like service principals detected</td></tr>';
 
   // Update sort indicators on headers
   document.querySelectorAll('#agents-table th[data-sort]').forEach(th => {
@@ -1899,6 +1932,7 @@ async function loadAgents() {
               ${th('Risk','risk')}
               ${th('Write Scopes','write')}
               ${th('Consent Scope','consent')}
+              ${th('Owners / Sponsors','owners')}
               ${th('Status','status')}
             </tr></thead>
             <tbody id="agents-tbody"></tbody>
@@ -1907,6 +1941,8 @@ async function loadAgents() {
       </div>
     `;
     renderAgentsTable();
+    // Fetch owners/sponsors in background — re-render table when done
+    fetchAgentOwnersSponsors(agentSps).then(() => renderAgentsTable());
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
   }
