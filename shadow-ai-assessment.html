@@ -2413,12 +2413,127 @@ async function loadCompliance() {
 
 // ── USERS ─────────────────────────────────────────────────────────────────
 
+const USER_RISK_DETAIL_LABELS = {
+  adminConfirmedUserCompromised:       'Admin confirmed compromised',
+  mcasImpossibleTravel:                'Impossible travel detected',
+  mcasSuspiciousInboxManipulationRules:'Suspicious inbox rules',
+  investigationsThreatIntelligence:    'Microsoft threat intelligence',
+  generic:                             'Generic risk detected',
+  adminGeneratedTemporaryPassword:     'Temp password issued',
+  userPerformedSecuredPasswordChange:  'User changed password',
+  userPerformedSecuredPasswordReset:   'User reset password',
+  adminConfirmedSigninSafe:            'Admin confirmed safe sign-in',
+  aiConfirmedSigninSafe:               'AI confirmed safe sign-in',
+  userPassedMFADrivenByRiskBasedPolicy:'Passed MFA challenge',
+  adminDismissedAllRiskForUser:        'Admin dismissed all risk',
+  adminConfirmedAccountSafe:           'Admin confirmed account safe',
+  hidden:                              'Risk detail hidden',
+  unknownFutureValue:                  'Unknown',
+};
+
+function fmtUserRiskDetail(detail) {
+  return USER_RISK_DETAIL_LABELS[detail] || (detail || '—').replace(/([A-Z])/g, ' $1').trim();
+}
+
+function userRiskLevel(u) {
+  const { userAiApps, riskySet } = STATE.data;
+  const upn = u.userPrincipalName;
+  if (riskySet?.has(upn)) return 'high';
+  const apps = userAiApps?.[upn]?.size || 0;
+  if (apps >= 5) return 'high';
+  if (apps >= 2) return 'medium';
+  if (apps >= 1) return 'low';
+  return 'info';
+}
+
+function renderUsersTable() {
+  const tbody = document.getElementById('users-tbody');
+  if (!tbody) return;
+  const { users, userAiApps, riskyDetailMap, adminRoles } = STATE.data;
+  if (!users) return;
+
+  const RISK_SCORE = { high: 3, medium: 2, low: 1, info: 0 };
+  const key = STATE.userSortKey || 'risk';
+  const dir = STATE.userSortDir || 'desc';
+
+  const getVal = (u, k) => {
+    switch (k) {
+      case 'name':    return (u.displayName || u.userPrincipalName || '').toLowerCase();
+      case 'dept':    return (u.department || u.jobTitle || '').toLowerCase();
+      case 'type': {
+        const agentMatchName = (u.displayName||'').match(/^(\w+?)AgentUser-[0-9a-f-]{36}/i);
+        const agentMatchUpn  = (u.userPrincipalName||'').match(/^(\w+?)AgentUser-[0-9a-f-]{36}/i);
+        if (u.agentId || agentMatchName || agentMatchUpn || /agentuser/i.test(u.userPrincipalName||'')) return 'agent';
+        if (adminRoles?.[u.userPrincipalName]?.has('Global Administrator')) return 'globaladmin';
+        return (u.userType || 'member').toLowerCase();
+      }
+      case 'aiApps':  return userAiApps?.[u.userPrincipalName]?.size || 0;
+      case 'risk':    return RISK_SCORE[userRiskLevel(u)] ?? 0;
+      case 'idp':     return riskyDetailMap?.[u.userPrincipalName] ? 1 : 0;
+      case 'account': return u.accountEnabled ? 1 : 0;
+      default:        return '';
+    }
+  };
+
+  const sorted = sortRows(users, key, dir, getVal);
+  applySortIndicators('users-table', key, dir);
+
+  tbody.innerHTML = sorted.slice(0, 50).map(u => {
+    const initials = (u.displayName||'?').split(' ').map(n=>n[0]).join('').slice(0,2).toUpperCase();
+    const aiAppCount = userAiApps?.[u.userPrincipalName]?.size || 0;
+    const aiAppList = [...(userAiApps?.[u.userPrincipalName]||[])].slice(0,3).join(', ');
+    const agentMatchName = (u.displayName||'').match(/^(\w+?)AgentUser-[0-9a-f-]{36}/i);
+    const agentMatchUpn  = (u.userPrincipalName||'').match(/^(\w+?)AgentUser-[0-9a-f-]{36}/i);
+    const agentMatch = agentMatchName || agentMatchUpn;
+    const isAgentUpn = /agentuser/i.test(u.userPrincipalName||'');
+    const isAgentUser = !!u.agentId || !!agentMatch || isAgentUpn;
+    const agentService = agentMatch ? agentMatch[1].replace(/([A-Z])/g,' $1').trim() : null;
+    const userRoles = adminRoles?.[u.userPrincipalName];
+    const isGlobalAdmin = userRoles?.has('Global Administrator');
+    const otherAdminRoles = userRoles ? [...userRoles].filter(r => r !== 'Global Administrator') : [];
+    const rd = riskyDetailMap?.[u.userPrincipalName];
+    return `<tr>
+      <td>
+        <div class="user-cell">
+          <div class="user-avatar" style="${isAgentUser?'background:var(--accent-purple)':isGlobalAdmin?'background:var(--accent-red)':''}">${isAgentUser?'🤖':esc(initials)}</div>
+          <div>
+            <div class="user-name">${esc(u.displayName||u.userPrincipalName)}</div>
+            <div class="user-email">${esc(u.userPrincipalName)}</div>
+          </div>
+        </div>
+      </td>
+      <td class="text-muted">${esc(u.department||u.jobTitle||'—')}</td>
+      <td>${isAgentUser
+        ? `<span class="badge badge-purple">🤖 Agent User</span>${agentService?`<br><span style="font-size:10px;color:var(--text-muted)">${esc(agentService)}</span>`:''}`
+        : `<span class="badge ${u.userType==='Guest'?'badge-purple':'badge-info'}">${esc(u.userType||'Member')}</span>`
+      }${isGlobalAdmin ? `<br><span class="badge badge-critical" style="margin-top:3px">🔑 Global Admin</span>` : ''}${otherAdminRoles.length ? `<br><span style="font-size:10px;color:var(--text-muted)" title="${esc(otherAdminRoles.join(', '))}">${otherAdminRoles.length} other role(s)</span>` : ''}</td>
+      <td>${aiAppCount ? `<strong>${aiAppCount}</strong> <span class="text-muted">${esc(aiAppList)}${aiAppCount>3?'…':''}</span>` : '<span class="text-muted">—</span>'}</td>
+      <td>${riskBadge(userRiskLevel(u))}</td>
+      <td>${rd ? (() => {
+        const detail = fmtUserRiskDetail(rd.riskDetail);
+        const updated = rd.riskLastUpdatedDateTime ? new Date(rd.riskLastUpdatedDateTime).toLocaleDateString() : '';
+        return `<span class="text-critical" style="font-size:12px">⚠️ ${esc(detail)}</span>${updated ? `<br><span class="text-muted" style="font-size:10px">${updated}</span>` : ''}`;
+      })() : '<span class="text-muted">—</span>'}</td>
+      <td>${u.accountEnabled?'<span class="text-low">✅ Active</span>':'<span class="text-critical">🚫 Disabled</span>'}</td>
+    </tr>`;
+  }).join('');
+}
+
+function sortUsersTable(key) {
+  if (STATE.userSortKey === key) {
+    STATE.userSortDir = STATE.userSortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    STATE.userSortKey = key;
+    STATE.userSortDir = (key === 'name' || key === 'dept' || key === 'type') ? 'asc' : 'desc';
+  }
+  renderUsersTable();
+}
+
 async function loadUsers() {
   const el = document.getElementById('users-content');
   try {
     const [users, signIns, riskyUsers, adminRoles] = await Promise.all([fetchUsers(), fetchSignIns(), fetchRiskyUsers(), fetchAdminRoles()]);
     const aiSignIns = signIns.filter(s => AI_KEYWORDS.some(k => (s.appDisplayName||'').toLowerCase().includes(k)));
-    // Count AI apps per user
     const userAiApps = {};
     aiSignIns.forEach(s => {
       if (!s.userPrincipalName) return;
@@ -2429,45 +2544,20 @@ async function loadUsers() {
     const riskySet = new Set(activeRiskyUsers.map(u => u.userPrincipalName));
     const riskyDetailMap = Object.fromEntries(activeRiskyUsers.map(u => [u.userPrincipalName, u]));
 
-    const RISK_DETAIL_LABELS = {
-      adminConfirmedUserCompromised:       'Admin confirmed compromised',
-      mcasImpossibleTravel:                'Impossible travel detected',
-      mcasSuspiciousInboxManipulationRules:'Suspicious inbox rules',
-      investigationsThreatIntelligence:    'Microsoft threat intelligence',
-      generic:                             'Generic risk detected',
-      adminGeneratedTemporaryPassword:     'Temp password issued',
-      userPerformedSecuredPasswordChange:  'User changed password',
-      userPerformedSecuredPasswordReset:   'User reset password',
-      adminConfirmedSigninSafe:            'Admin confirmed safe sign-in',
-      aiConfirmedSigninSafe:               'AI confirmed safe sign-in',
-      userPassedMFADrivenByRiskBasedPolicy:'Passed MFA challenge',
-      adminDismissedAllRiskForUser:        'Admin dismissed all risk',
-      adminConfirmedAccountSafe:           'Admin confirmed account safe',
-      hidden:                              'Risk detail hidden',
-      unknownFutureValue:                  'Unknown',
-    };
-    const fmtRiskDetail = detail => RISK_DETAIL_LABELS[detail] || (detail || '—').replace(/([A-Z])/g, ' $1').trim();
-    const riskLevel = u => {
-      const upn = u.userPrincipalName;
-      if (riskySet.has(upn)) return 'high';
-      const apps = userAiApps[upn]?.size || 0;
-      if (apps >= 5) return 'high';
-      if (apps >= 2) return 'medium';
-      if (apps >= 1) return 'low';
-      return 'info';
-    };
+    STATE.data.users = users;
+    STATE.data.userAiApps = userAiApps;
+    STATE.data.riskySet = riskySet;
+    STATE.data.riskyDetailMap = riskyDetailMap;
+    STATE.data.adminRoles = adminRoles;
 
-    const sorted = [...users].sort((a,b) => {
-      const scores = {high:3,medium:2,low:1,info:0};
-      return (scores[riskLevel(b)]||0) - (scores[riskLevel(a)]||0);
-    });
+    const highRiskCount = users.filter(u => userRiskLevel(u) === 'high').length;
 
     el.innerHTML = `
       ${STATE.data.usersError ? permWarn('User.Read.All', STATE.data.usersError) : ''}
       <div class="kpi-row">
         <div class="kpi-card critical">
           <div class="kpi-label">High-Risk Users (AI)</div>
-          <div class="kpi-value text-critical">${sorted.filter(u=>riskLevel(u)==='high').length}</div>
+          <div class="kpi-value text-critical">${highRiskCount}</div>
           <div class="kpi-icon">🚨</div>
         </div>
         <div class="kpi-card medium">
@@ -2492,56 +2582,22 @@ async function loadUsers() {
           <span class="data-source source-derived">⚡ Derived from sign-ins &amp; Identity Protection</span>
         </div>
         <div class="table-wrap">
-          <table>
-            <thead><tr><th>User</th><th>Department</th><th>Type</th><th>AI Apps Used</th><th>Risk Level</th><th>Identity Protection</th><th>Account</th></tr></thead>
-            <tbody>${sorted.slice(0,50).map(u => {
-              const initials = (u.displayName||'?').split(' ').map(n=>n[0]).join('').slice(0,2).toUpperCase();
-              const aiAppCount = userAiApps[u.userPrincipalName]?.size || 0;
-              const aiAppList = [...(userAiApps[u.userPrincipalName]||[])].slice(0,3).join(', ');
-              // Check displayName AND UPN separately — displayName||UPN short-circuits to displayName always
-              const agentMatchName = (u.displayName||'').match(/^(\w+?)AgentUser-[0-9a-f-]{36}/i);
-              const agentMatchUpn  = (u.userPrincipalName||'').match(/^(\w+?)AgentUser-[0-9a-f-]{36}/i);
-              const agentMatch = agentMatchName || agentMatchUpn;
-              // u.agentId: Graph beta field for agent-linked user accounts (e.g. My Agent User 01)
-              // Also catch UPNs like agentuser01@... which have no GUID suffix
-              const isAgentUpn = /agentuser/i.test(u.userPrincipalName||'');
-              const isAgentUser = !!u.agentId || !!agentMatch || isAgentUpn;
-              const agentService = agentMatch ? agentMatch[1].replace(/([A-Z])/g,' $1').trim() : null;
-              const userRoles = adminRoles[u.userPrincipalName];
-              const isGlobalAdmin = userRoles?.has('Global Administrator');
-              const otherAdminRoles = userRoles ? [...userRoles].filter(r => r !== 'Global Administrator') : [];
-              return `<tr>
-                <td>
-                  <div class="user-cell">
-                    <div class="user-avatar" style="${isAgentUser?'background:var(--accent-purple)':isGlobalAdmin?'background:var(--accent-red)':''}">${isAgentUser?'🤖':esc(initials)}</div>
-                    <div>
-                      <div class="user-name">${esc(u.displayName||u.userPrincipalName)}</div>
-                      <div class="user-email">${esc(u.userPrincipalName)}</div>
-                    </div>
-                  </div>
-                </td>
-                <td class="text-muted">${esc(u.department||u.jobTitle||'—')}</td>
-                <td>${isAgentUser
-                  ? `<span class="badge badge-purple">🤖 Agent User</span>${agentService?`<br><span style="font-size:10px;color:var(--text-muted)">${esc(agentService)}</span>`:''}`
-                  : `<span class="badge ${u.userType==='Guest'?'badge-purple':'badge-info'}">${esc(u.userType||'Member')}</span>`
-                }${isGlobalAdmin ? `<br><span class="badge badge-critical" style="margin-top:3px">🔑 Global Admin</span>` : ''}${otherAdminRoles.length ? `<br><span style="font-size:10px;color:var(--text-muted)" title="${esc(otherAdminRoles.join(', '))}">${otherAdminRoles.length} other role(s)</span>` : ''}</td>
-                <td>${aiAppCount ? `<strong>${aiAppCount}</strong> <span class="text-muted">${esc(aiAppList)}${aiAppCount>3?'…':''}</span>` : '<span class="text-muted">—</span>'}</td>
-                <td>${riskBadge(riskLevel(u))}</td>
-                <td>${(() => {
-                  const rd = riskyDetailMap[u.userPrincipalName];
-                  if (!rd) return '<span class="text-muted">—</span>';
-                  const detail = fmtRiskDetail(rd.riskDetail);
-                  const updated = rd.riskLastUpdatedDateTime ? new Date(rd.riskLastUpdatedDateTime).toLocaleDateString() : '';
-                  return `<span class="text-critical" style="font-size:12px">⚠️ ${esc(detail)}</span>${updated ? `<br><span class="text-muted" style="font-size:10px">${updated}</span>` : ''}`;
-                })()}</td>
-                <td>${u.accountEnabled?'<span class="text-low">✅ Active</span>':'<span class="text-critical">🚫 Disabled</span>'}</td>
-              </tr>`;
-            }).join('')}
-            </tbody>
+          <table id="users-table">
+            <thead><tr>
+              ${makeSortableTh('User', 'name', 'sortUsersTable')}
+              ${makeSortableTh('Department', 'dept', 'sortUsersTable')}
+              ${makeSortableTh('Type', 'type', 'sortUsersTable')}
+              ${makeSortableTh('AI Apps Used', 'aiApps', 'sortUsersTable')}
+              ${makeSortableTh('Risk Level', 'risk', 'sortUsersTable')}
+              ${makeSortableTh('Identity Protection', 'idp', 'sortUsersTable')}
+              ${makeSortableTh('Account', 'account', 'sortUsersTable')}
+            </tr></thead>
+            <tbody id="users-tbody"></tbody>
           </table>
         </div>
       </div>
     `;
+    renderUsersTable();
   } catch (e) {
     el.innerHTML = permWarn('User.Read.All', e.message);
   }
