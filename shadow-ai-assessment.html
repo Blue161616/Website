@@ -1989,6 +1989,17 @@ function renderAllAgentTables() {
   renderClassicTable();
 }
 
+async function fetchAgentIdentitySps() {
+  if (STATE.data.agentIdentitySps) return STATE.data.agentIdentitySps;
+  try {
+    const fields = 'id,displayName,appId,publisherName,accountEnabled,tags,createdDateTime,servicePrincipalType,notes,description,alternativeNames,applicationTemplateId';
+    // v1.0 GA endpoint — OData type cast on servicePrincipals (requires AgentIdentity.Read.All)
+    const items = await ggetAll(`${GRAPH}/servicePrincipals/microsoft.graph.agentIdentity?$top=999&$select=${fields}`, 10);
+    STATE.data.agentIdentitySps = items;
+  } catch { STATE.data.agentIdentitySps = []; }
+  return STATE.data.agentIdentitySps;
+}
+
 async function fetchBlueprintSps() {
   if (STATE.data.blueprintSps) return STATE.data.blueprintSps;
   try {
@@ -1996,13 +2007,14 @@ async function fetchBlueprintSps() {
     const appFields = 'id,displayName,appId,publisherName,tags,createdDateTime,notes,description,alternativeNames,applicationTemplateId';
     const BP_TAGS = ['AgentIdentityBlueprint', 'AgentBlueprintPrincipal', 'AgentIdentityBlueprintPrincipal'];
 
-    // Layer 1: v1.0 GA endpoint — OData type cast on applications collection (requires AgentIdentityBlueprint.Read.All)
-    //   GET /v1.0/applications/microsoft.graph.agentIdentityBlueprint
-    //   Returns application objects; cross-referenced to SPs below via appId.
+    // Layer 1: v1.0 GA endpoints (requires AgentIdentityBlueprint.Read.All / AgentIdentity.Read.All)
+    //   Blueprints → /v1.0/applications/microsoft.graph.agentIdentityBlueprint (application objects)
+    //   Identities → /v1.0/servicePrincipals/microsoft.graph.agentIdentity (used for Layer 3 reverse-lookup)
     // Layer 2: tag-based SP queries (fallback / supplement)
     // Layer 3: reverse-discover via agent identity alternativeNames
-    const [allSps, blueprintAppsResp, ...tagResps] = await Promise.all([
+    const [allSps, agentIdentities, blueprintAppsResp, ...tagResps] = await Promise.all([
       fetchServicePrincipals(),
+      fetchAgentIdentitySps(),
       gget(`${GRAPH}/applications/microsoft.graph.agentIdentityBlueprint?$top=999&$select=${appFields}`).catch(() => ({ value: [] })),
       ...BP_TAGS.map(tag =>
         gget(`${GRAPH}/servicePrincipals?$filter=tags/any(t:t eq '${tag}')&$top=500&$select=${spFields}&$count=true`, true)
@@ -2023,7 +2035,7 @@ async function fetchBlueprintSps() {
       if (sp) {
         add(sp);
       } else {
-        // SP not in cached list — add the app object itself shaped as an SP-like record
+        // SP not in cached list — use the app object shaped as an SP-like record
         add({ ...app, servicePrincipalType: 'Application', accountEnabled: true });
       }
     });
@@ -2031,15 +2043,15 @@ async function fetchBlueprintSps() {
     // Layer 2: tag queries
     tagResps.flatMap(r => r.value || []).forEach(add);
 
-    // Layer 3: walk every ServiceIdentity SP's alternativeNames to find parent blueprints
-    // catches blueprints with no tags and not in the v1.0 list
-    allSps
-      .filter(sp => sp.servicePrincipalType === 'ServiceIdentity')
-      .forEach(sp => {
-        (sp.alternativeNames || []).forEach(altId => {
-          add(spByAppId.get(altId) || spById.get(altId));
-        });
+    // Layer 3: walk agent identities' alternativeNames to find parent blueprints not caught above
+    // Uses the dedicated GA endpoint instead of filtering allSps by type
+    const identitySource = agentIdentities.length > 0 ? agentIdentities
+      : allSps.filter(sp => sp.servicePrincipalType === 'ServiceIdentity');
+    identitySource.forEach(sp => {
+      (sp.alternativeNames || []).forEach(altId => {
+        add(spByAppId.get(altId) || spById.get(altId));
       });
+    });
 
     STATE.data.blueprintSps = results;
   } catch { STATE.data.blueprintSps = []; }
@@ -2049,13 +2061,14 @@ async function fetchBlueprintSps() {
 async function loadAgents() {
   const el = document.getElementById('agents-content');
   try {
-    const [sps, grants, explicitBlueprints] = await Promise.all([
-      fetchServicePrincipals(), fetchOAuth2Grants(), fetchBlueprintSps(),
+    const [sps, grants, explicitBlueprints, agentIdentities] = await Promise.all([
+      fetchServicePrincipals(), fetchOAuth2Grants(), fetchBlueprintSps(), fetchAgentIdentitySps(),
     ]);
 
-    // Merge explicit blueprint query results into the full SP list (dedup by id)
+    // Merge blueprints + GA agent identities into the full SP list (dedup by id)
     const spMap = new Map(sps.map(sp => [sp.id, sp]));
     explicitBlueprints.forEach(sp => { if (!spMap.has(sp.id)) spMap.set(sp.id, sp); });
+    agentIdentities.forEach(sp => { if (!spMap.has(sp.id)) spMap.set(sp.id, sp); });
     const allSps = [...spMap.values()];
 
     const agentSps = allSps.filter(sp => {
@@ -2067,13 +2080,20 @@ async function loadAgents() {
         AGENT_WRITE_SCOPES.some(s => (g.scope||'').includes(s)));
       const isAgentBlueprint  = tags.some(t => t === 'agentidentityblueprint' || t === 'agentblueprintprincipal' || t === 'agentidentityblueprintprincipal');
       const isServiceIdentity = sp.servicePrincipalType === 'ServiceIdentity';
-      return (isAgent || (isAi && hasWriteScopes) || isAgentBlueprint || isServiceIdentity);
+      // Also include anything returned by the GA typed endpoints
+      const isExplicitIdentity = agentIdentities.some(a => a.id === sp.id);
+      return (isAgent || (isAi && hasWriteScopes) || isAgentBlueprint || isServiceIdentity || isExplicitIdentity);
     });
 
     // Build blueprint ↔ agent identity relationship from ALL SPs (including explicit blueprints).
     // Agent identity SPs store their parent blueprint's appId in alternativeNames.
     if (!STATE.data.agentLinkedAgents) {
       const blueprintByAppId = {}, blueprintById = {};
+      // Build blueprint lookup from all known blueprints (explicit list covers tag-less ones)
+      explicitBlueprints.forEach(sp => {
+        blueprintByAppId[sp.appId] = sp;
+        blueprintById[sp.id]       = sp;
+      });
       allSps.forEach(sp => {
         const tags = (sp.tags || []).map(t => t.toLowerCase());
         if (tags.some(t => t === 'agentidentityblueprint' || t === 'agentblueprintprincipal' || t === 'agentidentityblueprintprincipal')) {
@@ -2083,8 +2103,10 @@ async function loadAgents() {
       });
       const linkedAgents         = {};  // blueprintSp.id → [agent display names]
       const agentParentBlueprint = {};  // agentSp.id    → { blueprintSpId, blueprintName }
-      allSps.forEach(sp => {
-        if (sp.servicePrincipalType !== 'ServiceIdentity') return;
+      // Use GA identity endpoint when available, fall back to type filter
+      const identitySource = agentIdentities.length > 0 ? agentIdentities
+        : allSps.filter(sp => sp.servicePrincipalType === 'ServiceIdentity');
+      identitySource.forEach(sp => {
         (sp.alternativeNames || []).forEach(altId => {
           const bp = blueprintByAppId[altId] || blueprintById[altId];
           if (!bp) return;
@@ -2099,8 +2121,9 @@ async function loadAgents() {
 
     STATE.data.agentSps   = agentSps;
     STATE.data.agentGrants = grants;
+    const agentIdentityIds = new Set(agentIdentities.map(a => a.id));
     const bpSps = agentSps.filter(sp => getAgentType(sp).type === 'blueprint');
-    const idSps = agentSps.filter(sp => sp.servicePrincipalType === 'ServiceIdentity' || (() => { const t = getAgentType(sp).type; return t === 'copilot-studio' || t === 'ai-foundry'; })());
+    const idSps = agentSps.filter(sp => agentIdentityIds.has(sp.id) || sp.servicePrincipalType === 'ServiceIdentity' || (() => { const t = getAgentType(sp).type; return t === 'copilot-studio' || t === 'ai-foundry'; })());
     const clSps = agentSps.filter(sp => getAgentType(sp).type === 'classic');
     const writeCount = agentSps.filter(sp => grants.some(g => g.clientId===sp.id && AGENT_WRITE_SCOPES.some(s=>(g.scope||'').includes(s)))).length;
     const tenantWide = grants.filter(g => g.consentType==='AllPrincipals' && agentSps.some(a=>a.id===g.clientId)).length;
