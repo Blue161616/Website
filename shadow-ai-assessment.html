@@ -1902,7 +1902,11 @@ function renderIdentityTable() {
   const key = STATE.idSortKey || 'risk';
   const dir = STATE.idSortDir || 'desc';
 
-  const idSps = agentSps.filter(sp => sp.servicePrincipalType === 'ServiceIdentity' || (() => { const t = getAgentType(sp).type; return t === 'copilot-studio' || t === 'ai-foundry'; })());
+  const idSps = agentSps.filter(sp =>
+    STATE.data.agentIdentityIds?.has(sp.id) ||
+    sp.servicePrincipalType === 'ServiceIdentity' ||
+    (() => { const t = getAgentType(sp).type; return t === 'copilot-studio' || t === 'ai-foundry'; })()
+  );
 
   const getVal = (sp, k) => {
     if (k === 'name')      return (sp.displayName||'').toLowerCase();
@@ -2000,10 +2004,22 @@ function renderAllAgentTables() {
 async function fetchAgentIdentitySps() {
   if (STATE.data.agentIdentitySps) return STATE.data.agentIdentitySps;
   try {
-    const fields = 'id,displayName,appId,publisherName,accountEnabled,tags,createdDateTime,servicePrincipalType,notes,description,alternativeNames,applicationTemplateId';
-    // v1.0 GA endpoint — OData type cast on servicePrincipals (requires AgentIdentity.Read.All)
-    const items = await ggetAll(`${GRAPH}/servicePrincipals/microsoft.graph.agentIdentity?$top=999&$select=${fields}`, 10);
-    STATE.data.agentIdentitySps = items;
+    const spFields  = 'id,displayName,appId,publisherName,accountEnabled,tags,createdDateTime,servicePrincipalType,notes,description,alternativeNames,applicationTemplateId';
+    const appFields = 'id,displayName,appId,publisherName,tags,createdDateTime,notes,description,alternativeNames,applicationTemplateId';
+    // v1.0 GA endpoints — OData type casts (require AgentIdentity.Read.All)
+    //   servicePrincipals/microsoft.graph.agentIdentity  → agent identity enterprise apps
+    //   applications/microsoft.graph.agentIdentity       → agent identity app registrations (if available)
+    const [spItems, appItems] = await Promise.all([
+      ggetAll(`${GRAPH}/servicePrincipals/microsoft.graph.agentIdentity?$top=999&$select=${spFields}`, 10).catch(() => []),
+      ggetAll(`${GRAPH}/applications/microsoft.graph.agentIdentity?$top=999&$select=${appFields}`, 10).catch(() => []),
+    ]);
+    // Merge, dedup by id
+    const seen = new Set();
+    const merged = [];
+    [...spItems, ...appItems].forEach(item => {
+      if (item?.id && !seen.has(item.id)) { seen.add(item.id); merged.push(item); }
+    });
+    STATE.data.agentIdentitySps = merged;
   } catch { STATE.data.agentIdentitySps = []; }
   return STATE.data.agentIdentitySps;
 }
@@ -2114,26 +2130,62 @@ async function loadAgents() {
       });
       const linkedAgents         = {};  // blueprintSp.id → [agent display names]
       const agentParentBlueprint = {};  // agentSp.id    → { blueprintSpId, blueprintName }
-      // Use GA identity endpoint when available, fall back to type filter
+
+      const addLink = (identitySp, bp) => {
+        if (!linkedAgents[bp.id]) linkedAgents[bp.id] = [];
+        const name = identitySp.displayName || identitySp.id;
+        if (!linkedAgents[bp.id].includes(name)) linkedAgents[bp.id].push(name);
+        agentParentBlueprint[identitySp.id] = { blueprintSpId: bp.id, blueprintName: bp.displayName };
+      };
+
+      // Direction 1: Identity → Blueprint (via identity's alternativeNames)
+      // Uses GA typed endpoint results; falls back to servicePrincipalType filter
       const identitySource = agentIdentities.length > 0 ? agentIdentities
         : allSps.filter(sp => sp.servicePrincipalType === 'ServiceIdentity');
       identitySource.forEach(sp => {
         (sp.alternativeNames || []).forEach(altId => {
           const bp = blueprintByAppId[altId] || blueprintById[altId];
-          if (!bp) return;
-          if (!linkedAgents[bp.id]) linkedAgents[bp.id] = [];
-          linkedAgents[bp.id].push(sp.displayName || sp.id);
-          agentParentBlueprint[sp.id] = { blueprintSpId: bp.id, blueprintName: bp.displayName };
+          if (bp) addLink(sp, bp);
         });
       });
+
+      // Direction 2: Blueprint → Identity (forward sweep via GET .../agentIdentityBlueprint)
+      // Catches identities not returned by the GA identity endpoint by scanning ALL SPs
+      // whose alternativeNames reference a known blueprint appId or id
+      explicitBlueprints.forEach(bp => {
+        allSps.forEach(sp => {
+          if (!agentParentBlueprint[sp.id] && (sp.alternativeNames || []).some(a => a === bp.appId || a === bp.id)) {
+            addLink(sp, bp);
+          }
+        });
+      });
+
       STATE.data.agentLinkedAgents    = linkedAgents;
       STATE.data.agentParentBlueprint = agentParentBlueprint;
+
+      // Persist all known identity IDs: GA endpoint + forward-discovered via blueprints
+      STATE.data.agentIdentityIds = new Set([
+        ...agentIdentities.map(a => a.id),
+        ...Object.keys(agentParentBlueprint),
+      ]);
+
+      // Add any forward-discovered identities that aren't yet in agentSps
+      Object.keys(agentParentBlueprint).forEach(id => {
+        if (!agentSps.some(s => s.id === id)) {
+          const sp = allSps.find(s => s.id === id);
+          if (sp) agentSps.push(sp);
+        }
+      });
     }
 
     STATE.data.agentSps   = agentSps;
     STATE.data.agentGrants = grants;
     const bpSps = agentSps.filter(sp => getAgentType(sp).type === 'blueprint');
-    const idSps = agentSps.filter(sp => agentIdentityIds.has(sp.id) || sp.servicePrincipalType === 'ServiceIdentity' || (() => { const t = getAgentType(sp).type; return t === 'copilot-studio' || t === 'ai-foundry'; })());
+    const idSps = agentSps.filter(sp =>
+      STATE.data.agentIdentityIds?.has(sp.id) ||
+      sp.servicePrincipalType === 'ServiceIdentity' ||
+      (() => { const t = getAgentType(sp).type; return t === 'copilot-studio' || t === 'ai-foundry'; })()
+    );
     const clSps = agentSps.filter(sp => getAgentType(sp).type === 'classic');
     const writeCount = agentSps.filter(sp => grants.some(g => g.clientId===sp.id && AGENT_WRITE_SCOPES.some(s=>(g.scope||'').includes(s)))).length;
     const tenantWide = grants.filter(g => g.consentType==='AllPrincipals' && agentSps.some(a=>a.id===g.clientId)).length;
