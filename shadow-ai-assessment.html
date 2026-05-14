@@ -493,7 +493,7 @@ function adminConsent() {
   const allScopes = ['openid', 'offline_access', ...GRAPH_SCOPES]
     .map(s => s.replace('https://graph.microsoft.com/', ''))
     .join(' ');
-  const url = 'https://login.microsoftonline.com/common/v2.0/adminconsent'
+  const url = 'https://login.microsoftonline.com/organizations/v2.0/adminconsent'
     + '?client_id=' + encodeURIComponent(cid)
     + '&scope=' + encodeURIComponent(allScopes)
     + '&redirect_uri=' + encodeURIComponent(getRedirectUri());
@@ -1914,11 +1914,17 @@ function renderIdentityTable() {
   const key = STATE.idSortKey || 'risk';
   const dir = STATE.idSortDir || 'desc';
 
-  const idSps = agentSps.filter(sp =>
-    STATE.data.agentIdentityIds?.has(sp.id) ||
-    sp.servicePrincipalType === 'ServiceIdentity' ||
-    (() => { const t = getAgentType(sp).type; return t === 'copilot-studio' || t === 'ai-foundry'; })()
-  );
+  // Entra classic agents = ServiceIdentity SPs with no blueprint link → shown in classic table instead
+  const isEntraClassic = sp =>
+    (STATE.data.agentIdentityIds?.has(sp.id) || sp.servicePrincipalType === 'ServiceIdentity') &&
+    !parentMap[sp.id];
+
+  const idSps = agentSps.filter(sp => {
+    if (isEntraClassic(sp)) return false;
+    return STATE.data.agentIdentityIds?.has(sp.id) ||
+      sp.servicePrincipalType === 'ServiceIdentity' ||
+      (() => { const t = getAgentType(sp).type; return t === 'copilot-studio' || t === 'ai-foundry'; })();
+  });
 
   const getVal = (sp, k) => {
     if (k === 'name')      return (sp.displayName||'').toLowerCase();
@@ -1948,7 +1954,7 @@ function renderIdentityTable() {
       <td>${ws.length ? ws.map(s=>`<span class="badge badge-critical" style="font-size:10px">${esc(s)}</span>`).join(' ') : '<span style="opacity:.4">—</span>'}</td>
       <td><span class="badge ${ct==='AllPrincipals'?'badge-critical':'badge-medium'}">${esc(ct)}</span></td>
       <td>${agentOwnerCell(agentOwnersSponsors?.[sp.id], loading)}</td>
-      <td>${sp.accountEnabled ? statusBadge('unblocked') : statusBadge('disabled')}</td>
+      <td>${sp.accountEnabled ? statusBadge('enabled') : statusBadge('disabled')}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="7" class="empty-state text-muted">No agent identities found</td></tr>';
 
@@ -1966,15 +1972,19 @@ function sortIdentityTable(key) {
 function renderClassicTable() {
   const tbody = document.getElementById('classic-tbody');
   if (!tbody) return;
-  const { agentSps, agentGrants } = STATE.data;
+  const { agentSps, agentGrants, agentParentBlueprint } = STATE.data;
   if (!agentSps) return;
 
   const key = STATE.clSortKey || 'risk';
   const dir = STATE.clSortDir || 'desc';
+  const parentMap = agentParentBlueprint || {};
 
-  const clSps = agentSps.filter(sp => getAgentType(sp).type === 'classic');
+  // Entra classic agents = ServiceIdentity SPs with no blueprint link (same logic as identity table exclusion)
+  const isEntraAgent = sp =>
+    (STATE.data.agentIdentityIds?.has(sp.id) || sp.servicePrincipalType === 'ServiceIdentity') &&
+    !parentMap[sp.id];
 
-  const isEntraAgent = sp => sp.servicePrincipalType === 'ServiceIdentity';
+  const clSps = agentSps.filter(sp => getAgentType(sp).type === 'classic' || isEntraAgent(sp));
 
   const getVal = (sp, k) => {
     if (k === 'name')    return (sp.displayName||'').toLowerCase();
@@ -1993,15 +2003,15 @@ function renderClassicTable() {
     const ws = AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants||[]).includes(s));
     const ct = agentGrants?.find(g=>g.clientId===sp.id)?.consentType || '—';
     const typeCell = isEntraAgent(sp)
-      ? `<span class="badge badge-info" style="background:rgba(57,211,83,.12);color:var(--risk-low);border:1px solid rgba(57,211,83,.3);font-size:10px" title="ServiceIdentity SP — matches Entra classic agent definition">🔷 Entra Agent</span>`
+      ? `<span class="badge badge-info" style="background:rgba(57,211,83,.12);color:var(--risk-low);border:1px solid rgba(57,211,83,.3);font-size:10px" title="ServiceIdentity SP — Entra agent without blueprint">🔷 Entra Agent</span>`
       : `<span style="opacity:.4;font-size:11px">Classic SP</span>`;
-    return `<tr>
+    return `<tr${isEntraAgent(sp) ? ' style="background:rgba(57,211,83,.04)"' : ''}>
       <td>${agentSpCell(sp)}</td>
       <td>${typeCell}</td>
       <td>${riskBadge(r)}</td>
       <td>${ws.length ? ws.map(s=>`<span class="badge badge-critical" style="font-size:10px">${esc(s)}</span>`).join(' ') : '<span style="opacity:.4">—</span>'}</td>
       <td><span class="badge ${ct==='AllPrincipals'?'badge-critical':'badge-medium'}">${esc(ct)}</span></td>
-      <td>${sp.accountEnabled ? statusBadge('unblocked') : statusBadge('disabled')}</td>
+      <td>${sp.accountEnabled ? statusBadge('enabled') : statusBadge('disabled')}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="6" class="empty-state text-muted">No classic agents found</td></tr>';
 
@@ -2245,12 +2255,17 @@ async function loadAgents() {
     STATE.data.agentSps   = agentSps;
     STATE.data.agentGrants = grants;
     const bpSps = agentSps.filter(sp => getAgentType(sp).type === 'blueprint');
-    const idSps = agentSps.filter(sp =>
-      STATE.data.agentIdentityIds?.has(sp.id) ||
-      sp.servicePrincipalType === 'ServiceIdentity' ||
-      (() => { const t = getAgentType(sp).type; return t === 'copilot-studio' || t === 'ai-foundry'; })()
-    );
-    const clSps = agentSps.filter(sp => getAgentType(sp).type === 'classic');
+    const parentMap = STATE.data.agentParentBlueprint || {};
+    const isEntraClassicKpi = sp =>
+      (STATE.data.agentIdentityIds?.has(sp.id) || sp.servicePrincipalType === 'ServiceIdentity') &&
+      !parentMap[sp.id];
+    const idSps = agentSps.filter(sp => {
+      if (isEntraClassicKpi(sp)) return false;
+      return STATE.data.agentIdentityIds?.has(sp.id) ||
+        sp.servicePrincipalType === 'ServiceIdentity' ||
+        (() => { const t = getAgentType(sp).type; return t === 'copilot-studio' || t === 'ai-foundry'; })();
+    });
+    const clSps = agentSps.filter(sp => getAgentType(sp).type === 'classic' || isEntraClassicKpi(sp));
     const writeCount = agentSps.filter(sp => grants.some(g => g.clientId===sp.id && AGENT_WRITE_SCOPES.some(s=>(g.scope||'').includes(s)))).length;
     const tenantWide = grants.filter(g => g.consentType==='AllPrincipals' && agentSps.some(a=>a.id===g.clientId)).length;
 
