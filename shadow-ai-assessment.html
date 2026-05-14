@@ -2009,7 +2009,7 @@ function renderAllAgentTables() {
 async function fetchAgentIdentitySps() {
   if (STATE.data.agentIdentitySps) return STATE.data.agentIdentitySps;
   try {
-    const spFields  = 'id,displayName,appId,publisherName,accountEnabled,tags,createdDateTime,servicePrincipalType,notes,description,alternativeNames,applicationTemplateId';
+    const spFields  = 'id,displayName,appId,publisherName,accountEnabled,tags,createdDateTime,servicePrincipalType,notes,description,alternativeNames,applicationTemplateId,agentIdentityBlueprintId';
     const appFields = 'id,displayName,appId,publisherDomain,tags,createdDateTime,notes,description,applicationTemplateId';
     // v1.0 GA endpoints — OData type casts (require AgentIdentity.Read.All)
     //   servicePrincipals/microsoft.graph.agentIdentity  → agent identity enterprise apps
@@ -2083,12 +2083,15 @@ async function fetchBlueprintSps() {
     // Layer 2: tag queries
     tagResps.flatMap(r => r.value || []).forEach(add);
 
-    // Layer 3: walk agent identities' alternativeNames to find parent blueprints not caught above
-    // Uses the dedicated GA endpoint instead of filtering allSps by type
+    // Layer 3: use agentIdentityBlueprintId (typed property from /microsoft.graph.agentIdentity endpoint)
+    // to discover any blueprints not yet in results. Falls back to alternativeNames for legacy SPs.
     const identitySource = agentIdentities.length > 0 ? agentIdentities
       : allSps.filter(sp => sp.servicePrincipalType === 'ServiceIdentity');
     identitySource.forEach(sp => {
-      (sp.alternativeNames || []).forEach(altId => {
+      const refs = sp.agentIdentityBlueprintId
+        ? [sp.agentIdentityBlueprintId, ...(sp.alternativeNames || [])]
+        : (sp.alternativeNames || []);
+      refs.forEach(altId => {
         add(spByAppId.get(altId) || spById.get(altId));
       });
     });
@@ -2154,26 +2157,36 @@ async function loadAgents() {
         agentParentBlueprint[identitySp.id] = { blueprintSpId: bp.id, blueprintName: bp.displayName };
       };
 
-      // Direction 1: Identity → Blueprint (via identity's alternativeNames)
-      // Uses GA typed endpoint results; falls back to servicePrincipalType filter
+      // Direction 1: Identity → Blueprint via agentIdentityBlueprintId (typed property from GA endpoint)
+      // This is the authoritative link — the field directly holds the parent blueprint's appId.
+      // Falls back to alternativeNames for any legacy SPs not from the typed endpoint.
       const identitySource = agentIdentities.length > 0 ? agentIdentities
         : allSps.filter(sp => sp.servicePrincipalType === 'ServiceIdentity');
       identitySource.forEach(sp => {
+        if (sp.agentIdentityBlueprintId) {
+          const bp = blueprintByAppId[sp.agentIdentityBlueprintId] || blueprintById[sp.agentIdentityBlueprintId];
+          if (bp) { addLink(sp, bp); return; }
+        }
         (sp.alternativeNames || []).forEach(altId => {
           const bp = blueprintByAppId[altId] || blueprintById[altId];
           if (bp) addLink(sp, bp);
         });
       });
 
-      // Direction 2: Blueprint → Identity (forward sweep via GET .../agentIdentityBlueprint)
-      // Catches identities not returned by the GA identity endpoint by scanning ALL SPs
-      // whose alternativeNames reference a known blueprint appId or id
-      explicitBlueprints.forEach(bp => {
-        allSps.forEach(sp => {
-          if (!agentParentBlueprint[sp.id] && (sp.alternativeNames || []).some(a => a === bp.appId || a === bp.id)) {
-            addLink(sp, bp);
-          }
-        });
+      // Direction 2: forward sweep — catch any ServiceIdentity SPs in allSps not from the GA endpoint
+      // that have agentIdentityBlueprintId or alternativeNames referencing a known blueprint
+      allSps.forEach(sp => {
+        if (agentParentBlueprint[sp.id]) return;
+        if (sp.agentIdentityBlueprintId) {
+          const bp = blueprintByAppId[sp.agentIdentityBlueprintId] || blueprintById[sp.agentIdentityBlueprintId];
+          if (bp) { addLink(sp, bp); return; }
+        }
+        if (sp.servicePrincipalType === 'ServiceIdentity') {
+          (sp.alternativeNames || []).forEach(altId => {
+            const bp = blueprintByAppId[altId] || blueprintById[altId];
+            if (bp) addLink(sp, bp);
+          });
+        }
       });
 
       STATE.data.agentLinkedAgents    = linkedAgents;
