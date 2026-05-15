@@ -615,7 +615,7 @@ async function fetchOrg() {
 async function fetchServicePrincipals() {
   if (STATE.data.servicePrincipals) return STATE.data.servicePrincipals;
   try {
-    const items = await ggetAll(`${GRAPH}/servicePrincipals?$top=500&$select=id,displayName,appId,publisherName,homepage,accountEnabled,appOwnerOrganizationId,tags,createdDateTime,servicePrincipalType,notes,description,alternativeNames,applicationTemplateId&$count=true`, 8, true);
+    const items = await ggetAll(`${GRAPH}/servicePrincipals?$top=500&$select=id,displayName,appId,publisherName,homepage,accountEnabled,appOwnerOrganizationId,tags,createdDateTime,servicePrincipalType,notes,description,alternativeNames,applicationTemplateId,appRoleAssignmentRequired,passwordCredentials,keyCredentials&$count=true`, 8, true);
     STATE.data.servicePrincipals = items;
   } catch (e) { STATE.data.servicePrincipals = []; STATE.data.spError = e.message; }
   return STATE.data.servicePrincipals;
@@ -1031,6 +1031,10 @@ async function loadDashboard() {
     const cisoDataResColor = { High:'var(--risk-high)', Medium:'var(--risk-medium)', Low:'var(--risk-low)', Safe:'var(--risk-low)' }[cisoDataRes];
     const cisoSensitive    = highRiskAi.length > 3 ? 'High' : highRiskAi.length > 0 ? 'Medium' : 'Low';
     const cisoSensColor    = { High:'var(--risk-high)', Medium:'var(--risk-medium)', Low:'var(--risk-low)' }[cisoSensitive];
+    const cisoUnsanctioned = (STATE.data.mcasApps || []).filter(a => {
+      const s = (a.status || '').toLowerCase();
+      return a.type === 0 || a.sanctioned === false || s === 'unsanctioned' || s === 'blocked';
+    }).length;
 
     el.innerHTML = `
       <!-- CISO Executive Banner -->
@@ -1048,10 +1052,10 @@ async function loadDashboard() {
         <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--border);border-top:1px solid var(--border)">
           ${[
             { label:'Shadow AI Risk',          value: cisoShadowRisk,                                                                       color: cisoRiskColor },
-            { label:'Unsanctioned AI Apps',    value: String(aiApps.length),                                                                color: aiApps.length > 10 ? 'var(--risk-high)' : aiApps.length > 0 ? 'var(--risk-medium)' : 'var(--risk-low)' },
+            { label:'Unsanctioned AI Apps',    value: String(cisoUnsanctioned),                                                             color: cisoUnsanctioned > 5 ? 'var(--risk-critical)' : cisoUnsanctioned > 0 ? 'var(--risk-high)' : 'var(--risk-low)' },
             { label:'External LLM Usage',      value: aiSignIns.length > 0 ? 'Detected' : 'None detected',                                 color: aiSignIns.length > 0 ? 'var(--risk-medium)' : 'var(--risk-low)' },
             { label:'Data Residency Risk',     value: cisoDataRes,                                                                          color: cisoDataResColor },
-            { label:'Public AI Agents',        value: String(dashRiskyCount),                                                               color: dashRiskyCount > 0 ? 'var(--risk-medium)' : 'var(--risk-low)' },
+            { label:'Risky AI Agents',         value: String(dashRiskyCount),                                                               color: dashRiskyCount > 0 ? 'var(--risk-medium)' : 'var(--risk-low)' },
             { label:'Sensitive Data Exposure', value: cisoSensitive,                                                                        color: cisoSensColor },
           ].map(m => '<div style="background:var(--bg-card);padding:14px 18px;display:flex;justify-content:space-between;align-items:center">'
               + '<span style="font-size:12px;color:var(--text-muted)">' + esc(m.label) + '</span>'
@@ -1740,6 +1744,81 @@ function renderMcasApps(el, apps, mcasUrl) {
       </div>
     </div>
   `;
+
+  // Append credential hygiene card
+  const credDiv = document.createElement('div');
+  credDiv.style.marginTop = '16px';
+  credDiv.innerHTML = renderCredentialHygieneHtml();
+  el.appendChild(credDiv);
+}
+
+function renderCredentialHygieneHtml() {
+  const sps   = STATE.data.servicePrincipals || [];
+  const aiSps = sps.filter(isAiApp);
+  const now   = Date.now();
+  const d30   = now + 30  * 86400000;
+  const d90   = now + 90  * 86400000;
+
+  const rows = [];
+  for (const sp of aiSps) {
+    for (const c of (sp.passwordCredentials || [])) {
+      const exp = c.endDateTime ? new Date(c.endDateTime) : null;
+      if (!exp) continue;
+      const t = exp.getTime();
+      const status = t < now ? 'expired' : t < d30 ? 'critical' : t < d90 ? 'warning' : 'ok';
+      if (status === 'ok') continue;
+      rows.push({ sp, kind: 'Secret', name: c.displayName || c.hint || '—', exp, status });
+    }
+    for (const c of (sp.keyCredentials || [])) {
+      const exp = c.endDateTime ? new Date(c.endDateTime) : null;
+      if (!exp) continue;
+      const t = exp.getTime();
+      const status = t < now ? 'expired' : t < d30 ? 'critical' : t < d90 ? 'warning' : 'ok';
+      if (status === 'ok') continue;
+      rows.push({ sp, kind: 'Certificate', name: c.displayName || '—', exp, status });
+    }
+  }
+
+  rows.sort((a, b) => {
+    const o = { expired: 0, critical: 1, warning: 2 };
+    return (o[a.status] - o[b.status]) || (a.exp - b.exp);
+  });
+
+  const credBadge = s => {
+    if (s === 'expired')  return '<span class="badge badge-critical" style="font-size:10px">❌ Expired</span>';
+    if (s === 'critical') return '<span class="badge badge-critical" style="font-size:10px">🔴 &lt;30 days</span>';
+    return '<span class="badge badge-medium" style="font-size:10px">⚠️ &lt;90 days</span>';
+  };
+
+  const expired = rows.filter(r => r.status === 'expired').length;
+  const critical = rows.filter(r => r.status === 'critical').length;
+
+  return '<div class="card">'
+    + '<div class="card-header">'
+    + '<div class="card-title">🔑 Credential Hygiene — Secrets &amp; Certificates</div>'
+    + (rows.length
+        ? '<span style="font-size:11px;color:var(--risk-critical)">' + expired + ' expired · ' + critical + ' expiring &lt;30d</span>'
+        : '<span style="font-size:11px;color:var(--risk-low)">✅ All credentials healthy</span>')
+    + '<span class="data-source source-live">● passwordCredentials · keyCredentials</span>'
+    + '</div>'
+    + (rows.length
+      ? '<div class="table-wrap"><table>'
+        + '<thead><tr><th>Application</th><th>Type</th><th>Name</th><th>Expires</th><th>Status</th></tr></thead>'
+        + '<tbody>'
+        + rows.map(r =>
+            '<tr>'
+            + '<td><strong style="font-size:13px">' + esc(r.sp.displayName) + '</strong>'
+            + (r.sp.publisherName ? '<span style="font-size:11px;color:var(--text-muted);margin-left:6px">' + esc(r.sp.publisherName) + '</span>' : '')
+            + '</td>'
+            + '<td><span style="font-size:11px;color:var(--text-muted)">' + r.kind + '</span></td>'
+            + '<td class="mono" style="font-size:11px">' + esc(r.name) + '</td>'
+            + '<td class="mono" style="font-size:11px;white-space:nowrap">' + r.exp.toLocaleDateString('en-GB') + '</td>'
+            + '<td>' + credBadge(r.status) + '</td>'
+            + '</tr>'
+          ).join('')
+        + '</tbody></table></div>'
+      : '<div class="card-body"><div class="empty-state text-muted">No expiring or expired credentials found among detected AI apps.</div></div>')
+    + '</div>';
 }
 
 // ── AI MODELS ─────────────────────────────────────────────────────────────
@@ -2417,9 +2496,10 @@ function renderClassicTable() {
     if (k === 'type')    return isEntraAgent(sp) ? 0 : 1;
     if (k === 'risk')    return RISK_ORDER[riskScore(sp, agentGrants||[])] ?? -1;
     if (k === 'write')   return AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants||[]).includes(s)).length;
-    if (k === 'consent') return agentGrants?.find(g=>g.clientId===sp.id)?.consentType || '';
-    if (k === 'owners')  return (agentOwnersSponsors?.[sp.id]?.owners?.length||0) + (agentOwnersSponsors?.[sp.id]?.sponsors?.length||0);
-    if (k === 'status')  return sp.accountEnabled ? 1 : 0;
+    if (k === 'consent')    return agentGrants?.find(g=>g.clientId===sp.id)?.consentType || '';
+    if (k === 'assignReq') return sp.appRoleAssignmentRequired ? 1 : 0;
+    if (k === 'owners')    return (agentOwnersSponsors?.[sp.id]?.owners?.length||0) + (agentOwnersSponsors?.[sp.id]?.sponsors?.length||0);
+    if (k === 'status')    return sp.accountEnabled ? 1 : 0;
     return 0;
   };
 
@@ -2440,10 +2520,13 @@ function renderClassicTable() {
       <td>${riskBadge(r)}</td>
       <td>${ws.length ? ws.map(s=>`<span class="badge badge-critical" style="font-size:10px">${esc(s)}</span>`).join(' ') : '<span style="opacity:.4">—</span>'}</td>
       <td><span class="badge ${ct==='AllPrincipals'?'badge-critical':'badge-medium'}">${esc(ct)}</span></td>
+      <td>${sp.appRoleAssignmentRequired
+        ? '<span class="badge badge-low" style="font-size:10px">✅ Yes</span>'
+        : '<span class="badge badge-medium" style="font-size:10px;opacity:.8">⚠️ No</span>'}</td>
       <td>${agentOwnerCell(agentOwnersSponsors?.[sp.id], loading, 'owner')}</td>
       <td>${sp.accountEnabled ? statusBadge('enabled') : statusBadge('disabled')}</td>
     </tr>`;
-  }).join('') || '<tr><td colspan="7" class="empty-state text-muted">No classic agents found</td></tr>';
+  }).join('') || '<tr><td colspan="8" class="empty-state text-muted">No classic agents found</td></tr>';
 
   applySortIndicators('classic-table', key, dir);
 }
@@ -2849,6 +2932,7 @@ async function loadAgents() {
                 ${th('Risk','risk','sortClassicTable')}
                 ${th('Write Scopes','write','sortClassicTable')}
                 ${th('Consent Scope','consent','sortClassicTable')}
+                ${th('Assign. Required','assignReq','sortClassicTable')}
                 ${th('Owner','owners','sortClassicTable')}
                 ${th('Status','status','sortClassicTable')}
               </tr></thead>
