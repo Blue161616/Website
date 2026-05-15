@@ -873,6 +873,42 @@ function handleRedirectParams() {
   }
 }
 
+// ── SECURE SCORE ──────────────────────────────────────────────────────────
+
+async function fetchSecureScore() {
+  if (STATE.data.secureScore !== undefined) return STATE.data.secureScore;
+  try {
+    const [scoreRes, profilesRes] = await Promise.all([
+      gget(`${GRAPH}/security/secureScores?$top=1&$select=currentScore,maxScore,controlScores`),
+      gget(`${GRAPH}/security/secureScoreControlProfiles?$top=500&$select=controlName,maxScore,controlCategory`).catch(() => ({ value: [] }))
+    ]);
+    const score = (scoreRes?.value || [])[0];
+    if (!score) { STATE.data.secureScore = null; return null; }
+
+    const profileMap = {};
+    for (const p of (profilesRes?.value || [])) profileMap[p.controlName] = p;
+
+    const cats = {};
+    for (const cs of (score.controlScores || [])) {
+      const cat = cs.controlCategory;
+      if (!['Identity','Data','Device','Apps'].includes(cat)) continue;
+      if (!cats[cat]) cats[cat] = { earned: 0, max: 0 };
+      cats[cat].earned += cs.score || 0;
+      cats[cat].max += profileMap[cs.controlName]?.maxScore || 0;
+    }
+
+    STATE.data.secureScore = {
+      current: score.currentScore,
+      max: score.maxScore,
+      pct: score.maxScore > 0 ? Math.round(score.currentScore / score.maxScore * 1000) / 10 : 0,
+      categories: cats
+    };
+  } catch {
+    STATE.data.secureScore = null;
+  }
+  return STATE.data.secureScore;
+}
+
 // ── DASHBOARD ─────────────────────────────────────────────────────────────
 
 async function loadDashboard() {
@@ -881,6 +917,7 @@ async function loadDashboard() {
     const [sps, grants, signIns, users, riskyUsers, caP] = await Promise.all([
       fetchServicePrincipals(), fetchOAuth2Grants(), fetchSignIns(),
       fetchUsers(), fetchRiskyUsers(), fetchCAPolicies(),
+      fetchSecureScore().catch(() => null),
       // Fetch cloud discovery in parallel so the shadow KPI is correct on first load.
       // Runs silently — failure just means we fall back to SP-based count.
       STATE.data.mcasApps === undefined
@@ -910,7 +947,9 @@ async function loadDashboard() {
     const blockedCa = caP.filter(p => p.state === 'disabled').length;
     const reportOnlyCa = caP.filter(p => p.state === 'enabledForReportingButNotEnforced').length;
 
-    // build risk score (simple heuristic)
+    const secScore = STATE.data.secureScore ?? null;
+
+    // Heuristic fallback risk score (used only when Secure Score API is unavailable)
     let riskPts = 40;
     if (aiApps.length > 10) riskPts += 15;
     if (highRiskAi.length > 0) riskPts += Math.min(highRiskAi.length * 3, 20);
@@ -1033,20 +1072,35 @@ async function loadDashboard() {
           </div>
         </div>
         <div class="card">
-          <div class="card-header"><div class="card-title">Risk Distribution</div></div>
+          <div class="card-header">
+            <div class="card-title">Microsoft Secure Score</div>
+            ${secScore
+              ? `<span class="data-source source-live" style="font-size:10px">● Live from Graph</span>`
+              : `<span style="font-size:10px;color:var(--text-dim)">⚠️ Heuristic fallback</span>`}
+          </div>
           <div class="risk-score-wrap">
             <div class="risk-score-ring">
               <canvas id="dash-risk-donut" width="130" height="130"></canvas>
               <div class="risk-score-center">
-                <div class="risk-score-number" style="color:${scoreColor(overallRisk)}">${overallRisk}</div>
-                <div class="risk-score-label">Risk</div>
+                <div class="risk-score-number" style="font-size:${secScore?'24px':'32px'};color:${secScore
+                  ? (secScore.pct >= 70 ? 'var(--risk-low)' : secScore.pct >= 40 ? 'var(--risk-medium)' : 'var(--risk-critical)')
+                  : scoreColor(overallRisk)}">${secScore ? secScore.pct + '%' : overallRisk}</div>
+                <div class="risk-score-label">${secScore ? 'Secure Score' : 'Risk'}</div>
               </div>
             </div>
             <div class="risk-legend">
-              <div class="risk-legend-item"><div class="risk-legend-dot" style="background:var(--risk-critical)"></div><span style="flex:1">Critical</span><strong>${critCount}</strong></div>
-              <div class="risk-legend-item"><div class="risk-legend-dot" style="background:var(--risk-high)"></div><span style="flex:1">High</span><strong>${highCount}</strong></div>
-              <div class="risk-legend-item"><div class="risk-legend-dot" style="background:var(--risk-medium)"></div><span style="flex:1">Medium</span><strong>${medCount}</strong></div>
-              <div class="risk-legend-item"><div class="risk-legend-dot" style="background:var(--risk-low)"></div><span style="flex:1">Low</span><strong>${lowCount}</strong></div>
+              ${secScore
+                ? ['Identity','Data','Device','Apps'].filter(c => secScore.categories[c]).map(cat => {
+                    const d = secScore.categories[cat];
+                    const pct = d.max > 0 ? (d.earned / d.max * 100).toFixed(1) + '%' : '—';
+                    const colors = { Identity:'#a371f7', Data:'#39d353', Device:'#388bfd', Apps:'#e3b341' };
+                    return `<div class="risk-legend-item"><div class="risk-legend-dot" style="background:${colors[cat]}"></div><span style="flex:1">${cat}</span><strong>${pct}</strong></div>`;
+                  }).join('')
+                : `<div class="risk-legend-item"><div class="risk-legend-dot" style="background:var(--risk-critical)"></div><span style="flex:1">Critical</span><strong>${critCount}</strong></div>
+                   <div class="risk-legend-item"><div class="risk-legend-dot" style="background:var(--risk-high)"></div><span style="flex:1">High</span><strong>${highCount}</strong></div>
+                   <div class="risk-legend-item"><div class="risk-legend-dot" style="background:var(--risk-medium)"></div><span style="flex:1">Medium</span><strong>${medCount}</strong></div>
+                   <div class="risk-legend-item"><div class="risk-legend-dot" style="background:var(--risk-low)"></div><span style="flex:1">Low</span><strong>${lowCount}</strong></div>`
+              }
             </div>
           </div>
         </div>
@@ -1095,11 +1149,18 @@ async function loadDashboard() {
       options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom',labels:{boxWidth:10,padding:10}}},
         scales:{x:{grid:{display:false},ticks:{font:{size:10}}}, y:{beginAtZero:true,grid:{color:'rgba(48,54,61,.5)'}}} },
     });
+    const CAT_COLORS = { Identity:'#a371f7', Data:'#39d353', Device:'#388bfd', Apps:'#e3b341' };
     STATE.charts['dash-risk-donut'] = new Chart(document.getElementById('dash-risk-donut'), {
       type: 'doughnut',
-      data: { labels:['Critical','High','Medium','Low'],
-        datasets:[{data:[critCount,highCount,medCount,lowCount],
-          backgroundColor:['#f85149','#ff7b72','#f0883e','#3fb950'],borderWidth:0}] },
+      data: secScore ? {
+        labels: ['Achieved', 'Remaining'],
+        datasets: [{ data: [secScore.pct, 100 - secScore.pct],
+          backgroundColor: ['#388bfd', 'rgba(48,54,61,0.5)'], borderWidth: 0 }]
+      } : {
+        labels: ['Critical','High','Medium','Low'],
+        datasets: [{ data: [critCount,highCount,medCount,lowCount],
+          backgroundColor: ['#f85149','#ff7b72','#f0883e','#3fb950'], borderWidth: 0 }]
+      },
       options: { cutout:'70%', responsive:true, maintainAspectRatio:true, plugins:{legend:{display:false}} },
     });
 
