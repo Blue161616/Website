@@ -261,7 +261,7 @@
       <strong>Required delegated permissions (admin consent):</strong><br>
       <code>Application.Read.All</code> &nbsp;<code>AuditLog.Read.All</code> &nbsp;<code>User.Read.All</code><br>
       <code>Policy.Read.All</code> &nbsp;<code>Organization.Read.All</code> &nbsp;<code>IdentityRiskyUser.Read.All</code><br>
-      <code>IdentityRiskyServicePrincipal.Read.All</code> &nbsp;<code>SecurityAlert.Read.All</code> &nbsp;<code>SecurityEvents.Read.All</code><br>
+      <code>IdentityRiskyServicePrincipal.Read.All</code> &nbsp;<code>IdentityRiskyAgent.Read.All</code> &nbsp;<code>SecurityAlert.Read.All</code> &nbsp;<code>SecurityEvents.Read.All</code><br>
       <code>RoleManagement.Read.All</code> &nbsp;<code>Reports.Read.All</code> &nbsp;<code>CloudApp-Discovery.Read.All</code><br>
       <code>AgentIdentityBlueprint.Read.All</code> &nbsp;<code>AgentIdentity.Read.All</code> &nbsp;<code>AgentIdentityBlueprintPrincipal.Read.All</code><br>
       <br>
@@ -385,6 +385,7 @@ const GRAPH_SCOPES = [
   'https://graph.microsoft.com/Organization.Read.All',
   'https://graph.microsoft.com/IdentityRiskyUser.Read.All',
   'https://graph.microsoft.com/IdentityRiskyServicePrincipal.Read.All',
+  'https://graph.microsoft.com/IdentityRiskyAgent.Read.All',
   'https://graph.microsoft.com/SecurityAlert.Read.All',
   'https://graph.microsoft.com/SecurityEvents.Read.All',
   'https://graph.microsoft.com/RoleManagement.Read.All',
@@ -720,15 +721,26 @@ async function fetchSecurityAlerts() {
 async function fetchRiskyAgents() {
   if (STATE.data.riskyAgents) return STATE.data.riskyAgents;
   try {
-    const items = await ggetAll(`${GRAPH}/identityProtection/riskyServicePrincipals?$top=100&$select=id,appId,displayName,riskLevel,riskState,riskLastUpdatedDateTime,isEnabled`, 3);
+    const fields = 'id,agentDisplayName,blueprintId,identityType,isDeleted,isEnabled,isProcessing,riskDetail,riskLastModifiedDateTime,riskLevel,riskState';
+    const items = await ggetAll(
+      `${GRAPH_BETA}/identityProtection/riskyAgents?$top=100&$select=${fields}`,
+      5
+    );
     STATE.data.riskyAgents = items;
-  } catch (e) {
+    STATE.data.riskyAgentMap = new Map(items.map(a => [a.id, a]));
+  } catch {
+    // Fallback: riskyServicePrincipals (older endpoint, less detail)
     try {
-      // fall back to beta if v1.0 not yet available in tenant
-      const items = await ggetAll(`${GRAPH_BETA}/identityProtection/riskyServicePrincipals?$top=100&$select=id,appId,displayName,riskLevel,riskState,riskLastUpdatedDateTime,isEnabled`, 3);
+      const items = await ggetAll(
+        `${GRAPH}/identityProtection/riskyServicePrincipals?$top=100&$select=id,appId,displayName,riskLevel,riskState,riskLastUpdatedDateTime,isEnabled`,
+        3
+      );
       STATE.data.riskyAgents = items;
+      STATE.data.riskyAgentMap = new Map(items.map(a => [a.id, a]));
+      STATE.data.riskyAgentsUsedFallback = true;
     } catch (e2) {
       STATE.data.riskyAgents = [];
+      STATE.data.riskyAgentMap = new Map();
       STATE.data.riskyAgentsError = e2.message;
     }
   }
@@ -918,6 +930,7 @@ async function loadDashboard() {
       fetchServicePrincipals(), fetchOAuth2Grants(), fetchSignIns(),
       fetchUsers(), fetchRiskyUsers(), fetchCAPolicies(),
       fetchSecureScore().catch(() => null),
+      fetchRiskyAgents().catch(() => []),
       // Fetch cloud discovery in parallel so the shadow KPI is correct on first load.
       // Runs silently — failure just means we fall back to SP-based count.
       STATE.data.mcasApps === undefined
@@ -948,6 +961,11 @@ async function loadDashboard() {
     const reportOnlyCa = caP.filter(p => p.state === 'enabledForReportingButNotEnforced').length;
 
     const secScore = STATE.data.secureScore ?? null;
+
+    const dashRiskyAgents  = STATE.data.riskyAgents || [];
+    const dashRiskyCount   = dashRiskyAgents.filter(a => a.riskLevel && a.riskLevel !== 'none').length;
+    const dashRiskyHighCount = dashRiskyAgents.filter(a => a.riskLevel === 'high').length;
+    const dashRiskyMedCount  = dashRiskyAgents.filter(a => a.riskLevel === 'medium').length;
 
     // Heuristic fallback risk score (used only when Secure Score API is unavailable)
     let riskPts = 40;
@@ -1053,11 +1071,11 @@ async function loadDashboard() {
           <div class="kpi-delta">${STATE.data.riskyUsersError?'*Requires P2 license':'Identity Protection'}</div>
           <div class="kpi-icon">⚠️</div>
         </div>
-        <div class="kpi-card medium">
-          <div class="kpi-label">Overall Risk Score</div>
-          <div class="kpi-value" style="color:${scoreColor(overallRisk)}">${overallRisk}</div>
-          <div class="kpi-delta">${overallRisk>=80?'CRITICAL':overallRisk>=60?'HIGH':overallRisk>=40?'MEDIUM':'LOW'} — heuristic</div>
-          <div class="kpi-icon">🎯</div>
+        <div class="kpi-card ${dashRiskyCount > 0 ? 'critical' : 'low'}">
+          <div class="kpi-label">Risky Agents</div>
+          <div class="kpi-value ${dashRiskyCount > 0 ? 'text-critical' : 'text-low'}">${dashRiskyCount}${STATE.data.riskyAgentsError ? '*' : ''}</div>
+          <div class="kpi-delta">${dashRiskyHighCount} high · ${dashRiskyMedCount} medium${STATE.data.riskyAgentsError ? ' · *no P2' : ' · Identity Protection'}</div>
+          <div class="kpi-icon">⚡</div>
         </div>
       </div>
 
@@ -2149,8 +2167,10 @@ function renderBlueprintTable() {
     const principalBadge = hasPrincipal
       ? `<span class="badge badge-info" style="background:rgba(163,113,247,.12);color:var(--accent-purple);border:1px solid rgba(163,113,247,.3);font-size:10px;margin-left:6px" title="Has an AgentIdentityBlueprintPrincipal service principal">🔑 Has Principal</span>`
       : '';
-    return `<tr${hasPrincipal ? ' style="background:rgba(163,113,247,.04)"' : ''}>
-      <td>${agentSpCell(sp)}${principalBadge}</td>
+    const riskyInfo = STATE.data.riskyAgentMap?.get(sp.id);
+    const riskyBadge = riskyInfo ? `<span class="badge badge-critical" style="font-size:10px;margin-left:6px" title="Risky agent · ${riskyInfo.riskState||''}">⚡ ${riskyInfo.riskLevel||'risk'}</span>` : '';
+    return `<tr${hasPrincipal ? ' style="background:rgba(163,113,247,.04)"' : ''}${riskyInfo ? ' style="background:rgba(248,81,73,.05)"' : ''}>
+      <td>${agentSpCell(sp)}${principalBadge}${riskyBadge}</td>
       <td>${linkedCell}</td>
       <td>${agentOwnerCell(agentOwnersSponsors?.[sp.id], loading)}</td>
       <td>${sp.accountEnabled ? statusBadge('enabled') : statusBadge('disabled')}</td>
@@ -2217,8 +2237,10 @@ function renderIdentityTable() {
     const parentCell = parent
       ? `<span style="font-size:12px">📋 ${esc(parent.blueprintName)}</span>`
       : `<span style="opacity:.4">—</span>`;
-    return `<tr>
-      <td>${agentSpCell(sp)}</td>
+    const riskyInfo = STATE.data.riskyAgentMap?.get(sp.id);
+    const riskyBadge = riskyInfo ? `<span class="badge badge-critical" style="font-size:10px;margin-left:6px" title="Risky agent · ${riskyInfo.riskState||''}">⚡ ${riskyInfo.riskLevel||'risk'}</span>` : '';
+    return `<tr${riskyInfo ? ' style="background:rgba(248,81,73,.05)"' : ''}>
+      <td>${agentSpCell(sp)}${riskyBadge}</td>
       <td>${parentCell}</td>
       <td>${riskBadge(r)}</td>
       <td>${ws.length ? ws.map(s=>`<span class="badge badge-critical" style="font-size:10px">${esc(s)}</span>`).join(' ') : '<span style="opacity:.4">—</span>'}</td>
@@ -2279,8 +2301,10 @@ function renderClassicTable() {
     const typeCell = isEntraAgent(sp)
       ? `<span class="badge badge-info" style="background:rgba(57,211,83,.12);color:var(--risk-low);border:1px solid rgba(57,211,83,.3);font-size:10px" title="ServiceIdentity SP — Entra agent without blueprint">🔷 Entra Agent</span>`
       : `<span style="opacity:.4;font-size:11px">Classic SP</span>`;
-    return `<tr${isEntraAgent(sp) ? ' style="background:rgba(57,211,83,.04)"' : ''}>
-      <td>${agentSpCell(sp)}</td>
+    const riskyInfo = STATE.data.riskyAgentMap?.get(sp.id);
+    const riskyBadge = riskyInfo ? `<span class="badge badge-critical" style="font-size:10px;margin-left:6px" title="Risky agent · ${riskyInfo.riskState||''}">⚡ ${riskyInfo.riskLevel||'risk'}</span>` : '';
+    return `<tr${riskyInfo ? ' style="background:rgba(248,81,73,.05)"' : (isEntraAgent(sp) ? ' style="background:rgba(57,211,83,.04)"' : '')}>
+      <td>${agentSpCell(sp)}${riskyBadge}</td>
       <td>${typeCell}</td>
       <td>${riskBadge(r)}</td>
       <td>${ws.length ? ws.map(s=>`<span class="badge badge-critical" style="font-size:10px">${esc(s)}</span>`).join(' ') : '<span style="opacity:.4">—</span>'}</td>
@@ -2300,7 +2324,7 @@ function sortClassicTable(key) {
 
 function showAgentSection(name) {
   STATE.agentSection = name;
-  const sections = ['blueprints', 'identities', 'classic'];
+  const sections = ['blueprints', 'identities', 'classic', 'risky'];
   sections.forEach(s => {
     const sec = document.getElementById('section-' + s);
     const kpi = document.getElementById('kpi-agent-' + s);
@@ -2441,7 +2465,13 @@ async function loadAgents() {
     const [sps, grants, explicitBlueprints, agentIdentities] = await Promise.all([
       fetchServicePrincipals(), fetchOAuth2Grants(), fetchBlueprintSps(), fetchAgentIdentitySps(),
       fetchBlueprintPrincipals(),
+      fetchRiskyAgents().catch(() => []),
     ]);
+    const riskyAgents = STATE.data.riskyAgents || [];
+    const riskyAgentMap = STATE.data.riskyAgentMap || new Map();
+    const riskyAgentCount = riskyAgents.filter(a => a.riskLevel && a.riskLevel !== 'none').length;
+    const riskyHighCount  = riskyAgents.filter(a => a.riskLevel === 'high').length;
+    const riskyMedCount   = riskyAgents.filter(a => a.riskLevel === 'medium').length;
 
     // Merge blueprints + GA agent identities into the full SP list (dedup by id)
     const spMap = new Map(sps.map(sp => [sp.id, sp]));
@@ -2588,10 +2618,11 @@ async function loadAgents() {
             <div class="kpi-value text-low">${clSps.length}</div>
             <div class="kpi-icon">⚙️</div>
           </div>
-          <div class="kpi-card critical">
-            <div class="kpi-label">With Write Access</div>
-            <div class="kpi-value text-critical">${writeCount}</div>
-            <div class="kpi-icon">✍️</div>
+          <div class="kpi-card ${riskyAgentCount > 0 ? 'critical' : 'low'}" id="kpi-agent-risky" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('risky')">
+            <div class="kpi-label">Risky Agents</div>
+            <div class="kpi-value ${riskyAgentCount > 0 ? 'text-critical' : 'text-low'}">${riskyAgentCount}${STATE.data.riskyAgentsError ? '*' : ''}</div>
+            <div class="kpi-delta">${riskyHighCount} high · ${riskyMedCount} medium${STATE.data.riskyAgentsError ? ' · *no P2' : ''}</div>
+            <div class="kpi-icon">⚡</div>
           </div>
         </div>
       </div>
@@ -2665,6 +2696,54 @@ async function loadAgents() {
           </div>
         </div>
       </div>
+
+      <!-- Risky Agents (Identity Protection) -->
+      <div id="section-risky">
+        ${STATE.data.riskyAgentsError ? permWarn('IdentityRiskyAgent.Read.All', STATE.data.riskyAgentsError) : ''}
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">⚡ Risky Agents — Identity Protection Preview (${riskyAgentCount})</div>
+            <span class="data-source source-live" style="font-size:10px">${STATE.data.riskyAgentsUsedFallback ? '⚠️ Fallback: riskyServicePrincipals' : '● beta/identityProtection/riskyAgents'}</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>Agent Name</th>
+                <th>Identity Type</th>
+                <th>Blueprint</th>
+                <th>Risk Level</th>
+                <th>Risk State</th>
+                <th>Last Updated</th>
+                <th>Enabled</th>
+              </tr></thead>
+              <tbody>${riskyAgents.length ? [...riskyAgents]
+                .sort((a,b) => ({'high':3,'medium':2,'low':1}[b.riskLevel]||0) - ({'high':3,'medium':2,'low':1}[a.riskLevel]||0))
+                .map(a => {
+                  const riskStateMap = { confirmedCompromised:'Confirmed compromised', atRisk:'At risk', confirmedSafe:'Confirmed safe', dismissed:'Dismissed', none:'None' };
+                  const riskStateCls = a.riskState==='confirmedCompromised' ? 'badge-critical' : a.riskState==='atRisk' ? 'badge-high' : 'badge-medium';
+                  const typeLabel = { agentIdentity:'🤖 Agent Identity', agentUser:'👤 Agent User', agentIdentityBlueprintPrincipal:'📋 Blueprint Principal' }[a.identityType] || esc(a.identityType||'—');
+                  const name = esc(a.agentDisplayName || a.displayName || '—');
+                  const bpId = a.blueprintId;
+                  const bpSp = bpId ? [...(STATE.data.blueprintSps||[])].find(s => s.id === bpId || s.appId === bpId) : null;
+                  return `<tr style="${a.riskState==='confirmedCompromised'?'background:rgba(248,81,73,.05)':''}">
+                    <td><strong>${name}</strong><br><span class="mono text-muted" style="font-size:10px">${esc(a.id.slice(0,18))}…</span></td>
+                    <td style="font-size:12px">${typeLabel}</td>
+                    <td style="font-size:11px">${bpSp ? `<span style="color:var(--accent-purple)">📋 ${esc(bpSp.displayName)}</span>` : bpId ? `<span class="mono text-muted">${bpId.slice(0,16)}…</span>` : '<span style="opacity:.4">—</span>'}</td>
+                    <td>${riskBadge(a.riskLevel||'medium')}</td>
+                    <td><span class="badge ${riskStateCls}" style="font-size:10px">${esc(riskStateMap[a.riskState]||a.riskState||'—')}</span></td>
+                    <td class="mono text-muted" style="font-size:11px">${(a.riskLastModifiedDateTime||a.riskLastUpdatedDateTime) ? new Date(a.riskLastModifiedDateTime||a.riskLastUpdatedDateTime).toLocaleString() : '—'}</td>
+                    <td>${a.isEnabled===false ? '<span class="text-critical">🚫 Disabled</span>' : '<span class="text-low">✅ Enabled</span>'}</td>
+                  </tr>`;
+                }).join('')
+              : `<tr><td colspan="7" class="empty-state text-muted">${STATE.data.riskyAgentsError ? 'Requires IdentityRiskyAgent.Read.All + Entra P2 license' : '✅ No risky agents detected'}</td></tr>`}
+              </tbody>
+            </table>
+          </div>
+          ${riskyAgents.length ? `<div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
+            ℹ️ Source: Entra ID Protection · <strong>${riskyHighCount}</strong> high · <strong>${riskyMedCount}</strong> medium risk · data from <code>beta/identityProtection/riskyAgents</code>
+          </div>` : ''}
+        </div>
+      </div>
     `;
     renderAllAgentTables();
     showAgentSection(STATE.agentSection || 'blueprints');
@@ -2699,7 +2778,7 @@ async function loadDataRisk() {
 
     el.innerHTML = `
       ${STATE.data.riskyUsersError ? permWarn('IdentityRiskyUser.Read.All', STATE.data.riskyUsersError) : ''}
-      ${STATE.data.riskyAgentsError ? permWarn('IdentityRiskyServicePrincipal.Read.All', STATE.data.riskyAgentsError) : ''}
+      ${STATE.data.riskyAgentsError ? permWarn('IdentityRiskyAgent.Read.All', STATE.data.riskyAgentsError) : ''}
 
       <div class="kpi-row">
         <div class="kpi-card critical">
@@ -2732,19 +2811,27 @@ async function loadDataRisk() {
       <div class="card">
         <div class="card-header">
           <div class="card-title">⚡ Risky Agents — Identity Protection (Preview)</div>
-          <span class="data-source source-live">● identityProtection/riskyServicePrincipals</span>
+          <span class="data-source source-live" style="font-size:10px">${STATE.data.riskyAgentsUsedFallback ? '⚠️ Fallback: riskyServicePrincipals' : '● beta/identityProtection/riskyAgents'}</span>
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Agent / Service Principal</th><th>App ID</th><th>Risk Level</th><th>Risk State</th><th>Last Updated</th><th>Enabled</th></tr></thead>
-            <tbody>${riskyAgents.length ? riskyAgents.map(a => `<tr>
-              <td><strong>${esc(a.displayName||'—')}</strong></td>
-              <td class="mono text-muted">${esc((a.appId||'').slice(0,18))}…</td>
-              <td>${riskBadge(a.riskLevel||'medium')}</td>
-              <td><span class="badge ${a.riskState==='confirmedCompromised'?'badge-critical':a.riskState==='atRisk'?'badge-high':'badge-medium'}">${esc(a.riskState||'—')}</span></td>
-              <td class="mono text-muted">${a.riskLastUpdatedDateTime?new Date(a.riskLastUpdatedDateTime).toLocaleString():'—'}</td>
-              <td>${a.isEnabled===false?'<span class="text-critical">🚫 Disabled</span>':'<span class="text-low">✅ Enabled</span>'}</td>
-            </tr>`).join('') : `<tr><td colspan="6" class="empty-state text-muted">${STATE.data.riskyAgentsError?'Requires IdentityRiskyServicePrincipal.Read.All + Entra P2':'No risky agents detected'}</td></tr>`}
+            <thead><tr><th>Agent Name</th><th>Identity Type</th><th>Risk Level</th><th>Risk State</th><th>Last Updated</th><th>Enabled</th></tr></thead>
+            <tbody>${riskyAgents.length ? [...riskyAgents]
+              .sort((a,b) => ({'high':3,'medium':2,'low':1}[b.riskLevel]||0) - ({'high':3,'medium':2,'low':1}[a.riskLevel]||0))
+              .map(a => {
+                const riskStateMap = { confirmedCompromised:'Confirmed compromised', atRisk:'At risk', confirmedSafe:'Confirmed safe', dismissed:'Dismissed', none:'None' };
+                const riskStateCls = a.riskState==='confirmedCompromised'?'badge-critical':a.riskState==='atRisk'?'badge-high':'badge-medium';
+                const typeLabel = { agentIdentity:'🤖 Agent Identity', agentUser:'👤 Agent User', agentIdentityBlueprintPrincipal:'📋 Blueprint Principal' }[a.identityType] || esc(a.identityType||a.appId||'—');
+                return `<tr style="${a.riskState==='confirmedCompromised'?'background:rgba(248,81,73,.05)':''}">
+                  <td><strong>${esc(a.agentDisplayName||a.displayName||'—')}</strong><br><span class="mono text-muted" style="font-size:10px">${esc(a.id.slice(0,18))}…</span></td>
+                  <td style="font-size:12px">${typeLabel}</td>
+                  <td>${riskBadge(a.riskLevel||'medium')}</td>
+                  <td><span class="badge ${riskStateCls}" style="font-size:10px">${esc(riskStateMap[a.riskState]||a.riskState||'—')}</span></td>
+                  <td class="mono text-muted" style="font-size:11px">${(a.riskLastModifiedDateTime||a.riskLastUpdatedDateTime)?new Date(a.riskLastModifiedDateTime||a.riskLastUpdatedDateTime).toLocaleString():'—'}</td>
+                  <td>${a.isEnabled===false?'<span class="text-critical">🚫 Disabled</span>':'<span class="text-low">✅ Enabled</span>'}</td>
+                </tr>`;
+              }).join('')
+            : `<tr><td colspan="6" class="empty-state text-muted">${STATE.data.riskyAgentsError?'Requires IdentityRiskyAgent.Read.All + Entra P2':'✅ No risky agents detected'}</td></tr>`}
             </tbody>
           </table>
         </div>
