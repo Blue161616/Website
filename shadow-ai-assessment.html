@@ -2690,31 +2690,60 @@ async function loadDataRisk() {
 async function loadCompliance() {
   const el = document.getElementById('compliance-content');
   try {
-    const [caP, org, grantPolicies] = await Promise.all([
-      fetchCAPolicies(), fetchOrg(), fetchGrantPolicies()
+    const [caP, org, grantPolicies, sps, signIns] = await Promise.all([
+      fetchCAPolicies(), fetchOrg(), fetchGrantPolicies(),
+      fetchServicePrincipals(), fetchSignIns(),
     ]);
     const authPolicy = STATE.data.authPolicy || {};
     const secDefaults = STATE.data.secDefaults || {};
-    const licenses = org.verifiedDomains || [];
     const enabledCa = caP.filter(p => p.state === 'enabled');
     const disabledCa = caP.filter(p => p.state === 'disabled');
     const reportCa = caP.filter(p => p.state === 'enabledForReportingButNotEnforced');
-    const aiBlockCa = caP.filter(p =>
-      JSON.stringify(p.conditions||{}).toLowerCase().includes('ai') ||
-      JSON.stringify(p.conditions||{}).toLowerCase().includes('copilot'));
+    const isAiCaPolicy = p => {
+      const name = (p.displayName || '').toLowerCase();
+      const cond = JSON.stringify(p.conditions || {}).toLowerCase();
+      return name.includes('agent') || name.includes('copilot') || name.includes(' ai') || name.startsWith('ai ')
+        || cond.includes('agent') || cond.includes('copilot') || cond.includes('"ai"');
+    };
+    const aiBlockCa = caP.filter(isAiCaPolicy);
 
-    // Derive scores
-    const gdprScore = Math.round(
-      (enabledCa.length > 0 ? 25 : 0) +
-      (secDefaults.isEnabled ? 15 : 0) +
-      (!authPolicy.defaultUserRolePermissions?.allowedToCreateApps ? 20 : 0) +
-      (aiBlockCa.length > 0 ? 20 : 0) +
-      (grantPolicies.length > 0 ? 20 : 0));
+    // ── GDPR Compliance: based on AI models in use ─────────────────────────
+    // Build model list from SPs + sign-ins, same logic as loadModels()
+    const aiApps = sps.filter(isAiApp);
+    const modelSigninCounts = {};
+    signIns.forEach(s => {
+      const name = s.appDisplayName || '';
+      if (AI_KEYWORDS.some(k => name.toLowerCase().includes(k)))
+        modelSigninCounts[name] = (modelSigninCounts[name] || 0) + 1;
+    });
+    const gdprModelMap = {};
+    [...aiApps.map(a => a.displayName), ...Object.keys(modelSigninCounts)].forEach(name => {
+      const info = detectModel(name);
+      if (info.model === 'Unknown') return;
+      const key = info.model + '|' + info.provider;
+      if (!gdprModelMap[key]) gdprModelMap[key] = { ...info, calls: 0, apps: [] };
+      gdprModelMap[key].calls += modelSigninCounts[name] || 0;
+      gdprModelMap[key].apps.push(name);
+    });
+    const gdprModels = Object.values(gdprModelMap);
+    // Score: weighted by sign-in usage; if no sign-ins, weighted equally by model count
+    const totalCalls = gdprModels.reduce((s, m) => s + m.calls, 0);
+    const compliantModels = gdprModels.filter(m => m.gdprOk);
+    const nonCompliantModels = gdprModels.filter(m => !m.gdprOk);
+    const gdprScore = gdprModels.length === 0 ? null
+      : totalCalls > 0
+        ? Math.round((compliantModels.reduce((s,m)=>s+m.calls,0) / totalCalls) * 100)
+        : Math.round((compliantModels.length / gdprModels.length) * 100);
+
+    // ── AI Governance Score: based on CA policies ──────────────────────────
     const govScore = Math.round(
       (enabledCa.length > 5 ? 30 : enabledCa.length * 4) +
       (aiBlockCa.length > 0 ? 30 : 0) +
       (secDefaults.isEnabled ? 20 : 0) +
       (!authPolicy.defaultUserRolePermissions?.allowedToCreateApps ? 20 : 0));
+
+    const gdprScoreDisplay = gdprScore === null ? '—' : gdprScore + '%';
+    const gdprClass = gdprScore === null ? 'info' : gdprScore >= 70 ? 'low' : gdprScore >= 40 ? 'medium' : 'critical';
 
     el.innerHTML = `
       ${STATE.data.caError ? permWarn('Policy.Read.All', STATE.data.caError) : ''}
@@ -2723,10 +2752,10 @@ async function loadCompliance() {
         <span class="data-source source-live">● Live from Graph</span>
       </div>
       <div class="kpi-row">
-        <div class="kpi-card ${gdprScore>=70?'low':gdprScore>=40?'medium':'critical'}">
-          <div class="kpi-label">GDPR Readiness Score</div>
-          <div class="kpi-value" style="color:${scoreColor(gdprScore)}">${gdprScore}%</div>
-          <div class="kpi-delta">Based on CA policies &amp; consent settings</div>
+        <div class="kpi-card ${gdprClass}">
+          <div class="kpi-label">GDPR Compliance</div>
+          <div class="kpi-value" style="color:${gdprScore===null?'var(--text-muted)':scoreColor(gdprScore)}">${gdprScoreDisplay}</div>
+          <div class="kpi-delta">${gdprModels.length ? `${compliantModels.length}/${gdprModels.length} AI models EU-compliant` : 'No AI models detected yet'}</div>
           <div class="kpi-icon">🇪🇺</div>
         </div>
         <div class="kpi-card ${govScore>=70?'low':govScore>=40?'medium':'critical'}">
@@ -2749,6 +2778,34 @@ async function loadCompliance() {
         </div>
       </div>
 
+      ${gdprModels.length ? `
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">🇪🇺 GDPR Compliance — AI Model Assessment</div>
+          <span class="text-muted" style="font-size:11px">Based on data residency &amp; GDPR status of AI models detected in your tenant</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Model</th><th>Provider</th><th>Data Residency</th><th>Trains on Prompts</th><th>GDPR Status</th><th>Sign-in Events</th><th>Compliance</th></tr></thead>
+            <tbody>${gdprModels.sort((a,b) => (a.gdprOk===b.gdprOk?0:a.gdprOk?-1:1) || b.calls-a.calls).map(m => `<tr style="${!m.gdprOk?'background:rgba(248,81,73,.04)':''}">
+              <td><strong>${esc(m.model)}</strong></td>
+              <td class="text-muted">${esc(m.provider)}</td>
+              <td class="mono">${esc(m.residency)}</td>
+              <td>${m.training==='Yes'?'<span class="text-critical">⚠️ Yes</span>':m.training==='No'?'<span class="text-low">✅ No</span>':'<span class="text-medium">⚡ '+esc(m.training)+'</span>'}</td>
+              <td class="mono text-muted" style="font-size:11px">${esc(m.residency)}</td>
+              <td style="font-weight:600">${m.calls||'—'}</td>
+              <td>${m.gdprOk
+                ? '<span class="badge badge-low">✅ Compliant</span>'
+                : '<span class="badge badge-critical">❌ Non-compliant</span>'}</td>
+            </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+        ${nonCompliantModels.length ? `<div style="padding:10px 14px;font-size:12px;color:var(--risk-high);border-top:1px solid var(--border)">
+          ⚠️ Non-compliant models: ${nonCompliantModels.map(m=>`<strong>${esc(m.model)}</strong> (${esc(m.residency)})`).join(', ')} — data processed outside EU without adequate GDPR safeguards.
+        </div>` : `<div style="padding:10px 14px;font-size:12px;color:var(--risk-low);border-top:1px solid var(--border)">✅ All detected AI models are GDPR-compliant.</div>`}
+      </div>` : ''}
+
       <div class="grid-2">
         <div class="card">
           <div class="card-header"><div class="card-title">Conditional Access Policies</div></div>
@@ -2757,17 +2814,15 @@ async function loadCompliance() {
               <thead><tr><th>Policy</th><th>State</th><th>AI Relevant</th><th>Grant Controls</th></tr></thead>
               <tbody>${caP.map(p => {
                 const stateMap = {enabled:'enabled',disabled:'disabled',enabledForReportingButNotEnforced:'reportOnly'};
-                const isAiRel = JSON.stringify(p.conditions||{}).toLowerCase().includes('ai') ||
-                  JSON.stringify(p.conditions||{}).toLowerCase().includes('copilot') ||
-                  (p.displayName||'').toLowerCase().includes('ai') ||
-                  (p.displayName||'').toLowerCase().includes('copilot');
-                const grants = Object.keys(p.grantControls?.builtInControls ? {a:1} : {}).length
-                  ? (p.grantControls?.builtInControls||[]).join(', ')
-                  : (p.grantControls?.builtInControls||[]).join(', ') || 'Block / none';
-                return `<tr>
-                  <td><strong>${esc(p.displayName)}</strong><br><span class="mono text-muted">${new Date(p.createdDateTime||Date.now()).toLocaleDateString()}</span></td>
+                const aiRel = isAiCaPolicy(p);
+                return `<tr style="${aiRel ? 'background:rgba(163,113,247,.06)' : ''}">
+                  <td>
+                    <strong>${esc(p.displayName)}</strong>
+                    ${aiRel ? `<span class="badge" style="margin-left:8px;background:rgba(163,113,247,.15);color:var(--accent-purple);border:1px solid rgba(163,113,247,.3);font-size:10px">🤖 AI Policy</span>` : ''}
+                    <br><span class="mono text-muted">${new Date(p.createdDateTime||Date.now()).toLocaleDateString()}</span>
+                  </td>
                   <td>${statusBadge(stateMap[p.state]||'inactive')}</td>
-                  <td>${isAiRel?'<span class="text-critical">⚠️ Yes</span>':'<span class="text-muted">—</span>'}</td>
+                  <td>${aiRel ? '<span style="color:var(--accent-purple);font-weight:600">🤖 Yes</span>' : '<span class="text-muted">—</span>'}</td>
                   <td class="text-muted mono">${esc((p.grantControls?.builtInControls||[]).join(', ')||'—')}</td>
                 </tr>`;
               }).join('') || '<tr><td colspan="4" class="empty-state text-muted">No CA policies found</td></tr>'}
