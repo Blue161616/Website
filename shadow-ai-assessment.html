@@ -1941,35 +1941,6 @@ async function loadModels() {
         </div>
       </div>` : ''}
 
-      ${mcasAiApps.length ? `
-      <div class="card">
-        <div class="card-header">
-          <div class="card-title">🛡️ Defender for Cloud Apps — AI Discovery (30d)</div>
-          <span class="text-muted" style="font-size:11px">${mcasAiApps.length} AI-related apps detected via network traffic · <span style="color:var(--risk-medium)">MCAS</span></span>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>App</th><th>Category</th><th>Users</th><th>Traffic</th><th>Transactions</th><th>Last Seen</th><th>Status</th><th>Risk</th></tr></thead>
-            <tbody>${mcasAiApps.sort((a,b)=>(b.usersCount||0)-(a.usersCount||0)).slice(0,30).map(a => {
-              const info = detectModel(a.name || '');
-              const status = a.tags?.includes('Sanctioned') ? `<span class="badge badge-low">✅ Sanctioned</span>`
-                : a.tags?.includes('Unsanctioned') ? `<span class="badge badge-critical">🚫 Blocked</span>`
-                : `<span class="badge badge-medium">⚠️ Unmanaged</span>`;
-              return `<tr>
-                <td><strong>${esc(a.name||'')}</strong><br><span class="text-muted" style="font-size:10px">${esc(info.model !== 'Unknown' ? info.model : (a.category||''))}</span></td>
-                <td class="text-muted" style="font-size:11px">${esc(a.category||'—')}</td>
-                <td style="font-weight:600">${a.usersCount||0}</td>
-                <td class="mono text-muted" style="font-size:11px">${a.trafficTotalBytes ? fmtBytes(a.trafficTotalBytes) : '—'}</td>
-                <td>${a.trafficTotalEvents||0}</td>
-                <td class="text-muted" style="font-size:11px">${a.lastSeen ? new Date(a.lastSeen).toLocaleDateString() : '—'}</td>
-                <td>${status}</td>
-                <td>${riskBadge(info.risk)}</td>
-              </tr>`;
-            }).join('')}
-            </tbody>
-          </table>
-        </div>
-      </div>` : `<div class="card"><div class="card-body"><span class="text-muted" style="font-size:12px">🛡️ No Defender for Cloud Apps data — ensure <code>CloudApp-Discovery.Read.All</code> is consented and cloud discovery is streaming.</span></div></div>`}
     `;
 
     // Chart
@@ -2766,23 +2737,39 @@ async function loadAgents() {
 
 async function fetchAgentAppPerms(agentSps, allSps) {
   if (STATE.data.agentAppPerms) return STATE.data.agentAppPerms;
-  // Build appRole name lookup: resourceSpId → {roleId → roleName}
-  const roleBySpId = {};
-  for (const sp of allSps) {
-    if ((sp.appRoles||[]).length) {
-      roleBySpId[sp.id] = {};
-      for (const r of sp.appRoles) roleBySpId[sp.id][r.id] = r.value || r.displayName || r.id;
-    }
-  }
-  const result = {};
+
+  // Step 1: fetch all appRoleAssignments for agents in parallel
+  const rawPerms = {};
   await Promise.all(agentSps.slice(0, 80).map(async sp => {
     try {
       const d = await gget(`${GRAPH}/servicePrincipals/${sp.id}/appRoleAssignments?$select=resourceId,resourceDisplayName,appRoleId`);
-      result[sp.id] = (d.value||[])
-        .filter(a => a.appRoleId && a.appRoleId !== '00000000-0000-0000-0000-000000000000')
-        .map(a => ({ resource: a.resourceDisplayName||'', role: roleBySpId[a.resourceId]?.[a.appRoleId] || a.appRoleId }));
-    } catch { result[sp.id] = []; }
+      rawPerms[sp.id] = (d.value||[]).filter(a => a.appRoleId && a.appRoleId !== '00000000-0000-0000-0000-000000000000');
+    } catch { rawPerms[sp.id] = []; }
   }));
+
+  // Step 2: collect unique resource SPs referenced across all assignments
+  const allAssignments = Object.values(rawPerms).flat();
+  const uniqueResourceIds = [...new Set(allAssignments.map(a => a.resourceId).filter(Boolean))];
+
+  // Step 3: build role-name map — allSps has no appRoles field so fetch resource SPs individually
+  // (typically 3-5 well-known SPs: MS Graph, SharePoint, Exchange, etc.)
+  const roleBySpId = {};
+  await Promise.all(uniqueResourceIds.map(async id => {
+    try {
+      const d = await gget(`${GRAPH}/servicePrincipals/${id}?$select=id,appRoles`);
+      roleBySpId[id] = {};
+      for (const r of (d.appRoles||[])) roleBySpId[id][r.id] = r.value || r.displayName || r.id;
+    } catch { roleBySpId[id] = {}; }
+  }));
+
+  // Step 4: resolve role names
+  const result = {};
+  for (const [spId, assignments] of Object.entries(rawPerms)) {
+    result[spId] = assignments.map(a => ({
+      resource: a.resourceDisplayName || '',
+      role: roleBySpId[a.resourceId]?.[a.appRoleId] || a.appRoleId
+    }));
+  }
   STATE.data.agentAppPerms = result;
   return result;
 }
