@@ -4141,73 +4141,91 @@ async function loadProtection() {
       fetchNamedLocations(),
     ]);
 
-    // ── Agent SPs (blueprints + identities + classic agents) ─────────────
-    const agentSps = STATE.data.agentSps || (() => {
-      const spMap = new Map(sps.map(s => [s.id, s]));
-      return [...spMap.values()].filter(sp => {
-        const tags = (sp.tags||[]).map(t=>t.toLowerCase());
-        return AGENT_KEYWORDS.some(k=>(sp.displayName||'').toLowerCase().includes(k))
-          || tags.some(t=>t.includes('agentidentity')||t.includes('agentblueprint'))
-          || sp.servicePrincipalType === 'ServiceIdentity';
-      });
-    })();
-
-    // ── CA coverage analysis (agents only) ───────────────────────────────
+    // ── Agent-targeted CA policies ────────────────────────────────────────
     const enabledCa = caP.filter(p => p.state === 'enabled');
-    const agentCoverage = agentSps.map(sp => {
-      const coveringPolicies = enabledCa.filter(p => {
-        const inc = p.conditions?.applications?.includeApplications || [];
-        const exc = p.conditions?.applications?.excludeApplications || [];
-        if (exc.includes(sp.appId)) return false;
-        return inc.includes('All') || inc.includes(sp.appId);
-      });
-      return { sp, policies: coveringPolicies };
-    });
-    const uncovered = agentCoverage.filter(a => !a.policies.length);
 
-    // ── CA controls summary ───────────────────────────────────────────────
+    const isAgentCa = p => {
+      const u = p.conditions?.users || {};
+      // AllAgentIdUsers in includeUsers (agent user policies)
+      if ((u.includeUsers||[]).includes('AllAgentIdUsers')) return true;
+      // includeAgents preview field (agent identity policies)
+      if ((u.includeAgents||[]).length > 0) return true;
+      // Name-based fallback for policies that target agents but use classic user conditions
+      return isAiCaPolicy(p);
+    };
+
+    const agentCaPolicies = caP.filter(isAgentCa)
+      .sort((a,b) => (CA_STATE_ORDER[b.state]??-1) - (CA_STATE_ORDER[a.state]??-1) || (b.createdDateTime||'').localeCompare(a.createdDateTime||''));
+
+    const agentAssignment = p => {
+      const u = p.conditions?.users || {};
+      const parts = [];
+      const incAgents = u.includeAgents || [];
+      if (incAgents.includes('allAgentIdentities')) parts.push('All agent identities');
+      else if (incAgents.length) parts.push(incAgents.length + ' agent(s) selected');
+      if ((u.includeUsers||[]).includes('AllAgentIdUsers')) parts.push('All Agent ID Users');
+      return parts.join(' · ') || '—';
+    };
+
+    const targetResources = p => {
+      const apps = p.conditions?.applications?.includeApplications || [];
+      if (!apps.length) return '<span style="opacity:.4">—</span>';
+      if (apps.includes('All')) return '<span style="font-size:11px">All resources</span>';
+      return `<span style="font-size:11px">${apps.length} resource${apps.length!==1?'s':''}</span>`;
+    };
+
+    const policyControls = p => {
+      const grants = p.grantControls?.builtInControls || [];
+      const parts = [
+        ...grants,
+        p.grantControls?.authenticationStrength ? '🔐 Auth Strength' : null,
+        p.sessionControls?.tokenProtection?.isEnabled ? '🔑 Token Protection' : null,
+        p.sessionControls?.signInFrequency?.isEnabled ? '⏱️ Sign-in Freq.' : null,
+      ].filter(Boolean);
+      return parts.length
+        ? parts.map(c => `<span style="display:inline-block;margin:1px 2px;padding:1px 6px;border-radius:3px;background:rgba(56,139,253,.1);color:var(--accent-blue);font-size:10px">${esc(c)}</span>`).join('')
+        : '<span style="opacity:.4">—</span>';
+    };
+
+    // ── CA controls summary (all enabled policies) ────────────────────────
     const withMfa             = enabledCa.filter(p => (p.grantControls?.builtInControls||[]).includes('mfa'));
     const withAuthStrength    = enabledCa.filter(p => p.grantControls?.authenticationStrength);
     const withTokenProtect    = enabledCa.filter(p => p.sessionControls?.tokenProtection?.isEnabled);
     const withSignInFreq      = enabledCa.filter(p => p.sessionControls?.signInFrequency?.isEnabled);
     const withCompliantDevice = enabledCa.filter(p => (p.grantControls?.builtInControls||[]).includes('compliantDevice'));
 
-    const agentTypeBadge = sp => {
-      const t = getAgentType(sp).type;
-      if (t === 'blueprint')      return '<span style="font-size:10px;padding:1px 6px;border-radius:3px;background:rgba(163,113,247,.15);color:var(--accent-purple)">📋 Blueprint</span>';
-      if (t === 'copilot-studio') return '<span style="font-size:10px;padding:1px 6px;border-radius:3px;background:rgba(56,139,253,.12);color:var(--accent-blue)">🤖 Identity</span>';
-      if (t === 'ai-foundry')     return '<span style="font-size:10px;padding:1px 6px;border-radius:3px;background:rgba(56,139,253,.12);color:var(--accent-blue)">🔷 AI Foundry</span>';
-      return '<span style="font-size:10px;padding:1px 6px;border-radius:3px;background:rgba(139,148,158,.1);color:var(--text-muted)">⚙️ Classic</span>';
-    };
+    const enabledAgent  = agentCaPolicies.filter(p => p.state === 'enabled').length;
+    const reportAgent   = agentCaPolicies.filter(p => p.state === 'enabledForReportingButNotEnforced').length;
+    const blockAgent    = agentCaPolicies.filter(p => (p.grantControls?.builtInControls||[]).includes('block')).length;
 
     el.innerHTML = `
       <div class="section-header" style="margin-bottom:16px">
         <div>
           <div class="section-title">🛡️ Protection</div>
-          <div class="section-sub">Conditional Access coverage for agent blueprints, identities, and classic agents</div>
+          <div class="section-sub">Conditional Access policies assigned to Agents (Preview) — agent identities and agent users</div>
         </div>
         <span class="data-source source-live">● identity/conditionalAccess/policies · ${enabledCa.length} enabled policies</span>
       </div>
 
       <!-- KPI row -->
       <div class="kpi-row">
-        <div class="kpi-card ${uncovered.length ? 'critical' : 'low'}">
-          <div class="kpi-label">Uncovered Agents</div>
-          <div class="kpi-value ${uncovered.length ? 'text-critical' : 'text-low'}">${uncovered.length}</div>
-          <div class="kpi-delta">of ${agentSps.length} agents have no CA policy</div>
-          <div class="kpi-icon">🔓</div>
+        <div class="kpi-card ${agentCaPolicies.length ? 'info' : 'medium'}">
+          <div class="kpi-label">Agent CA Policies</div>
+          <div class="kpi-value text-blue">${agentCaPolicies.length}</div>
+          <div class="kpi-delta">${enabledAgent} enabled · ${reportAgent} report-only</div>
+          <div class="kpi-icon">🛡️</div>
+        </div>
+        <div class="kpi-card ${blockAgent ? 'low' : 'medium'}">
+          <div class="kpi-label">Block Controls</div>
+          <div class="kpi-value ${blockAgent ? 'text-low' : 'text-medium'}">${blockAgent}</div>
+          <div class="kpi-delta">Policies with block grant control</div>
+          <div class="kpi-icon">🚫</div>
         </div>
         <div class="kpi-card ${withTokenProtect.length ? 'low' : 'medium'}">
           <div class="kpi-label">Token Protection</div>
           <div class="kpi-value ${withTokenProtect.length ? 'text-low' : 'text-medium'}">${withTokenProtect.length}</div>
           <div class="kpi-delta">CA policies with token binding</div>
           <div class="kpi-icon">🔑</div>
-        </div>
-        <div class="kpi-card ${withMfa.length ? 'low' : 'medium'}">
-          <div class="kpi-label">Require MFA</div>
-          <div class="kpi-value ${withMfa.length ? 'text-low' : 'text-medium'}">${withMfa.length}</div>
-          <div class="kpi-delta">CA policies enforcing MFA</div>
-          <div class="kpi-icon">🔢</div>
         </div>
         <div class="kpi-card ${withAuthStrength.length ? 'low' : 'medium'}">
           <div class="kpi-label">Auth Strength</div>
@@ -4223,42 +4241,40 @@ async function loadProtection() {
         </div>
       </div>
 
-      <!-- CA Coverage for Agent SPs -->
+      <!-- Agent CA Policies table -->
       <div class="card" style="margin-bottom:16px">
         <div class="card-header">
-          <div class="card-title">🔐 Conditional Access — Agent Coverage (${agentSps.length})</div>
-          <span class="data-source source-live">● identity/conditionalAccess/policies</span>
+          <div class="card-title">🔐 Conditional Access — Agent Policies (${agentCaPolicies.length})</div>
+          <span class="data-source source-live">● identity/conditionalAccess/policies · assignment: Agents (Preview)</span>
         </div>
         <div style="font-size:11px;color:var(--text-dim);padding:6px 16px 4px">
-          Enabled CA policies covering each agent service principal (via explicit appId or "All Applications").
-          ${uncovered.length
-            ? `<span style="color:var(--risk-critical);font-weight:600"> ⚠️ ${uncovered.length} agent${uncovered.length!==1?'s':''} uncovered.</span>`
-            : ' <span style="color:var(--risk-low)">✅ All agents are covered by at least one CA policy.</span>'}
+          CA policies where the assignment targets agent identities, agent users, or AI-related principals.
         </div>
+        ${agentCaPolicies.length ? `
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Agent</th><th>Type</th><th>Coverage</th><th>Policies Applied</th><th>Controls</th></tr></thead>
-            <tbody>${agentCoverage.sort((a,b) => a.policies.length - b.policies.length).map(({ sp, policies }) => {
-              const controls = [...new Set(policies.flatMap(p => [
-                ...(p.grantControls?.builtInControls||[]),
-                p.grantControls?.authenticationStrength ? '🔐 Auth Strength' : null,
-                p.sessionControls?.tokenProtection?.isEnabled ? '🔑 Token Protection' : null,
-                p.sessionControls?.signInFrequency?.isEnabled ? '⏱️ Sign-in Freq.' : null,
-                p.sessionControls?.persistentBrowser?.isEnabled === false ? '🌐 No Persistent Browser' : null,
-              ].filter(Boolean)))];
-              return `<tr style="${!policies.length?'background:rgba(248,81,73,.04)':''}">
-                <td><strong>${esc(sp.displayName)}</strong><br><span class="mono text-muted" style="font-size:10px">${esc((sp.appId||sp.id||'').slice(0,28))}…</span></td>
-                <td>${agentTypeBadge(sp)}</td>
-                <td>${policies.length
-                  ? `<span class="badge badge-low" style="font-size:10px">✅ ${policies.length} polic${policies.length!==1?'ies':'y'}</span>`
-                  : `<span class="badge badge-critical" style="font-size:10px">🔓 Uncovered</span>`}</td>
-                <td style="font-size:11px;max-width:240px">${policies.slice(0,4).map(p=>`<span style="display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(p.displayName)}</span>`).join('')}${policies.length>4?`<span class="text-muted">+${policies.length-4} more</span>`:''}</td>
-                <td style="font-size:11px">${controls.slice(0,4).map(c=>`<span style="display:inline-block;margin:1px 2px;padding:1px 5px;border-radius:3px;background:rgba(56,139,253,.1);color:var(--accent-blue);font-size:10px">${esc(c)}</span>`).join('')||'<span style="opacity:.4">—</span>'}</td>
+            <thead><tr>
+              <th>Policy</th><th>State</th><th>Assignment</th><th>Target Resources</th><th>Controls</th><th>Created</th>
+            </tr></thead>
+            <tbody>${agentCaPolicies.map(p => {
+              const stateMap = { enabled:'enabled', disabled:'disabled', enabledForReportingButNotEnforced:'reportOnly' };
+              const assignment = agentAssignment(p);
+              const isBlock = (p.grantControls?.builtInControls||[]).includes('block');
+              return `<tr style="${isBlock && p.state==='enabled' ? 'background:rgba(63,185,80,.03)' : ''}">
+                <td>
+                  <strong style="font-size:13px">${esc(p.displayName)}</strong>
+                  ${isBlock ? `<span class="badge badge-low" style="font-size:10px;margin-left:6px">🚫 Block</span>` : ''}
+                </td>
+                <td>${statusBadge(stateMap[p.state]||'inactive')}</td>
+                <td style="font-size:11px;color:var(--text-muted)">${esc(assignment)}</td>
+                <td>${targetResources(p)}</td>
+                <td>${policyControls(p)}</td>
+                <td class="mono text-muted" style="font-size:11px;white-space:nowrap">${p.createdDateTime ? new Date(p.createdDateTime).toLocaleDateString() : '—'}</td>
               </tr>`;
             }).join('')}
             </tbody>
           </table>
-        </div>
+        </div>` : '<div class="card-body"><div class="empty-state text-muted">No agent-targeted CA policies found. Create policies in Entra ID → Security → Conditional Access, setting assignment to "Agents (Preview)".</div></div>'}
       </div>
 
       <!-- Auth Strength Policies + CA Controls Summary -->
