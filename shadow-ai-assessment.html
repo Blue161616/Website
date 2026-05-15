@@ -2131,18 +2131,19 @@ async function fetchAgentOwnersSponsors(agentSps) {
 
 // ── Agent table helpers ────────────────────────────────────────────────────
 
-function agentOwnerCell(meta, loading) {
+function agentOwnerCell(meta, loading, hideSponsor = false) {
   if (loading) return '<span class="text-muted" style="font-size:11px">…</span>';
   const owners   = meta?.owners   || [];
-  const sponsors = meta?.sponsors || [];
+  const sponsors = hideSponsor ? [] : (meta?.sponsors || []);
   if (!owners.length && !sponsors.length) {
-    return `<span class="badge badge-medium" style="font-size:10px;opacity:.8" title="No owner or sponsor assigned — accountability gap">⚠️ No Owner</span>`;
+    const tip = hideSponsor ? 'No owner assigned' : 'No owner or sponsor assigned — accountability gap';
+    return `<span class="badge badge-medium" style="font-size:10px;opacity:.8" title="${tip}">⚠️ No Owner</span>`;
   }
   const parts = [
     ...owners.map(n   => `<span style="font-size:11px;display:block">👤 ${esc(n)}</span>`),
     ...sponsors.map(n => `<span style="font-size:11px;display:block">⭐ ${esc(n)}</span>`),
   ];
-  if (!sponsors.length) {
+  if (!hideSponsor && !sponsors.length) {
     parts.push(`<span style="font-size:10px;opacity:.5;display:block;margin-top:2px">No sponsor</span>`);
   }
   return parts.join('');
@@ -2354,7 +2355,7 @@ function renderClassicTable() {
       <td>${riskBadge(r)}</td>
       <td>${ws.length ? ws.map(s=>`<span class="badge badge-critical" style="font-size:10px">${esc(s)}</span>`).join(' ') : '<span style="opacity:.4">—</span>'}</td>
       <td><span class="badge ${ct==='AllPrincipals'?'badge-critical':'badge-medium'}">${esc(ct)}</span></td>
-      <td>${agentOwnerCell(agentOwnersSponsors?.[sp.id], loading)}</td>
+      <td>${agentOwnerCell(agentOwnersSponsors?.[sp.id], loading, true)}</td>
       <td>${sp.accountEnabled ? statusBadge('enabled') : statusBadge('disabled')}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="7" class="empty-state text-muted">No classic agents found</td></tr>';
@@ -4075,29 +4076,275 @@ async function loadLicenses() {
   }
 }
 
-// ── PROTECTION (Defender XDR Advanced Hunting) ────────────────────────────
+// ── PROTECTION ────────────────────────────────────────────────────────────
 
+async function fetchSecurityAlerts() {
+  if (STATE.data.securityAlerts) return STATE.data.securityAlerts;
+  try {
+    const d = await gget(
+      `${GRAPH}/security/alerts_v2?$top=100&$orderby=createdDateTime desc` +
+      `&$select=id,title,severity,status,createdDateTime,category,description,alertWebUrl,classification,determination,evidence`
+    );
+    STATE.data.securityAlerts = d.value || [];
+  } catch (e) {
+    STATE.data.securityAlerts = [];
+    STATE.data.securityAlertsError = e.message;
+  }
+  return STATE.data.securityAlerts;
+}
+
+async function fetchAuthStrengthPolicies() {
+  if (STATE.data.authStrengthPolicies) return STATE.data.authStrengthPolicies;
+  try {
+    const d = await gget(`${GRAPH}/policies/authenticationStrengthPolicies?$select=id,displayName,description,policyType,requirementsSatisfied,allowedCombinations`);
+    STATE.data.authStrengthPolicies = d.value || [];
+  } catch (e) {
+    STATE.data.authStrengthPolicies = [];
+    STATE.data.authStrengthError = e.message;
+  }
+  return STATE.data.authStrengthPolicies;
+}
+
+async function fetchNamedLocations() {
+  if (STATE.data.namedLocations) return STATE.data.namedLocations;
+  try {
+    const d = await gget(`${GRAPH}/identity/conditionalAccess/namedLocations?$select=id,displayName,createdDateTime,modifiedDateTime`);
+    STATE.data.namedLocations = d.value || [];
+  } catch (e) {
+    STATE.data.namedLocations = [];
+  }
+  return STATE.data.namedLocations;
+}
 
 async function loadProtection() {
   const el = document.getElementById('protection-content');
+  el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Loading protection data…</div>';
+  try {
+    const [alerts, caP, sps, grants, authStrengths, namedLocs] = await Promise.all([
+      fetchSecurityAlerts(),
+      fetchCAPolicies(),
+      fetchServicePrincipals(),
+      fetchOAuth2Grants(),
+      fetchAuthStrengthPolicies(),
+      fetchNamedLocations(),
+    ]);
 
-  // Encode a KQL query as a Defender portal deep-link (base64 encoding for the query param)
-  const defenderLink = (kql) =>
-    `https://security.microsoft.com/v2/advanced-hunting?query=${encodeURIComponent(kql.trim())}`;
+    const aiApps = sps.filter(isAiApp);
 
-  const kqlCard = ({ icon, title, description, kql, table }) => `
-    <div class="card" style="margin-bottom:12px">
-      <div class="card-header" style="padding-bottom:8px">
-        <div class="card-title">${icon} ${esc(title)}</div>
-        <a href="${defenderLink(kql)}" target="_blank" rel="noopener"
-           style="font-size:11px;color:var(--accent-blue);text-decoration:none;white-space:nowrap">
-          ↗ Open in Defender
-        </a>
+    // ── CA coverage analysis ──────────────────────────────────────────────
+    const enabledCa = caP.filter(p => p.state === 'enabled');
+    const appCoverage = aiApps.map(sp => {
+      const coveringPolicies = enabledCa.filter(p => {
+        const inc = p.conditions?.applications?.includeApplications || [];
+        const exc = p.conditions?.applications?.excludeApplications || [];
+        if (exc.includes(sp.appId)) return false;
+        return inc.includes('All') || inc.includes(sp.appId);
+      });
+      return { sp, policies: coveringPolicies };
+    });
+    const uncoveredApps = appCoverage.filter(a => !a.policies.length);
+    const coveredApps   = appCoverage.filter(a => a.policies.length > 0);
+
+    // ── CA controls summary ───────────────────────────────────────────────
+    const withMfa            = enabledCa.filter(p => (p.grantControls?.builtInControls||[]).includes('mfa'));
+    const withAuthStrength   = enabledCa.filter(p => p.grantControls?.authenticationStrength);
+    const withTokenProtect   = enabledCa.filter(p => p.sessionControls?.tokenProtection?.isEnabled);
+    const withSignInFreq     = enabledCa.filter(p => p.sessionControls?.signInFrequency?.isEnabled);
+    const withCompliantDevice = enabledCa.filter(p => (p.grantControls?.builtInControls||[]).includes('compliantDevice'));
+
+    // ── Alert stats ───────────────────────────────────────────────────────
+    const AI_ALERT_TERMS = ['agent','copilot','ai','openai','gpt','foundry','jailbreak','prompt injection'];
+    const aiAlerts    = alerts.filter(a => AI_ALERT_TERMS.some(t => (a.title||'').toLowerCase().includes(t)));
+    const critAlerts  = alerts.filter(a => a.severity === 'critical' || a.severity === 'high');
+    const newAlerts   = alerts.filter(a => a.status === 'new');
+    const sevOrder    = { critical:4, high:3, medium:2, low:1, informational:0, unknown:-1 };
+    const sortedAlerts = [...alerts].sort((a,b) => (sevOrder[b.severity]||0) - (sevOrder[a.severity]||0));
+
+    const sevBadge = s => ({
+      critical: '<span class="badge badge-critical">🔴 Critical</span>',
+      high:     '<span class="badge badge-high">🟠 High</span>',
+      medium:   '<span class="badge badge-medium">🟡 Medium</span>',
+      low:      '<span class="badge badge-low">🟢 Low</span>',
+      informational: '<span class="badge" style="background:rgba(139,148,158,.15);color:var(--text-muted)">ℹ️ Info</span>',
+    }[s] || `<span class="badge">${esc(s||'—')}</span>`);
+
+    const statusBadgeProt = s => ({
+      new:         '<span class="badge badge-critical" style="font-size:10px">🔔 New</span>',
+      inProgress:  '<span class="badge badge-medium" style="font-size:10px">🔄 In Progress</span>',
+      resolved:    '<span class="badge badge-low" style="font-size:10px">✅ Resolved</span>',
+      dismissed:   '<span class="badge" style="font-size:10px;opacity:.6">↩️ Dismissed</span>',
+    }[s] || `<span class="badge" style="font-size:10px">${esc(s||'—')}</span>`);
+
+    el.innerHTML = `
+      <div class="section-header" style="margin-bottom:16px">
+        <div>
+          <div class="section-title">🛡️ Protection</div>
+          <div class="section-sub">Security alerts, CA policy coverage, and authentication strength controls</div>
+        </div>
+        <span class="data-source source-live">● Microsoft Graph Security API · Identity Protection · CA policies</span>
       </div>
-      <div style="padding:0 14px 8px;font-size:12px;color:var(--text-muted)">${description}</div>
-      <div style="margin:0 14px 12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--text-primary);white-space:pre;overflow-x:auto;line-height:1.6">${esc(kql.trim())}</div>
-      ${table ? `<div style="padding:0 14px 10px;font-size:11px;color:var(--text-dim)">Table: <code>${esc(table)}</code></div>` : ''}
-    </div>`;
+
+      <!-- KPI row -->
+      <div class="kpi-row">
+        <div class="kpi-card ${critAlerts.length ? 'critical' : 'low'}">
+          <div class="kpi-label">High/Critical Alerts</div>
+          <div class="kpi-value ${critAlerts.length ? 'text-critical' : 'text-low'}">${critAlerts.length}</div>
+          <div class="kpi-delta">${newAlerts.length} new · ${alerts.length} total</div>
+          <div class="kpi-icon">🚨</div>
+        </div>
+        <div class="kpi-card ${aiAlerts.length ? 'high' : 'low'}">
+          <div class="kpi-label">AI-Related Alerts</div>
+          <div class="kpi-value ${aiAlerts.length ? 'text-high' : 'text-low'}">${aiAlerts.length}</div>
+          <div class="kpi-delta">Copilot, agent, prompt injection</div>
+          <div class="kpi-icon">🤖</div>
+        </div>
+        <div class="kpi-card ${uncoveredApps.length ? 'critical' : 'low'}">
+          <div class="kpi-label">Uncovered AI Apps</div>
+          <div class="kpi-value ${uncoveredApps.length ? 'text-critical' : 'text-low'}">${uncoveredApps.length}</div>
+          <div class="kpi-delta">of ${aiApps.length} AI apps have no CA policy</div>
+          <div class="kpi-icon">🔓</div>
+        </div>
+        <div class="kpi-card ${withTokenProtect.length ? 'low' : 'medium'}">
+          <div class="kpi-label">Token Protection</div>
+          <div class="kpi-value ${withTokenProtect.length ? 'text-low' : 'text-medium'}">${withTokenProtect.length}</div>
+          <div class="kpi-delta">CA policies with token binding</div>
+          <div class="kpi-icon">🔑</div>
+        </div>
+        <div class="kpi-card info">
+          <div class="kpi-label">Named Locations</div>
+          <div class="kpi-value text-blue">${namedLocs.length}</div>
+          <div class="kpi-delta">${withSignInFreq.length} policies enforce sign-in freq.</div>
+          <div class="kpi-icon">📍</div>
+        </div>
+      </div>
+
+      <!-- Security Alerts -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">🚨 Security Alerts (${alerts.length})</div>
+          <span class="data-source source-live">● security/alerts_v2 · SecurityAlert.Read.All</span>
+        </div>
+        ${STATE.data.securityAlertsError && !alerts.length
+          ? permWarn('SecurityAlert.Read.All', STATE.data.securityAlertsError)
+          : alerts.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Title</th><th>Severity</th><th>Status</th><th>Category</th><th>Created</th><th>Link</th>
+            </tr></thead>
+            <tbody>${sortedAlerts.slice(0, 50).map(a => {
+              const isAi = AI_ALERT_TERMS.some(t => (a.title||'').toLowerCase().includes(t));
+              return `<tr style="${a.severity==='critical'?'background:rgba(248,81,73,.04)':a.severity==='high'?'background:rgba(255,123,114,.03)':''}">
+                <td>
+                  <strong style="font-size:13px">${isAi ? '🤖 ' : ''}${esc(a.title||'—')}</strong>
+                  ${a.description ? `<br><span class="text-muted" style="font-size:10px">${esc(a.description.slice(0,120))}${a.description.length>120?'…':''}</span>` : ''}
+                </td>
+                <td>${sevBadge(a.severity)}</td>
+                <td>${statusBadgeProt(a.status)}</td>
+                <td class="text-muted" style="font-size:12px">${esc(a.category||'—')}</td>
+                <td class="mono text-muted" style="font-size:11px;white-space:nowrap">${a.createdDateTime ? new Date(a.createdDateTime).toLocaleDateString() : '—'}</td>
+                <td>${a.alertWebUrl ? `<a href="${esc(a.alertWebUrl)}" target="_blank" rel="noopener" style="font-size:11px;color:var(--accent-blue)">↗ View</a>` : '<span style="opacity:.4">—</span>'}</td>
+              </tr>`;
+            }).join('')}
+            </tbody>
+          </table>
+        </div>` : '<div class="card-body"><div class="empty-state text-muted">✅ No security alerts found in this tenant.</div></div>'}
+      </div>
+
+      <!-- CA Coverage for AI Apps -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">🔐 Conditional Access — AI App Coverage (${aiApps.length} apps)</div>
+          <span class="data-source source-live">● identity/conditionalAccess/policies</span>
+        </div>
+        <div style="font-size:11px;color:var(--text-dim);padding:6px 16px 0">
+          Enabled CA policies covering each AI app (via explicit appId or "All Applications" include).
+          ${uncoveredApps.length ? `<span style="color:var(--risk-critical);font-weight:600"> ⚠️ ${uncoveredApps.length} app${uncoveredApps.length!==1?'s':''} have no CA policy coverage.</span>` : ' <span style="color:var(--risk-low)">✅ All AI apps are covered.</span>'}
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>AI Application</th><th>Coverage</th><th>Policies Applied</th><th>Controls</th></tr></thead>
+            <tbody>${appCoverage.sort((a,b) => a.policies.length - b.policies.length).map(({ sp, policies }) => {
+              const controls = [...new Set(policies.flatMap(p => [
+                ...(p.grantControls?.builtInControls||[]),
+                p.grantControls?.authenticationStrength ? '🔐 Auth Strength' : null,
+                p.sessionControls?.tokenProtection?.isEnabled ? '🔑 Token Protection' : null,
+                p.sessionControls?.signInFrequency?.isEnabled ? '⏱️ Sign-in Freq.' : null,
+                p.sessionControls?.persistentBrowser?.isEnabled === false ? '🌐 No Persistent Browser' : null,
+              ].filter(Boolean)))];
+              return `<tr style="${!policies.length?'background:rgba(248,81,73,.04)':''}">
+                <td><strong>${esc(sp.displayName)}</strong><br><span class="mono text-muted" style="font-size:10px">${esc(sp.appId.slice(0,28))}…</span></td>
+                <td>${policies.length
+                  ? `<span class="badge badge-low" style="font-size:10px">✅ ${policies.length} polic${policies.length!==1?'ies':'y'}</span>`
+                  : `<span class="badge badge-critical" style="font-size:10px">🔓 Uncovered</span>`}</td>
+                <td style="font-size:11px;max-width:260px">${policies.slice(0,4).map(p => `<span style="display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(p.displayName)}</span>`).join('')}${policies.length>4?`<span class="text-muted">+${policies.length-4} more</span>`:''}</td>
+                <td style="font-size:11px">${controls.slice(0,4).map(c => `<span style="display:inline-block;margin:1px 2px;padding:1px 6px;border-radius:3px;background:rgba(56,139,253,.1);color:var(--accent-blue);font-size:10px">${esc(c)}</span>`).join('')||'<span style="opacity:.4">—</span>'}</td>
+              </tr>`;
+            }).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Auth Strength Policies + CA Controls Summary -->
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">💪 Authentication Strength Policies (${authStrengths.length})</div>
+            <span class="data-source source-live">● policies/authenticationStrengthPolicies</span>
+          </div>
+          ${STATE.data.authStrengthError && !authStrengths.length
+            ? `<div class="card-body text-muted" style="font-size:12px">${esc(STATE.data.authStrengthError)}</div>`
+            : authStrengths.length ? `<div class="table-wrap"><table>
+            <thead><tr><th>Policy</th><th>Type</th><th>Used in CA</th><th>Satisfies</th></tr></thead>
+            <tbody>${authStrengths.map(p => {
+              const usedInCa = enabledCa.filter(ca => ca.grantControls?.authenticationStrength?.id === p.id).length;
+              const typeLabel = p.policyType === 'builtIn'
+                ? '<span class="badge badge-info" style="font-size:10px">Built-in</span>'
+                : '<span class="badge badge-medium" style="font-size:10px">Custom</span>';
+              const satisfies = p.requirementsSatisfied === 'mfa'
+                ? '<span style="color:var(--risk-low);font-size:11px">✅ MFA</span>'
+                : `<span style="font-size:11px">${esc(p.requirementsSatisfied||'—')}</span>`;
+              return `<tr>
+                <td><strong style="font-size:12px">${esc(p.displayName)}</strong>${p.description?`<br><span class="text-muted" style="font-size:10px">${esc(p.description.slice(0,80))}</span>`:''}</td>
+                <td>${typeLabel}</td>
+                <td style="font-size:12px;text-align:center">${usedInCa > 0 ? `<span style="color:var(--risk-low)">${usedInCa}</span>` : '<span style="opacity:.4">0</span>'}</td>
+                <td>${satisfies}</td>
+              </tr>`;
+            }).join('')}
+            </tbody></table></div>`
+            : '<div class="card-body"><div class="empty-state text-muted">No authentication strength policies found.</div></div>'}
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">🔒 CA Session & Grant Controls</div>
+            <span class="data-source source-live">● Enabled CA policies (${enabledCa.length})</span>
+          </div>
+          <div class="card-body">
+            ${[
+              { label: 'Require MFA', count: withMfa.length, icon: '🔢', color: 'var(--accent-blue)', desc: 'Built-in MFA grant control' },
+              { label: 'Auth Strength', count: withAuthStrength.length, icon: '💪', color: 'var(--accent-purple)', desc: 'Named authentication strength' },
+              { label: 'Token Protection', count: withTokenProtect.length, icon: '🔑', color: 'var(--risk-low)', desc: 'Session token binding required' },
+              { label: 'Compliant Device', count: withCompliantDevice.length, icon: '📱', color: 'var(--accent-teal)', desc: 'Intune-compliant device required' },
+              { label: 'Sign-in Frequency', count: withSignInFreq.length, icon: '⏱️', color: 'var(--gold)', desc: 'Periodic re-authentication enforced' },
+              { label: 'Named Locations', count: namedLocs.length, icon: '📍', color: 'var(--text-muted)', desc: 'Trusted/untrusted location definitions' },
+            ].map(({ label, count, icon, color, desc }) => `
+              <div class="progress-row">
+                <div class="progress-label" style="width:160px;color:${count>0?color:'var(--text-dim)'}">${icon} ${label}</div>
+                <div class="progress-bar-bg" style="flex:1"><div class="progress-bar-fill" style="width:${enabledCa.length?Math.round(count/Math.max(enabledCa.length,1)*100):0}%;background:${color};opacity:${count>0?1:.3}"></div></div>
+                <div class="progress-val" style="width:32px;color:${count>0?color:'var(--text-dim)'}">${count}</div>
+              </div>
+              <div style="font-size:10px;color:var(--text-dim);margin:-4px 0 6px 22px">${desc}</div>
+            `).join('')}
+          </div>
+        </div>
+      </div>
+    `;
+  } catch (e) {
+    el.innerHTML = permWarn('SecurityAlert.Read.All, Policy.Read.All', e.message);
+  }
+}
 
   const QUERIES = [
     {
