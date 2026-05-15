@@ -2060,7 +2060,57 @@ const AGENT_WRITE_SCOPES = ['Mail.Send','Mail.ReadWrite','Files.ReadWrite.All','
   'Sites.ReadWrite.All','User.ReadWrite.All','Directory.ReadWrite.All'];
 const AGENT_KEYWORDS = ['agent','bot','automation','pipeline','workflow','copilot','assistant','automat'];
 
+// Permissions explicitly blocked for agent identities per Microsoft Agent ID platform docs
+// These cannot be consented to or exercised by agent service principals
+const BLOCKED_AGENT_PERMS = new Set([
+  // File & SharePoint access
+  'Files.Read.All','Files.ReadWrite.All',
+  'Sites.Read.All','Sites.ReadWrite.All','Sites.FullControl.All','Sites.Manage.All',
+  // Directory & identity write
+  'Directory.ReadWrite.All','Directory.Write.Restricted','Directory.AccessAsUser.All',
+  // Group management
+  'Group.ReadWrite.All','Group.Write.Restricted','GroupMember.ReadWrite.All',
+  // Application & consent management
+  'Application.ReadWrite.All','Application.ReadWrite.OwnedBy',
+  'AppRoleAssignment.ReadWrite.All','DelegatedPermissionGrant.ReadWrite.All',
+  // User lifecycle
+  'User.ReadWrite.All','User.DeleteRestore.All','User.EnableDisableAccount.All',
+  // Teams & chat
+  'Chat.Read.All','Chat.ReadWrite.All','ChannelMessage.Read.All',
+  'TeamMember.ReadWrite.All','Channel.Delete.All',
+  // Role management
+  'RoleManagement.ReadWrite.All','RoleManagement.ReadWrite.Directory',
+  'RoleAssignmentSchedule.ReadWrite.Directory','RoleEligibilitySchedule.ReadWrite.Directory',
+  'PrivilegedAccess.ReadWrite.AzureAD','PrivilegedAccess.ReadWrite.AzureADGroup',
+  // Custom security attributes
+  'CustomSecAttributeAssignment.ReadWrite.All','CustomSecAttributeDefinition.ReadWrite.All',
+  // Device management
+  'Device.ReadWrite.All','DeviceManagementConfiguration.Read.All',
+  // Policy
+  'Policy.ReadWrite.All','Policy.ReadWrite.ConditionalAccess',
+  // Auth methods
+  'UserAuthenticationMethod.Read.All','UserAuthenticationMethod.ReadWrite.All',
+  // Identity risk
+  'IdentityRiskyUser.ReadWrite.All','IdentityRiskyUser.ConfirmCompromised.All',
+]);
+
 const RISK_ORDER = { critical:3, high:2, medium:1, low:0 };
+
+async function fetchAgentAuditLog() {
+  if (STATE.data.agentAuditLog) return STATE.data.agentAuditLog;
+  try {
+    const d = await gget(
+      `${GRAPH}/auditLogs/directoryAudits?$filter=category eq 'AgentIdentity'` +
+      `&$orderby=activityDateTime desc&$top=100` +
+      `&$select=id,activityDateTime,activityDisplayName,category,result,resultReason,initiatedBy,targetResources`
+    );
+    STATE.data.agentAuditLog = d.value || [];
+  } catch (e) {
+    STATE.data.agentAuditLog = [];
+    STATE.data.agentAuditLogError = e.message;
+  }
+  return STATE.data.agentAuditLog;
+}
 
 async function fetchAgentOwnersSponsors(agentSps) {
   if (STATE.data.agentOwnersSponsors) return STATE.data.agentOwnersSponsors;
@@ -2085,11 +2135,17 @@ function agentOwnerCell(meta, loading) {
   if (loading) return '<span class="text-muted" style="font-size:11px">…</span>';
   const owners   = meta?.owners   || [];
   const sponsors = meta?.sponsors || [];
-  if (!owners.length && !sponsors.length) return '<span style="opacity:.4">—</span>';
-  return [
+  if (!owners.length && !sponsors.length) {
+    return `<span class="badge badge-medium" style="font-size:10px;opacity:.8" title="No owner or sponsor assigned — accountability gap">⚠️ No Owner</span>`;
+  }
+  const parts = [
     ...owners.map(n   => `<span style="font-size:11px;display:block">👤 ${esc(n)}</span>`),
     ...sponsors.map(n => `<span style="font-size:11px;display:block">⭐ ${esc(n)}</span>`),
-  ].join('');
+  ];
+  if (!sponsors.length) {
+    parts.push(`<span style="font-size:10px;opacity:.5;display:block;margin-top:2px">No sponsor</span>`);
+  }
+  return parts.join('');
 }
 
 function agentSpCell(sp) {
@@ -2251,12 +2307,13 @@ function sortIdentityTable(key) {
 function renderClassicTable() {
   const tbody = document.getElementById('classic-tbody');
   if (!tbody) return;
-  const { agentSps, agentGrants, agentParentBlueprint } = STATE.data;
+  const { agentSps, agentGrants, agentParentBlueprint, agentOwnersSponsors } = STATE.data;
   if (!agentSps) return;
 
   const key = STATE.clSortKey || 'risk';
   const dir = STATE.clSortDir || 'desc';
   const parentMap = agentParentBlueprint || {};
+  const loading = !agentOwnersSponsors;
 
   // Any agent identity without a blueprint link = Entra classic agent (matches identity table exclusion logic)
   const isEntraAgent = sp => {
@@ -2275,6 +2332,7 @@ function renderClassicTable() {
     if (k === 'risk')    return RISK_ORDER[riskScore(sp, agentGrants||[])] ?? -1;
     if (k === 'write')   return AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants||[]).includes(s)).length;
     if (k === 'consent') return agentGrants?.find(g=>g.clientId===sp.id)?.consentType || '';
+    if (k === 'owners')  return (agentOwnersSponsors?.[sp.id]?.owners?.length||0) + (agentOwnersSponsors?.[sp.id]?.sponsors?.length||0);
     if (k === 'status')  return sp.accountEnabled ? 1 : 0;
     return 0;
   };
@@ -2296,9 +2354,10 @@ function renderClassicTable() {
       <td>${riskBadge(r)}</td>
       <td>${ws.length ? ws.map(s=>`<span class="badge badge-critical" style="font-size:10px">${esc(s)}</span>`).join(' ') : '<span style="opacity:.4">—</span>'}</td>
       <td><span class="badge ${ct==='AllPrincipals'?'badge-critical':'badge-medium'}">${esc(ct)}</span></td>
+      <td>${agentOwnerCell(agentOwnersSponsors?.[sp.id], loading)}</td>
       <td>${sp.accountEnabled ? statusBadge('enabled') : statusBadge('disabled')}</td>
     </tr>`;
-  }).join('') || '<tr><td colspan="6" class="empty-state text-muted">No classic agents found</td></tr>';
+  }).join('') || '<tr><td colspan="7" class="empty-state text-muted">No classic agents found</td></tr>';
 
   applySortIndicators('classic-table', key, dir);
 }
@@ -2311,7 +2370,7 @@ function sortClassicTable(key) {
 
 function showAgentSection(name) {
   STATE.agentSection = name;
-  const sections = ['blueprints', 'identities', 'classic', 'risky'];
+  const sections = ['blueprints', 'identities', 'classic', 'risky', 'audit'];
   sections.forEach(s => {
     const sec = document.getElementById('section-' + s);
     const kpi = document.getElementById('kpi-agent-' + s);
@@ -2327,6 +2386,22 @@ function renderAllAgentTables() {
   renderBlueprintTable();
   renderIdentityTable();
   renderClassicTable();
+  // Update "No Owner" KPI once ownership data is available
+  const { agentSps, agentOwnersSponsors } = STATE.data;
+  const valEl = document.getElementById('kpi-no-owner-val');
+  const subEl = document.getElementById('kpi-no-owner-sub');
+  const cardEl = document.getElementById('kpi-agent-no-owner');
+  if (!valEl || !subEl || !cardEl) return;
+  if (!agentOwnersSponsors || !agentSps) { valEl.textContent = '…'; subEl.textContent = 'Loading ownership data'; return; }
+  const noOwner = agentSps.filter(sp => {
+    const m = agentOwnersSponsors[sp.id];
+    return !m || (!m.owners.length && !m.sponsors.length);
+  });
+  const count = noOwner.length;
+  valEl.textContent = count;
+  valEl.className = `kpi-value ${count > 0 ? 'text-medium' : 'text-low'}`;
+  subEl.textContent = count > 0 ? `of ${agentSps.length} agents unowned` : 'All agents have an owner';
+  cardEl.className = `kpi-card ${count > 0 ? 'medium' : 'low'}`;
 }
 
 async function fetchAgentIdentitySps() {
@@ -2589,7 +2664,7 @@ async function loadAgents() {
           </div>
           <span class="data-source source-derived">⚡ Derived from service principals</span>
         </div>
-        <div class="kpi-row" style="grid-template-columns:repeat(4,1fr);margin-bottom:0">
+        <div class="kpi-row" style="grid-template-columns:repeat(6,1fr);margin-bottom:0">
           <div class="kpi-card medium" id="kpi-agent-blueprints" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('blueprints')">
             <div class="kpi-label">Agent Blueprints</div>
             <div class="kpi-value text-medium">${bpSps.length}</div>
@@ -2610,6 +2685,18 @@ async function loadAgents() {
             <div class="kpi-value ${riskyAgentCount > 0 ? 'text-critical' : 'text-low'}">${riskyAgentCount}${STATE.data.riskyAgentsError ? '*' : ''}</div>
             <div class="kpi-delta">${riskyHighCount} high · ${riskyMedCount} medium${STATE.data.riskyAgentsError ? ' · *no P2' : ''}</div>
             <div class="kpi-icon">⚡</div>
+          </div>
+          <div class="kpi-card medium" id="kpi-agent-no-owner" title="Agents with no owner or sponsor assigned">
+            <div class="kpi-label">No Owner</div>
+            <div class="kpi-value text-medium" id="kpi-no-owner-val">…</div>
+            <div class="kpi-delta" id="kpi-no-owner-sub">Loading ownership data</div>
+            <div class="kpi-icon">👤</div>
+          </div>
+          <div class="kpi-card info" id="kpi-agent-audit" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('audit')">
+            <div class="kpi-label">Audit Log</div>
+            <div class="kpi-value text-blue" id="kpi-audit-val">…</div>
+            <div class="kpi-delta">Agent identity events</div>
+            <div class="kpi-icon">🕐</div>
           </div>
         </div>
       </div>
@@ -2676,6 +2763,7 @@ async function loadAgents() {
                 ${th('Risk','risk','sortClassicTable')}
                 ${th('Write Scopes','write','sortClassicTable')}
                 ${th('Consent Scope','consent','sortClassicTable')}
+                ${th('Owners / Sponsors','owners','sortClassicTable')}
                 ${th('Status','status','sortClassicTable')}
               </tr></thead>
               <tbody id="classic-tbody"></tbody>
@@ -2731,11 +2819,94 @@ async function loadAgents() {
           </div>` : ''}
         </div>
       </div>
+
+      <!-- Agent Audit Log -->
+      <div id="section-audit">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">🕐 Agent Identity Audit Log</div>
+            <span class="data-source source-live">● auditLogs/directoryAudits · category: AgentIdentity</span>
+          </div>
+          <div id="audit-log-body" class="card-body">
+            <div class="empty-state text-muted">Loading audit events…</div>
+          </div>
+        </div>
+      </div>
     `;
     renderAllAgentTables();
     showAgentSection(STATE.agentSection || 'blueprints');
-    // Owners/sponsors load in background — re-render all tables when done
+    // Owners/sponsors load in background — re-render tables when done
     fetchAgentOwnersSponsors(agentSps).then(() => renderAllAgentTables());
+    // Audit log loads in background — populate section when done
+    fetchAgentAuditLog().then(events => {
+      const auditEl = document.getElementById('audit-log-body');
+      const kpiAuditVal = document.getElementById('kpi-audit-val');
+      if (kpiAuditVal) kpiAuditVal.textContent = events.length;
+      if (!auditEl) return;
+      if (STATE.data.agentAuditLogError && !events.length) {
+        auditEl.innerHTML = permWarn('AuditLog.Read.All', STATE.data.agentAuditLogError);
+        return;
+      }
+      if (!events.length) {
+        auditEl.innerHTML = '<div class="empty-state text-muted">No AgentIdentity audit events found. Requires AuditLog.Read.All and recent agent activity.</div>';
+        return;
+      }
+      const actIcon = op => {
+        if (/create/i.test(op)) return '✨';
+        if (/delete/i.test(op)) return '🗑️';
+        if (/update|patch/i.test(op)) return '✏️';
+        if (/assign|add.*owner|add.*sponsor/i.test(op)) return '👤';
+        if (/remove.*owner|remove.*sponsor/i.test(op)) return '➖';
+        if (/consent/i.test(op)) return '🔑';
+        return '📝';
+      };
+      const resultBadge = r => r === 'success'
+        ? '<span class="badge badge-low" style="font-size:10px">✅ Success</span>'
+        : r === 'failure'
+        ? '<span class="badge badge-critical" style="font-size:10px">❌ Failure</span>'
+        : `<span class="badge badge-medium" style="font-size:10px">${esc(r||'—')}</span>`;
+      auditEl.innerHTML = `
+        <div class="table-wrap" style="padding:0">
+          <table>
+            <thead><tr>
+              <th style="width:36px"></th>
+              <th>Activity</th>
+              <th>Target Agent</th>
+              <th>Initiated By</th>
+              <th>Result</th>
+              <th>Time</th>
+            </tr></thead>
+            <tbody>${events.map(ev => {
+              const target = (ev.targetResources||[])[0];
+              const targetName = target?.displayName || target?.id?.slice(0,18) || '—';
+              const actor = ev.initiatedBy?.user?.displayName || ev.initiatedBy?.user?.userPrincipalName
+                || ev.initiatedBy?.app?.displayName || '—';
+              const ts = ev.activityDateTime ? new Date(ev.activityDateTime) : null;
+              const rowBg = ev.result === 'failure' ? 'background:rgba(248,81,73,.04)' : '';
+              return `<tr style="${rowBg}">
+                <td style="text-align:center;font-size:16px">${actIcon(ev.activityDisplayName||'')}</td>
+                <td>
+                  <strong style="font-size:13px">${esc(ev.activityDisplayName||'—')}</strong>
+                  ${ev.resultReason ? `<br><span class="text-muted" style="font-size:10px">${esc(ev.resultReason)}</span>` : ''}
+                </td>
+                <td>
+                  <span style="font-size:12px">${esc(targetName)}</span>
+                  ${target?.id ? `<br><span class="mono text-muted" style="font-size:10px">${esc(target.id.slice(0,24))}…</span>` : ''}
+                </td>
+                <td class="text-muted" style="font-size:12px">${esc(actor)}</td>
+                <td>${resultBadge(ev.result)}</td>
+                <td class="mono text-muted" style="font-size:11px;white-space:nowrap">
+                  ${ts ? ts.toLocaleDateString() + '<br>' + ts.toLocaleTimeString() : '—'}
+                </td>
+              </tr>`;
+            }).join('')}
+            </tbody>
+          </table>
+        </div>
+        <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
+          ℹ️ Showing ${events.length} most recent AgentIdentity events · Source: <code>auditLogs/directoryAudits</code>
+        </div>`;
+    });
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
   }
@@ -2812,6 +2983,24 @@ async function loadDataRisk() {
 
     // Fetch application-level permissions (appRoleAssignments) for each agent
     const agentAppPerms = await fetchAgentAppPerms(agentSps, sps);
+
+    // Compute blocked permission violations for agent SPs
+    const blockedViolations = []; // { sp, role, resource, kind }
+    for (const sp of agentSps) {
+      // Application permissions
+      for (const p of (agentAppPerms[sp.id] || [])) {
+        if (BLOCKED_AGENT_PERMS.has(p.role)) {
+          blockedViolations.push({ sp, role: p.role, resource: p.resource || 'Microsoft Graph', kind: 'App' });
+        }
+      }
+      // Delegated OAuth2 scopes
+      for (const scope of getScopesForSp(sp.id, grants)) {
+        if (BLOCKED_AGENT_PERMS.has(scope)) {
+          blockedViolations.push({ sp, role: scope, resource: 'Microsoft Graph (delegated)', kind: 'Delegated' });
+        }
+      }
+    }
+    const violatingAgentIds = new Set(blockedViolations.map(v => v.sp.id));
 
     // Build per-agent rows
     const TYPE_CFG = {
@@ -2913,6 +3102,12 @@ async function loadDataRisk() {
           <div class="kpi-delta">Mail.Read / Mail.ReadWrite granted</div>
           <div class="kpi-icon">📧</div>
         </div>
+        <div class="kpi-card critical" style="cursor:pointer;border:2px solid transparent;transition:border-color .15s" onclick="document.getElementById('blocked-violations').scrollIntoView({behavior:'smooth',block:'start'});document.getElementById('blocked-violations').style.outline='2px solid var(--risk-critical)';setTimeout(()=>{document.getElementById('blocked-violations').style.outline='none'},2500)">
+          <div class="kpi-label">Blocked Perm Violations</div>
+          <div class="kpi-value text-critical">${blockedViolations.length}</div>
+          <div class="kpi-delta">${violatingAgentIds.size} agent${violatingAgentIds.size!==1?'s':''} · Click to view</div>
+          <div class="kpi-icon">🚫</div>
+        </div>
       </div>
 
       <div class="grid-2">
@@ -2965,6 +3160,33 @@ async function loadDataRisk() {
             </tbody>
           </table>
         </div>
+      </div>
+
+      <div id="blocked-violations" class="card" style="scroll-margin-top:12px;transition:outline .3s;border-color:${blockedViolations.length?'rgba(248,81,73,.35)':'var(--border)'}">
+        <div class="card-header">
+          <div class="card-title" style="color:${blockedViolations.length?'var(--risk-critical)':'var(--text-primary)'}">🚫 Blocked Permission Violations (${blockedViolations.length})</div>
+          <span class="data-source source-live">● Microsoft Agent ID platform — restricted permissions</span>
+        </div>
+        ${blockedViolations.length ? `
+        <div style="font-size:11px;color:var(--text-dim);padding:6px 16px 0">
+          These permissions are explicitly blocked for agent identities by the Microsoft Agent ID platform. Agents holding them may be unable to use them, or the grants may indicate misconfiguration.
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Agent</th><th>Type</th><th>Blocked Permission</th><th>Resource</th><th>Kind</th></tr></thead>
+            <tbody>${blockedViolations.map(v => `<tr style="background:rgba(248,81,73,.04)">
+              <td style="min-width:160px">
+                <strong style="font-size:13px">${esc(v.sp.displayName||'—')}</strong>
+                <br><span class="mono text-muted" style="font-size:10px">${esc((v.sp.appId||v.sp.id||'').slice(0,28))}…</span>
+              </td>
+              <td>${(()=>{const t=getAgentType(v.sp);return`<span style="font-size:11px;padding:2px 7px;border-radius:3px;background:rgba(248,81,73,.1);color:var(--risk-critical)">${esc(t.label||t.type)}</span>`})()}</td>
+              <td><code style="font-size:12px;color:var(--risk-high);font-weight:600">${esc(v.role)}</code></td>
+              <td class="text-muted" style="font-size:12px">${esc(v.resource)}</td>
+              <td><span class="badge ${v.kind==='App'?'badge-critical':'badge-medium'}" style="font-size:10px">${v.kind==='App'?'App Permission':'Delegated Scope'}</span></td>
+            </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>` : `<div class="card-body"><div class="empty-state" style="color:var(--risk-low)">✅ No blocked permission violations detected across ${agentSps.length} agent service principals.</div></div>`}
       </div>
 
       <div class="kpi-row" style="margin-top:8px">
