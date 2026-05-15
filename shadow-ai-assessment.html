@@ -3930,18 +3930,44 @@ async function loadProtection() {
     return '⚙️';
   };
 
+  // Step 1: verify we can get a Defender token before running any queries
+  try { await getDefenderToken(); } catch (e) {
+    el.innerHTML = `
+      <div class="card"><div class="card-body">
+        <div style="text-align:center;padding:32px">
+          <div style="font-size:32px;margin-bottom:12px">🛡️</div>
+          <div style="font-size:15px;font-weight:600;margin-bottom:8px">Defender XDR consent required</div>
+          <div class="text-muted" style="margin-bottom:16px">
+            Grant <code>AdvancedQuery.Read</code> on the <code>WindowsDefenderATP</code> API to read AI agent inventory, alerts, and observability data from Microsoft Defender.
+          </div>
+          <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+            <button class="btn btn-primary" onclick="defenderConsent()">🔐 Grant Defender Consent</button>
+            <button class="btn btn-ghost" onclick="retryProtection()">↻ Retry</button>
+          </div>
+          <div class="text-muted" style="font-size:11px;margin-top:12px">
+            In Azure Portal → App Registrations → API Permissions → Add permission →<br>
+            APIs my org uses → <strong>WindowsDefenderATP</strong> → Delegated → <strong>AdvancedQuery.Read</strong> → Grant admin consent<br>
+            Then click <strong>Retry</strong> to reload without losing your session.
+          </div>
+        </div>
+      </div></div>`;
+    return;
+  }
+
   try {
+    // Step 2: run all three queries — catch per-query so one failure doesn't block the rest
+    const safeQuery = async (kql) => { try { return await defenderQuery(kql); } catch(e) { return { _error: e.message }; } };
+
     const [agentRows, alertRows, eventRows] = await Promise.all([
-      defenderQuery(`
+      safeQuery(`
         AIAgentsInfo
         | summarize arg_max(Timestamp, *) by AIAgentId
         | where AgentStatus != "Deleted"
         | project AIAgentId, AgentDisplayName, AgentStatus, AgentPlatform, RegistrySource,
                   AgentOwnerUpn, AuthenticationType, HasExternalAccess, Timestamp
         | top 200 by Timestamp desc
-      `).catch(() => null),
-
-      defenderQuery(`
+      `),
+      safeQuery(`
         AlertInfo
         | where Timestamp > ago(30d)
         | where Category has_any ("AI","Agent","MachineLearning")
@@ -3949,147 +3975,132 @@ async function loadProtection() {
             or Title has_any ("agent","AI","jailbreak","prompt injection","exfiltration","copilot")
         | top 50 by Timestamp desc
         | project AlertId, Timestamp, Title, Category, Severity, ServiceSource, DetectionSource, Status
-      `).catch(() => null),
-
-      defenderQuery(`
+      `),
+      safeQuery(`
         CloudAppEvents
         | where Timestamp > ago(7d)
         | where AppName has_any ("Agent 365","Copilot Studio","Azure AI Foundry","Microsoft Copilot")
             or Application has_any ("Agent","Copilot","Foundry")
         | summarize Events=count(), LastSeen=max(Timestamp) by AppName, ActionType
         | top 50 by Events desc
-      `).catch(() => null),
+      `),
     ]);
 
-    const agentCount  = agentRows?.length ?? 0;
-    const alertCount  = alertRows?.length ?? 0;
-    const highAlerts  = alertRows?.filter(a => a.Severity === 'High').length ?? 0;
-    const platforms   = [...new Set((agentRows||[]).map(r => r.AgentPlatform).filter(Boolean))];
+    // Unwrap: error objects become empty arrays with a warning rendered inline
+    const agentData  = Array.isArray(agentRows)  ? agentRows  : [];
+    const alertData  = Array.isArray(alertRows)  ? alertRows  : [];
+    const eventData  = Array.isArray(eventRows)  ? eventRows  : [];
+    const agentErr   = agentRows?._error;
+    const alertErr   = alertRows?._error;
+    const eventErr   = eventRows?._error;
+    // reassign for the rest of the template
+    const [agentRowsFinal, alertRowsFinal, eventRowsFinal] = [agentData, alertData, eventData];
+
+    const agentCount = agentRowsFinal.length;
+    const alertCount = alertRowsFinal.length;
+    const highAlerts = alertRowsFinal.filter(a => a.Severity === 'High').length;
+    const platforms  = [...new Set(agentRowsFinal.map(r => r.AgentPlatform).filter(Boolean))];
+    const tableErr   = s => s ? `<tr><td colspan="7" class="empty-state" style="color:var(--risk-medium)">⚠️ Query error: ${esc(s.slice(0,200))}</td></tr>` : '';
 
     el.innerHTML = `
       <div class="section-header">
         <div class="section-title">Defender for AI — Security for AI Agents</div>
-        <span class="data-source" style="color:var(--risk-medium)">● Microsoft Defender XDR · Advanced Hunting</span>
+        <span style="display:flex;gap:8px;align-items:center">
+          <span class="data-source" style="color:var(--risk-medium)">● Microsoft Defender XDR · Advanced Hunting</span>
+          <button class="btn btn-ghost" style="font-size:11px;padding:2px 8px" onclick="retryProtection()">↻ Refresh</button>
+        </span>
       </div>
 
       <div class="kpi-row">
         <div class="kpi-card ${agentCount > 0 ? 'info' : 'low'}">
           <div class="kpi-label">AI Agents Discovered</div>
-          <div class="kpi-value text-blue">${agentRows === null ? '—' : agentCount}</div>
-          <div class="kpi-delta">${platforms.length ? platforms.slice(0,3).join(' · ') : 'via AIAgentsInfo table'}</div>
+          <div class="kpi-value text-blue">${agentErr ? '⚠️' : agentCount}</div>
+          <div class="kpi-delta">${agentErr ? 'Query error — see table' : platforms.length ? platforms.slice(0,3).join(' · ') : 'via AIAgentsInfo table'}</div>
           <div class="kpi-icon">🤖</div>
         </div>
         <div class="kpi-card ${highAlerts > 0 ? 'critical' : alertCount > 0 ? 'high' : 'low'}">
           <div class="kpi-label">AI Agent Alerts (30d)</div>
-          <div class="kpi-value ${highAlerts > 0 ? 'text-critical' : alertCount > 0 ? 'text-high' : 'text-low'}">${alertRows === null ? '—' : alertCount}</div>
-          <div class="kpi-delta">${highAlerts} high severity</div>
+          <div class="kpi-value ${highAlerts > 0 ? 'text-critical' : alertCount > 0 ? 'text-high' : 'text-low'}">${alertErr ? '⚠️' : alertCount}</div>
+          <div class="kpi-delta">${alertErr ? 'Query error — see table' : highAlerts + ' high severity'}</div>
           <div class="kpi-icon">🚨</div>
         </div>
-        <div class="kpi-card ${(eventRows?.length ?? 0) > 0 ? 'medium' : 'low'}">
+        <div class="kpi-card ${eventData.length > 0 ? 'medium' : 'low'}">
           <div class="kpi-label">Activity Event Types (7d)</div>
-          <div class="kpi-value text-medium">${eventRows === null ? '—' : (eventRows?.length ?? 0)}</div>
-          <div class="kpi-delta">Cloud app observability</div>
+          <div class="kpi-value text-medium">${eventErr ? '⚠️' : eventData.length}</div>
+          <div class="kpi-delta">${eventErr ? 'Query error — see table' : 'Cloud app observability'}</div>
           <div class="kpi-icon">📡</div>
         </div>
-        <div class="kpi-card info" style="cursor:pointer" onclick="defenderConsent()">
-          <div class="kpi-label">Defender Consent</div>
-          <div class="kpi-value text-blue">🔐</div>
-          <div class="kpi-delta">Click to grant AdvancedQuery.Read</div>
-          <div class="kpi-icon">⚡</div>
+        <div class="kpi-card low">
+          <div class="kpi-label">Token Status</div>
+          <div class="kpi-value text-low">✅</div>
+          <div class="kpi-delta">Defender connected</div>
+          <div class="kpi-icon">🔐</div>
         </div>
       </div>
-
-      ${agentRows === null ? `
-        <div class="card">
-          <div class="card-body">
-            <div style="text-align:center;padding:32px">
-              <div style="font-size:32px;margin-bottom:12px">🛡️</div>
-              <div style="font-size:15px;font-weight:600;margin-bottom:8px">Defender XDR consent required</div>
-              <div class="text-muted" style="margin-bottom:16px">
-                Grant <code>AdvancedHunting.Read.All</code> on the <code>WindowsDefenderATP</code> API to read AI agent inventory, alerts, and observability data from Microsoft Defender.
-              </div>
-              <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
-                <button class="btn btn-primary" onclick="defenderConsent()">🔐 Grant Defender Consent</button>
-                <button class="btn btn-ghost" onclick="retryProtection()">↻ Retry</button>
-              </div>
-              <div class="text-muted" style="font-size:11px;margin-top:12px">
-                In Azure Portal → App Registrations → API Permissions → Add permission →<br>
-                APIs my org uses → <strong>WindowsDefenderATP</strong> → Delegated → <strong>AdvancedQuery.Read</strong> → Grant admin consent<br>
-                Then click <strong>Retry</strong> to reload without losing your session.
-              </div>
-            </div>
-          </div>
-        </div>` : `
 
       <div class="card">
         <div class="card-header">
           <div class="card-title">🤖 AI Agent Inventory — Defender (${agentCount})</div>
-          <span class="text-muted" style="font-size:11px">Source: <code>AIAgentsInfo</code> table · Agent 365 managed agents</span>
+          <span class="text-muted" style="font-size:11px">Source: <code>AIAgentsInfo</code> · Agent 365 managed agents</span>
         </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Agent</th><th>Platform</th><th>Status</th><th>Auth Type</th><th>External Access</th><th>Owner</th><th>Last Seen</th></tr></thead>
-            <tbody>${agentCount ? agentRows.map(a => `<tr>
-              <td>
-                <strong>${esc(a.AgentDisplayName||'—')}</strong>
-                <br><span class="mono text-muted" style="font-size:10px">${esc((a.AIAgentId||'').slice(0,36))}</span>
-              </td>
-              <td>${platformIcon(a.AgentPlatform)} <span style="font-size:12px">${esc(a.AgentPlatform||a.RegistrySource||'—')}</span></td>
-              <td><span class="badge badge-${a.AgentStatus==='Active'?'low':'medium'}">${esc(a.AgentStatus||'—')}</span></td>
-              <td class="text-muted" style="font-size:12px">${esc(a.AuthenticationType||'—')}</td>
-              <td>${a.HasExternalAccess ? '<span class="badge badge-high">Yes</span>' : '<span class="badge badge-low">No</span>'}</td>
-              <td class="text-muted" style="font-size:11px">${esc(a.AgentOwnerUpn||'—')}</td>
-              <td class="mono text-muted" style="font-size:11px">${a.Timestamp ? new Date(a.Timestamp).toLocaleDateString() : '—'}</td>
-            </tr>`).join('') : '<tr><td colspan="7" class="empty-state text-muted">No agents found in AIAgentsInfo table — requires Agent 365 subscription</td></tr>'}
-            </tbody>
-          </table>
-        </div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Agent</th><th>Platform</th><th>Status</th><th>Auth Type</th><th>External Access</th><th>Owner</th><th>Last Seen</th></tr></thead>
+          <tbody>${agentErr ? tableErr(agentErr) : agentCount ? agentRowsFinal.map(a => `<tr>
+            <td>
+              <strong>${esc(a.AgentDisplayName||'—')}</strong>
+              <br><span class="mono text-muted" style="font-size:10px">${esc((a.AIAgentId||'').slice(0,36))}</span>
+            </td>
+            <td>${platformIcon(a.AgentPlatform)} <span style="font-size:12px">${esc(a.AgentPlatform||a.RegistrySource||'—')}</span></td>
+            <td><span class="badge badge-${a.AgentStatus==='Active'?'low':'medium'}">${esc(a.AgentStatus||'—')}</span></td>
+            <td class="text-muted" style="font-size:12px">${esc(a.AuthenticationType||'—')}</td>
+            <td>${a.HasExternalAccess ? '<span class="badge badge-high">Yes</span>' : '<span class="badge badge-low">No</span>'}</td>
+            <td class="text-muted" style="font-size:11px">${esc(a.AgentOwnerUpn||'—')}</td>
+            <td class="mono text-muted" style="font-size:11px">${a.Timestamp ? new Date(a.Timestamp).toLocaleDateString() : '—'}</td>
+          </tr>`).join('') : '<tr><td colspan="7" class="empty-state text-muted">No agents found — requires Agent 365 subscription and AIAgentsInfo data</td></tr>'}
+          </tbody>
+        </table></div>
       </div>
 
       <div class="card">
         <div class="card-header">
           <div class="card-title">🚨 AI Agent Alerts — Last 30 Days (${alertCount})</div>
-          <span class="text-muted" style="font-size:11px">Source: <code>AlertInfo</code> table · Jailbreaks, prompt injection, suspicious execution</span>
+          <span class="text-muted" style="font-size:11px">Source: <code>AlertInfo</code> · Jailbreaks, prompt injection, suspicious execution</span>
         </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Alert</th><th>Severity</th><th>Category</th><th>Source</th><th>Detection</th><th>Status</th><th>Time</th></tr></thead>
-            <tbody>${alertCount ? alertRows.map(a => `<tr>
-              <td><strong style="font-size:12px">${esc(a.Title||'—')}</strong></td>
-              <td>${severityBadge(a.Severity)}</td>
-              <td class="text-muted" style="font-size:11px">${esc(a.Category||'—')}</td>
-              <td class="text-muted" style="font-size:11px">${esc(a.ServiceSource||'—')}</td>
-              <td class="text-muted" style="font-size:11px">${esc(a.DetectionSource||'—')}</td>
-              <td><span class="badge badge-${a.Status==='Resolved'?'low':a.Status==='Active'?'critical':'medium'}">${esc(a.Status||'—')}</span></td>
-              <td class="mono text-muted" style="font-size:11px">${a.Timestamp ? new Date(a.Timestamp).toLocaleString() : '—'}</td>
-            </tr>`).join('') : '<tr><td colspan="7" class="empty-state text-muted">No AI-related alerts in the last 30 days</td></tr>'}
-            </tbody>
-          </table>
-        </div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Alert</th><th>Severity</th><th>Category</th><th>Source</th><th>Detection</th><th>Status</th><th>Time</th></tr></thead>
+          <tbody>${alertErr ? tableErr(alertErr) : alertCount ? alertRowsFinal.map(a => `<tr>
+            <td><strong style="font-size:12px">${esc(a.Title||'—')}</strong></td>
+            <td>${severityBadge(a.Severity)}</td>
+            <td class="text-muted" style="font-size:11px">${esc(a.Category||'—')}</td>
+            <td class="text-muted" style="font-size:11px">${esc(a.ServiceSource||'—')}</td>
+            <td class="text-muted" style="font-size:11px">${esc(a.DetectionSource||'—')}</td>
+            <td><span class="badge badge-${a.Status==='Resolved'?'low':a.Status==='Active'?'critical':'medium'}">${esc(a.Status||'—')}</span></td>
+            <td class="mono text-muted" style="font-size:11px">${a.Timestamp ? new Date(a.Timestamp).toLocaleString() : '—'}</td>
+          </tr>`).join('') : '<tr><td colspan="7" class="empty-state text-muted">No AI-related alerts in the last 30 days</td></tr>'}
+          </tbody>
+        </table></div>
       </div>
 
       <div class="card">
         <div class="card-header">
           <div class="card-title">📡 Agent Observability — Activity (7d)</div>
-          <span class="text-muted" style="font-size:11px">Source: <code>CloudAppEvents</code> table · Tool invocations &amp; agent actions</span>
+          <span class="text-muted" style="font-size:11px">Source: <code>CloudAppEvents</code> · Tool invocations &amp; agent actions</span>
         </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>App / Agent</th><th>Action Type</th><th>Events</th><th>Last Seen</th></tr></thead>
-            <tbody>${(eventRows||[]).length ? eventRows.map(e => `<tr>
-              <td><strong style="font-size:12px">${esc(e.AppName||'—')}</strong></td>
-              <td class="mono" style="font-size:11px">${esc(e.ActionType||'—')}</td>
-              <td style="font-weight:600">${e.Events||0}</td>
-              <td class="mono text-muted" style="font-size:11px">${e.LastSeen ? new Date(e.LastSeen).toLocaleString() : '—'}</td>
-            </tr>`).join('') : '<tr><td colspan="4" class="empty-state text-muted">No agent observability events — ensure Agent 365 SDK is emitting telemetry</td></tr>'}
-            </tbody>
-          </table>
-        </div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>App / Agent</th><th>Action Type</th><th>Events</th><th>Last Seen</th></tr></thead>
+          <tbody>${eventErr ? tableErr(eventErr) : eventData.length ? eventData.map(e => `<tr>
+            <td><strong style="font-size:12px">${esc(e.AppName||'—')}</strong></td>
+            <td class="mono" style="font-size:11px">${esc(e.ActionType||'—')}</td>
+            <td style="font-weight:600">${e.Events||0}</td>
+            <td class="mono text-muted" style="font-size:11px">${e.LastSeen ? new Date(e.LastSeen).toLocaleString() : '—'}</td>
+          </tr>`).join('') : '<tr><td colspan="4" class="empty-state text-muted">No agent observability events — ensure Agent 365 SDK is emitting telemetry</td></tr>'}
+          </tbody>
+        </table></div>
         <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
-          ℹ️ Requires <strong>Microsoft 365 app connector</strong> enabled in Defender for Cloud Apps and agents emitting observability data via the Agent 365 SDK.
+          ℹ️ Requires <strong>Microsoft 365 app connector</strong> in Defender for Cloud Apps and agents emitting observability via the Agent 365 SDK.
           From July 1, 2026 an <strong>Agent 365 subscription</strong> is required for full access.
         </div>
-      </div>`}
+      </div>
     `;
   } catch (e) {
     el.innerHTML = `
