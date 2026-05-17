@@ -2331,37 +2331,45 @@ const RISK_ORDER = { critical:3, high:2, medium:1, low:0 };
 
 async function fetchAgentAuditLog() {
   if (STATE.data.agentAuditLog) return STATE.data.agentAuditLog;
-  // Agent-related audit events appear under Application / ServicePrincipal / User categories.
-  // The agentType property (on initiatedBy, performedBy, targetResources) identifies agent involvement;
-  // any value other than 'notAgentic' means the event involves an agent identity.
-  const sel = 'id,activityDateTime,activityDisplayName,category,result,resultReason,initiatedBy,targetResources';
-  const isAgentEvent = e => {
-    const check = o => o?.agentType && o.agentType !== 'notAgentic';
-    return (e.targetResources||[]).some(check) || check(e.initiatedBy?.user) || check(e.initiatedBy?.app);
-  };
+  // Normalize events from either signIns or directoryAudits into a common shape
+  const normalizeSignIn = e => ({
+    id: e.id,
+    activityDateTime: e.createdDateTime,
+    activityDisplayName: 'Sign-in',
+    category: 'SignIn',
+    result: e.status?.errorCode === 0 ? 'success' : 'failure',
+    resultReason: e.status?.failureReason || null,
+    risk: e.riskLevelDuringSignIn || e.riskState || null,
+    initiatedBy: { app: { displayName: e.appDisplayName || null } },
+    targetResources: [{ displayName: e.resourceDisplayName || e.appDisplayName || null, id: e.appId || null }],
+    _source: 'signIn', _raw: e,
+  });
+  const normalizeAudit = e => ({ ...e, _source: 'audit', _raw: e });
+
   try {
-    // Primary: filter server-side by agentType (requires ConsistencyLevel: eventual)
-    let items = [];
-    try {
-      const r = await gget(
-        `${GRAPH}/auditLogs/directoryAudits` +
-        `?$filter=targetResources/any(t: t/agentType ne 'notAgentic')` +
-        `&$orderby=activityDateTime desc&$top=200&$count=true&$select=${sel}`,
-        true
-      );
-      items = (r.value || []).filter(isAgentEvent);
-    } catch {
-      // Fallback: fetch last 30 days across relevant categories, filter client-side
-      const since = new Date(Date.now() - 30 * 86400000).toISOString().slice(0,10);
-      const r = await gget(
-        `${GRAPH}/auditLogs/directoryAudits` +
-        `?$filter=activityDateTime ge ${since}T00:00:00Z` +
-        ` and (category eq 'ApplicationManagement' or category eq 'UserManagement')` +
-        `&$orderby=activityDateTime desc&$top=500&$select=${sel}`
-      );
-      items = (r.value || []).filter(isAgentEvent);
+    // Primary: beta signIns endpoint — service principal sign-ins where agentType = AgentIdentity
+    const siSel = 'id,createdDateTime,appDisplayName,appId,resourceDisplayName,status,riskLevelDuringSignIn,riskState,agent,signInEventTypes';
+    const siResp = await gget(
+      `${GRAPH_BETA}/auditLogs/signIns` +
+      `?$filter=signInEventTypes/any(t: t eq 'servicePrincipal') and agent/agentType eq 'AgentIdentity'` +
+      `&$top=200&$select=${siSel}`,
+      true
+    ).catch(() => null);
+
+    if (siResp?.value?.length) {
+      STATE.data.agentAuditLog = siResp.value.map(normalizeSignIn);
+      return STATE.data.agentAuditLog;
     }
-    STATE.data.agentAuditLog = items;
+
+    // Fallback: directoryAudits filtered by agentType on targetResources
+    const auSel = 'id,activityDateTime,activityDisplayName,category,result,resultReason,initiatedBy,targetResources';
+    const auResp = await gget(
+      `${GRAPH}/auditLogs/directoryAudits` +
+      `?$filter=targetResources/any(t: t/agentType ne 'notAgentic')` +
+      `&$orderby=activityDateTime desc&$top=200&$count=true&$select=${auSel}`,
+      true
+    ).catch(() => null);
+    STATE.data.agentAuditLog = (auResp?.value || []).map(normalizeAudit);
   } catch (e) {
     STATE.data.agentAuditLog = [];
     STATE.data.agentAuditLogError = e.message;
