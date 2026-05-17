@@ -2331,13 +2331,37 @@ const RISK_ORDER = { critical:3, high:2, medium:1, low:0 };
 
 async function fetchAgentAuditLog() {
   if (STATE.data.agentAuditLog) return STATE.data.agentAuditLog;
+  // Agent-related audit events appear under Application / ServicePrincipal / User categories.
+  // The agentType property (on initiatedBy, performedBy, targetResources) identifies agent involvement;
+  // any value other than 'notAgentic' means the event involves an agent identity.
+  const sel = 'id,activityDateTime,activityDisplayName,category,result,resultReason,initiatedBy,targetResources';
+  const isAgentEvent = e => {
+    const check = o => o?.agentType && o.agentType !== 'notAgentic';
+    return (e.targetResources||[]).some(check) || check(e.initiatedBy?.user) || check(e.initiatedBy?.app);
+  };
   try {
-    const d = await gget(
-      `${GRAPH}/auditLogs/directoryAudits?$filter=category eq 'AgentIdentity'` +
-      `&$orderby=activityDateTime desc&$top=100` +
-      `&$select=id,activityDateTime,activityDisplayName,category,result,resultReason,initiatedBy,targetResources`
-    );
-    STATE.data.agentAuditLog = d.value || [];
+    // Primary: filter server-side by agentType (requires ConsistencyLevel: eventual)
+    let items = [];
+    try {
+      const r = await gget(
+        `${GRAPH}/auditLogs/directoryAudits` +
+        `?$filter=targetResources/any(t: t/agentType ne 'notAgentic')` +
+        `&$orderby=activityDateTime desc&$top=200&$count=true&$select=${sel}`,
+        true
+      );
+      items = (r.value || []).filter(isAgentEvent);
+    } catch {
+      // Fallback: fetch last 30 days across relevant categories, filter client-side
+      const since = new Date(Date.now() - 30 * 86400000).toISOString().slice(0,10);
+      const r = await gget(
+        `${GRAPH}/auditLogs/directoryAudits` +
+        `?$filter=activityDateTime ge ${since}T00:00:00Z` +
+        ` and (category eq 'ApplicationManagement' or category eq 'UserManagement')` +
+        `&$orderby=activityDateTime desc&$top=500&$select=${sel}`
+      );
+      items = (r.value || []).filter(isAgentEvent);
+    }
+    STATE.data.agentAuditLog = items;
   } catch (e) {
     STATE.data.agentAuditLog = [];
     STATE.data.agentAuditLogError = e.message;
