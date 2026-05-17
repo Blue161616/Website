@@ -790,6 +790,31 @@ async function fetchGrantPolicies() {
   return STATE.data.grantPolicies;
 }
 
+async function fetchTenantRegion() {
+  if (STATE.data.tenantRegion !== undefined) return STATE.data.tenantRegion;
+  try {
+    const org = await fetchOrg();
+    const tenantId = org.id;
+    // OIDC discovery endpoint is public (no auth) and reliably returns tenant_region_scope
+    const [oidc, betaOrg] = await Promise.all([
+      fetch(`https://login.microsoftonline.com/${tenantId}/v2.0/.well-known/openid-configuration`).then(r => r.json()).catch(() => ({})),
+      gget(`https://graph.microsoft.com/beta/organization?$select=id,tenantRegionSubScope,preferredDataLocation`).then(r => r.value?.[0] || {}).catch(() => ({})),
+    ]);
+    const SCOPE_LABEL = { EU:'Europe', NA:'North America', AP:'Asia Pacific', OC:'Oceania',
+      AF:'Africa', ME:'Middle East', LA:'Latin America', IN:'India',
+      UK:'United Kingdom', CA:'Canada', JP:'Japan', KR:'South Korea' };
+    const scope = oidc.tenant_region_scope || null;
+    STATE.data.tenantRegion = {
+      regionScope:    scope,
+      regionLabel:    SCOPE_LABEL[scope] || scope || '—',
+      subScope:       betaOrg.tenantRegionSubScope || oidc.tenant_region_sub_scope || null,
+      preferredData:  betaOrg.preferredDataLocation || null,
+      cloud:          oidc.cloud_instance_name || 'microsoftonline.com',
+    };
+  } catch { STATE.data.tenantRegion = null; }
+  return STATE.data.tenantRegion;
+}
+
 // ── Shared render helpers ──────────────────────────────────────────────────
 
 function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
@@ -2474,7 +2499,8 @@ function renderIdentityTable() {
     return STATE.data.agentIdentityIds?.has(sp.id) ||
       sp.servicePrincipalType === 'ServiceIdentity' ||
       t === 'copilot-studio' || t === 'ai-foundry' ||
-      STATE.data.agentBuilderAppIds?.has(sp.appId);
+      STATE.data.agentBuilderAppIds?.has(sp.appId) ||
+      STATE.data.agentBuilderSpIds?.has(sp.id);
   };
 
   const idSps = agentSps.filter(sp => {
@@ -2549,7 +2575,8 @@ function renderClassicTable() {
     return STATE.data.agentIdentityIds?.has(sp.id) ||
       sp.servicePrincipalType === 'ServiceIdentity' ||
       t === 'copilot-studio' || t === 'ai-foundry' ||
-      STATE.data.agentBuilderAppIds?.has(sp.appId);
+      STATE.data.agentBuilderAppIds?.has(sp.appId) ||
+      STATE.data.agentBuilderSpIds?.has(sp.id);
   };
 
   const clSps = agentSps.filter(sp => isEntraAgent(sp));
@@ -2669,15 +2696,25 @@ async function fetchAgentIdentitySps() {
 async function fetchAgentBuilderApps() {
   if (STATE.data.agentBuilderAppIds) return STATE.data.agentBuilderAppIds;
   try {
-    // Fetch application registrations tagged AIAgentBuilder — used by Copilot Studio and AI Foundry
-    // agents that predate the typed agentIdentity endpoint or don't appear in it.
-    // We store appId so we can cross-reference against service principals by sp.appId.
-    const items = await ggetAll(
-      `${GRAPH}/applications?$filter=tags/any(t: t eq 'AIAgentBuilder')&$top=999&$count=true&$select=id,displayName,appId,tags`,
-      10, true
-    ).catch(() => []);
-    STATE.data.agentBuilderAppIds = new Set(items.map(a => a.appId).filter(Boolean));
+    // Query applications by each Copilot Studio tag separately (some agents may have only a subset).
+    // AIAgentBuilder, AgentCreatedBy:CopilotStudio, and AgenticApp are the three tags set by
+    // Copilot Studio on both the app registration and its service principal.
+    const fields = 'id,displayName,appId,tags,createdDateTime';
+    const [byBuilder, byCreatedBy, byAgenticApp] = await Promise.all([
+      ggetAll(`${GRAPH}/applications?$filter=tags/any(t: t eq 'AIAgentBuilder')&$top=999&$count=true&$select=${fields}`, 10, true).catch(() => []),
+      ggetAll(`${GRAPH}/applications?$filter=tags/any(t: t eq 'AgentCreatedBy:CopilotStudio')&$top=999&$count=true&$select=${fields}`, 10, true).catch(() => []),
+      ggetAll(`${GRAPH}/applications?$filter=tags/any(t: t eq 'AgenticApp')&$top=999&$count=true&$select=${fields}`, 10, true).catch(() => []),
+    ]);
+    // Dedup by id across all three result sets
+    const seen = new Set();
+    const merged = [];
+    [...byBuilder, ...byCreatedBy, ...byAgenticApp].forEach(app => {
+      if (app?.id && !seen.has(app.id)) { seen.add(app.id); merged.push(app); }
+    });
+    STATE.data.agentBuilderApps = merged;
+    STATE.data.agentBuilderAppIds = new Set(merged.map(a => a.appId).filter(Boolean));
   } catch {
+    STATE.data.agentBuilderApps = [];
     STATE.data.agentBuilderAppIds = new Set();
   }
   return STATE.data.agentBuilderAppIds;
@@ -2794,18 +2831,26 @@ async function loadAgents() {
     const spMap = new Map(sps.map(sp => [sp.id, sp]));
     explicitBlueprints.forEach(sp => { if (!spMap.has(sp.id)) spMap.set(sp.id, sp); });
     agentIdentities.forEach(sp => { if (!spMap.has(sp.id)) spMap.set(sp.id, sp); });
-    // Inject AIAgentBuilder application objects as pseudo-SPs for Classic Agents that have no
-    // matching service principal in the tenant SP list (or whose SP wasn't fetched due to pagination).
-    const existingByAppId = new Set([...spMap.values()].map(sp => sp.appId).filter(Boolean));
+    // For each AIAgentBuilder app: find its matching SP by appId and record the SP id.
+    // If no matching SP exists, inject the app object itself as a pseudo-SP so it appears in tables.
+    const spByAppId = new Map([...spMap.values()].filter(sp => sp.appId).map(sp => [sp.appId, sp]));
+    const agentBuilderSpIds = new Set();
     (STATE.data.agentBuilderApps || []).forEach(app => {
-      if (app.appId && !existingByAppId.has(app.appId)) {
-        spMap.set(app.id, {
+      if (!app.appId) return;
+      const matchedSp = spByAppId.get(app.appId);
+      if (matchedSp) {
+        agentBuilderSpIds.add(matchedSp.id);
+      } else {
+        const pseudo = {
           id: app.id, displayName: app.displayName, appId: app.appId,
           tags: app.tags || [], createdDateTime: app.createdDateTime,
           servicePrincipalType: 'Application', accountEnabled: null, publisherName: null,
-        });
+        };
+        spMap.set(app.id, pseudo);
+        agentBuilderSpIds.add(app.id);
       }
     });
+    STATE.data.agentBuilderSpIds = agentBuilderSpIds;
     const allSps = [...spMap.values()];
     const agentIdentityIds = new Set(agentIdentities.map(a => a.id));
 
@@ -2822,7 +2867,7 @@ async function loadAgents() {
       const isExplicitIdentity  = agentIdentityIds.has(sp.id);
       const isCopilotStudio     = sp.publisherName === 'Microsoft Copilot Studio' || /\(Microsoft Copilot Studio\)/i.test(sp.displayName||'');
       const isFoundryPath       = /\/projects\//i.test(sp.displayName||'');
-      const isAgentBuilderApp   = STATE.data.agentBuilderAppIds?.has(sp.appId);
+      const isAgentBuilderApp   = STATE.data.agentBuilderAppIds?.has(sp.appId) || STATE.data.agentBuilderSpIds?.has(sp.id);
       return (isAgent || (isAi && hasWriteScopes) || isAgentBlueprint || isServiceIdentity || isExplicitBlueprint || isExplicitIdentity || isCopilotStudio || isFoundryPath || isAgentBuilderApp);
     });
 
@@ -2914,7 +2959,8 @@ async function loadAgents() {
       return STATE.data.agentIdentityIds?.has(sp.id) ||
         sp.servicePrincipalType === 'ServiceIdentity' ||
         t === 'copilot-studio' || t === 'ai-foundry' ||
-        STATE.data.agentBuilderAppIds?.has(sp.appId);
+        STATE.data.agentBuilderAppIds?.has(sp.appId) ||
+        STATE.data.agentBuilderSpIds?.has(sp.id);
     };
     const idSps = agentSps.filter(sp => {
       if (isEntraClassicKpi(sp)) return false;
@@ -3596,9 +3642,9 @@ async function loadDataRisk() {
 async function loadCompliance() {
   const el = document.getElementById('compliance-content');
   try {
-    const [caP, org, grantPolicies, sps, signIns] = await Promise.all([
+    const [caP, org, grantPolicies, sps, signIns, tenantRegion] = await Promise.all([
       fetchCAPolicies(), fetchOrg(), fetchGrantPolicies(),
-      fetchServicePrincipals(), fetchSignIns(),
+      fetchServicePrincipals(), fetchSignIns(), fetchTenantRegion(),
     ]);
     const authPolicy = STATE.data.authPolicy || {};
     const secDefaults = STATE.data.secDefaults || {};
@@ -3708,26 +3754,22 @@ async function loadCompliance() {
 
       <div class="grid-2">
         <div class="card">
-          <div class="card-header"><div class="card-title">Conditional Access Policies</div></div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Policy</th><th>State</th><th>AI Relevant</th><th>Grant Controls</th></tr></thead>
-              <tbody>${caP.map(p => {
-                const stateMap = {enabled:'enabled',disabled:'disabled',enabledForReportingButNotEnforced:'reportOnly'};
-                const aiRel = isAiCaPolicy(p);
-                return `<tr style="${aiRel ? 'background:rgba(163,113,247,.06)' : ''}">
-                  <td>
-                    <strong>${esc(p.displayName)}</strong>
-                    ${aiRel ? `<span class="badge" style="margin-left:8px;background:rgba(163,113,247,.15);color:var(--accent-purple);border:1px solid rgba(163,113,247,.3);font-size:10px">🤖 AI Policy</span>` : ''}
-                    <br><span class="mono text-muted">${new Date(p.createdDateTime||Date.now()).toLocaleDateString()}</span>
-                  </td>
-                  <td>${statusBadge(stateMap[p.state]||'inactive')}</td>
-                  <td>${aiRel ? '<span style="color:var(--accent-purple);font-weight:600">🤖 Yes</span>' : '<span class="text-muted">—</span>'}</td>
-                  <td class="text-muted mono">${esc((p.grantControls?.builtInControls||[]).join(', ')||'—')}</td>
-                </tr>`;
-              }).join('') || '<tr><td colspan="4" class="empty-state text-muted">No CA policies found</td></tr>'}
-              </tbody>
-            </table>
+          <div class="card-header"><div class="card-title">🌍 Tenant Region &amp; Data Residency</div></div>
+          <div class="card-body">
+            ${tenantRegion ? [
+              { label: 'Azure AD Region', value: esc(tenantRegion.subScope || tenantRegion.regionLabel), risk: false },
+              { label: 'Geography', value: esc(tenantRegion.regionLabel), risk: false },
+              { label: 'Data Residency Scope', value: tenantRegion.regionScope
+                  ? `<span style="font-weight:600;color:${tenantRegion.regionScope==='EU'?'var(--risk-low)':'var(--risk-medium)'}">${esc(tenantRegion.regionScope)}</span>${tenantRegion.regionScope==='EU' ? ' — GDPR boundary' : ' — outside EU'}`
+                  : '—',
+                risk: tenantRegion.regionScope && tenantRegion.regionScope !== 'EU' },
+              { label: 'Preferred Data Location', value: esc(tenantRegion.preferredData || '—'), risk: false },
+              { label: 'Cloud', value: esc(tenantRegion.cloud || '—'), risk: false },
+            ].map(row => `
+              <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(48,54,61,.4)">
+                <span class="text-muted" style="font-size:12px">${esc(row.label)}</span>
+                <span style="font-size:12px;color:${row.risk?'var(--risk-high)':'var(--text-primary)'}">${row.value}</span>
+              </div>`).join('') : '<p class="text-muted" style="font-size:12px">Region data unavailable</p>'}
           </div>
         </div>
         <div class="card">
@@ -3735,18 +3777,18 @@ async function loadCompliance() {
           <div class="card-body">
             ${[
               { label: 'Security Defaults', value: secDefaults.isEnabled ? '✅ Enabled' : '❌ Disabled', risk: !secDefaults.isEnabled },
-              { label: 'Users can register apps', value: authPolicy.defaultUserRolePermissions?.allowedToCreateApps ? '⚠️ Yes (risk)' : '✅ No', risk: authPolicy.defaultUserRolePermissions?.allowedToCreateApps },
-              { label: 'Guest invite permission', value: esc(authPolicy.allowInvitesFrom||'—'), risk: authPolicy.allowInvitesFrom && authPolicy.allowInvitesFrom !== 'adminsAndGuestInviters' },
-              { label: 'Org name', value: esc(org.displayName||'—'), risk: false },
-              { label: 'Country', value: esc(org.countryLetterCode||'—'), risk: false },
-              { label: 'On-prem sync', value: org.onPremisesSyncEnabled ? '⚠️ Hybrid (AD sync)' : '✅ Cloud-only', risk: org.onPremisesSyncEnabled },
-              { label: 'Domains', value: esc((org.verifiedDomains||[]).map(d=>d.id).join(', ')||'—'), risk: false },
-              { label: 'Permission grant policies', value: grantPolicies.map(p=>esc(p.displayName||p.id)).join(', ')||'—', risk: grantPolicies.some(p=>(p.id||'').includes('user-default')) },
-            ].map(row => `
-              <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(48,54,61,.4)">
-                <span class="text-muted" style="font-size:12px">${esc(row.label)}</span>
-                <span style="font-size:12px;color:${row.risk?'var(--risk-high)':'var(--text-primary)'}">${row.value}</span>
-              </div>`).join('')}
+            { label: 'Users can register apps', value: authPolicy.defaultUserRolePermissions?.allowedToCreateApps ? '⚠️ Yes (risk)' : '✅ No', risk: authPolicy.defaultUserRolePermissions?.allowedToCreateApps },
+            { label: 'Guest invite permission', value: esc(authPolicy.allowInvitesFrom||'—'), risk: authPolicy.allowInvitesFrom && authPolicy.allowInvitesFrom !== 'adminsAndGuestInviters' },
+            { label: 'Org name', value: esc(org.displayName||'—'), risk: false },
+            { label: 'Country', value: esc(org.countryLetterCode||'—'), risk: false },
+            { label: 'On-prem sync', value: org.onPremisesSyncEnabled ? '⚠️ Hybrid (AD sync)' : '✅ Cloud-only', risk: org.onPremisesSyncEnabled },
+            { label: 'Domains', value: esc((org.verifiedDomains||[]).map(d=>d.id).join(', ')||'—'), risk: false },
+            { label: 'Permission grant policies', value: grantPolicies.map(p=>esc(p.displayName||p.id)).join(', ')||'—', risk: grantPolicies.some(p=>(p.id||'').includes('user-default')) },
+          ].map(row => `
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(48,54,61,.4)">
+              <span class="text-muted" style="font-size:12px">${esc(row.label)}</span>
+              <span style="font-size:12px;color:${row.risk?'var(--risk-high)':'var(--text-primary)'}">${row.value}</span>
+            </div>`).join('')}
           </div>
         </div>
       </div>
