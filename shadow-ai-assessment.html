@@ -582,6 +582,22 @@ async function ggetAll(url, maxPages = 5, consistency = false) {
   return items;
 }
 
+async function batchRequest(requests) {
+  const results = {};
+  for (let i = 0; i < requests.length; i += 20) {
+    const chunk = requests.slice(i, i + 20);
+    const token = await getToken();
+    const r = await fetch(`${GRAPH}/$batch`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requests: chunk }),
+    });
+    const data = await r.json();
+    (data.responses || []).forEach(resp => { results[resp.id] = resp; });
+  }
+  return results;
+}
+
 
 // ── AI app detection ───────────────────────────────────────────────────────
 
@@ -2329,6 +2345,96 @@ const BLOCKED_AGENT_PERMS = new Set([
 
 const RISK_ORDER = { critical:3, high:2, medium:1, low:0 };
 
+const CLASSIC_HIGH_PRIV_ROLES = new Set([
+  '62e90394-69f5-4237-9190-012177145e10', // Global Administrator
+  '9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3', // Application Administrator
+  '158c047a-c907-4556-b7ef-446551a6b5f7', // Cloud Application Administrator
+  '7698a772-787b-4ac8-901f-60d6b08affd2', // Conditional Access Administrator
+  'e8611ab8-c189-46e8-94e1-60213ab1f814', // Privileged Role Administrator
+  'fe930be7-5e62-47db-91af-98c3a49a38b1', // User Administrator
+  '29232cdf-9323-42fd-ade2-1d097af3e4de', // Exchange Administrator
+  'f28a1f50-f6e7-4571-818b-6a12f2af6b6c', // SharePoint Administrator
+]);
+const CLASSIC_HIGH_PRIV_NAMES = {
+  '62e90394-69f5-4237-9190-012177145e10': 'Global Administrator',
+  '9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3': 'Application Administrator',
+  '158c047a-c907-4556-b7ef-446551a6b5f7': 'Cloud Application Administrator',
+  '7698a772-787b-4ac8-901f-60d6b08affd2': 'Conditional Access Administrator',
+  'e8611ab8-c189-46e8-94e1-60213ab1f814': 'Privileged Role Administrator',
+  'fe930be7-5e62-47db-91af-98c3a49a38b1': 'User Administrator',
+  '29232cdf-9323-42fd-ade2-1d097af3e4de': 'Exchange Administrator',
+  'f28a1f50-f6e7-4571-818b-6a12f2af6b6c': 'SharePoint Administrator',
+};
+
+function classifyClassicAgent(enr) {
+  const now = Date.now();
+  const last = enr.lastActivity ? new Date(enr.lastActivity).getTime() : null;
+  const active30d = last && (now - last) < 30 * 86400e3;
+  const active90d = last && (now - last) < 90 * 86400e3;
+  const highPriv  = enr.highPrivRoles.length > 0;
+  const hasPerms  = enr.permCount > 0;
+  const hasOwners = enr.ownerCount > 0;
+  if (highPriv || (active30d && hasPerms)) return 'HIGH';
+  if (!active90d && !hasPerms && !hasOwners) return 'LOW';
+  return 'MEDIUM';
+}
+
+async function enrichClassicAgents(classicSps) {
+  if (STATE.data.classicEnrichment) return;
+  const enr = new Map(); // sp.id → enrichment object
+  classicSps.forEach(sp => enr.set(sp.id, { lastActivity: null, permCount: 0, ownerCount: 0, highPrivRoles: [], usage: 'MEDIUM' }));
+
+  // Phase A: bulk SP sign-in fetch (near real-time, ~15min lag)
+  try {
+    const siSel = 'id,createdDateTime,servicePrincipalId,status';
+    let siItems = [];
+    try {
+      siItems = await ggetAll(
+        `${GRAPH_BETA}/auditLogs/signIns?$filter=signInEventTypes/any(t: t eq 'servicePrincipal')&$orderby=createdDateTime desc&$top=500&$select=${siSel}`,
+        1, true
+      );
+    } catch { /* AuditLog.Read.All may not be consented */ }
+    siItems.forEach(si => {
+      const id = si.servicePrincipalId;
+      if (!id || !enr.has(id)) return;
+      const e = enr.get(id);
+      if (!e.lastActivity || si.createdDateTime > e.lastActivity) e.lastActivity = si.createdDateTime;
+    });
+  } catch { /* ignore */ }
+
+  // Phase B: batch dir roles + oauth2 grants + app role assignments
+  const batchReqs = [];
+  for (const sp of classicSps) {
+    const id = sp.id;
+    batchReqs.push({ id: `dirroles_${id}`, method: 'GET', url: `/roleManagement/directory/roleAssignments?$filter=principalId eq '${id}'&$select=id,roleDefinitionId` });
+    batchReqs.push({ id: `grants_${id}`,   method: 'GET', url: `/servicePrincipals/${id}/oauth2PermissionGrants?$top=100` });
+    batchReqs.push({ id: `approles_${id}`, method: 'GET', url: `/servicePrincipals/${id}/appRoleAssignments?$top=100` });
+  }
+  try {
+    const results = await batchRequest(batchReqs);
+    for (const sp of classicSps) {
+      const id = sp.id;
+      const e = enr.get(id);
+      const dirRoles  = results[`dirroles_${id}`]?.body?.value || [];
+      const grants    = results[`grants_${id}`]?.body?.value   || [];
+      const appRoles  = results[`approles_${id}`]?.body?.value || [];
+      e.highPrivRoles = dirRoles
+        .filter(r => CLASSIC_HIGH_PRIV_ROLES.has(r.roleDefinitionId))
+        .map(r => CLASSIC_HIGH_PRIV_NAMES[r.roleDefinitionId] || r.roleDefinitionId);
+      e.permCount  = grants.length + appRoles.length;
+      e.ownerCount = (STATE.data.agentOwnersSponsors?.[id]?.owners?.length || 0) + (STATE.data.agentOwnersSponsors?.[id]?.sponsors?.length || 0);
+      // Fallback last activity from signInActivity if beta log had no entry
+      if (!e.lastActivity && sp.signInActivity) {
+        e.lastActivity = sp.signInActivity.lastSignInDateTime || sp.signInActivity.lastSuccessfulSignInDateTime || null;
+      }
+      e.usage = classifyClassicAgent(e);
+    }
+  } catch { /* batch may fail — keep defaults */ }
+
+  STATE.data.classicEnrichment = enr;
+  renderClassicTable();
+}
+
 async function fetchAgentAuditLog() {
   if (STATE.data.agentAuditLog) return STATE.data.agentAuditLog;
   // Normalize events from either signIns or directoryAudits into a common shape
@@ -2593,7 +2699,7 @@ function renderClassicTable() {
   const { agentSps, agentGrants, agentParentBlueprint, agentOwnersSponsors } = STATE.data;
   if (!agentSps) return;
 
-  const key = STATE.clSortKey || 'risk';
+  const key = STATE.clSortKey || 'usage';
   const dir = STATE.clSortDir || 'desc';
   const parentMap = agentParentBlueprint || {};
   const loading = !agentOwnersSponsors;
@@ -2613,24 +2719,32 @@ function renderClassicTable() {
 
   const clSps = agentSps.filter(sp => isEntraAgent(sp));
 
+  const enrMap = STATE.data.classicEnrichment;
+  const enriching = !enrMap;
+
   const getVal = (sp, k) => {
-    if (k === 'name')    return (sp.displayName||'').toLowerCase();
-    if (k === 'type')    return isEntraAgent(sp) ? 0 : 1;
-    if (k === 'risk')    return RISK_ORDER[riskScore(sp, agentGrants||[])] ?? -1;
-    if (k === 'write')   return AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants||[]).includes(s)).length;
-    if (k === 'consent')    return agentGrants?.find(g=>g.clientId===sp.id)?.consentType || '';
-    if (k === 'assignReq') return sp.appRoleAssignmentRequired ? 1 : 0;
-    if (k === 'owners')    return (agentOwnersSponsors?.[sp.id]?.owners?.length||0) + (agentOwnersSponsors?.[sp.id]?.sponsors?.length||0);
-    if (k === 'status')    return sp.accountEnabled ? 1 : 0;
+    const e = enrMap?.get(sp.id);
+    if (k === 'name')     return (sp.displayName||'').toLowerCase();
+    if (k === 'type')     return isEntraAgent(sp) ? 0 : 1;
+    if (k === 'usage')    return e ? { HIGH:2, MEDIUM:1, LOW:0 }[e.usage] ?? 1 : -1;
+    if (k === 'activity') return e?.lastActivity || '';
+    if (k === 'perms')    return e?.permCount ?? -1;
+    if (k === 'highpriv') return e?.highPrivRoles?.length ?? 0;
+    if (k === 'owners')   return (agentOwnersSponsors?.[sp.id]?.owners?.length||0) + (agentOwnersSponsors?.[sp.id]?.sponsors?.length||0);
+    if (k === 'status')   return sp.accountEnabled ? 1 : 0;
     return 0;
   };
 
   const sorted = sortRows(clSps, key, dir, getVal);
 
+  const usageBadge = usage => {
+    if (usage === 'HIGH')   return `<span class="badge badge-critical" style="font-size:10px">● High</span>`;
+    if (usage === 'LOW')    return `<span class="badge badge-low"      style="font-size:10px">● Low</span>`;
+    return                         `<span class="badge badge-medium"   style="font-size:10px">● Medium</span>`;
+  };
+
   tbody.innerHTML = sorted.map(sp => {
-    const r  = riskScore(sp, agentGrants||[]);
-    const ws = AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants||[]).includes(s));
-    const ct = agentGrants?.find(g=>g.clientId===sp.id)?.consentType || '—';
+    const e = enrMap?.get(sp.id);
     const agType = getAgentType(sp);
     const typeCell = (() => {
       if (agType.type === 'copilot-studio' || STATE.data.agentBuilderAppIds?.has(sp.appId) || STATE.data.agentBuilderSpIds?.has(sp.id)) {
@@ -2650,15 +2764,25 @@ function renderClassicTable() {
     })();
     const riskyInfo = STATE.data.riskyAgentMap?.get(sp.id);
     const riskyBadge = riskyInfo ? `<span class="badge badge-critical" style="font-size:10px;margin-left:6px" title="Risky agent · ${riskyInfo.riskState||''}">⚡ ${riskyInfo.riskLevel||'risk'}</span>` : '';
+
+    const usageCell  = enriching ? `<span class="text-muted" style="font-size:11px">…</span>` : usageBadge(e?.usage || 'MEDIUM');
+    const actCell    = enriching ? `<span class="text-muted" style="font-size:11px">…</span>`
+                     : e?.lastActivity ? `<span style="font-size:11px">${new Date(e.lastActivity).toLocaleDateString()}</span>`
+                     : `<span style="opacity:.4">—</span>`;
+    const permCell   = enriching ? `<span class="text-muted" style="font-size:11px">…</span>`
+                     : `<span style="font-size:12px;color:${(e?.permCount||0)>0?'var(--text-primary)':'var(--text-dim)'}">${e?.permCount ?? 0}</span>`;
+    const privCell   = enriching ? `<span class="text-muted" style="font-size:11px">…</span>`
+                     : (e?.highPrivRoles?.length > 0)
+                       ? e.highPrivRoles.map(r=>`<span class="badge badge-critical" style="font-size:10px" title="${esc(r)}">⚠️ ${esc(r)}</span>`).join('<br>')
+                       : `<span style="opacity:.4">—</span>`;
+
     return `<tr${riskyInfo ? ' style="background:rgba(248,81,73,.05)"' : (isEntraAgent(sp) ? ' style="background:rgba(57,211,83,.04)"' : '')}>
       <td>${agentSpCell(sp)}${riskyBadge}</td>
       <td>${typeCell}</td>
-      <td>${riskBadge(r)}</td>
-      <td>${ws.length ? ws.map(s=>`<span class="badge badge-critical" style="font-size:10px">${esc(s)}</span>`).join(' ') : '<span style="opacity:.4">—</span>'}</td>
-      <td><span class="badge ${ct==='AllPrincipals'?'badge-critical':'badge-medium'}">${esc(ct)}</span></td>
-      <td>${sp.appRoleAssignmentRequired
-        ? '<span class="badge badge-low" style="font-size:10px">✅ Yes</span>'
-        : '<span class="badge badge-medium" style="font-size:10px;opacity:.8">⚠️ No</span>'}</td>
+      <td>${usageCell}</td>
+      <td>${actCell}</td>
+      <td>${permCell}</td>
+      <td>${privCell}</td>
       <td>${agentOwnerCell(agentOwnersSponsors?.[sp.id], loading, 'owner')}</td>
       <td>${sp.accountEnabled === true ? statusBadge('enabled') : sp.accountEnabled === false ? statusBadge('disabled') : '<span style="opacity:.4;font-size:11px">—</span>'}</td>
     </tr>`;
@@ -3012,6 +3136,19 @@ async function loadAgents() {
 
     STATE.data.agentSps   = agentSps;
     STATE.data.agentGrants = grants;
+
+    // Kick off async enrichment for classic agents (sign-in activity + dir roles + permissions).
+    // Runs in background and re-renders the classic table when done.
+    const classicSps = agentSps.filter(sp => {
+      const parentMap2 = STATE.data.agentParentBlueprint || {};
+      if (parentMap2[sp.id]) return false;
+      if (/\(Security Copilot\)/i.test(sp.displayName||'')) return false;
+      const t = getAgentType(sp).type;
+      return STATE.data.agentIdentityIds?.has(sp.id) || sp.servicePrincipalType === 'ServiceIdentity' ||
+        t === 'copilot-studio' || t === 'ai-foundry' ||
+        STATE.data.agentBuilderAppIds?.has(sp.appId) || STATE.data.agentBuilderSpIds?.has(sp.id);
+    });
+    enrichClassicAgents(classicSps).catch(() => {});
     const bpSps = agentSps.filter(sp => getAgentType(sp).type === 'blueprint');
     const parentMap = STATE.data.agentParentBlueprint || {};
     const hasMsBlueprint  = sp => /\(Security Copilot\)/i.test(sp.displayName||'');
@@ -3144,10 +3281,10 @@ async function loadAgents() {
               <thead><tr>
                 ${th('Agent / App','name','sortClassicTable')}
                 ${th('Type','type','sortClassicTable')}
-                ${th('Risk','risk','sortClassicTable')}
-                ${th('Write Scopes','write','sortClassicTable')}
-                ${th('Consent Scope','consent','sortClassicTable')}
-                ${th('Assign. Required','assignReq','sortClassicTable')}
+                ${th('Usage','usage','sortClassicTable')}
+                ${th('Last Activity','activity','sortClassicTable')}
+                ${th('Permissions','perms','sortClassicTable')}
+                ${th('High Priv','highpriv','sortClassicTable')}
                 ${th('Owner','owners','sortClassicTable')}
                 ${th('Status','status','sortClassicTable')}
               </tr></thead>
