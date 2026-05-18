@@ -676,8 +676,8 @@ function classifyAgent(agent) {
   const signIn30 = agent._signIn30d || 0;
   const signIn90 = agent._signIn90d || 0;
 
-  // HIGH USAGE: (active30d AND has perms) OR (highPriv AND active90d)
-  if ((active30d && hasPerms) || (highPriv && active90d)) {
+  // HIGH USAGE: highPriv role assigned (always), OR active30d with permissions
+  if (highPriv || (active30d && hasPerms)) {
     return 'HIGH USAGE';
   }
   // LOW USAGE: not active90d AND no perms AND no owners AND signIn90<5
@@ -763,13 +763,14 @@ async function enrichAgents(agents) {
 
   setProgress(45, 'Phase 2 · Enrichment', 'Fetching owners, permissions, and directory roles via $batch…');
 
-  // Phase B: $batch for owners, memberOf, oauth2Grants, appRoleAssignments
+  // Phase B: $batch for owners, dirRoleAssignments, oauth2Grants, appRoleAssignments
+  // Note: directory role assignments for SPs are NOT in memberOf — use roleManagement endpoint
   const batchReqs = [];
   const realIds = realAgents.map(a => a.id);
 
   for (const id of realIds) {
     batchReqs.push({ id: `owners_${id}`,   method: 'GET', url: `/servicePrincipals/${id}/owners?$select=id,displayName,userPrincipalName&$top=10` });
-    batchReqs.push({ id: `memberOf_${id}`,  method: 'GET', url: `/servicePrincipals/${id}/memberOf?$select=id,displayName,roleTemplateId` });
+    batchReqs.push({ id: `dirroles_${id}`, method: 'GET', url: `/roleManagement/directory/roleAssignments?$filter=principalId eq '${id}'&$select=id,roleDefinitionId` });
     batchReqs.push({ id: `grants_${id}`,   method: 'GET', url: `/servicePrincipals/${id}/oauth2PermissionGrants?$top=100` });
     batchReqs.push({ id: `roles_${id}`,    method: 'GET', url: `/servicePrincipals/${id}/appRoleAssignments?$top=100` });
   }
@@ -778,15 +779,15 @@ async function enrichAgents(agents) {
 
   for (const agent of realAgents) {
     const id = agent.id;
-    agent._owners   = batchResults[`owners_${id}`]?.body?.value || [];
-    agent._memberOf = batchResults[`memberOf_${id}`]?.body?.value || [];
+    agent._owners       = batchResults[`owners_${id}`]?.body?.value || [];
+    agent._dirRoles     = batchResults[`dirroles_${id}`]?.body?.value || [];
     agent._oauth2Grants = batchResults[`grants_${id}`]?.body?.value || [];
-    agent._appRoles = batchResults[`roles_${id}`]?.body?.value || [];
+    agent._appRoles     = batchResults[`roles_${id}`]?.body?.value || [];
 
-    // Extract high-privilege roles from memberOf
-    agent._highPrivRoles = (agent._memberOf || [])
-      .filter(g => g.roleTemplateId && HIGH_PRIV_ROLES.has(g.roleTemplateId))
-      .map(g => HIGH_PRIV_NAMES[g.roleTemplateId] || g.displayName);
+    // Extract high-privilege directory roles via roleDefinitionId (same GUID as roleTemplateId)
+    agent._highPrivRoles = (agent._dirRoles || [])
+      .filter(r => r.roleDefinitionId && HIGH_PRIV_ROLES.has(r.roleDefinitionId))
+      .map(r => HIGH_PRIV_NAMES[r.roleDefinitionId] || r.roleDefinitionId);
 
     // Compute derived counts
     agent._ownerCount = agent._owners?.length || 0;
