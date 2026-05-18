@@ -2660,7 +2660,7 @@ function renderClassicTable() {
         ? '<span class="badge badge-low" style="font-size:10px">✅ Yes</span>'
         : '<span class="badge badge-medium" style="font-size:10px;opacity:.8">⚠️ No</span>'}</td>
       <td>${agentOwnerCell(agentOwnersSponsors?.[sp.id], loading, 'owner')}</td>
-      <td>${sp.accountEnabled ? statusBadge('enabled') : statusBadge('disabled')}</td>
+      <td>${sp.accountEnabled === true ? statusBadge('enabled') : sp.accountEnabled === false ? statusBadge('disabled') : '<span style="opacity:.4;font-size:11px">—</span>'}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="8" class="empty-state text-muted">No classic agents found</td></tr>';
 
@@ -2742,27 +2742,41 @@ async function fetchAgentIdentitySps() {
 async function fetchAgentBuilderApps() {
   if (STATE.data.agentBuilderAppIds) return STATE.data.agentBuilderAppIds;
   try {
-    // Query applications by each Copilot Studio tag separately (some agents may have only a subset).
-    // AIAgentBuilder, AgentCreatedBy:CopilotStudio, and AgenticApp are the three tags set by
-    // Copilot Studio on both the app registration and its service principal.
-    const fields = 'id,displayName,appId,tags,createdDateTime';
-    const [byBuilder, byCreatedBy, byAgenticApp, byAgenticInstance] = await Promise.all([
-      ggetAll(`${GRAPH}/applications?$filter=tags/any(t: t eq 'AIAgentBuilder')&$top=999&$count=true&$select=${fields}`, 10, true).catch(() => []),
-      ggetAll(`${GRAPH}/applications?$filter=tags/any(t: t eq 'AgentCreatedBy:CopilotStudio')&$top=999&$count=true&$select=${fields}`, 10, true).catch(() => []),
-      ggetAll(`${GRAPH}/applications?$filter=tags/any(t: t eq 'AgenticApp')&$top=999&$count=true&$select=${fields}`, 10, true).catch(() => []),
-      ggetAll(`${GRAPH}/applications?$filter=tags/any(t: t eq 'AgenticInstance')&$top=999&$count=true&$select=${fields}`, 10, true).catch(() => []),
+    // Query applications by each agentic tag separately (some agents may have only a subset).
+    // Also query service principals directly — AI Foundry project SPs are first-party Microsoft
+    // apps with no app registration in the customer tenant, so the /applications query misses them.
+    const appFields = 'id,displayName,appId,tags,createdDateTime';
+    const spFields  = 'id,displayName,appId,publisherName,tags,createdDateTime,servicePrincipalType,accountEnabled,appOwnerOrganizationId';
+    const AGENTIC_TAGS = ['AIAgentBuilder','AgentCreatedBy:CopilotStudio','AgenticApp','AgenticInstance'];
+
+    const [appResults, spResults] = await Promise.all([
+      Promise.all(AGENTIC_TAGS.map(tag =>
+        ggetAll(`${GRAPH}/applications?$filter=tags/any(t: t eq '${tag}')&$top=999&$count=true&$select=${appFields}`, 10, true).catch(() => [])
+      )),
+      Promise.all(AGENTIC_TAGS.map(tag =>
+        ggetAll(`${GRAPH}/servicePrincipals?$filter=tags/any(t: t eq '${tag}')&$top=999&$count=true&$select=${spFields}`, 10, true).catch(() => [])
+      )),
     ]);
-    // Dedup by id across all four result sets
-    const seen = new Set();
+
+    const seenApp = new Set();
     const merged = [];
-    [...byBuilder, ...byCreatedBy, ...byAgenticApp, ...byAgenticInstance].forEach(app => {
-      if (app?.id && !seen.has(app.id)) { seen.add(app.id); merged.push(app); }
+    appResults.flat().forEach(app => {
+      if (app?.id && !seenApp.has(app.id)) { seenApp.add(app.id); merged.push(app); }
     });
     STATE.data.agentBuilderApps = merged;
     STATE.data.agentBuilderAppIds = new Set(merged.map(a => a.appId).filter(Boolean));
+
+    // Store tag-discovered SPs separately so loadAgents can merge them into spMap
+    const seenSp = new Set();
+    const agentBuilderSpsFromTags = [];
+    spResults.flat().forEach(sp => {
+      if (sp?.id && !seenSp.has(sp.id)) { seenSp.add(sp.id); agentBuilderSpsFromTags.push(sp); }
+    });
+    STATE.data.agentBuilderSpsFromTags = agentBuilderSpsFromTags;
   } catch {
     STATE.data.agentBuilderApps = [];
     STATE.data.agentBuilderAppIds = new Set();
+    STATE.data.agentBuilderSpsFromTags = [];
   }
   return STATE.data.agentBuilderAppIds;
 }
@@ -2874,10 +2888,12 @@ async function loadAgents() {
     const riskyHighCount  = riskyAgents.filter(a => a.riskLevel === 'high').length;
     const riskyMedCount   = riskyAgents.filter(a => a.riskLevel === 'medium').length;
 
-    // Merge blueprints + GA agent identities into the full SP list (dedup by id)
+    // Merge blueprints + GA agent identities + tag-discovered SPs into the full SP list (dedup by id)
     const spMap = new Map(sps.map(sp => [sp.id, sp]));
     explicitBlueprints.forEach(sp => { if (!spMap.has(sp.id)) spMap.set(sp.id, sp); });
     agentIdentities.forEach(sp => { if (!spMap.has(sp.id)) spMap.set(sp.id, sp); });
+    // AI Foundry project SPs are first-party apps (no app registration in tenant) — discovered via SP tag queries
+    (STATE.data.agentBuilderSpsFromTags || []).forEach(sp => { if (!spMap.has(sp.id)) spMap.set(sp.id, sp); });
     // For each AIAgentBuilder app: find its matching SP by appId and record the SP id.
     // If no matching SP exists, inject the app object itself as a pseudo-SP so it appears in tables.
     const spByAppId = new Map([...spMap.values()].filter(sp => sp.appId).map(sp => [sp.appId, sp]));
