@@ -464,6 +464,464 @@ const HIGH_PRIV_NAMES = {
 
 const AGENTIC_TAGS = ['AIAgentBuilder','AgentCreatedBy:CopilotStudio','AgenticApp','AgenticInstance'];
 
+// ── Constants (add near the top, alongside the existing const block) ────────
+const USAGE_WINDOW_DAYS    = 30;   // analysis window; capped by tenant log retention
+const LOW_MED_THRESHOLD    = 5;    // < this many sign-ins in window  → LOW
+const MED_HIGH_THRESHOLD   = 50;   // < this many → MEDIUM, >= → HIGH
+// New classification value: 'UNKNOWN' (data unavailable — never auto-LOW)
+
+// ── Constants (add near the top, alongside the existing const block) ────────
+const USAGE_WINDOW_DAYS    = 30;   // analysis window; capped by tenant log retention
+const LOW_MED_THRESHOLD    = 5;    // < this many sign-ins in window  → LOW
+const MED_HIGH_THRESHOLD   = 50;   // < this many → MEDIUM, >= → HIGH
+// New classification value: 'UNKNOWN' (data unavailable — never auto-LOW)
+
+// ── Module-level flag set by the licensing gate ────────────────────────────
+let signInDataAvailable = null;    // null = not probed, true/false after probe
+
+// ── Licensing / permission gate ────────────────────────────────────────────
+// Probes the summarized SP sign-in endpoint ONCE. Distinguishes:
+//   - tenant lacks Entra ID P1/P2  → classification disabled (hard block)
+//   - app/role lacks permission    → classification disabled (hard block)
+//   - success                      → proceed
+// Returns { ok:true } or { ok:false, reason:string }.
+async function probeSignInData() {
+  const token = await getToken();
+  // aggregationWindow is required by the function signature; d1 = per-day rows.
+  const url = `${GRAPH_BETA}/auditLogs/getSummarizedServicePrincipalSignIns(aggregationWindow='d1')?$top=1`;
+  const r = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  });
+  if (r.ok) { signInDataAvailable = true; return { ok: true }; }
+
+  const body = await r.json().catch(() => ({}));
+  const msg = (body?.error?.message || r.statusText || '').toLowerCase();
+  signInDataAvailable = false;
+
+  // 403 from a missing premium SKU vs. a missing Graph permission read differently.
+  if (msg.includes('premium') || msg.includes('b2c') || msg.includes('license')) {
+    return { ok: false, reason:
+      'This tenant does not have a Microsoft Entra ID P1 or P2 license. ' +
+      'Sign-in usage data is unavailable, so usage classification is disabled. ' +
+      'Discovery, permissions and ownership data are still shown.' };
+  }
+  if (r.status === 401 || r.status === 403) {
+    return { ok: false, reason:
+      `Insufficient permissions to read sign-in activity (${r.status}). ` +
+      'Confirm AuditLog.Read.All admin consent and a Reports Reader / Security Reader ' +
+      'role for the signed-in account. Usage classification is disabled.' };
+  }
+  return { ok: false, reason:
+    `Could not query sign-in summary (${r.status} ${body?.error?.message || r.statusText}). ` +
+    'Usage classification is disabled.' };
+}
+
+// ── Fetch + aggregate summarized SP sign-ins (full pagination) ─────────────
+// The function endpoint has no server-side date filter, so we page everything
+// the tenant retains and window client-side on aggregationDateTime.
+// Returns Map<appId, { total, sinceWindow, lastDay }>.
+async function fetchSignInSummary() {
+  const counts = new Map();
+  const cutoff = Date.now() - USAGE_WINDOW_DAYS * 86400e3;
+
+  let next = `${GRAPH_BETA}/auditLogs/getSummarizedServicePrincipalSignIns`
+           + `(aggregationWindow='d1')?$top=1000`;
+  let page = 0;
+  const MAX_PAGES = 50;          // 50 × 1000 rows safety ceiling
+  let truncated = false;
+
+  while (next && page < MAX_PAGES) {
+    let data;
+    try {
+      data = await gget(next);
+    } catch (e) {
+      // Mid-pagination failure: surface as partial, do not silently zero-fill.
+      truncated = true;
+      break;
+    }
+    for (const row of (data.value || [])) {
+      const appId = row.appId;
+      if (!appId) continue;
+      const cnt = Number(row.signInCount) || 0;
+      const day = row.aggregationDateTime
+        ? new Date(row.aggregationDateTime).getTime() : null;
+
+      let agg = counts.get(appId);
+      if (!agg) { agg = { total: 0, sinceWindow: 0, lastDay: null }; counts.set(appId, agg); }
+      agg.total += cnt;
+      if (day !== null && day >= cutoff) agg.sinceWindow += cnt;
+      if (day !== null && (agg.lastDay === null || day > agg.lastDay)) agg.lastDay = day;
+    }
+    next = data['@odata.nextLink'] || null;
+    page++;
+  }
+  if (next && page >= MAX_PAGES) truncated = true;
+
+  counts._truncated = truncated;       // read by enrichAgents for the log line
+  counts._windowDays = USAGE_WINDOW_DAYS;
+  return counts;
+}
+
+// ── Enrichment (drop-in replacement for the existing enrichAgents) ──────────
+async function enrichAgents(agents) {
+  setProgress(25, 'Phase 2 · Enrichment',
+    `Enriching ${agents.length} agents with activity, permissions, and ownership data…`);
+
+  const realAgents = agents.filter(a => !a._isPseudo && !a.id.startsWith('app:'));
+
+  // ── Phase A: real sign-in volume from the summarized API ─────────────────
+  // signInDataAvailable was set by probeSignInData() in startAudit BEFORE this runs.
+  let summary = null;
+  if (signInDataAvailable) {
+    setProgress(30, 'Phase 2 · Enrichment',
+      `Fetching aggregated sign-in counts (last ${USAGE_WINDOW_DAYS}d, all SPs)…`);
+    try {
+      summary = await fetchSignInSummary();
+      if (summary._truncated) {
+        setProgress(40, 'Phase 2 · Enrichment',
+          'Sign-in summary truncated at safety limit — counts may be partial.', 'log-warn');
+      } else {
+        setProgress(40, 'Phase 2 · Enrichment',
+          `Sign-in summary loaded (${summary.size} apps with activity).`, 'log-ok');
+      }
+    } catch (e) {
+      // Hard failure after the probe succeeded — treat as unavailable, not zero.
+      signInDataAvailable = false;
+      summary = null;
+      setProgress(40, 'Phase 2 · Enrichment',
+        'Sign-in summary query failed — usage will be marked UNKNOWN.', 'log-err');
+    }
+  } else {
+    setProgress(40, 'Phase 2 · Enrichment',
+      'Sign-in data unavailable in this tenant — usage will be marked UNKNOWN.', 'log-warn');
+  }
+
+  // Also pull beta signInActivity for the LAST-SEEN timestamp only (not for
+  // volume). It is a weak signal and may be null for delegated/OBO agents,
+  // so it is used only to populate the "Last Activity" column, never to classify.
+  const CONCURRENCY = 10;
+  for (let i = 0; i < realAgents.length; i += CONCURRENCY) {
+    const chunk = realAgents.slice(i, i + CONCURRENCY);
+    await Promise.all(chunk.map(async agent => {
+      try {
+        const d = await gget(`${GRAPH_BETA}/servicePrincipals/${agent.id}?$select=id,signInActivity`);
+        agent.signInActivity = d.signInActivity || null;
+      } catch { agent.signInActivity = null; }
+    }));
+    setProgress(40 + Math.round((i / Math.max(1, realAgents.length)) * 8),
+      'Phase 2 · Enrichment');
+  }
+
+  setProgress(48, 'Phase 2 · Enrichment',
+    'Fetching owners, permissions, and directory roles via $batch…');
+
+  // ── Phase B: owners / memberOf / grants / appRoles (unchanged) ───────────
+  const batchReqs = [];
+  const realIds = realAgents.map(a => a.id);
+  for (const id of realIds) {
+    batchReqs.push({ id: `owners_${id}`,   method: 'GET', url: `/servicePrincipals/${id}/owners?$select=id,displayName,userPrincipalName&$top=10` });
+    batchReqs.push({ id: `memberOf_${id}`,  method: 'GET', url: `/servicePrincipals/${id}/memberOf?$select=id,displayName,roleTemplateId` });
+    batchReqs.push({ id: `grants_${id}`,   method: 'GET', url: `/servicePrincipals/${id}/oauth2PermissionGrants?$top=100` });
+    batchReqs.push({ id: `roles_${id}`,    method: 'GET', url: `/servicePrincipals/${id}/appRoleAssignments?$top=100` });
+  }
+  const batchResults = await batchRequest(batchReqs);
+
+  for (const agent of realAgents) {
+    const id = agent.id;
+    agent._owners       = batchResults[`owners_${id}`]?.body?.value || [];
+    agent._memberOf     = batchResults[`memberOf_${id}`]?.body?.value || [];
+    agent._oauth2Grants = batchResults[`grants_${id}`]?.body?.value || [];
+    agent._appRoles     = batchResults[`roles_${id}`]?.body?.value || [];
+
+    agent._highPrivRoles = (agent._memberOf || [])
+      .filter(g => g.roleTemplateId && HIGH_PRIV_ROLES.has(g.roleTemplateId))
+      .map(g => HIGH_PRIV_NAMES[g.roleTemplateId] || g.displayName);
+
+    agent._ownerCount = agent._owners?.length || 0;
+    agent._permCount  = (agent._oauth2Grants?.length || 0) + (agent._appRoles?.length || 0);
+
+    // Real volume, joined on appId (NOT the SP object id — schema-correct).
+    if (signInDataAvailable && summary) {
+      const agg = summary.get(agent.appId);
+      agent._signInWindow = agg ? agg.sinceWindow : 0;   // 0 = genuinely zero
+      agent._signInTotal  = agg ? agg.total       : 0;
+      agent._signInLastDay = agg ? agg.lastDay : null;
+    } else {
+      agent._signInWindow = null;                        // null = data unavailable
+      agent._signInTotal  = null;
+      agent._signInLastDay = null;
+    }
+  }
+
+  // Pseudo-SPs (app registrations with no SP): no sign-in surface possible.
+  for (const agent of agents.filter(a => a._isPseudo)) {
+    agent._owners = []; agent._memberOf = []; agent._oauth2Grants = []; agent._appRoles = [];
+    agent._highPrivRoles = []; agent._ownerCount = 0; agent._permCount = 0;
+    agent.signInActivity = null;
+    agent._signInWindow = signInDataAvailable ? 0 : null;
+    agent._signInTotal  = signInDataAvailable ? 0 : null;
+    agent._signInLastDay = null;
+  }
+
+  setProgress(70, 'Phase 2 · Enrichment', 'Enrichment complete.', 'log-ok');
+}
+
+// ── Classification (drop-in replacement for the existing classifyAgent) ─────
+function classifyAgent(agent) {
+  const now = Date.now();
+  const n = agent._signInWindow;          // real count in window, or null
+  const highPriv = (agent._highPrivRoles?.length || 0) > 0;
+
+  // Last-seen, used only for the high-priv recency override (not for volume).
+  const lastSeen = agent._signInLastDay
+    ?? (agent.signInActivity?.lastSignInDateTime
+        ? new Date(agent.signInActivity.lastSignInDateTime).getTime() : null);
+  const active90d = lastSeen !== null && (now - lastSeen) < 90 * 86400e3;
+
+  // 1. Data genuinely unavailable → UNKNOWN. Never silently becomes LOW.
+  if (n === null) {
+    // A high-priv agent we can't measure is still a review priority, not unknown-noise.
+    return highPriv ? 'HIGH USAGE' : 'UNKNOWN';
+  }
+
+  // 2. High-privilege override: privileged + seen recently = HIGH regardless of count.
+  if (highPriv && active90d) return 'HIGH USAGE';
+
+  // 3. Volume-based tiers on the REAL count.
+  if (n >= MED_HIGH_THRESHOLD) return 'HIGH USAGE';
+  if (n >= LOW_MED_THRESHOLD)  return 'MEDIUM USAGE';
+
+  // 4. n is 0..(LOW_MED_THRESHOLD-1). Genuinely low — but a privileged or
+  //    owner-bearing SP with low traffic is "review", not "decommission".
+  if (highPriv || (agent._permCount || 0) > 0 || (agent._ownerCount || 0) > 0) {
+    return 'MEDIUM USAGE';
+  }
+  return 'LOW USAGE';
+}
+
+// ── Module-level flag set by the licensing gate ────────────────────────────
+let signInDataAvailable = null;    // null = not probed, true/false after probe
+
+// ── Licensing / permission gate ────────────────────────────────────────────
+// Probes the summarized SP sign-in endpoint ONCE. Distinguishes:
+//   - tenant lacks Entra ID P1/P2  → classification disabled (hard block)
+//   - app/role lacks permission    → classification disabled (hard block)
+//   - success                      → proceed
+// Returns { ok:true } or { ok:false, reason:string }.
+async function probeSignInData() {
+  const token = await getToken();
+  // aggregationWindow is required by the function signature; d1 = per-day rows.
+  const url = `${GRAPH_BETA}/auditLogs/getSummarizedServicePrincipalSignIns(aggregationWindow='d1')?$top=1`;
+  const r = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  });
+  if (r.ok) { signInDataAvailable = true; return { ok: true }; }
+
+  const body = await r.json().catch(() => ({}));
+  const msg = (body?.error?.message || r.statusText || '').toLowerCase();
+  signInDataAvailable = false;
+
+  // 403 from a missing premium SKU vs. a missing Graph permission read differently.
+  if (msg.includes('premium') || msg.includes('b2c') || msg.includes('license')) {
+    return { ok: false, reason:
+      'This tenant does not have a Microsoft Entra ID P1 or P2 license. ' +
+      'Sign-in usage data is unavailable, so usage classification is disabled. ' +
+      'Discovery, permissions and ownership data are still shown.' };
+  }
+  if (r.status === 401 || r.status === 403) {
+    return { ok: false, reason:
+      `Insufficient permissions to read sign-in activity (${r.status}). ` +
+      'Confirm AuditLog.Read.All admin consent and a Reports Reader / Security Reader ' +
+      'role for the signed-in account. Usage classification is disabled.' };
+  }
+  return { ok: false, reason:
+    `Could not query sign-in summary (${r.status} ${body?.error?.message || r.statusText}). ` +
+    'Usage classification is disabled.' };
+}
+
+// ── Fetch + aggregate summarized SP sign-ins (full pagination) ─────────────
+// The function endpoint has no server-side date filter, so we page everything
+// the tenant retains and window client-side on aggregationDateTime.
+// Returns Map<appId, { total, sinceWindow, lastDay }>.
+async function fetchSignInSummary() {
+  const counts = new Map();
+  const cutoff = Date.now() - USAGE_WINDOW_DAYS * 86400e3;
+
+  let next = `${GRAPH_BETA}/auditLogs/getSummarizedServicePrincipalSignIns`
+           + `(aggregationWindow='d1')?$top=1000`;
+  let page = 0;
+  const MAX_PAGES = 50;          // 50 × 1000 rows safety ceiling
+  let truncated = false;
+
+  while (next && page < MAX_PAGES) {
+    let data;
+    try {
+      data = await gget(next);
+    } catch (e) {
+      // Mid-pagination failure: surface as partial, do not silently zero-fill.
+      truncated = true;
+      break;
+    }
+    for (const row of (data.value || [])) {
+      const appId = row.appId;
+      if (!appId) continue;
+      const cnt = Number(row.signInCount) || 0;
+      const day = row.aggregationDateTime
+        ? new Date(row.aggregationDateTime).getTime() : null;
+
+      let agg = counts.get(appId);
+      if (!agg) { agg = { total: 0, sinceWindow: 0, lastDay: null }; counts.set(appId, agg); }
+      agg.total += cnt;
+      if (day !== null && day >= cutoff) agg.sinceWindow += cnt;
+      if (day !== null && (agg.lastDay === null || day > agg.lastDay)) agg.lastDay = day;
+    }
+    next = data['@odata.nextLink'] || null;
+    page++;
+  }
+  if (next && page >= MAX_PAGES) truncated = true;
+
+  counts._truncated = truncated;       // read by enrichAgents for the log line
+  counts._windowDays = USAGE_WINDOW_DAYS;
+  return counts;
+}
+
+// ── Enrichment (drop-in replacement for the existing enrichAgents) ──────────
+async function enrichAgents(agents) {
+  setProgress(25, 'Phase 2 · Enrichment',
+    `Enriching ${agents.length} agents with activity, permissions, and ownership data…`);
+
+  const realAgents = agents.filter(a => !a._isPseudo && !a.id.startsWith('app:'));
+
+  // ── Phase A: real sign-in volume from the summarized API ─────────────────
+  // signInDataAvailable was set by probeSignInData() in startAudit BEFORE this runs.
+  let summary = null;
+  if (signInDataAvailable) {
+    setProgress(30, 'Phase 2 · Enrichment',
+      `Fetching aggregated sign-in counts (last ${USAGE_WINDOW_DAYS}d, all SPs)…`);
+    try {
+      summary = await fetchSignInSummary();
+      if (summary._truncated) {
+        setProgress(40, 'Phase 2 · Enrichment',
+          'Sign-in summary truncated at safety limit — counts may be partial.', 'log-warn');
+      } else {
+        setProgress(40, 'Phase 2 · Enrichment',
+          `Sign-in summary loaded (${summary.size} apps with activity).`, 'log-ok');
+      }
+    } catch (e) {
+      // Hard failure after the probe succeeded — treat as unavailable, not zero.
+      signInDataAvailable = false;
+      summary = null;
+      setProgress(40, 'Phase 2 · Enrichment',
+        'Sign-in summary query failed — usage will be marked UNKNOWN.', 'log-err');
+    }
+  } else {
+    setProgress(40, 'Phase 2 · Enrichment',
+      'Sign-in data unavailable in this tenant — usage will be marked UNKNOWN.', 'log-warn');
+  }
+
+  // Also pull beta signInActivity for the LAST-SEEN timestamp only (not for
+  // volume). It is a weak signal and may be null for delegated/OBO agents,
+  // so it is used only to populate the "Last Activity" column, never to classify.
+  const CONCURRENCY = 10;
+  for (let i = 0; i < realAgents.length; i += CONCURRENCY) {
+    const chunk = realAgents.slice(i, i + CONCURRENCY);
+    await Promise.all(chunk.map(async agent => {
+      try {
+        const d = await gget(`${GRAPH_BETA}/servicePrincipals/${agent.id}?$select=id,signInActivity`);
+        agent.signInActivity = d.signInActivity || null;
+      } catch { agent.signInActivity = null; }
+    }));
+    setProgress(40 + Math.round((i / Math.max(1, realAgents.length)) * 8),
+      'Phase 2 · Enrichment');
+  }
+
+  setProgress(48, 'Phase 2 · Enrichment',
+    'Fetching owners, permissions, and directory roles via $batch…');
+
+  // ── Phase B: owners / memberOf / grants / appRoles (unchanged) ───────────
+  const batchReqs = [];
+  const realIds = realAgents.map(a => a.id);
+  for (const id of realIds) {
+    batchReqs.push({ id: `owners_${id}`,   method: 'GET', url: `/servicePrincipals/${id}/owners?$select=id,displayName,userPrincipalName&$top=10` });
+    batchReqs.push({ id: `memberOf_${id}`,  method: 'GET', url: `/servicePrincipals/${id}/memberOf?$select=id,displayName,roleTemplateId` });
+    batchReqs.push({ id: `grants_${id}`,   method: 'GET', url: `/servicePrincipals/${id}/oauth2PermissionGrants?$top=100` });
+    batchReqs.push({ id: `roles_${id}`,    method: 'GET', url: `/servicePrincipals/${id}/appRoleAssignments?$top=100` });
+  }
+  const batchResults = await batchRequest(batchReqs);
+
+  for (const agent of realAgents) {
+    const id = agent.id;
+    agent._owners       = batchResults[`owners_${id}`]?.body?.value || [];
+    agent._memberOf     = batchResults[`memberOf_${id}`]?.body?.value || [];
+    agent._oauth2Grants = batchResults[`grants_${id}`]?.body?.value || [];
+    agent._appRoles     = batchResults[`roles_${id}`]?.body?.value || [];
+
+    agent._highPrivRoles = (agent._memberOf || [])
+      .filter(g => g.roleTemplateId && HIGH_PRIV_ROLES.has(g.roleTemplateId))
+      .map(g => HIGH_PRIV_NAMES[g.roleTemplateId] || g.displayName);
+
+    agent._ownerCount = agent._owners?.length || 0;
+    agent._permCount  = (agent._oauth2Grants?.length || 0) + (agent._appRoles?.length || 0);
+
+    // Real volume, joined on appId (NOT the SP object id — schema-correct).
+    if (signInDataAvailable && summary) {
+      const agg = summary.get(agent.appId);
+      agent._signInWindow = agg ? agg.sinceWindow : 0;   // 0 = genuinely zero
+      agent._signInTotal  = agg ? agg.total       : 0;
+      agent._signInLastDay = agg ? agg.lastDay : null;
+    } else {
+      agent._signInWindow = null;                        // null = data unavailable
+      agent._signInTotal  = null;
+      agent._signInLastDay = null;
+    }
+  }
+
+  // Pseudo-SPs (app registrations with no SP): no sign-in surface possible.
+  for (const agent of agents.filter(a => a._isPseudo)) {
+    agent._owners = []; agent._memberOf = []; agent._oauth2Grants = []; agent._appRoles = [];
+    agent._highPrivRoles = []; agent._ownerCount = 0; agent._permCount = 0;
+    agent.signInActivity = null;
+    agent._signInWindow = signInDataAvailable ? 0 : null;
+    agent._signInTotal  = signInDataAvailable ? 0 : null;
+    agent._signInLastDay = null;
+  }
+
+  setProgress(70, 'Phase 2 · Enrichment', 'Enrichment complete.', 'log-ok');
+}
+
+// ── Classification (drop-in replacement for the existing classifyAgent) ─────
+function classifyAgent(agent) {
+  const now = Date.now();
+  const n = agent._signInWindow;          // real count in window, or null
+  const highPriv = (agent._highPrivRoles?.length || 0) > 0;
+
+  // Last-seen, used only for the high-priv recency override (not for volume).
+  const lastSeen = agent._signInLastDay
+    ?? (agent.signInActivity?.lastSignInDateTime
+        ? new Date(agent.signInActivity.lastSignInDateTime).getTime() : null);
+  const active90d = lastSeen !== null && (now - lastSeen) < 90 * 86400e3;
+
+  // 1. Data genuinely unavailable → UNKNOWN. Never silently becomes LOW.
+  if (n === null) {
+    // A high-priv agent we can't measure is still a review priority, not unknown-noise.
+    return highPriv ? 'HIGH USAGE' : 'UNKNOWN';
+  }
+
+  // 2. High-privilege override: privileged + seen recently = HIGH regardless of count.
+  if (highPriv && active90d) return 'HIGH USAGE';
+
+  // 3. Volume-based tiers on the REAL count.
+  if (n >= MED_HIGH_THRESHOLD) return 'HIGH USAGE';
+  if (n >= LOW_MED_THRESHOLD)  return 'MEDIUM USAGE';
+
+  // 4. n is 0..(LOW_MED_THRESHOLD-1). Genuinely low — but a privileged or
+  //    owner-bearing SP with low traffic is "review", not "decommission".
+  if (highPriv || (agent._permCount || 0) > 0 || (agent._ownerCount || 0) > 0) {
+    return 'MEDIUM USAGE';
+  }
+  return 'LOW USAGE';
+}
+
 // ── State ──────────────────────────────────────────────────────────────────
 let msalApp = null;
 let accessToken = null;
@@ -740,6 +1198,24 @@ async function discoverAgents() {
   const agents = [...spMap.values()];
   setProgress(20, 'Phase 1 · Discovery', `Found ${agents.length} agentic service principals.`, 'log-ok');
   return agents;
+}
+
+const probe = await probeSignInData();
+if (!probe.ok) {
+  const err = document.getElementById('error-banner');
+  err.textContent = probe.reason;
+  err.style.display = 'block';
+  // Do NOT return — discovery/permissions are still useful. enrichAgents
+  // already handles signInDataAvailable === false → UNKNOWN.
+}
+
+const probe = await probeSignInData();
+if (!probe.ok) {
+  const err = document.getElementById('error-banner');
+  err.textContent = probe.reason;
+  err.style.display = 'block';
+  // Do NOT return — discovery/permissions are still useful. enrichAgents
+  // already handles signInDataAvailable === false → UNKNOWN.
 }
 
 // ── Enrichment ─────────────────────────────────────────────────────────────
