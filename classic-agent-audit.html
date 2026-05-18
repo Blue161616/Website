@@ -746,18 +746,49 @@ async function discoverAgents() {
 async function enrichAgents(agents) {
   setProgress(25, 'Phase 2 · Enrichment', `Enriching ${agents.length} agents with activity, permissions, and ownership data…`);
 
-  // Phase A: beta signInActivity (direct, 10 concurrent, skip pseudo-SPs)
   const realAgents = agents.filter(a => !a._isPseudo && !a.id.startsWith('app:'));
+
+  // Phase A: bulk SP sign-in log lookup (near real-time, ~15 min lag)
+  // Fetch last 500 SP sign-ins and build a map of spId → most recent datetime
+  setProgress(27, 'Phase 2 · Enrichment', 'Fetching recent sign-in activity from audit logs…');
+  const recentSignIns = new Map(); // servicePrincipalId → lastSignInDateTime
+  try {
+    const siSel = 'id,createdDateTime,servicePrincipalId,servicePrincipalName,status';
+    const siData = await gget(
+      `${GRAPH}/auditLogs/signIns?$filter=signInEventTypes/any(t: t eq 'servicePrincipal')` +
+      `&$orderby=createdDateTime desc&$top=500&$select=${siSel}`,
+      true
+    );
+    for (const si of (siData?.value || [])) {
+      const spId = si.servicePrincipalId;
+      if (spId && !recentSignIns.has(spId)) {
+        recentSignIns.set(spId, si.createdDateTime);
+      }
+    }
+    setProgress(33, 'Phase 2 · Enrichment', `Sign-in log: found activity for ${recentSignIns.size} principals.`, 'log-ok');
+  } catch (e) {
+    setProgress(33, 'Phase 2 · Enrichment', `Sign-in log unavailable (${e.message}), falling back to signInActivity…`, 'log-warn');
+  }
+
+  // Apply near-real-time sign-in data to agents
+  for (const agent of realAgents) {
+    if (recentSignIns.has(agent.id)) {
+      agent._recentSignIn = recentSignIns.get(agent.id);
+    }
+  }
+
+  // Phase A2: beta signInActivity for agents not seen in recent logs (catches older activity)
+  const needsSignInActivity = realAgents.filter(a => !a._recentSignIn);
   const CONCURRENCY = 10;
-  for (let i = 0; i < realAgents.length; i += CONCURRENCY) {
-    const chunk = realAgents.slice(i, i + CONCURRENCY);
+  for (let i = 0; i < needsSignInActivity.length; i += CONCURRENCY) {
+    const chunk = needsSignInActivity.slice(i, i + CONCURRENCY);
     await Promise.all(chunk.map(async agent => {
       try {
         const data = await gget(`${GRAPH_BETA}/servicePrincipals/${agent.id}?$select=id,signInActivity`);
         agent.signInActivity = data.signInActivity || null;
       } catch { agent.signInActivity = null; }
     }));
-    const pct = 25 + Math.round((i / realAgents.length) * 20);
+    const pct = 33 + Math.round((i / Math.max(needsSignInActivity.length, 1)) * 12);
     setProgress(pct, 'Phase 2 · Enrichment');
   }
 
@@ -814,7 +845,11 @@ function classifyAll(agents) {
   for (const agent of agents) {
     agent.origin = detectOrigin(agent);
     agent.recommendation = classifyAgent(agent);
-    agent._lastActivity = agent.signInActivity?.lastSignInDateTime || null;
+    // Prefer near-real-time sign-in log over the 24h-lagged signInActivity property
+    agent._lastActivity = agent._recentSignIn
+      || agent.signInActivity?.lastSignInDateTime
+      || agent.signInActivity?.lastSuccessfulSignInDateTime
+      || null;
   }
   setProgress(78, 'Phase 3 · Classification', `Classification complete — ${agents.filter(a => a.recommendation === 'HIGH USAGE').length} HIGH, ${agents.filter(a => a.recommendation === 'MEDIUM USAGE').length} MEDIUM, ${agents.filter(a => a.recommendation === 'LOW USAGE').length} LOW.`, 'log-ok');
 }
