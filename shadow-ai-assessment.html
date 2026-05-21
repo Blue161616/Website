@@ -1303,45 +1303,6 @@ async function loadDashboard() {
   }
 }
 
-// ── MCAS Cloud Discovery (API token auth) ─────────────────────────────────
-// MCAS portal URL OAuth (resource/.default) fails if the MCAS service principal
-// is not installed in the tenant. API tokens from MDCA Settings → API tokens
-// always work and use the Authorization: Token header.
-
-function getMcasConfig() {
-  return {
-    url:   (localStorage.getItem('mcasUrl')   || '').replace(/^https?:\/\//,'').replace(/\/$/,''),
-    token: localStorage.getItem('mcasApiToken') || '',
-  };
-}
-
-async function detectMcasUrl() {
-  // Best-guess from onmicrosoft.com subdomain — region may be wrong, user can correct
-  const org = await fetchOrg();
-  const domains = org.verifiedDomains || [];
-  const omsDomain = domains.find(d => d.name?.endsWith('.onmicrosoft.com') && !d.name.includes('.mail.'));
-  if (!omsDomain) return null;
-  const sub = omsDomain.name.replace('.onmicrosoft.com', '');
-  return `${sub}.portal.cloudappsecurity.com`; // neutral — user verifies from About page
-}
-
-async function fetchMcasAppsFromUrl(mcasUrl, apiToken) {
-  let all = [], skip = 0, hasNext = true;
-  while (hasNext && skip < 2000) {
-    const r = await fetch(
-      `https://${mcasUrl}/api/v1/discovery/discovered_apps/?enriched=true&limit=100&skip=${skip}&sortField=users&sortDirection=desc`,
-      { headers: { Authorization: 'Token ' + apiToken } }   // MCAS uses "Token", not "Bearer"
-    );
-    if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + r.statusText + ': ' + t.slice(0, 300)); }
-    const d = await r.json();
-    const page = Array.isArray(d) ? d : (d.data || d.value || []);
-    all = all.concat(page);
-    hasNext = !!d.hasNext && page.length === 100;
-    skip += 100;
-  }
-  return all;
-}
-
 function mcasRiskColor(score) {
   if (score == null) return 'var(--text-dim)';
   if (score <= 4) return 'var(--risk-critical)';
@@ -1476,129 +1437,6 @@ function mcasSortBy(key) {
   renderMcasApps(document.getElementById('shadow-content'), STATE.data.mcasApps, STATE.data.mcasUrl);
 }
 
-const MCAS_PS_SCRIPT = (url, token) => `# Run in PowerShell — exports all Generative AI discovered apps from Defender for Cloud Apps
-$headers = @{ Authorization = "Token ${token||'<YOUR-API-TOKEN>'}" }
-$url = "https://${url||'<YOUR-MCAS-URL>'}/api/v1/discovery/discovered_apps"
-$all = @(); $skip = 0
-do {
-  $r = Invoke-RestMethod "$url/?enriched=true&limit=100&skip=$skip&sortField=users&sortDirection=desc" -Headers $headers
-  $all += $r.data ?? $r
-  $skip += 100
-} while ($r.hasNext -and $skip -lt 2000)
-$all | ConvertTo-Json -Depth 10 | Out-File -Encoding utf8 mcas-apps.json
-Write-Host "Exported $($all.Count) apps to mcas-apps.json"`;
-
-function showMcasSetup(el, err, prefillUrl, prefillToken) {
-  const cfg = getMcasConfig();
-  el.innerHTML = `
-    <div style="max-width:680px;margin:30px auto">
-      <div class="card">
-        <div class="card-header"><div class="card-title">🔧 Connect Defender for Cloud Apps</div></div>
-        <div class="card-body">
-          ${err ? `<div class="perm-warn" style="margin-bottom:18px">⚠️ ${esc(err.slice(0,300))}</div>` : ''}
-
-          <div class="tab-bar" style="margin-bottom:18px">
-            <button class="tab active" id="tab-import" onclick="mcasTab('import')">📂 Import from PowerShell</button>
-            <button class="tab" id="tab-api" onclick="mcasTab('api')">🔌 Direct API (same-origin only)</button>
-          </div>
-
-          <!-- IMPORT TAB -->
-          <div id="mcas-panel-import">
-            <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;line-height:1.6">
-              Run the PowerShell script below, then upload the resulting <code style="background:var(--bg-hover);padding:1px 5px;border-radius:3px">mcas-apps.json</code> file.
-              This avoids browser CORS restrictions — the script calls the MCAS API server-side.
-            </p>
-            <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:12px;font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--text-muted);white-space:pre;overflow-x:auto;margin-bottom:14px;line-height:1.6">${esc(MCAS_PS_SCRIPT(prefillUrl||cfg.url, ''))}</div>
-            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-              <input type="file" id="mcas-file-input" accept=".json" style="display:none" onchange="importMcasFile()" />
-              <button class="btn btn-primary" onclick="document.getElementById('mcas-file-input').click()">📂 Choose mcas-apps.json</button>
-              <span id="mcas-file-status" style="font-size:12px;color:var(--text-muted)"></span>
-            </div>
-          </div>
-
-          <!-- API TAB -->
-          <div id="mcas-panel-api" style="display:none">
-            <div class="perm-warn" style="margin-bottom:14px">
-              ⚠️ Direct browser→MCAS API calls are blocked by CORS when the page is hosted on a different domain.
-              This only works if the page is served from the same origin as the MCAS portal, or via a CORS proxy.
-            </div>
-            <div style="margin-bottom:14px">
-              <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:6px">
-                API URL <span style="color:var(--text-dim);font-weight:400;text-transform:none">— from Settings → Cloud Apps → About</span>
-              </label>
-              <input id="mcas-url-input" type="text" value="${esc(prefillUrl||cfg.url||'')}"
-                placeholder="blue1600.us.portal.cloudappsecurity.com"
-                style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);
-                  color:var(--text-primary);padding:9px 12px;border-radius:6px;font-size:13px;
-                  font-family:ui-monospace,Consolas,monospace;outline:none" />
-            </div>
-            <div style="margin-bottom:16px">
-              <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:6px">
-                API Token <span style="color:var(--text-dim);font-weight:400;text-transform:none">— Settings → Cloud Apps → API tokens → New token</span>
-              </label>
-              <input id="mcas-token-input" type="password" value="${esc(prefillToken||cfg.token||'')}"
-                placeholder="Paste your MDCA API token"
-                style="width:100%;background:var(--bg-secondary);border:1px solid var(--border);
-                  color:var(--text-primary);padding:9px 12px;border-radius:6px;font-size:13px;
-                  font-family:ui-monospace,Consolas,monospace;outline:none" />
-            </div>
-            <button class="btn btn-primary" onclick="saveMcasConfig()">Connect →</button>
-          </div>
-
-        </div>
-      </div>
-    </div>`;
-}
-
-function mcasTab(tab) {
-  document.getElementById('mcas-panel-import').style.display = tab==='import' ? '' : 'none';
-  document.getElementById('mcas-panel-api').style.display   = tab==='api'    ? '' : 'none';
-  document.getElementById('tab-import').classList.toggle('active', tab==='import');
-  document.getElementById('tab-api').classList.toggle('active', tab==='api');
-}
-
-function importMcasFile() {
-  const file = document.getElementById('mcas-file-input')?.files?.[0];
-  if (!file) return;
-  const statusEl = document.getElementById('mcas-file-status');
-  statusEl.textContent = 'Reading…';
-  const reader = new FileReader();
-  reader.onload = e => {
-    try {
-      let parsed = JSON.parse(e.target.result);
-      // Handle both array and {data:[...]} shapes
-      const all = Array.isArray(parsed) ? parsed : (parsed.data || parsed.value || []);
-      if (!all.length) throw new Error('No app records found in JSON — check the file format.');
-      const genAi = all.filter(a =>
-        /generative.?ai|genai/i.test(a.appInfo?.category || a.category || '') ||
-        (a.tags || []).some(t => /generative.?ai|genai/i.test(t))
-      );
-      STATE.data.mcasApps = genAi.length ? genAi : all;
-      STATE.data.mcasFilteredToGenAi = genAi.length > 0;
-      STATE.data.mcasTotal = all.length;
-      STATE.data.mcasUrl = 'imported from file';
-      STATE.loaded.add('shadow-apps');
-      updateDashShadowKpi();
-      renderMcasApps(document.getElementById('shadow-content'), STATE.data.mcasApps, 'imported from ' + file.name);
-    } catch (err) {
-      statusEl.textContent = '❌ ' + err.message;
-    }
-  };
-  reader.readAsText(file);
-}
-
-function saveMcasConfig() {
-  const url = (document.getElementById('mcas-url-input')?.value || '').trim()
-    .replace(/^https?:\/\//, '').replace(/\/$/, '');
-  const token = (document.getElementById('mcas-token-input')?.value || '').trim();
-  if (!url || !token) return;
-  localStorage.setItem('mcasUrl', url);
-  localStorage.setItem('mcasApiToken', token);
-  STATE.data.mcasApps = undefined;
-  STATE.loaded.delete('shadow-apps');
-  loadShadowApps();
-}
-
 async function loadShadowApps() {
   const el = document.getElementById('shadow-content');
 
@@ -1618,38 +1456,8 @@ async function loadShadowApps() {
     STATE.data.mcasUrl = 'Microsoft Graph (CloudApp-Discovery.Read.All)';
     updateDashShadowKpi();
     renderMcasApps(el, STATE.data.mcasApps, STATE.data.mcasUrl);
-    return;
   } catch (graphErr) {
-    console.warn('Graph cloud discovery failed, falling back to manual config:', graphErr.message);
-  }
-
-  // Fallback: MCAS API token or file import
-  const cfg = getMcasConfig();
-  if (!cfg.url || !cfg.token) {
-    let guessUrl = cfg.url;
-    if (!guessUrl) {
-      try { guessUrl = await detectMcasUrl(); } catch { /* ignore */ }
-    }
-    showMcasSetup(el, null, guessUrl, cfg.token);
-    return;
-  }
-
-  STATE.data.mcasUrl = cfg.url;
-  el.innerHTML = `<div class="section-loading"><span class="spinner"></span>Connecting to <span class="mono">${esc(cfg.url)}</span>…</div>`;
-  try {
-    const all = await fetchMcasAppsFromUrl(cfg.url, cfg.token);
-    STATE.data.mcasTotal = all.length;
-    const genAi = all.filter(a =>
-      /generative.?ai|genai/i.test(a.appInfo?.category || a.category || '') ||
-      (a.tags || []).some(t => /generative.?ai|genai/i.test(t))
-    );
-    STATE.data.mcasApps = genAi.length ? genAi : all;
-    STATE.data.mcasFilteredToGenAi = genAi.length > 0;
-    updateDashShadowKpi();
-    renderMcasApps(el, STATE.data.mcasApps, cfg.url);
-  } catch (e) {
-    STATE.data.mcasApps = undefined;
-    showMcasSetup(el, e.message, cfg.url, cfg.token);
+    el.innerHTML = permWarn('CloudApp-Discovery.Read.All', graphErr.message);
   }
 }
 
