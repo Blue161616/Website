@@ -695,6 +695,30 @@ async function fetchSignIns() {
   return STATE.data.signIns;
 }
 
+// Targeted sign-in fetch filtered by AI app IDs — used for the dashboard chart
+// to avoid burning page budget on non-AI sign-ins in high-volume tenants.
+async function fetchAiSignInsForChart(aiApps) {
+  if (STATE.data.aiChartSignIns) return STATE.data.aiChartSignIns;
+  try {
+    const since = new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);
+    const appIds = [...new Set((aiApps || []).map(sp => sp.appId).filter(Boolean))].slice(0, 12);
+    const sel = '$select=userPrincipalName,appDisplayName,appId,createdDateTime';
+    let url;
+    if (appIds.length > 0) {
+      const idFilter = appIds.map(id => `appId eq '${id}'`).join(' or ');
+      url = `${GRAPH}/auditLogs/signIns?$top=500&${sel}&$filter=createdDateTime ge ${since}T00:00:00Z and (${idFilter})`;
+    } else {
+      url = `${GRAPH}/auditLogs/signIns?$top=500&${sel}&$filter=createdDateTime ge ${since}T00:00:00Z`;
+    }
+    STATE.data.aiChartSignIns = await ggetAll(url, 12);
+  } catch (e) {
+    STATE.data.aiChartSignIns = (STATE.data.signIns || []).filter(s =>
+      AI_KEYWORDS.some(k => (s.appDisplayName || '').toLowerCase().includes(k))
+    );
+  }
+  return STATE.data.aiChartSignIns;
+}
+
 async function fetchUsers() {
   if (STATE.data.users) return STATE.data.users;
   try {
@@ -1298,6 +1322,40 @@ async function loadDashboard() {
     document.getElementById('alert-badge').textContent = critCount + highCount;
     updateDashShadowKpi();
     updateDashAgentKpi();
+
+    // Background: re-render sign-in chart with targeted, server-side-filtered data
+    // so high-volume tenants show the full 14-day history instead of just today.
+    fetchAiSignInsForChart(aiApps).then(targeted => {
+      if (!targeted || targeted === STATE.data.signIns) return; // no improvement
+      const days = 14;
+      const buckets2 = Array.from({length: days}, (_, i) => {
+        const d = new Date(Date.now() - (days-1-i)*86400000);
+        return { label: d.toLocaleDateString('en', {month:'short',day:'numeric'}), count: 0, users: new Set() };
+      });
+      targeted.forEach(s => {
+        const d = new Date(s.createdDateTime);
+        const idx = Math.floor((Date.now() - d.getTime()) / 86400000);
+        if (idx >= 0 && idx < days) {
+          buckets2[days-1-idx].count++;
+          if (s.userPrincipalName) buckets2[days-1-idx].users.add(s.userPrincipalName);
+        }
+      });
+      destroyChart('dash-signins');
+      const canvas = document.getElementById('dash-signins-chart');
+      if (!canvas) return;
+      STATE.charts['dash-signins'] = new Chart(canvas, {
+        type: 'bar',
+        data: {
+          labels: buckets2.map(b => b.label),
+          datasets: [
+            { label: 'Sign-ins', data: buckets2.map(b => b.count), backgroundColor: 'rgba(56,139,253,.6)', borderRadius: 3 },
+            { label: 'Unique users', data: buckets2.map(b => b.users.size), backgroundColor: 'rgba(163,113,247,.5)', borderRadius: 3 },
+          ],
+        },
+        options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom',labels:{boxWidth:10,padding:10}}},
+          scales:{x:{grid:{display:false},ticks:{font:{size:10}}}, y:{beginAtZero:true,grid:{color:'rgba(48,54,61,.5)'}}} },
+      });
+    }).catch(() => {});
   } catch (e) {
     el.innerHTML = `<div class="perm-warn">⚠️ Could not load dashboard: ${esc(e.message)}</div>`;
   }
