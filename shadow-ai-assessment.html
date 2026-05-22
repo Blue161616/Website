@@ -698,20 +698,30 @@ async function fetchSignIns() {
 
 // Targeted sign-in fetch filtered by AI app IDs — used for the dashboard chart
 // to avoid burning page budget on non-AI sign-ins in high-volume tenants.
+// Processes all detected AI app IDs in batches of 15 to stay within Graph URL limits.
 async function fetchAiSignInsForChart(aiApps) {
   if (STATE.data.aiChartSignIns) return STATE.data.aiChartSignIns;
   try {
     const since = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
-    const appIds = [...new Set((aiApps || []).map(sp => sp.appId).filter(Boolean))].slice(0, 12);
+    const appIds = [...new Set((aiApps || []).map(sp => sp.appId).filter(Boolean))];
     const sel = '$select=userPrincipalName,appDisplayName,appId,createdDateTime';
-    let url;
+    const allSignIns = [];
     if (appIds.length > 0) {
-      const idFilter = appIds.map(id => `appId eq '${id}'`).join(' or ');
-      url = `${GRAPH}/auditLogs/signIns?$top=500&${sel}&$filter=createdDateTime ge ${since}T00:00:00Z and (${idFilter})`;
+      // Batch into groups of 15 — keeps URL well under Graph limits while covering all AI apps
+      const CHUNK = 15;
+      for (let i = 0; i < appIds.length; i += CHUNK) {
+        const chunk = appIds.slice(i, i + CHUNK);
+        const idFilter = chunk.map(id => `appId eq '${id}'`).join(' or ');
+        const url = `${GRAPH}/auditLogs/signIns?$top=500&${sel}&$filter=createdDateTime ge ${since}T00:00:00Z and (${idFilter})`;
+        try { allSignIns.push(...await ggetAll(url, 6)); } catch { /* skip failed batch */ }
+      }
     } else {
-      url = `${GRAPH}/auditLogs/signIns?$top=500&${sel}&$filter=createdDateTime ge ${since}T00:00:00Z`;
+      // No known AI app IDs — fall back to keyword-matched subset of general sign-ins
+      allSignIns.push(...(STATE.data.signIns || []).filter(s =>
+        AI_KEYWORDS.some(k => (s.appDisplayName || '').toLowerCase().includes(k))
+      ));
     }
-    STATE.data.aiChartSignIns = await ggetAll(url, 12);
+    STATE.data.aiChartSignIns = allSignIns;
   } catch (e) {
     STATE.data.aiChartSignIns = (STATE.data.signIns || []).filter(s =>
       AI_KEYWORDS.some(k => (s.appDisplayName || '').toLowerCase().includes(k))
@@ -1084,8 +1094,12 @@ async function loadDashboard() {
 
     const aiApps = sps.filter(isAiApp);
 
-    // Match AI sign-ins by appDisplayName keywords
-    const aiSignIns = signIns.filter(s => AI_KEYWORDS.some(k => (s.appDisplayName||'').toLowerCase().includes(k)));
+    // Match AI sign-ins by appDisplayName keywords OR known AI service principal appId
+    const aiAppIds = new Set(aiApps.map(sp => sp.appId).filter(Boolean));
+    const aiSignIns = signIns.filter(s =>
+      AI_KEYWORDS.some(k => (s.appDisplayName||'').toLowerCase().includes(k)) ||
+      aiAppIds.has(s.appId)
+    );
     const aiUsers = [...new Set(aiSignIns.map(s => s.userPrincipalName).filter(Boolean))];
 
     // High-risk grants: check ALL grants for high-risk scopes (not just AI-detected SPs)
