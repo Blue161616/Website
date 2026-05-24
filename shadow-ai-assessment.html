@@ -1519,8 +1519,13 @@ async function fetchMcasAppsFromGraph() {
             lastSeen:             a.lastSeenDateTime,
             type:                 typeFromTags,
             tags,
+            _streamIds:           [stream.id],   // track which streams contain this app
             _source:              'graph',
           };
+        } else {
+          // Accumulate stream IDs in case the same app appears in multiple streams
+          if (!appMap[key]._streamIds) appMap[key]._streamIds = [];
+          if (!appMap[key]._streamIds.includes(stream.id)) appMap[key]._streamIds.push(stream.id);
         }
       });
     } catch { /* skip streams that error */ }
@@ -4948,28 +4953,54 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 // ── App-users popover ──────────────────────────────────────────────────────
 
+// Fetch per-user activity for a discovered app via the MCAS Graph API.
+// Uses $expand=userActivity on the aggregatedAppsDetails endpoint.
+async function fetchMcasAppUsers(app) {
+  const streamIds = app._streamIds;
+  if (!streamIds?.length || !app.appId) return null;
+  const userMap = new Map();
+  for (const streamId of streamIds) {
+    try {
+      const url = `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${streamId}/microsoft.graph.security.aggregatedAppsDetails(period=duration'P30D')?$filter=id eq '${app.appId}'&$expand=userActivity`;
+      const resp = await gget(url);
+      const detail = (resp.value || [])[0];
+      if (!detail) continue;
+      for (const u of (detail.userActivity || [])) {
+        const upn = u.userPrincipalName || u.userEmail;
+        if (!upn) continue;
+        const lastSeen = u.lastSeenDateTime ? new Date(u.lastSeenDateTime) : null;
+        const existing = userMap.get(upn);
+        if (!existing || (lastSeen && (!existing.lastSeen || lastSeen > existing.lastSeen))) {
+          userMap.set(upn, {
+            upn,
+            displayName: u.userDisplayName || upn.split('@')[0],
+            lastSeen,
+            upload: u.uploadNetworkTrafficInBytes ?? 0,
+            download: u.downloadNetworkTrafficInBytes ?? 0,
+            tx: u.transactionCount ?? 0,
+            _source: 'mcas',
+          });
+        }
+      }
+    } catch { /* skip streams that fail */ }
+  }
+  return userMap.size > 0 ? [...userMap.values()] : null;
+}
+
+// Fallback: match users from Azure AD sign-in logs by app name
 function _appNameMatches(mcasName, signInAppName) {
   const m = mcasName.toLowerCase();
-  const s = signInAppName.toLowerCase();
+  const s = (signInAppName || '').toLowerCase();
   if (!s) return false;
   if (m === s) return true;
-  // MCAS name contains the sign-in display name (e.g. "ChatGPT (Consumer…)" contains "chatgpt")
   if (s.length > 4 && m.includes(s)) return true;
-  // Sign-in display name contains the first significant word of the MCAS name
   const firstWord = m.split(/[\s(]/)[0];
   if (firstWord.length >= 5 && s.includes(firstWord)) return true;
   return false;
 }
 
-function showAppUsers(idx, anchorEl) {
-  const a = (STATE._mcasRowMap || {})[idx];
-  if (!a) return;
-  const appName = a.name ?? '—';
-
-  // Gather sign-ins from both the general pool and the targeted AI chart pool
+function _usersFromSignIns(appName) {
   const pool = [...(STATE.data.signIns || []), ...(STATE.data.aiChartSignIns || [])];
-
-  // Deduplicate: upn → { displayName, lastSeen }
   const userMap = new Map();
   for (const s of pool) {
     if (!_appNameMatches(appName, s.appDisplayName || '')) continue;
@@ -4978,50 +5009,81 @@ function showAppUsers(idx, anchorEl) {
     const date = s.createdDateTime ? new Date(s.createdDateTime) : null;
     const existing = userMap.get(upn);
     if (!existing || (date && (!existing.lastSeen || date > existing.lastSeen))) {
-      userMap.set(upn, { upn, displayName: s.userDisplayName || upn.split('@')[0], lastSeen: date });
+      userMap.set(upn, { upn, displayName: s.userDisplayName || upn.split('@')[0], lastSeen: date, _source: 'signin' });
     }
   }
+  return [...userMap.values()].sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+}
 
-  const users = [...userMap.values()].sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
-
-  // Build popover content
-  document.getElementById('pop-app-name').textContent = appName;
+function _renderPopoverUsers(users, sourceName) {
   const body = document.getElementById('pop-body');
-  if (users.length === 0) {
+  if (!users || users.length === 0) {
     body.innerHTML = `<div style="font-size:11px;color:var(--text-dim);font-style:italic;padding:4px 0">
-      No sign-in events matched this app in the loaded window.<br>
-      Sign-in logs require <code style="font-size:10px;background:var(--bg-hover);padding:1px 4px;border-radius:3px">AuditLog.Read.All</code>.
+      No user data found for this app in the last 30 days.<br>
+      Requires <code style="font-size:10px;background:var(--bg-hover);padding:1px 4px;border-radius:3px">AuditLog.Read.All</code> and active MDCA discovery.
     </div>`;
-  } else {
-    body.innerHTML = users.map(u => {
-      const parts = (u.displayName || '').split(/[\s.@]/);
-      const initials = ((parts[0]||'').slice(0,1) + (parts[1]||'').slice(0,1)).toUpperCase() || '?';
-      const lastStr  = u.lastSeen ? u.lastSeen.toLocaleDateString('en', {month:'short', day:'numeric'}) : '—';
-      return `<div class="pop-row">
-        <div class="pop-avatar">${esc(initials)}</div>
-        <div style="flex:1;min-width:0">
-          <div class="pop-name">${esc(u.displayName)}</div>
-          <div class="pop-upn">${esc(u.upn)}</div>
-        </div>
-        <div class="pop-date">${lastStr}</div>
-      </div>`;
-    }).join('') + `<div class="pop-hint">${users.length} unique user${users.length !== 1 ? 's' : ''} · last 30 days</div>`;
+    return;
   }
+  const isMcas = users[0]?._source === 'mcas';
+  body.innerHTML = users.map(u => {
+    const parts   = (u.displayName || '').split(/[\s.@]/);
+    const initials = ((parts[0]||'').slice(0,1) + (parts[1]||'').slice(0,1)).toUpperCase() || '?';
+    const lastStr  = u.lastSeen ? u.lastSeen.toLocaleDateString('en', {month:'short', day:'numeric'}) : '—';
+    const sub      = isMcas && (u.tx || u.download)
+      ? `${u.tx ? u.tx + ' tx' : ''}${u.tx && u.download ? ' · ' : ''}${u.download ? fmtBytes(u.download) + ' ↓' : ''}`
+      : esc(u.upn);
+    return `<div class="pop-row">
+      <div class="pop-avatar">${esc(initials)}</div>
+      <div style="flex:1;min-width:0">
+        <div class="pop-name">${esc(u.displayName)}</div>
+        <div class="pop-upn">${sub}</div>
+      </div>
+      <div class="pop-date">${lastStr}</div>
+    </div>`;
+  }).join('') + `<div class="pop-hint">${users.length} user${users.length !== 1 ? 's' : ''} · ${sourceName} · last 30 days</div>`;
+}
 
-  // Position near anchor
-  const pop = document.getElementById('users-popover');
-  pop.style.display = 'block';
+function _positionPopover(anchorEl, estRows) {
+  const pop  = document.getElementById('users-popover');
   const rect = anchorEl.getBoundingClientRect();
-  const popH = Math.min(340, 80 + users.length * 46);
+  const popH = Math.min(340, 80 + estRows * 46);
   const top  = (rect.bottom + 8 + popH > window.innerHeight)
     ? Math.max(8, rect.top - popH - 8)
     : rect.bottom + 8;
   const left = Math.min(Math.max(8, rect.left - 60), window.innerWidth - 400);
   pop.style.top  = top  + 'px';
   pop.style.left = left + 'px';
+}
 
-  // Close on next outside click
+async function showAppUsers(idx, anchorEl) {
+  const a = (STATE._mcasRowMap || {})[idx];
+  if (!a) return;
+  const appName = a.name ?? '—';
+
+  // Show popover immediately with a loading state
+  const pop  = document.getElementById('users-popover');
+  const body = document.getElementById('pop-body');
+  document.getElementById('pop-app-name').textContent = appName;
+  body.innerHTML = `<div style="font-size:11px;color:var(--text-muted);padding:6px 0"><span class="spinner"></span> Loading users…</div>`;
+  pop.style.display = 'block';
+  _positionPopover(anchorEl, 3);
   setTimeout(() => document.addEventListener('click', _closePopoverOutside, { once: true }), 0);
+
+  // 1. Try MCAS Graph API (real traffic-based users)
+  if (a._source === 'graph' && a._streamIds?.length) {
+    const mcasUsers = await fetchMcasAppUsers(a);
+    if (mcasUsers) {
+      mcasUsers.sort((x, y) => (y.lastSeen || 0) - (x.lastSeen || 0));
+      _renderPopoverUsers(mcasUsers, 'MCAS discovery');
+      _positionPopover(anchorEl, mcasUsers.length);
+      return;
+    }
+  }
+
+  // 2. Fallback: Azure AD sign-in logs
+  const signinUsers = _usersFromSignIns(appName);
+  _renderPopoverUsers(signinUsers, 'sign-in logs');
+  _positionPopover(anchorEl, signinUsers.length || 1);
 }
 
 function closeUsersPopover() {
@@ -5030,7 +5092,6 @@ function closeUsersPopover() {
 function _closePopoverOutside(e) {
   const pop = document.getElementById('users-popover');
   if (pop.contains(e.target)) {
-    // Click inside — re-attach listener
     document.addEventListener('click', _closePopoverOutside, { once: true });
   } else {
     pop.style.display = 'none';
