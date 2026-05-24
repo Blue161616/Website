@@ -4971,61 +4971,84 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 // ── App-users popover ──────────────────────────────────────────────────────
 
-// Read per-user traffic data from the _mcasUsers already stored during initial app fetch.
-// Falls back to a live Graph API call (with $expand=userActivity) if _mcasUsers is absent
-// (e.g. the app was loaded before this version or the expand was silently ignored).
+// Fetch per-user traffic data for a discovered app.
+// Primary: navigation endpoint  …/aggregatedAppsDetails(period)/{appId}/users
+// Fallback: …/aggregatedAppsDetails(period)?$expand=userActivity  (filter client-side)
 async function fetchMcasAppUsers(app) {
-  // Fast path: user data already captured during the initial aggregatedAppsDetails fetch
+  // Fast path: user data already captured during the initial app fetch
   if (app._mcasUsers?.length) {
-    return app._mcasUsers.map(u => {
-      const upn = u.userPrincipalName || u.userEmail || u.id || '—';
-      return {
-        upn,
-        displayName: u.userDisplayName || u.displayName || upn.split('@')[0],
-        lastSeen:    u.lastSeenDateTime ? new Date(u.lastSeenDateTime) : null,
-        upload:      u.uploadNetworkTrafficInBytes ?? 0,
-        download:    u.downloadNetworkTrafficInBytes ?? 0,
-        tx:          u.transactionCount ?? 0,
-        _source:     'mcas',
-      };
-    });
+    return _normaliseMcasUsers(app._mcasUsers);
   }
 
-  // Slow path: re-fetch the specific app with $expand=userActivity
   const streamIds = app._streamIds;
   if (!streamIds?.length || !app.appId) return null;
+
   const userMap = new Map();
+
   for (const streamId of streamIds) {
+    // ── Strategy 1: proper navigation endpoint (user-recommended) ──────────
     try {
-      // Fetch all apps with expand, then find ours client-side (filter on function endpoints is unreliable)
+      const url = `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${streamId}/aggregatedAppsDetails(period=duration'P30D')/${app.appId}/users`;
+      const resp = await gget(url);
+      const users = resp.value || (Array.isArray(resp) ? resp : []);
+      if (users.length) {
+        console.debug('[MCAS /users sample]', users[0]);
+        for (const u of users) _mergeUser(userMap, u);
+        continue; // got data — skip strategy 2 for this stream
+      }
+    } catch (e) { console.warn('[fetchMcasAppUsers] /users endpoint failed:', e.message); }
+
+    // ── Strategy 2: $expand=userActivity, filter client-side ───────────────
+    try {
       const url = `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${streamId}/microsoft.graph.security.aggregatedAppsDetails(period=duration'P30D')?$top=500&$expand=userActivity`;
       const resp = await gget(url);
       const detail = (resp.value || []).find(a => String(a.id) === String(app.appId) || a.displayName === app.name);
-      if (!detail) continue;
-      // Debug: log raw user activity keys so we can refine field names if needed
-      if (detail.userActivity?.length) console.debug('[MCAS userActivity sample]', detail.userActivity[0]);
-      for (const u of (detail.userActivity || [])) {
-        const upn = u.userPrincipalName || u.userEmail || u.id;
-        if (!upn) continue;
-        const lastSeen = u.lastSeenDateTime ? new Date(u.lastSeenDateTime) : null;
-        const existing = userMap.get(upn);
-        if (!existing || (lastSeen && (!existing.lastSeen || lastSeen > existing.lastSeen))) {
-          userMap.set(upn, {
-            upn,
-            displayName: u.userDisplayName || u.displayName || upn.split('@')[0],
-            lastSeen,
-            upload: u.uploadNetworkTrafficInBytes ?? 0,
-            download: u.downloadNetworkTrafficInBytes ?? 0,
-            tx: u.transactionCount ?? 0,
-            _source: 'mcas',
-          });
-        }
+      if (detail?.userActivity?.length) {
+        console.debug('[MCAS userActivity sample]', detail.userActivity[0]);
+        for (const u of detail.userActivity) _mergeUser(userMap, u);
       }
-      // Cache result back on the app object for subsequent clicks
-      if (userMap.size > 0) app._mcasUsers = [...userMap.values()];
-    } catch (e) { console.warn('[fetchMcasAppUsers] stream', streamId, 'failed:', e.message); }
+    } catch (e) { console.warn('[fetchMcasAppUsers] $expand fallback failed:', e.message); }
   }
-  return userMap.size > 0 ? [...userMap.values()] : null;
+
+  if (userMap.size > 0) {
+    const result = [...userMap.values()];
+    app._mcasUsers = result; // cache for subsequent clicks
+    return result;
+  }
+  return null;
+}
+
+function _mergeUser(map, u) {
+  const upn = u.userPrincipalName || u.userEmail || u.id;
+  if (!upn) return;
+  const lastSeen = u.lastSeenDateTime ? new Date(u.lastSeenDateTime) : null;
+  const existing = map.get(upn);
+  if (!existing || (lastSeen && (!existing.lastSeen || lastSeen > existing.lastSeen))) {
+    map.set(upn, {
+      upn,
+      displayName: u.userDisplayName || u.displayName || upn.split('@')[0],
+      lastSeen,
+      upload:  u.uploadNetworkTrafficInBytes  ?? u.uploadedBytes  ?? 0,
+      download: u.downloadNetworkTrafficInBytes ?? u.downloadedBytes ?? 0,
+      tx:      u.transactionCount ?? u.transactions ?? 0,
+      _source: 'mcas',
+    });
+  }
+}
+
+function _normaliseMcasUsers(raw) {
+  return raw.map(u => {
+    const upn = u.upn || u.userPrincipalName || u.userEmail || u.id || '—';
+    return {
+      upn,
+      displayName: u.displayName || u.userDisplayName || upn.split('@')[0],
+      lastSeen:    u.lastSeen   ?? (u.lastSeenDateTime ? new Date(u.lastSeenDateTime) : null),
+      upload:      u.upload     ?? u.uploadNetworkTrafficInBytes  ?? 0,
+      download:    u.download   ?? u.downloadNetworkTrafficInBytes ?? 0,
+      tx:          u.tx         ?? u.transactionCount ?? 0,
+      _source:     'mcas',
+    };
+  });
 }
 
 // Fallback: match users from Azure AD sign-in logs by app name
