@@ -947,7 +947,11 @@ function scoreColor(n) {
 }
 
 function permWarn(perm, err) {
-  return `<div class="perm-warn">⚠️ Permission <code>${perm}</code> not available${err ? ' — ' + esc(err.slice(0,120)) : ''}. Grant admin consent and ensure the signed-in user has the required Entra role.</div>`;
+  const is500 = err && (err.startsWith('500') || err.includes('"code":"InternalServerError"'));
+  const hint  = is500
+    ? 'The service returned a 500 Internal Server Error — this typically means the underlying Microsoft service (Defender, Identity Protection, etc.) is not licensed or provisioned in this tenant, not a permission problem.'
+    : 'Grant admin consent and ensure the signed-in user has the required Entra role.';
+  return `<div class="perm-warn">${is500 ? '🔌' : '⚠️'} Permission <code>${perm}</code> not available${err ? ' — ' + esc(err.slice(0,150)) : ''}. ${hint}</div>`;
 }
 
 function destroyChart(key) {
@@ -4435,11 +4439,19 @@ async function loadAlerts() {
     const clsLabel = c => ({ truePositive:'✅ True positive', falsePositive:'🚫 False positive', benignPositive:'ℹ️ Benign', informationalExpectedActivity:'📋 Expected activity' }[c] || (c ? esc(c) : null));
 
     el.innerHTML = `
-      ${STATE.data.securityAlertsError ? permWarn('SecurityEvents.Read.All', STATE.data.securityAlertsError) : ''}
+      ${STATE.data.securityAlertsError ? (
+          STATE.data.securityAlertsIs500
+            ? `<div class="perm-warn">🔌 <strong>Microsoft Defender XDR is not provisioned in this tenant</strong> — <code>security/alerts_v2</code> returned a 500 Internal Server Error.
+               This is <em>not</em> a permission problem — the API requires Microsoft Defender for Endpoint, Microsoft 365 Defender, or Defender for Cloud Apps to be licensed and onboarded.
+               <br><span style="font-size:11px;opacity:.7">Both the v2 and v1 alert endpoints were tried. Error: ${esc(STATE.data.securityAlertsError.slice(0,150))}</span></div>`
+            : permWarn('SecurityEvents.Read.All', STATE.data.securityAlertsError)
+        ) : STATE.data.securityAlertsV1Fallback
+            ? `<div class="perm-warn" style="border-color:rgba(240,136,62,.4)">⚠️ <strong>Defender XDR alerts_v2 unavailable</strong> — showing alerts from the v1 endpoint instead. Some fields (classification, determination, alertWebUrl) may be missing.</div>`
+            : ''}
       <div class="section-header">
         <div class="section-title">Security Alerts</div>
         <div style="display:flex;align-items:center;gap:12px">
-          <span style="font-size:12px;color:var(--text-muted)">${derived.length} derived · ${secAlerts.length} from Defender</span>
+          <span style="font-size:12px;color:var(--text-muted)">${derived.length} derived · ${secAlerts.length} from Defender${STATE.data.securityAlertsV1Fallback ? ' (v1)' : ''}</span>
           <span class="data-source source-derived">⚡ Derived from Graph data + Defender</span>
         </div>
       </div>
@@ -4806,7 +4818,7 @@ async function loadLicenses() {
 // ── PROTECTION ────────────────────────────────────────────────────────────
 
 async function fetchSecurityAlerts() {
-  if (STATE.data.securityAlerts) return STATE.data.securityAlerts;
+  if (STATE.data.securityAlerts !== undefined) return STATE.data.securityAlerts;
   try {
     const d = await gget(
       `${GRAPH}/security/alerts_v2?$top=100&$orderby=createdDateTime desc` +
@@ -4814,8 +4826,22 @@ async function fetchSecurityAlerts() {
     );
     STATE.data.securityAlerts = d.value || [];
   } catch (e) {
+    const is500 = e.message.startsWith('500');
+    // 500 = Defender XDR not provisioned/licensed in this tenant — try v1 alerts as fallback
+    if (is500) {
+      try {
+        const d2 = await gget(
+          `${GRAPH}/security/alerts?$top=100&$select=id,title,severity,status,createdDateTime,category,description,webUrl`
+        );
+        // Normalise v1 shape to match v2 (alertWebUrl vs webUrl)
+        STATE.data.securityAlerts = (d2.value || []).map(a => ({ ...a, alertWebUrl: a.webUrl }));
+        STATE.data.securityAlertsV1Fallback = true;
+        return STATE.data.securityAlerts;
+      } catch { /* v1 also failed — fall through to error state */ }
+    }
     STATE.data.securityAlerts = [];
     STATE.data.securityAlertsError = e.message;
+    STATE.data.securityAlertsIs500 = is500;
   }
   return STATE.data.securityAlerts;
 }
