@@ -804,20 +804,13 @@ async function fetchGroups() {
 async function fetchCAPolicies() {
   if (STATE.data.caPolicies) return STATE.data.caPolicies;
   try {
-    const d = await gget(`${GRAPH}/identity/conditionalAccess/policies?$select=id,displayName,state,conditions,grantControls,createdDateTime`);
+    const d = await gget(`${GRAPH}/identity/conditionalAccess/policies?$select=id,displayName,state,conditions,grantControls,sessionControls,createdDateTime`);
     STATE.data.caPolicies = d.value || [];
   } catch (e) { STATE.data.caPolicies = []; STATE.data.caError = e.message; }
   return STATE.data.caPolicies;
 }
 
-async function fetchSecurityAlerts() {
-  if (STATE.data.secAlerts) return STATE.data.secAlerts;
-  try {
-    const d = await gget(`${GRAPH}/security/alerts_v2?$top=50&$select=id,title,severity,status,createdDateTime,description,category`);
-    STATE.data.secAlerts = d.value || [];
-  } catch (e) { STATE.data.secAlerts = []; STATE.data.secAlertsError = e.message; }
-  return STATE.data.secAlerts;
-}
+// fetchSecurityAlerts is defined below near loadProtection (richer fields, shared cache)
 
 async function fetchRiskyAgents() {
   if (STATE.data.riskyAgents) return STATE.data.riskyAgents;
@@ -849,7 +842,8 @@ async function fetchRiskyAgents() {
 }
 
 async function fetchIdProtectionAgentStats() {
-  if (STATE.data.idProtectionAgentStats) return STATE.data.idProtectionAgentStats;
+  // Use undefined as "not fetched" sentinel so null (error) is properly cached
+  if (STATE.data.idProtectionAgentStats !== undefined) return STATE.data.idProtectionAgentStats;
   try {
     // Total agents protected = all agent identities in the tenant (matches Entra portal)
     // Risk breakdown = from riskyAgents (beta) which tracks detected risk events
@@ -865,7 +859,7 @@ async function fetchIdProtectionAgentStats() {
     const none   = ra.filter(a => !a.riskLevel || a.riskLevel === 'none').length;
     STATE.data.idProtectionAgentStats = { total, high, medium, low, none };
   } catch (e) {
-    STATE.data.idProtectionAgentStats = null;
+    STATE.data.idProtectionAgentStats = null;  // null = fetched but failed
     STATE.data.idProtectionAgentStatsError = e.message;
   }
   return STATE.data.idProtectionAgentStats;
@@ -1010,13 +1004,13 @@ function refreshAll() {
   Object.values(STATE.charts).forEach(c => c.destroy());
   STATE.charts = {};
   // reset all page content
-  ['shadow','models','agents','risk','compliance','users','alerts','policies'].forEach(k => {
+  ['shadow','models','agents','risk','compliance','users','alerts','policies','licenses','protection'].forEach(k => {
     const el = document.getElementById(k + '-content');
     if (el) el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Reloading…</div>';
   });
   document.getElementById('dash-content').innerHTML = '<div class="section-loading"><span class="spinner"></span>Reloading…</div>';
+  // navigate() calls PAGE_LOADERS['dashboard']() automatically since STATE.loaded was cleared
   navigate('dashboard', document.querySelector('.nav-item.active'));
-  loadDashboard();
 }
 
 // ── Login UI helpers ───────────────────────────────────────────────────────
@@ -1246,12 +1240,13 @@ async function loadDashboard() {
           const valColor = hasErr ? 'var(--risk-critical)' : hasWarn ? 'var(--risk-medium)' : d.raw > 0 ? 'var(--accent-blue)' : 'var(--text-muted)';
           const icons    = { 'Users':'👥','Risky Users (P2)':'⚠️','Shadow AI Apps':'👻','AI Models':'🤖','Agent Identities':'🪪','Sign-in Events (30d)':'📈','Risky Agents':'⚡','CA Policies':'📋' };
           const delta    = d.err ? '❌ ' + d.err.slice(0,50) : d.warn ? '⚠️ ' + d.warn : d.filtered !== null ? d.filtered + ' ' + (d.filteredLabel||'') : '✅ OK';
-          const isShadow = d.label === 'Shadow AI Apps';
-          const isAgent  = d.label === 'Agent Identities';
+          const isShadow   = d.label === 'Shadow AI Apps';
+          const isAgent    = d.label === 'Agent Identities';
+          const isSignIns  = d.label === 'Sign-in Events (30d)';
           return `<div class="kpi-card ${alertCls}">
             <div class="kpi-label">${esc(d.label)}</div>
-            <div class="kpi-value" style="color:${valColor}"${isShadow ? ' id="dash-shadow-count"' : isAgent ? ' id="dash-agent-count"' : ''}>${d.raw}</div>
-            <div class="kpi-delta"${isShadow ? ' id="dash-shadow-delta"' : ''}>${esc(delta)}</div>
+            <div class="kpi-value" style="color:${valColor}"${isShadow ? ' id="dash-shadow-count"' : isAgent ? ' id="dash-agent-count"' : isSignIns ? ' id="dash-signins-count"' : ''}>${d.raw}</div>
+            <div class="kpi-delta"${isShadow ? ' id="dash-shadow-delta"' : isSignIns ? ' id="dash-signins-delta"' : ''}>${esc(delta)}</div>
             <div class="kpi-icon">${icons[d.label]||'📊'}</div>
           </div>`;
         }).join('')}
@@ -1371,7 +1366,7 @@ async function loadDashboard() {
     // Background: re-render sign-in chart with targeted, server-side-filtered data
     // so high-volume tenants show the full 30-day history instead of just today.
     fetchAiSignInsForChart(aiApps).then(targeted => {
-      if (!targeted || targeted === STATE.data.signIns) return; // no improvement
+      if (!targeted) return;
       const days = 30;
       const todayUTC2 = new Date(); todayUTC2.setUTCHours(0,0,0,0);
       const buckets2 = Array.from({length: days}, (_, i) => {
@@ -1386,6 +1381,18 @@ async function loadDashboard() {
           if (s.userPrincipalName) buckets2[days-1-idx].users.add(s.userPrincipalName);
         }
       });
+
+      // Update the Sign-in Events KPI card to reflect the targeted AI count
+      const totalAiSignIns = targeted.length;
+      const countEl = document.getElementById('dash-signins-count');
+      const deltaEl = document.getElementById('dash-signins-delta');
+      if (countEl) countEl.textContent = totalAiSignIns;
+      if (deltaEl) deltaEl.textContent = totalAiSignIns > 0
+        ? totalAiSignIns + ' AI-related (appId matched)'
+        : '0 AI-related';
+
+      // Only re-render chart if targeted data differs from the initial keyword-filtered set
+      if (targeted === STATE.data.signIns) return;
       destroyChart('dash-signins');
       const canvas = document.getElementById('dash-signins-chart');
       if (!canvas) return;
@@ -1584,8 +1591,110 @@ async function loadShadowApps() {
     updateDashShadowKpi();
     renderMcasApps(el, STATE.data.mcasApps, STATE.data.mcasUrl);
   } catch (graphErr) {
-    el.innerHTML = permWarn('CloudApp-Discovery.Read.All', graphErr.message);
+    // MCAS unavailable — fall back to SP / OAuth grant-based detection
+    el.innerHTML = '<div class="section-loading"><span class="spinner"></span>MCAS unavailable — loading SP-based AI app detection…</div>';
+    try {
+      const [sps, grants] = await Promise.all([fetchServicePrincipals(), fetchOAuth2Grants()]);
+      const aiApps = sps.filter(isAiApp);
+      renderSpFallbackApps(el, aiApps, grants, graphErr.message);
+    } catch (spErr) {
+      el.innerHTML = permWarn('CloudApp-Discovery.Read.All', graphErr.message)
+        + permWarn('Application.Read.All', spErr.message);
+    }
   }
+}
+
+function renderSpFallbackApps(el, aiApps, grants, mcasErrMsg) {
+  const critCount = aiApps.filter(sp => riskScore(sp, grants) === 'critical').length;
+  const highCount = aiApps.filter(sp => riskScore(sp, grants) === 'high').length;
+  const hrApps    = aiApps.filter(sp => highRiskScopesFor(sp.id, grants).length > 0);
+
+  el.innerHTML = `
+    <div class="perm-warn" style="margin-bottom:16px">
+      ⚠️ <strong>Defender for Cloud Apps discovery unavailable</strong> — <code>CloudApp-Discovery.Read.All</code> not granted or no discovery streams configured.
+      Showing AI app detection based on Entra service principals and OAuth2 grants instead.
+      ${mcasErrMsg ? `<br><span style="font-size:11px;opacity:.7">${esc(mcasErrMsg.slice(0,200))}</span>` : ''}
+    </div>
+
+    <div class="section-header" style="margin-bottom:12px">
+      <div>
+        <div class="section-title">Shadow AI Apps — SP-Based Detection</div>
+        <div class="section-sub">Detected via service principal display names &amp; publisher names · No MCAS traffic data available</div>
+      </div>
+      <span class="data-source source-derived">⚡ Derived from Entra service principals</span>
+    </div>
+
+    <div class="kpi-row">
+      <div class="kpi-card info">
+        <div class="kpi-label">AI Apps Detected</div>
+        <div class="kpi-value text-blue">${aiApps.length}</div>
+        <div class="kpi-delta">Via SP name matching</div>
+        <div class="kpi-icon">🤖</div>
+      </div>
+      <div class="kpi-card ${critCount > 0 ? 'critical' : 'medium'}">
+        <div class="kpi-label">Critical Risk</div>
+        <div class="kpi-value ${critCount > 0 ? 'text-critical' : 'text-medium'}">${critCount}</div>
+        <div class="kpi-delta">${highCount} high risk</div>
+        <div class="kpi-icon">🔴</div>
+      </div>
+      <div class="kpi-card ${hrApps.length > 0 ? 'high' : 'low'}">
+        <div class="kpi-label">High-Risk OAuth Scopes</div>
+        <div class="kpi-value ${hrApps.length > 0 ? 'text-high' : 'text-low'}">${hrApps.length}</div>
+        <div class="kpi-delta">Apps with Mail / Files / Calendar access</div>
+        <div class="kpi-icon">🔑</div>
+      </div>
+      <div class="kpi-card medium">
+        <div class="kpi-label">Tenant-Wide Grants</div>
+        <div class="kpi-value text-medium">${grants.filter(g => g.consentType === 'AllPrincipals' && aiApps.some(a => a.id === g.clientId)).length}</div>
+        <div class="kpi-delta">Admin-consented for all users</div>
+        <div class="kpi-icon">🔐</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Detected AI Applications (${aiApps.length})</div>
+        <span style="font-size:11px;color:var(--text-muted)">Sorted by risk · Enable Defender for Cloud Apps for traffic data &amp; user attribution</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Application</th><th>Publisher</th><th>Model / Provider</th><th>Data Residency</th>
+            <th>Risk</th><th>High-Risk Scopes</th><th>Consent</th><th>Created</th>
+          </tr></thead>
+          <tbody>${[...aiApps].sort((a, b) => {
+            const ord = { critical:4, high:3, medium:2, low:1 };
+            return (ord[riskScore(b, grants)] || 0) - (ord[riskScore(a, grants)] || 0);
+          }).map(sp => {
+            const r    = riskScore(sp, grants);
+            const mi   = detectModel(sp.displayName || '');
+            const hrs  = highRiskScopesFor(sp.id, grants);
+            const ct   = grants.find(g => g.clientId === sp.id)?.consentType;
+            return `<tr>
+              <td>
+                <strong>${esc(sp.displayName)}</strong>
+                ${!sp.accountEnabled ? '<br><span class="badge badge-critical" style="font-size:10px">Disabled</span>' : ''}
+              </td>
+              <td class="text-muted">${esc(sp.publisherName || '—')}</td>
+              <td><span style="font-size:12px">${esc(mi.model)}</span><br><span class="text-muted" style="font-size:10px">${esc(mi.provider)}</span></td>
+              <td class="mono text-muted" style="font-size:11px">${esc(mi.residency)}${mi.gdprOk ? ' <span class="text-low">✅</span>' : ' <span class="text-critical">❌</span>'}</td>
+              <td>${riskBadge(r)}</td>
+              <td>${hrs.length
+                ? `<span class="text-high">${hrs.slice(0, 3).map(esc).join('<br>')}${hrs.length > 3 ? `<br>+${hrs.length - 3} more` : ''}</span>`
+                : '<span class="text-muted">None</span>'}</td>
+              <td>${ct === 'AllPrincipals'
+                ? '<span class="badge badge-critical" style="font-size:10px">Tenant-wide</span>'
+                : ct === 'Principal'
+                ? '<span class="badge badge-info" style="font-size:10px">Delegated</span>'
+                : '<span class="text-muted" style="font-size:10px">—</span>'}</td>
+              <td class="mono text-muted" style="font-size:11px">${sp.createdDateTime ? new Date(sp.createdDateTime).toLocaleDateString() : '—'}</td>
+            </tr>`;
+          }).join('') || '<tr><td colspan="8" class="empty-state text-muted">No AI apps detected via service principal names</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
 }
 
 function renderMcasApps(el, apps, mcasUrl) {
@@ -1653,8 +1762,8 @@ function renderMcasApps(el, apps, mcasUrl) {
       <div style="display:flex;gap:8px;align-items:center">
         <span class="data-source source-live">● Live from MDCA</span>
         <button class="btn btn-ghost" style="font-size:11px"
-          onclick="localStorage.removeItem('mcasUrl');localStorage.removeItem('mcasApiToken');STATE.data.mcasApps=undefined;STATE.loaded.delete('shadow-apps');loadShadowApps()">
-          ⚙ Change
+          onclick="STATE.data.mcasApps=undefined;STATE.loaded.delete('shadow-apps');loadShadowApps()">
+          🔄 Re-fetch
         </button>
       </div>
     </div>
@@ -1679,10 +1788,10 @@ function renderMcasApps(el, apps, mcasUrl) {
         <div class="kpi-icon">⚠️</div>
       </div>
       <div class="kpi-card medium">
-        <div class="kpi-label">Unsanctioned Apps</div>
-        <div class="kpi-value text-medium">${unsanctioned.length}</div>
+        <div class="kpi-label">Total Users (30d)</div>
+        <div class="kpi-value text-medium">${totalUsers.toLocaleString()}</div>
         <div class="kpi-delta">${apps.filter(a => { const t = a.type; return t === 3 || (!isSanctioned(a) && !isUnsanctioned(a)); }).length} unreviewed · needs approval</div>
-        <div class="kpi-icon">🚫</div>
+        <div class="kpi-icon">👤</div>
       </div>
     </div>
 
@@ -1849,10 +1958,10 @@ function renderModelTable() {
 
   const srcBadgeInline = sources => {
     const badges = [];
-    if (sources?.sp)     badges.push('<span class="badge" style="font-size:9px;background:rgba(56,139,253,.15);color:var(--accent-blue)">SP</span>');
-    if (sources?.signin) badges.push('<span class="badge" style="font-size:9px;background:rgba(163,113,247,.15);color:var(--accent-purple)">Sign-in</span>');
-    if (sources?.mcas)   badges.push('<span class="badge" style="font-size:9px;background:rgba(63,185,80,.15);color:var(--risk-low)">MCAS</span>');
-    if (sources?.agent)  badges.push('<span class="badge" style="font-size:9px;background:rgba(227,179,65,.15);color:var(--gold)">Agent</span>');
+    if (sources?.has('sp'))     badges.push('<span class="badge" style="font-size:9px;background:rgba(56,139,253,.15);color:var(--accent-blue)">SP</span>');
+    if (sources?.has('signin')) badges.push('<span class="badge" style="font-size:9px;background:rgba(163,113,247,.15);color:var(--accent-purple)">Sign-in</span>');
+    if (sources?.has('mcas'))   badges.push('<span class="badge" style="font-size:9px;background:rgba(63,185,80,.15);color:var(--risk-low)">MCAS</span>');
+    if (sources?.has('agent'))  badges.push('<span class="badge" style="font-size:9px;background:rgba(227,179,65,.15);color:var(--gold)">Agent</span>');
     return badges.join(' ');
   };
 
@@ -2494,7 +2603,8 @@ function agentOwnerCell(meta, loading, mode = 'both-warn-owner') {
 }
 
 function agentSpCell(sp) {
-  return `<strong>${esc(sp.displayName)}</strong><br><span class="mono text-muted" style="font-size:10px">${esc(sp.appId.slice(0,18))}…</span>`;
+  const idStr = sp.appId || sp.id || '';
+  return `<strong>${esc(sp.displayName)}</strong><br><span class="mono text-muted" style="font-size:10px">${esc(idStr.slice(0,18))}…</span>`;
 }
 
 function applySortIndicators(tableId, key, dir) {
@@ -3284,7 +3394,7 @@ async function loadAgents() {
                   const bpId = a.blueprintId;
                   const bpSp = bpId ? [...(STATE.data.blueprintSps||[])].find(s => s.id === bpId || s.appId === bpId) : null;
                   return `<tr style="${a.riskState==='confirmedCompromised'?'background:rgba(248,81,73,.05)':''}">
-                    <td><strong>${name}</strong><br><span class="mono text-muted" style="font-size:10px">${esc(a.id.slice(0,18))}…</span></td>
+                    <td><strong>${name}</strong><br><span class="mono text-muted" style="font-size:10px">${esc((a.id||'').slice(0,18))}…</span></td>
                     <td style="font-size:12px">${typeLabel}</td>
                     <td style="font-size:11px">${bpSp ? `<span style="color:var(--accent-purple)">📋 ${esc(bpSp.displayName)}</span>` : bpId ? `<span class="mono text-muted">${bpId.slice(0,16)}…</span>` : '<span style="opacity:.4">—</span>'}</td>
                     <td>${riskBadge(a.riskLevel||'medium')}</td>
@@ -3625,11 +3735,15 @@ async function loadDataRisk() {
     const identityPermRows  = identitySps.map(makePermRow);
     const classicPermRows   = classicSps2.map(makePermRow);
 
+    // AI apps with email-related OAuth scopes (Mail.Read / Mail.ReadWrite / Mail.Send)
+    const MAIL_SCOPES = ['Mail.Read','Mail.ReadWrite','Mail.Send'];
+    const mailboxAiApps = aiApps.filter(sp => getScopesForSp(sp.id, grants).some(s => MAIL_SCOPES.includes(s)));
+
     el.innerHTML = `
       ${STATE.data.riskyUsersError ? permWarn('IdentityRiskyUser.Read.All', STATE.data.riskyUsersError) : ''}
       ${STATE.data.riskyAgentsError ? permWarn('IdentityRiskyAgent.Read.All', STATE.data.riskyAgentsError) : ''}
 
-      <div class="kpi-row">
+      <div class="kpi-row" style="grid-template-columns:repeat(5,1fr)">
         <div class="kpi-card critical">
           <div class="kpi-label">Risky Sign-ins to AI Apps</div>
           <div class="kpi-value text-critical">${riskyAiSignIns.length}</div>
@@ -3648,8 +3762,11 @@ async function loadDataRisk() {
           <div class="kpi-delta">${riskyAgents.filter(a=>a.riskLevel==='high').length} high · ${riskyAgents.filter(a=>a.riskLevel==='medium').length} medium${STATE.data.riskyAgentsError?' · *requires P2':''}</div>
           <div class="kpi-icon">⚡</div>
         </div>
-        <div class="kpi-card" style="display:none">
-          <div class="kpi-label">AI Apps with Mailbox Access</div>
+        <div class="kpi-card ${mailboxAiApps.length > 0 ? 'high' : 'low'}">
+          <div class="kpi-label">Mailbox Access (AI Apps)</div>
+          <div class="kpi-value ${mailboxAiApps.length > 0 ? 'text-high' : 'text-low'}">${mailboxAiApps.length}</div>
+          <div class="kpi-delta">${mailboxAiApps.length > 0 ? mailboxAiApps.slice(0,2).map(sp=>esc(sp.displayName)).join(', ')+(mailboxAiApps.length>2?'…':'') : '✅ No mailbox grants to AI apps'}</div>
+          <div class="kpi-icon">📧</div>
         </div>
         <div class="kpi-card critical" style="cursor:pointer;border:2px solid transparent;transition:border-color .15s" onclick="document.getElementById('blocked-violations').scrollIntoView({behavior:'smooth',block:'start'});document.getElementById('blocked-violations').style.outline='2px solid var(--risk-critical)';setTimeout(()=>{document.getElementById('blocked-violations').style.outline='none'},2500)">
           <div class="kpi-label">Blocked Perm Violations</div>
@@ -3892,13 +4009,13 @@ async function loadCompliance() {
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Model</th><th>Provider</th><th>Data Residency</th><th>Trains on Prompts</th><th>GDPR Status</th><th>Sign-in Events</th><th>Compliance</th></tr></thead>
-            <tbody>${gdprModels.sort((a,b) => (a.gdprOk===b.gdprOk?0:a.gdprOk?-1:1) || b.calls-a.calls).map(m => `<tr style="${!m.gdprOk?'background:rgba(248,81,73,.04)':''}">
+            <thead><tr><th>Model</th><th>Provider</th><th>Data Residency</th><th>Trains on Prompts</th><th>Risk Level</th><th>Sign-in Events</th><th>GDPR Compliance</th></tr></thead>
+            <tbody>${gdprModels.sort((a,b) => (a.gdprOk===b.gdprOk?0:a.gdprOk?1:-1) || b.calls-a.calls).map(m => `<tr style="${!m.gdprOk?'background:rgba(248,81,73,.04)':''}">
               <td><strong>${esc(m.model)}</strong></td>
               <td class="text-muted">${esc(m.provider)}</td>
-              <td class="mono">${esc(m.residency)}</td>
+              <td class="mono text-muted" style="font-size:12px">${esc(m.residency)}</td>
               <td>${m.training==='Yes'?'<span class="text-critical">⚠️ Yes</span>':m.training==='No'?'<span class="text-low">✅ No</span>':'<span class="text-medium">⚡ '+esc(m.training)+'</span>'}</td>
-              <td class="mono text-muted" style="font-size:11px">${esc(m.residency)}</td>
+              <td>${riskBadge(m.risk||'medium')}</td>
               <td style="font-weight:600">${m.calls||'—'}</td>
               <td>${m.gdprOk
                 ? '<span class="badge badge-low">✅ Compliant</span>'
@@ -4117,7 +4234,8 @@ function renderUsersTable() {
   const sorted = sortRows(users, key, dir, getVal);
   applySortIndicators('users-table', key, dir);
 
-  tbody.innerHTML = sorted.slice(0, 50).map(u => {
+  const limit = STATE.usersShowAll ? sorted.length : 50;
+  tbody.innerHTML = sorted.slice(0, limit).map(u => {
     const initials = (u.displayName||'?').split(' ').map(n=>n[0]).join('').slice(0,2).toUpperCase();
     const aiAppCount = userAiApps?.[u.userPrincipalName]?.size || 0;
     const aiAppList = [...(userAiApps?.[u.userPrincipalName]||[])].slice(0,3).join(', ');
@@ -4134,7 +4252,7 @@ function renderUsersTable() {
     return `<tr>
       <td>
         <div class="user-cell">
-          <div class="user-avatar" style="${isAgentUser?'background:var(--accent-purple)':isGlobalAdmin?'background:var(--accent-red)':''}">${isAgentUser?'🤖':esc(initials)}</div>
+          <div class="user-avatar" style="${isAgentUser?'background:var(--accent-purple)':isGlobalAdmin?'background:var(--risk-critical)':''}">${isAgentUser?'🤖':esc(initials)}</div>
           <div>
             <div class="user-name">${esc(u.displayName||u.userPrincipalName)}</div>
             <div class="user-email">${esc(u.userPrincipalName)}</div>
@@ -4156,6 +4274,26 @@ function renderUsersTable() {
       <td>${u.accountEnabled?'<span class="text-low">✅ Active</span>':'<span class="text-critical">🚫 Disabled</span>'}</td>
     </tr>`;
   }).join('');
+
+  // Append "show all" footer when list is truncated
+  if (!STATE.usersShowAll && sorted.length > 50) {
+    const remaining = sorted.length - 50;
+    const footer = document.createElement('tr');
+    footer.innerHTML = `<td colspan="7" style="text-align:center;padding:12px;border-top:1px solid var(--border)">
+      <button class="btn btn-ghost" style="font-size:12px" onclick="STATE.usersShowAll=true;renderUsersTable()">
+        Show ${remaining} more users (${sorted.length} total)
+      </button>
+    </td>`;
+    tbody.appendChild(footer);
+  } else if (STATE.usersShowAll && sorted.length > 50) {
+    const footer = document.createElement('tr');
+    footer.innerHTML = `<td colspan="7" style="text-align:center;padding:10px;border-top:1px solid var(--border)">
+      <button class="btn btn-ghost" style="font-size:12px" onclick="STATE.usersShowAll=false;renderUsersTable()">
+        ↑ Collapse to top 50
+      </button>
+    </td>`;
+    tbody.appendChild(footer);
+  }
 }
 
 function sortUsersTable(key) {
@@ -4284,16 +4422,26 @@ async function loadAlerts() {
 
     const allAlerts = [
       ...derived,
-      ...secAlerts.map(a => ({ sev: a.severity||'medium', title: a.title, desc: a.description, icon: '🛡️', source: 'Defender' })),
+      ...secAlerts.map(a => ({
+        sev: a.severity||'medium', title: a.title, desc: a.description, icon: '🛡️',
+        source: 'Defender' + (a.category ? ' · ' + a.category : '') + (a.status ? ' · ' + a.status : ''),
+        url: a.alertWebUrl || null,
+        classification: a.classification, determination: a.determination,
+      })),
     ];
 
     document.getElementById('alert-badge').textContent = allAlerts.filter(a=>a.sev==='critical'||a.sev==='high').length;
 
+    const clsLabel = c => ({ truePositive:'✅ True positive', falsePositive:'🚫 False positive', benignPositive:'ℹ️ Benign', informationalExpectedActivity:'📋 Expected activity' }[c] || (c ? esc(c) : null));
+
     el.innerHTML = `
-      ${STATE.data.secAlertsError ? permWarn('SecurityEvents.Read.All', STATE.data.secAlertsError) : ''}
+      ${STATE.data.securityAlertsError ? permWarn('SecurityEvents.Read.All', STATE.data.securityAlertsError) : ''}
       <div class="section-header">
         <div class="section-title">Security Alerts</div>
-        <span class="data-source source-derived">⚡ Derived from Graph data + Defender</span>
+        <div style="display:flex;align-items:center;gap:12px">
+          <span style="font-size:12px;color:var(--text-muted)">${derived.length} derived · ${secAlerts.length} from Defender</span>
+          <span class="data-source source-derived">⚡ Derived from Graph data + Defender</span>
+        </div>
       </div>
       <div class="card">
         ${allAlerts.length === 0
@@ -4302,9 +4450,13 @@ async function loadAlerts() {
           <div class="alert-item">
             <div class="alert-icon">${a.icon||'⚠️'}</div>
             <div style="flex:1">
-              <div class="alert-title">${esc(a.title)}</div>
+              <div class="alert-title">${esc(a.title)}${a.url ? ` <a href="${esc(a.url)}" target="_blank" rel="noopener" style="font-size:11px;color:var(--accent-blue);margin-left:6px;text-decoration:none">View in Defender →</a>` : ''}</div>
               <div class="alert-desc">${esc(a.desc||'')}</div>
-              <div class="alert-meta">${a.source||'Derived from Graph'}</div>
+              <div class="alert-meta" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                <span>${a.source||'Derived from Graph'}</span>
+                ${a.classification ? `<span style="color:var(--text-dim)">· ${clsLabel(a.classification)||esc(a.classification)}</span>` : ''}
+                ${a.determination && a.determination!=='unknown' ? `<span style="color:var(--text-dim)">· ${esc(a.determination)}</span>` : ''}
+              </div>
             </div>
             ${riskBadge(a.sev)}
           </div>`).join('')}
@@ -4344,8 +4496,22 @@ function renderPoliciesTable() {
     const appIds = p.conditions?.applications?.includeApplications || [];
     const incApps = appIds.length > 0 ? (appIds.includes('All') ? 'All apps' : appIds.length + ' app(s)') : '—';
     const appSort = appIds.includes('All') ? 9999 : appIds.length;
-    const controls = (p.grantControls?.builtInControls||[]).join(', ') || '—';
-    return { p, incDisplay, excDisplay, incApps, appSort, controls };
+    // Grant controls + auth strength + session controls all in one column
+    const grantCtls      = p.grantControls?.builtInControls || [];
+    const hasAuthStr     = !!p.grantControls?.authenticationStrength;
+    const hasTokenProt   = !!p.sessionControls?.tokenProtection?.isEnabled;
+    const hasSignInFreq  = !!p.sessionControls?.signInFrequency?.isEnabled;
+    const allCtls = [
+      ...grantCtls,
+      hasAuthStr    ? '🔐 Auth Strength'     : null,
+      hasTokenProt  ? '🔑 Token Protection'  : null,
+      hasSignInFreq ? '⏱️ Sign-in Freq.'    : null,
+    ].filter(Boolean);
+    const controls     = allCtls.join(', ') || '—';   // for sort
+    const controlsHtml = allCtls.length
+      ? allCtls.map(c => `<span style="display:inline-block;margin:1px 2px;padding:1px 6px;border-radius:3px;background:rgba(56,139,253,.1);color:var(--accent-blue);font-size:10px">${esc(c)}</span>`).join('')
+      : '<span style="opacity:.4">—</span>';
+    return { p, incDisplay, excDisplay, incApps, appSort, controls, controlsHtml };
   });
 
   const sorted = [...rows].sort((a, b) => {
@@ -4363,7 +4529,7 @@ function renderPoliciesTable() {
     return 0;
   });
 
-  tbody.innerHTML = sorted.map(({ p, incDisplay, excDisplay, incApps, controls }) => {
+  tbody.innerHTML = sorted.map(({ p, incDisplay, excDisplay, incApps, controlsHtml }) => {
     const aiRel = isAiCaPolicy(p);
     return `<tr style="${aiRel ? 'background:rgba(163,113,247,.06)' : ''}">
     <td>
@@ -4374,7 +4540,7 @@ function renderPoliciesTable() {
     <td class="text-muted" title="${esc(incDisplay)}">${esc(incDisplay)}</td>
     <td class="text-muted" title="${esc(excDisplay)}">${esc(excDisplay)}</td>
     <td class="text-muted">${esc(incApps)}</td>
-    <td class="mono text-muted">${esc(controls)}</td>
+    <td>${controlsHtml}</td>
     <td class="mono text-muted">${p.createdDateTime ? new Date(p.createdDateTime).toLocaleDateString() : '—'}</td>
   </tr>`;
   }).join('') || '<tr><td colspan="7" class="empty-state text-muted">No CA policies found</td></tr>';
