@@ -323,6 +323,7 @@
         <span class="perm-chip core">Organization.Read.All</span>
         <span class="perm-chip core">RoleManagement.Read.All</span>
         <span class="perm-chip core">CloudApp-Discovery.Read.All</span>
+        <span class="perm-chip core">Reports.Read.All</span>
       </div>
     </div>
 
@@ -407,6 +408,7 @@
       <button class="nav-item" onclick="navigate('models',this)"><span class="nav-icon">🤖</span>AI Models</button>
       <button class="nav-item" onclick="navigate('agents',this)"><span class="nav-icon">⚡</span>AI Agents</button>
       <button class="nav-item" onclick="navigate('mcp',this)"><span class="nav-icon">🔌</span>MCP Servers</button>
+      <button class="nav-item" onclick="navigate('copilot',this)"><span class="nav-icon">💬</span>Copilot Usage</button>
       <div class="nav-section-label">Risk &amp; Compliance</div>
       <button class="nav-item" onclick="navigate('data-risk',this)"><span class="nav-icon">🔐</span>Data Risk</button>
       <button class="nav-item" onclick="navigate('compliance',this)"><span class="nav-icon">✅</span>Compliance</button>
@@ -511,6 +513,11 @@
         <div id="mcp-content"><div class="section-loading"><span class="spinner"></span>Loading MCP server data…</div></div>
       </div>
 
+      <!-- ══ COPILOT USAGE ══ -->
+      <div class="page" id="page-copilot">
+        <div id="copilot-content"><div class="section-loading"><span class="spinner"></span>Loading Copilot usage data…</div></div>
+      </div>
+
       <!-- ══ CONSENT HISTORY ══ -->
       <div class="page" id="page-consent">
         <div id="consent-content"><div class="section-loading"><span class="spinner"></span>Loading consent history…</div></div>
@@ -547,6 +554,7 @@ const GRAPH_SCOPES = [
   'https://graph.microsoft.com/AgentIdentityBlueprint.Read.All',
   'https://graph.microsoft.com/AgentIdentity.Read.All',
   'https://graph.microsoft.com/AgentIdentityBlueprintPrincipal.Read.All',
+  'https://graph.microsoft.com/Reports.Read.All',
   'https://graph.microsoft.com/InformationProtectionPolicy.Read',
   'https://graph.microsoft.com/SensitivityLabel.Read',
   'https://graph.microsoft.com/SensitivityLabels.Read.All',
@@ -975,6 +983,35 @@ async function fetchMipPolicySettings() {
   return STATE.data.mipPolicySettings;
 }
 
+// ── M365 COPILOT USAGE ───────────────────────────────────────────────────────
+async function fetchCopilotUsage() {
+  if (STATE.data.copilotUsage !== undefined) return STATE.data.copilotUsage;
+  const result = { summary: null, userDetail: [], source: null, error: null };
+
+  // Try v1.0 summary endpoint first, fall back to beta
+  for (const base of [GRAPH, GRAPH_BETA]) {
+    try {
+      const d = await gget(`${base}/reports/getM365CopilotUsageSummary`);
+      result.summary = d;
+      result.source = base === GRAPH ? 'v1.0' : 'beta';
+      break;
+    } catch (_) {}
+  }
+
+  // User-level activity (D30) — returns JSON array via beta
+  try {
+    const d = await gget(`${GRAPH_BETA}/reports/getM365CopilotUserDetailWithPeriod(period='D30')`);
+    result.userDetail = Array.isArray(d) ? d : (d.value || []);
+  } catch (_) {}
+
+  if (!result.summary && !result.userDetail.length) {
+    result.error = 'Reports.Read.All permission required or M365 Copilot not licensed in this tenant.';
+  }
+
+  STATE.data.copilotUsage = result;
+  return result;
+}
+
 async function fetchSignIns() {
   if (STATE.data.signIns) return STATE.data.signIns;
   try {
@@ -1232,6 +1269,7 @@ const PAGE_TITLES = {
   agents:'AI Agents',mcp:'MCP Servers','data-risk':'Data Risk',compliance:'Compliance',
   users:'Users & Groups',alerts:'Security Alerts',policies:'Policies',licenses:'Licenses',
   protection:'Protection',sharing:'External Sharing Exposure',labels:'Sensitivity Label Exposure',consent:'Consent History',
+  copilot:'M365 Copilot Usage',
 };
 
 const PAGE_LOADERS = {
@@ -1244,6 +1282,7 @@ const PAGE_LOADERS = {
   sharing: loadExternalSharing,
   labels: loadSensitivityLabels,
   consent: loadConsentTimeline,
+  copilot: loadCopilotUsage,
 };
 
 function navigate(id, btn) {
@@ -1278,7 +1317,7 @@ function refreshAll() {
   Object.values(STATE.charts).forEach(c => c.destroy());
   STATE.charts = {};
   // reset all page content
-  ['shadow','models','agents','mcp','risk','compliance','users','alerts','policies','licenses','protection','sharing','labels','consent'].forEach(k => {
+  ['shadow','models','agents','mcp','copilot','risk','compliance','users','alerts','policies','licenses','protection','sharing','labels','consent'].forEach(k => {
     const el = document.getElementById(k + '-content');
     if (el) el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Reloading…</div>';
   });
@@ -7102,6 +7141,194 @@ async function showAppUsers(idx, anchorEl) {
   const signinUsers = _usersFromSignIns(appName);
   _renderPopoverUsers(signinUsers, 'sign-in logs');
   _positionPopover(anchorEl, signinUsers.length || 1);
+}
+
+// ── M365 COPILOT USAGE PAGE ──────────────────────────────────────────────────
+async function loadCopilotUsage() {
+  const el = document.getElementById('copilot-content');
+  el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Loading Copilot usage data…</div>';
+  try {
+    const usage = await fetchCopilotUsage();
+
+    if (usage.error && !usage.summary) {
+      el.innerHTML = permWarn('Reports.Read.All', usage.error);
+      return;
+    }
+
+    const s = usage.summary || {};
+
+    // Helper: extract activeUsers safely from nested or flat structure
+    const active = (key) => s[key]?.activeUsers ?? s[key]?.totalActiveUsers ?? 0;
+    const inactive = (key) => s[key]?.inactiveUsers ?? 0;
+
+    const apps = [
+      { key: 'teamsChat',    label: 'Teams Chat',   icon: '💬' },
+      { key: 'word',         label: 'Word',          icon: '📝' },
+      { key: 'excel',        label: 'Excel',         icon: '📊' },
+      { key: 'powerPoint',   label: 'PowerPoint',    icon: '📽️' },
+      { key: 'outlook',      label: 'Outlook',       icon: '📧' },
+      { key: 'oneNote',      label: 'OneNote',       icon: '📓' },
+      { key: 'loop',         label: 'Loop',          icon: '🔁' },
+      { key: 'copilotStudio',label: 'Copilot Studio',icon: '🤖' },
+    ].map(a => ({ ...a, activeUsers: active(a.key), inactiveUsers: inactive(a.key) }))
+     .filter(a => a.activeUsers > 0 || s[a.key] !== undefined);
+
+    const totalActive   = s.totalActiveUsers ?? s.userCopilot?.activeUsers ?? apps.reduce((n,a) => Math.max(n, a.activeUsers), 0);
+    const totalInactive = s.userCopilot?.inactiveUsers ?? 0;
+    const totalLicensed = totalActive + totalInactive;
+    const adoptionPct   = totalLicensed > 0 ? Math.round((totalActive / totalLicensed) * 100) : null;
+    const period        = s.reportPeriod || '30';
+    const refreshDate   = s.reportRefreshDate || '';
+
+    // Top app by usage
+    const topApp = [...apps].sort((a,b) => b.activeUsers - a.activeUsers)[0];
+
+    el.innerHTML = `
+      <div class="section-header">
+        <div>
+          <div class="section-title">M365 Copilot Usage</div>
+          <div class="section-sub">Microsoft 365 Copilot activity · last ${period} days</div>
+        </div>
+        <span class="data-source ${usage.source ? 'source-live' : 'source-derived'}">
+          ${usage.source ? `● reports/getM365CopilotUsageSummary (${usage.source})` : '⚡ No data'}
+          ${refreshDate ? ` · refreshed ${refreshDate}` : ''}
+        </span>
+      </div>
+
+      <div class="kpi-row" style="grid-template-columns:repeat(4,1fr);margin-bottom:20px">
+        <div class="kpi-card ${totalActive > 0 ? 'low' : 'info'}">
+          <div class="kpi-label">Active Copilot Users</div>
+          <div class="kpi-value ${totalActive > 0 ? 'text-low' : 'text-blue'}">${totalActive || '—'}</div>
+          <div class="kpi-delta">Last ${period} days</div>
+          <div class="kpi-icon">💬</div>
+        </div>
+        <div class="kpi-card info">
+          <div class="kpi-label">Licensed Users</div>
+          <div class="kpi-value text-blue">${totalLicensed || '—'}</div>
+          <div class="kpi-delta">${totalInactive > 0 ? `${totalInactive} inactive` : 'All active'}</div>
+          <div class="kpi-icon">🪪</div>
+        </div>
+        <div class="kpi-card ${adoptionPct !== null ? (adoptionPct >= 70 ? 'low' : adoptionPct >= 40 ? 'medium' : 'high') : 'info'}">
+          <div class="kpi-label">Adoption Rate</div>
+          <div class="kpi-value ${adoptionPct !== null ? (adoptionPct >= 70 ? 'text-low' : adoptionPct >= 40 ? 'text-medium' : 'text-high') : 'text-blue'}">
+            ${adoptionPct !== null ? adoptionPct + '%' : '—'}
+          </div>
+          <div class="kpi-delta">${adoptionPct !== null ? (adoptionPct >= 70 ? '✅ Good adoption' : adoptionPct >= 40 ? '⚠️ Moderate adoption' : '⚠️ Low adoption') : 'Insufficient data'}</div>
+          <div class="kpi-icon">📈</div>
+        </div>
+        <div class="kpi-card info">
+          <div class="kpi-label">Top App</div>
+          <div class="kpi-value" style="font-size:14px;margin-top:4px">${topApp ? topApp.icon + ' ' + esc(topApp.label) : '—'}</div>
+          <div class="kpi-delta">${topApp ? topApp.activeUsers + ' active users' : 'No data'}</div>
+          <div class="kpi-icon">🏆</div>
+        </div>
+      </div>
+
+      ${apps.length > 0 ? `
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
+
+        <!-- Usage by App -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">📊 Active Users by Copilot App</div>
+            <span style="font-size:11px;color:var(--text-muted)">Last ${period} days</span>
+          </div>
+          <div class="card-body" style="padding:14px">
+            ${apps.map(a => {
+              const pct = totalActive > 0 ? Math.round((a.activeUsers / totalActive) * 100) : 0;
+              return `
+              <div style="margin-bottom:12px">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+                  <span style="font-size:12px">${a.icon} ${esc(a.label)}</span>
+                  <span style="font-size:12px;font-weight:600;color:var(--accent-blue)">${a.activeUsers}</span>
+                </div>
+                <div style="background:var(--bg-secondary);border-radius:4px;height:6px;overflow:hidden">
+                  <div style="background:var(--accent-blue);height:100%;width:${pct}%;border-radius:4px;transition:width .4s"></div>
+                </div>
+                <div style="font-size:10px;color:var(--text-dim);margin-top:2px">${pct}% of active users</div>
+              </div>`;
+            }).join('')}
+          </div>
+        </div>
+
+        <!-- Active vs Inactive breakdown -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">📋 License Utilisation</div>
+            <span style="font-size:11px;color:var(--text-muted)">Active vs inactive licensed seats</span>
+          </div>
+          <div class="card-body" style="padding:14px">
+            ${totalLicensed > 0 ? `
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+              <div style="width:90px;height:90px;position:relative;flex-shrink:0">
+                <svg viewBox="0 0 36 36" style="width:100%;height:100%;transform:rotate(-90deg)">
+                  <circle cx="18" cy="18" r="15.9" fill="none" stroke="var(--bg-hover)" stroke-width="3.8"/>
+                  <circle cx="18" cy="18" r="15.9" fill="none" stroke="var(--accent-blue)" stroke-width="3.8"
+                    stroke-dasharray="${adoptionPct} ${100 - adoptionPct}" stroke-linecap="round"/>
+                </svg>
+                <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:var(--accent-blue)">${adoptionPct}%</div>
+              </div>
+              <div style="flex:1">
+                <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:12px">
+                  <span style="width:10px;height:10px;border-radius:50%;background:var(--accent-blue);flex-shrink:0"></span>
+                  <span style="color:var(--text-dim)">Active</span>
+                  <span style="margin-left:auto;font-weight:600">${totalActive}</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:6px;font-size:12px">
+                  <span style="width:10px;height:10px;border-radius:50%;background:var(--bg-hover);flex-shrink:0;border:1px solid var(--border)"></span>
+                  <span style="color:var(--text-dim)">Inactive</span>
+                  <span style="margin-left:auto;font-weight:600">${totalInactive}</span>
+                </div>
+              </div>
+            </div>
+            ${totalInactive > 0 ? `
+            <div style="padding:10px 12px;border-radius:8px;background:rgba(240,136,62,.08);border:1px solid rgba(240,136,62,.3);font-size:12px;color:var(--risk-medium)">
+              ⚠️ ${totalInactive} licensed users have not used Copilot in the last ${period} days — consider reviewing licence assignments.
+            </div>` : `
+            <div style="padding:10px 12px;border-radius:8px;background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.3);font-size:12px;color:var(--risk-low)">
+              ✅ All licensed users are actively using Copilot.
+            </div>`}
+            ` : `<div class="empty-state" style="padding:24px">No licence data available</div>`}
+          </div>
+        </div>
+      </div>
+      ` : `<div class="empty-state">No Copilot app usage data found. Ensure M365 Copilot is licensed and Reports.Read.All is consented.</div>`}
+
+      ${usage.userDetail.length > 0 ? `
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">👤 User Activity (last ${period} days)</div>
+          <span style="font-size:11px;color:var(--text-muted)">${usage.userDetail.length} users</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>User</th><th>Last Activity</th><th>Teams Chat</th><th>Word</th><th>Outlook</th><th>Excel</th><th>PowerPoint</th></tr></thead>
+            <tbody>${usage.userDetail.slice(0,50).map(u => `<tr>
+              <td><strong style="font-size:12px">${esc(u.displayName||u.userPrincipalName||'—')}</strong><br>
+                <span class="text-muted" style="font-size:10px">${esc(u.userPrincipalName||'')}</span></td>
+              <td style="font-size:11px">${u.lastActivityDate || '—'}</td>
+              <td style="text-align:center">${u.teamsChatCount > 0 || u.isCopilotForTeamsChatEnabled ? '✅' : '—'}</td>
+              <td style="text-align:center">${u.wordCount > 0 || u.isCopilotForWordEnabled ? '✅' : '—'}</td>
+              <td style="text-align:center">${u.outlookCount > 0 || u.isCopilotForOutlookEnabled ? '✅' : '—'}</td>
+              <td style="text-align:center">${u.excelCount > 0 || u.isCopilotForExcelEnabled ? '✅' : '—'}</td>
+              <td style="text-align:center">${u.powerPointCount > 0 || u.isCopilotForPowerPointEnabled ? '✅' : '—'}</td>
+            </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+        ${usage.userDetail.length > 50 ? `<div style="padding:8px 14px;font-size:11px;color:var(--text-muted)">Showing 50 of ${usage.userDetail.length} users</div>` : ''}
+      </div>` : ''}
+
+      ${!usage.summary && !usage.userDetail.length ? `
+      <div style="padding:24px;border-radius:10px;background:var(--bg-card);border:1px solid var(--border);text-align:center">
+        <div style="font-size:32px;margin-bottom:12px">💬</div>
+        <div style="font-weight:600;margin-bottom:6px">No Copilot usage data available</div>
+        <div style="font-size:12px;color:var(--text-muted)">This may mean M365 Copilot is not licensed in this tenant, or <code>Reports.Read.All</code> admin consent has not been granted.</div>
+      </div>` : ''}
+    `;
+  } catch (e) {
+    el.innerHTML = permWarn('Reports.Read.All', e.message);
+  }
 }
 
 function closeUsersPopover() {
