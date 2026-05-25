@@ -373,6 +373,7 @@
       </div>
       <div class="perm-section-body">
         <span class="perm-chip data">InformationProtectionPolicy.Read</span>
+        <span class="perm-chip data">SensitivityLabel.Read</span>
         <span class="perm-chip data">SharePointTenantSettings.Read.All</span>
       </div>
     </div>
@@ -554,6 +555,7 @@ const GRAPH_SCOPES = [
   'https://graph.microsoft.com/AgentIdentityBlueprintPrincipal.Read.All',
   'https://graph.microsoft.com/Reports.Read.All',
   'https://graph.microsoft.com/InformationProtectionPolicy.Read',
+  'https://graph.microsoft.com/SensitivityLabel.Read',
   'https://graph.microsoft.com/SharePointTenantSettings.Read.All',
 ];
 
@@ -991,26 +993,40 @@ async function fetchMipPolicySettings() {
 // ── M365 COPILOT USAGE ───────────────────────────────────────────────────────
 async function fetchCopilotUsage() {
   if (STATE.data.copilotUsage !== undefined) return STATE.data.copilotUsage;
-  const result = { summary: null, userDetail: [], source: null, error: null };
+  const result = { summary: null, userDetail: [], source: null, error: null, errorCode: null };
 
   // Try v1.0 summary endpoint first, fall back to beta
+  // Capture the last HTTP error code so we can distinguish 403 (no permission) vs 404/204 (no data)
+  let lastErr = null;
   for (const base of [GRAPH, GRAPH_BETA]) {
     try {
       const d = await gget(`${base}/reports/getM365CopilotUsageSummary`);
       result.summary = d;
       result.source = base === GRAPH ? 'v1.0' : 'beta';
       break;
-    } catch (_) {}
+    } catch (e) { lastErr = e; }
   }
 
-  // User-level activity (D30) — returns JSON array via beta
+  // User-level activity (D30)
   try {
     const d = await gget(`${GRAPH_BETA}/reports/getM365CopilotUserDetailWithPeriod(period='D30')`);
     result.userDetail = Array.isArray(d) ? d : (d.value || []);
-  } catch (_) {}
+  } catch (e) { if (!lastErr) lastErr = e; }
 
   if (!result.summary && !result.userDetail.length) {
-    result.error = 'Reports.Read.All permission required or M365 Copilot not licensed in this tenant.';
+    const msg  = (lastErr?.message || '').toLowerCase();
+    const is403 = msg.includes('403') || msg.includes('forbidden') || msg.includes('authorization_request_denied') || msg.includes('access_denied');
+    const is404 = msg.includes('404') || msg.includes('not found');
+    if (is403) {
+      result.errorCode = 'forbidden';
+      result.error = 'Access denied (403). Sign out and sign back in to refresh your token, then verify you have the Reports Reader role.';
+    } else if (is404) {
+      result.errorCode = 'nodata';
+      result.error = 'No Copilot usage data found (404). This usually means no one has used M365 Copilot yet in this tenant, or data is not yet available (reports can take up to 48 h to appear).';
+    } else {
+      result.errorCode = 'unknown';
+      result.error = lastErr?.message || 'Reports.Read.All permission required or M365 Copilot not licensed in this tenant.';
+    }
   }
 
   STATE.data.copilotUsage = result;
@@ -7177,7 +7193,7 @@ async function loadCopilotUsage() {
             <div class="section-sub">Microsoft 365 Copilot activity · usage reports unavailable</div>
           </div>
           <span class="data-source" style="background:rgba(240,136,62,.1);color:var(--risk-medium);border-color:rgba(240,136,62,.3)">
-            ⚠ Reports.Read.All not consented
+            ${{forbidden:'⚠ Token missing Reports.Read.All — sign in again', nodata:'ℹ No usage data yet', unknown:'⚠ Reports unavailable'}[usage.errorCode] || '⚠ Reports unavailable'}
           </span>
         </div>
 
@@ -7231,9 +7247,24 @@ async function loadCopilotUsage() {
             <div class="card-title">⚠️ Usage Data Unavailable</div>
           </div>
           <div class="card-body" style="padding:20px">
+            ${usage.errorCode === 'nodata' ? `
+              <div style="display:flex;align-items:flex-start;gap:14px">
+                <div style="font-size:36px;line-height:1">📭</div>
+                <div>
+                  <div style="font-size:13px;font-weight:600;margin-bottom:6px">No Copilot usage data yet</div>
+                  <p style="font-size:12px;color:var(--text-muted);line-height:1.7;margin:0">
+                    Microsoft 365 Copilot is licensed in this tenant but no usage has been recorded yet,
+                    or the data is still being processed (reports can take up to <strong>48 hours</strong> to appear after first use).
+                    Once users start using Copilot in Teams, Word, Outlook or other apps, this page will populate automatically.
+                  </p>
+                </div>
+              </div>
+            ` : `
             <p style="font-size:13px;color:var(--text-muted);margin-bottom:16px">
-              Detailed Copilot usage reports require the <code style="background:var(--bg-hover);padding:2px 6px;border-radius:4px">Reports.Read.All</code>
-              permission with admin consent, and the signed-in user must hold one of the following Entra roles:
+              <code style="background:var(--bg-hover);padding:2px 6px;border-radius:4px">Reports.Read.All</code>
+              is granted but the current token does not include it yet.
+              You are a <strong>Global Administrator</strong> — just <strong>sign out and sign back in</strong> to get a fresh token.
+              If it still fails, the Microsoft Reports API also requires one of these Entra roles:
             </p>
             <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px">
               ${['Global Administrator','Reports Reader','Global Reader','Usage Summary Reports Reader'].map(r =>
@@ -7241,20 +7272,21 @@ async function loadCopilotUsage() {
               ).join('')}
             </div>
             <div style="border-top:1px solid var(--border);padding-top:16px">
-              <div style="font-size:12px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px">How to enable</div>
-              <ol style="font-size:12px;color:var(--text-muted);line-height:2;padding-left:18px;margin:0">
-                <li>In the <strong>Entra portal</strong>, go to <em>App registrations → Shadow AI V2 → API permissions</em></li>
-                <li>Add <code style="background:var(--bg-hover);padding:1px 5px;border-radius:3px">Reports.Read.All</code> as a delegated Microsoft Graph permission</li>
-                <li>Click <strong>Grant admin consent</strong></li>
-                <li>Ensure the signed-in account has the <strong>Reports Reader</strong> or <strong>Global Reader</strong> role in Entra ID</li>
-                <li>Click <strong>Grant admin consent</strong> below, then sign in again</li>
+              <div style="font-size:12px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px">Quick fix</div>
+              <ol style="font-size:12px;color:var(--text-muted);line-height:2.2;padding-left:18px;margin:0">
+                <li><strong>Sign out and sign back in</strong> — this refreshes the token to include Reports.Read.All</li>
+                <li>If still failing: check M365 Admin Center → Settings → Org settings → Reports → ensure "Display concealed user/group info" is OFF</li>
               </ol>
-              <div style="margin-top:16px">
+              <div style="margin-top:16px;display:flex;gap:10px;align-items:center">
+                <button class="btn btn-primary" onclick="signOut()" style="font-size:12px;padding:7px 16px">
+                  ↩ Sign out &amp; sign in again
+                </button>
                 <button class="btn btn-secondary" onclick="adminConsent()" style="font-size:12px;padding:7px 16px">
-                  🔑 Grant Admin Consent
+                  🔑 Re-run Admin Consent
                 </button>
               </div>
             </div>
+            `}
           </div>
         </div>
       `;
