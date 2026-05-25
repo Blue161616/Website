@@ -287,6 +287,7 @@
       <code>IdentityRiskyServicePrincipal.Read.All</code> &nbsp;<code>IdentityRiskyAgent.Read.All</code> &nbsp;<code>SecurityAlert.Read.All</code> &nbsp;<code>SecurityEvents.Read.All</code><br>
       <code>RoleManagement.Read.All</code> &nbsp;<code>CloudApp-Discovery.Read.All</code><br>
       <code>AgentIdentityBlueprint.Read.All</code> &nbsp;<code>AgentIdentity.Read.All</code> &nbsp;<code>AgentIdentityBlueprintPrincipal.Read.All</code><br>
+      <code>InformationProtectionPolicy.Read.All</code> &nbsp;<code>SharePointTenantSettings.Read.All</code><br>
       <br>
       Set platform to <strong>SPA</strong>, supported account types to <strong>multi-tenant</strong>.<br>
       <br>
@@ -454,6 +455,8 @@ const GRAPH_SCOPES = [
   'https://graph.microsoft.com/AgentIdentityBlueprint.Read.All',
   'https://graph.microsoft.com/AgentIdentity.Read.All',
   'https://graph.microsoft.com/AgentIdentityBlueprintPrincipal.Read.All',
+  'https://graph.microsoft.com/InformationProtectionPolicy.Read.All',
+  'https://graph.microsoft.com/SharePointTenantSettings.Read.All',
 ];
 
 // Known AI app patterns for detection (case-insensitive)
@@ -702,7 +705,8 @@ async function fetchOAuth2Grants() {
   if (STATE.data.grants) return STATE.data.grants;
   try {
     // Requires Cloud Application Administrator role — try tenant-wide first
-    const items = await ggetAll(`${GRAPH}/oauth2PermissionGrants?$top=500&$select=id,clientId,consentType,principalId,resourceId,scope,createdDateTime`, 6);
+    // Note: oauth2PermissionGrant objects do NOT have createdDateTime — use audit log for timestamps
+    const items = await ggetAll(`${GRAPH}/oauth2PermissionGrants?$top=500&$select=id,clientId,consentType,principalId,resourceId,scope`, 6);
     STATE.data.grants = items;
   } catch (e) {
     if (!e.message.includes('403')) {
@@ -718,7 +722,7 @@ async function fetchOAuth2Grants() {
       const grants = [];
       await Promise.all(aiSps.map(async sp => {
         try {
-          const d = await gget(`${GRAPH}/servicePrincipals/${sp.id}/oauth2PermissionGrants?$select=id,clientId,consentType,principalId,resourceId,scope,createdDateTime`);
+          const d = await gget(`${GRAPH}/servicePrincipals/${sp.id}/oauth2PermissionGrants?$select=id,clientId,consentType,principalId,resourceId,scope`);
           if (d.value) grants.push(...d.value);
         } catch { /* skip apps with no grants */ }
       }));
@@ -762,6 +766,43 @@ async function fetchSensitivityLabels() {
     }
   }
   return STATE.data.sensitivityLabels;
+}
+
+async function fetchConsentAuditEvents() {
+  if (STATE.data.consentAuditEvents !== undefined) return STATE.data.consentAuditEvents;
+  try {
+    // 'Consent to application' covers both user and admin consent events
+    // 'Add delegated permission grant' covers admin grant additions via API/portal
+    const [ev1, ev2] = await Promise.allSettled([
+      ggetAll(
+        `${GRAPH}/auditLogs/directoryAudits` +
+        `?$filter=activityDisplayName eq 'Consent to application'` +
+        `&$orderby=activityDateTime desc` +
+        `&$select=id,activityDateTime,activityDisplayName,initiatedBy,targetResources,result,additionalDetails` +
+        `&$top=500`, 3
+      ),
+      ggetAll(
+        `${GRAPH}/auditLogs/directoryAudits` +
+        `?$filter=activityDisplayName eq 'Add delegated permission grant'` +
+        `&$orderby=activityDateTime desc` +
+        `&$select=id,activityDateTime,activityDisplayName,initiatedBy,targetResources,result,additionalDetails` +
+        `&$top=200`, 2
+      ),
+    ]);
+    const items = [
+      ...(ev1.status === 'fulfilled' ? ev1.value : []),
+      ...(ev2.status === 'fulfilled' ? ev2.value : []),
+    ];
+    // Dedup by id and sort newest first
+    const seen = new Set();
+    STATE.data.consentAuditEvents = items
+      .filter(e => { if (seen.has(e.id)) return false; seen.add(e.id); return true; })
+      .sort((a, b) => new Date(b.activityDateTime) - new Date(a.activityDateTime));
+  } catch (e) {
+    STATE.data.consentAuditEvents = [];
+    STATE.data.consentAuditError = e.message;
+  }
+  return STATE.data.consentAuditEvents;
 }
 
 async function fetchLabelPolicies() {
@@ -6268,74 +6309,121 @@ async function loadMcpServers() {
 
 // ── CONSENT HISTORY TIMELINE ──────────────────────────────────────────────
 
-async function loadConsentTimeline() {
-  const el = document.getElementById('consent-content');
-  try {
-    const [grants, sps] = await Promise.all([fetchOAuth2Grants(), fetchServicePrincipals()]);
+// Shared week-bucketing utility (Monday-based ISO key)
+function weekKey(dt) {
+  const d = new Date(dt);
+  d.setHours(0,0,0,0);
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); // back to Monday
+  return d.toISOString().slice(0,10);
+}
 
-    const spMap = new Map(sps.map(s => [s.id, s]));
-
-    // Filter to grants that have createdDateTime
-    const datedGrants = grants.filter(g => g.createdDateTime);
-    const undatedCount = grants.length - datedGrants.length;
-
-    // Sort by date descending
-    const sorted = [...datedGrants].sort((a, b) =>
-      new Date(b.createdDateTime) - new Date(a.createdDateTime)
-    );
-
-    // Bucket by week (Monday-based)
-    const getWeekKey = dt => {
-      const d = new Date(dt);
-      d.setHours(0,0,0,0);
-      const day = d.getDay(); // 0=Sun
-      d.setDate(d.getDate() - ((day + 6) % 7)); // Monday
-      return d.toISOString().slice(0,10);
-    };
-
-    const weekBuckets = {};
-    datedGrants.forEach(g => {
-      const wk = getWeekKey(g.createdDateTime);
-      if (!weekBuckets[wk]) weekBuckets[wk] = { total: 0, admin: 0, user: 0, ai: 0 };
-      weekBuckets[wk].total++;
-      if (g.consentType === 'AllPrincipals') weekBuckets[wk].admin++;
-      else weekBuckets[wk].user++;
-      const clientSp = spMap.get(g.clientId);
-      if (clientSp && isAiApp(clientSp)) weekBuckets[wk].ai++;
+// Generate synthetic consent events for UI verification
+function generateMockConsentAuditEvents() {
+  const now = Date.now();
+  const apps = [
+    'Claude (Anthropic)', 'ChatGPT Plugin', 'Copilot Studio Bot',
+    'GitHub Copilot', 'Azure OpenAI Service', 'M365 MCP Client for Claude',
+    'Grammarly', 'Notion AI', 'Jasper AI', 'Midjourney Bot',
+  ];
+  const users = ['admin@contoso.com','alice@contoso.com','bob@contoso.com','devops@contoso.com'];
+  const events = [];
+  // Normal baseline: 2-4 per week for 12 weeks
+  for (let w = 0; w < 12; w++) {
+    const n = 2 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < n; i++) {
+      const daysAgo = w * 7 + Math.floor(Math.random() * 7);
+      events.push({
+        id: `mock-${w}-${i}`,
+        activityDateTime: new Date(now - daysAgo * 86400000).toISOString(),
+        activityDisplayName: 'Consent to application',
+        result: Math.random() > 0.08 ? 'success' : 'failure',
+        initiatedBy: { user: { userPrincipalName: users[i % users.length], displayName: users[i % users.length].split('@')[0] } },
+        targetResources: [{ displayName: apps[Math.floor(Math.random() * apps.length)], id: `app-${w}-${i}` }],
+        additionalDetails: [{ key: 'ConsentType', value: Math.random() > 0.65 ? 'AllPrincipals' : 'Principal' }],
+        _mock: true,
+      });
+    }
+  }
+  // Spike week 3 weeks ago: 14 events (shadow AI wave)
+  for (let i = 0; i < 14; i++) {
+    const daysAgo = 21 + Math.floor(Math.random() * 7);
+    events.push({
+      id: `mock-spike-${i}`,
+      activityDateTime: new Date(now - daysAgo * 86400000).toISOString(),
+      activityDisplayName: 'Consent to application',
+      result: 'success',
+      initiatedBy: { user: { userPrincipalName: users[i % users.length], displayName: users[i % users.length].split('@')[0] } },
+      targetResources: [{ displayName: apps[i % apps.length], id: `app-spike-${i}` }],
+      additionalDetails: [{ key: 'ConsentType', value: i < 4 ? 'AllPrincipals' : 'Principal' }],
+      _mock: true,
     });
+  }
+  return events.sort((a,b) => new Date(b.activityDateTime) - new Date(a.activityDateTime));
+}
 
-    const weekKeys = Object.keys(weekBuckets).sort();
-    const values   = weekKeys.map(k => weekBuckets[k].total);
-    const aiVals   = weekKeys.map(k => weekBuckets[k].ai);
-    const adminVals= weekKeys.map(k => weekBuckets[k].admin);
+function renderConsentTimeline(grants, auditEvents, spMap, isMock) {
+  const el = document.getElementById('consent-content');
+  if (!el) return;
 
-    // Spike detection: weeks with > mean + 2σ
-    const mean = values.reduce((a,b) => a+b, 0) / (values.length || 1);
-    const variance = values.reduce((a,b) => a + (b-mean)**2, 0) / (values.length || 1);
-    const stddev = Math.sqrt(variance);
-    const spikeThreshold = mean + 2 * stddev;
-    const spikeWeeks = weekKeys.filter((k, i) => values[i] > spikeThreshold && values[i] > 3);
+  // ── Stats from grants (always reliable) ──────────────────────────────────
+  const adminCount = grants.filter(g => g.consentType === 'AllPrincipals').length;
+  const userCount  = grants.filter(g => g.consentType === 'Principal').length;
+  const aiCount    = grants.filter(g => { const sp = spMap.get(g.clientId); return sp && isAiApp(sp); }).length;
 
-    // Stats
-    const adminCount = datedGrants.filter(g => g.consentType === 'AllPrincipals').length;
-    const userCount  = datedGrants.filter(g => g.consentType === 'Principal').length;
-    const aiCount    = datedGrants.filter(g => { const sp = spMap.get(g.clientId); return sp && isAiApp(sp); }).length;
-    const last30Days = datedGrants.filter(g => (Date.now() - new Date(g.createdDateTime)) < 30*86400000).length;
+  // ── Stats from audit events (may be empty if no AuditLog.Read.All) ───────
+  const successEvents = auditEvents.filter(e => e.result === 'success');
+  const last30Events  = successEvents.filter(e => (Date.now() - new Date(e.activityDateTime)) < 30*86400*1000);
+  const adminAudit    = successEvents.filter(e => (e.additionalDetails||[]).some(d => d.key==='ConsentType' && d.value==='AllPrincipals'));
 
-    el.innerHTML = `
+  // ── Timeline bucketing from audit events ──────────────────────────────────
+  const weekBuckets = {};
+  successEvents.forEach(e => {
+    const wk = weekKey(e.activityDateTime);
+    if (!weekBuckets[wk]) weekBuckets[wk] = { total:0, admin:0, user:0, ai:0, apps:new Set() };
+    weekBuckets[wk].total++;
+    const isAdminEv = (e.additionalDetails||[]).some(d => d.key==='ConsentType' && d.value==='AllPrincipals');
+    if (isAdminEv) weekBuckets[wk].admin++; else weekBuckets[wk].user++;
+    const appName = (e.targetResources||[])[0]?.displayName || '';
+    const sp = [...spMap.values()].find(s => s.displayName === appName);
+    if (sp && isAiApp(sp)) weekBuckets[wk].ai++;
+    weekBuckets[wk].apps.add(appName);
+  });
+
+  const weekKeys   = Object.keys(weekBuckets).sort();
+  const values     = weekKeys.map(k => weekBuckets[k].total);
+  const aiVals     = weekKeys.map(k => weekBuckets[k].ai);
+  const adminVals  = weekKeys.map(k => weekBuckets[k].admin);
+
+  // ── Spike detection ───────────────────────────────────────────────────────
+  const mean     = values.reduce((a,b)=>a+b,0) / (values.length||1);
+  const variance = values.reduce((a,b)=>a+(b-mean)**2,0) / (values.length||1);
+  const stddev   = Math.sqrt(variance);
+  const spikeThr = mean + 2*stddev;
+  const spikeWks = weekKeys.filter((k,i) => values[i] > spikeThr && values[i] > 2);
+
+  const hasAudit  = auditEvents.length > 0;
+  const hasChart  = weekKeys.length >= 2;
+
+  el.innerHTML = `
+    <div style="position:sticky;top:52px;z-index:80;background:var(--bg-primary);padding-bottom:10px;margin-bottom:4px;border-bottom:1px solid var(--border)">
       <div class="section-header" style="margin-bottom:10px">
         <div>
-          <div class="section-title">Consent History Timeline</div>
-          <div class="section-sub">OAuth2 permission grant activity over time — spot consent spikes and shadow AI adoption waves</div>
+          <div class="section-title">Consent History Timeline ${isMock ? '<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.15);color:var(--risk-medium);margin-left:8px">🧪 Mock data</span>' : ''}</div>
+          <div class="section-sub">OAuth2 grant snapshot + audit log consent events — spot shadow AI adoption waves and consent spikes</div>
         </div>
-        <span class="data-source source-live">● oauth2PermissionGrants · ${grants.length} total grants</span>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span class="data-source ${hasAudit ? 'source-live' : 'source-derived'}">
+            ${hasAudit ? `● auditLogs/directoryAudits · ${auditEvents.length} events` : '⚡ No audit events — AuditLog.Read.All needed for timeline'}
+          </span>
+          <button onclick="loadConsentTimelineMock()" style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer" title="Load synthetic data to verify the UI">🧪 Test with mock data</button>
+        </div>
       </div>
 
-      <div class="kpi-row" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px">
+      <div class="kpi-row" style="grid-template-columns:repeat(4,1fr);margin:0">
         <div class="kpi-card info">
-          <div class="kpi-label">Total Grants</div>
+          <div class="kpi-label">Active Grants</div>
           <div class="kpi-value text-blue">${grants.length}</div>
-          <div class="kpi-delta">${datedGrants.length} with date${undatedCount > 0 ? ` · ${undatedCount} undated` : ''}</div>
+          <div class="kpi-delta">${adminCount} admin · ${userCount} user</div>
           <div class="kpi-icon">🔑</div>
         </div>
         <div class="kpi-card ${adminCount > 0 ? 'medium' : 'low'}">
@@ -6350,153 +6438,221 @@ async function loadConsentTimeline() {
           <div class="kpi-delta">Grants to detected AI apps</div>
           <div class="kpi-icon">🤖</div>
         </div>
-        <div class="kpi-card ${last30Days > 0 ? 'info' : 'low'}">
-          <div class="kpi-label">Last 30 Days</div>
-          <div class="kpi-value text-blue">${last30Days}</div>
-          <div class="kpi-delta">${spikeWeeks.length > 0 ? `⚠️ ${spikeWeeks.length} spike week${spikeWeeks.length > 1 ? 's' : ''}` : '✅ No spikes'}</div>
+        <div class="kpi-card ${last30Events.length > 0 ? 'info' : 'low'}">
+          <div class="kpi-label">Consent Events (30d)</div>
+          <div class="kpi-value text-blue">${last30Events.length}</div>
+          <div class="kpi-delta">${spikeWks.length > 0 ? `⚠️ ${spikeWks.length} spike week${spikeWks.length>1?'s':''}` : hasAudit ? '✅ No spikes' : 'From audit log'}</div>
           <div class="kpi-icon">📅</div>
         </div>
       </div>
+    </div>
 
-      ${spikeWeeks.length ? `
-      <div class="perm-warn" style="border-color:rgba(240,136,62,.4);margin-bottom:16px">
-        ⚠️ <strong>Consent spike${spikeWeeks.length > 1 ? 's' : ''} detected</strong> in ${spikeWeeks.length} week${spikeWeeks.length > 1 ? 's' : ''}:
-        ${spikeWeeks.map(w => `<code>${w}</code> (${weekBuckets[w].total} grants${weekBuckets[w].ai > 0 ? `, ${weekBuckets[w].ai} AI` : ''})`).join(', ')}.
-        Review these weeks for unexpected bulk consent or shadow AI adoption events.
-      </div>` : ''}
+    ${!hasAudit ? `
+    <div style="margin-bottom:16px;padding:12px 16px;border-radius:8px;background:rgba(56,139,253,.06);border:1px solid rgba(56,139,253,.2);display:flex;align-items:flex-start;gap:12px">
+      <span style="font-size:20px">ℹ️</span>
+      <div style="font-size:12px;color:var(--text-muted)">
+        <strong style="color:var(--text-primary)">Timeline requires AuditLog.Read.All</strong><br>
+        The consent activity chart is populated from <code>auditLogs/directoryAudits</code> filtered to <em>"Consent to application"</em> events.
+        The permission <code>AuditLog.Read.All</code> must be admin-consented for this tenant.
+        ${STATE.data.consentAuditError ? `<br><span style="color:var(--risk-medium);font-size:11px">Error: ${esc(STATE.data.consentAuditError.slice(0,160))}</span>` : ''}
+        <br><span style="margin-top:6px;display:inline-block">Use the <strong>🧪 Test with mock data</strong> button above to see how the page looks with data.</span>
+      </div>
+    </div>` : ''}
 
-      ${datedGrants.length >= 2 ? `
-      <div class="card" style="margin-bottom:16px">
-        <div class="card-header">
-          <div class="card-title">📈 Consent Grant Timeline — by Week (${weekKeys.length} weeks)</div>
-          <div style="display:flex;gap:10px;align-items:center;font-size:11px">
-            <span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;background:rgba(56,139,253,.8);border-radius:2px;display:inline-block"></span>All grants</span>
-            <span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;background:rgba(163,113,247,.7);border-radius:2px;display:inline-block"></span>AI apps</span>
-            <span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;background:rgba(240,136,62,.6);border-radius:2px;display:inline-block"></span>Admin consent</span>
-          </div>
+    ${spikeWks.length ? `
+    <div class="perm-warn" style="border-color:rgba(240,136,62,.4);margin-bottom:16px">
+      ⚠️ <strong>Consent spike${spikeWks.length>1?'s':''} detected</strong> — ${spikeWks.length} week${spikeWks.length>1?'s':''} with unusually high consent activity:
+      ${spikeWks.map(w => `<code>${w}</code> (${weekBuckets[w].total} events · ${[...weekBuckets[w].apps].slice(0,3).join(', ')})`).join(' · ')}.
+      <br><span style="font-size:11px">Review these weeks for bulk shadow AI adoption or unexpected admin consent grants.</span>
+    </div>` : ''}
+
+    ${hasChart ? `
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-header">
+        <div class="card-title">📈 Consent Event Timeline — by Week (${weekKeys.length} weeks · ${successEvents.length} events total)</div>
+        <div style="display:flex;gap:12px;align-items:center;font-size:11px">
+          <span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;background:rgba(56,139,253,.75);border-radius:2px;display:inline-block"></span>All events</span>
+          <span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;background:rgba(163,113,247,.75);border-radius:2px;display:inline-block"></span>AI apps</span>
+          <span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;background:rgba(240,136,62,.7);border-radius:2px;display:inline-block"></span>Admin/tenant</span>
+          ${spikeWks.length ? '<span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;background:rgba(248,81,73,.8);border-radius:2px;display:inline-block"></span>Spike weeks</span>' : ''}
+          ${isMock ? '<span style="color:var(--risk-medium);font-size:10px">🧪 Mock data</span>' : ''}
         </div>
-        <div class="card-body" style="height:220px;padding:8px 12px">
-          <canvas id="consent-timeline-chart"></canvas>
-        </div>
-      </div>` : ''}
+      </div>
+      <div style="height:220px;padding:8px 16px">
+        <canvas id="consent-timeline-chart"></canvas>
+      </div>
+    </div>` : ''}
 
+    <div class="grid-2" style="margin-bottom:16px">
+      <!-- Audit events table -->
       <div class="card">
         <div class="card-header">
-          <div class="card-title">🔑 All Consent Grants (${sorted.length} with dates)</div>
-          <span class="data-source source-live">● oauth2PermissionGrants · sorted by date desc</span>
+          <div class="card-title">🕐 Consent Events Log (${auditEvents.length})</div>
+          <span class="data-source ${hasAudit?'source-live':'source-derived'}" style="font-size:10px">
+            ${hasAudit ? '● auditLogs/directoryAudits' : '⚡ No data — AuditLog.Read.All required'}
+          </span>
         </div>
-        ${undatedCount > 0 ? `<div style="padding:6px 16px 0;font-size:11px;color:var(--text-dim)">⚠️ ${undatedCount} grant${undatedCount > 1 ? 's' : ''} have no <code>createdDateTime</code> and are not shown below (they are counted in the KPIs above).</div>` : ''}
+        ${hasAudit ? `
         <div class="table-wrap">
           <table>
-            <thead><tr>
-              <th>App / Client</th>
-              <th>Consent Type</th>
-              <th>Scopes</th>
-              <th>Resource</th>
-              <th>AI?</th>
-              <th>Date</th>
-            </tr></thead>
-            <tbody>${sorted.slice(0, 200).map(g => {
-              const clientSp = spMap.get(g.clientId);
-              const resourceSp = spMap.get(g.resourceId);
-              const clientName = esc(clientSp?.displayName || g.clientId?.slice(0,18) || '—');
-              const resourceName = esc(resourceSp?.displayName || g.resourceId?.slice(0,18) || '—');
-              const isAi = clientSp && isAiApp(clientSp);
-              const isAdmin = g.consentType === 'AllPrincipals';
-              const scopeList = (g.scope||'').split(' ').filter(Boolean);
-              const scopeChips = scopeList.slice(0,4).map(s =>
-                `<span style="display:inline-block;margin:1px 2px;padding:1px 5px;border-radius:3px;background:rgba(56,139,253,.08);color:var(--text-muted);font-size:10px">${esc(s)}</span>`
-              ).join('') + (scopeList.length > 4 ? `<span style="font-size:10px;color:var(--text-dim)">+${scopeList.length - 4} more</span>` : '');
-              const weekKey = getWeekKey(g.createdDateTime);
-              const isSpike = spikeWeeks.includes(weekKey);
-              return `<tr style="${isSpike ? 'background:rgba(240,136,62,.04)' : isAi ? 'background:rgba(163,113,247,.03)' : ''}">
-                <td>
-                  <strong style="font-size:13px">${clientName}</strong>
-                  ${isAi ? '<span class="badge badge-info" style="font-size:9px;margin-left:4px">🤖 AI</span>' : ''}
-                  ${isSpike ? '<span class="badge badge-medium" style="font-size:9px;margin-left:4px">⚠️ Spike week</span>' : ''}
+            <thead><tr><th>Date</th><th>App Consented To</th><th>By</th><th>Type</th><th>Result</th></tr></thead>
+            <tbody>${auditEvents.slice(0,100).map(e => {
+              const appName  = (e.targetResources||[])[0]?.displayName || '—';
+              const actor    = e.initiatedBy?.user?.userPrincipalName || e.initiatedBy?.user?.displayName || e.initiatedBy?.app?.displayName || '—';
+              const isAdminEv= (e.additionalDetails||[]).some(d => d.key==='ConsentType' && d.value==='AllPrincipals');
+              const wk       = weekKey(e.activityDateTime);
+              const isSpike  = spikeWks.includes(wk);
+              const dt       = new Date(e.activityDateTime);
+              return `<tr style="${isSpike?'background:rgba(240,136,62,.05)':e.result!=='success'?'background:rgba(248,81,73,.04)':''}">
+                <td class="mono text-muted" style="font-size:10px;white-space:nowrap">
+                  ${dt.toLocaleDateString()}<br>${dt.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}
+                  ${isSpike?'<br><span style="color:var(--risk-medium);font-size:9px">⚠️ spike week</span>':''}
                 </td>
-                <td>${isAdmin
-                  ? '<span class="badge badge-medium" style="font-size:10px">🏢 Admin / Tenant</span>'
-                  : '<span class="badge badge-info" style="font-size:10px">👤 User</span>'}</td>
-                <td>${scopeChips || '<span style="opacity:.4;font-size:11px">—</span>'}</td>
-                <td style="font-size:12px;color:var(--text-muted)">${resourceName}</td>
-                <td style="text-align:center">${isAi ? '✅' : '<span style="opacity:.3">—</span>'}</td>
-                <td class="mono text-muted" style="font-size:11px;white-space:nowrap">${new Date(g.createdDateTime).toLocaleDateString()}</td>
+                <td><strong style="font-size:12px">${esc(appName)}</strong>${e._mock?'<span style="font-size:9px;color:var(--text-dim);margin-left:4px">🧪</span>':''}</td>
+                <td style="font-size:11px;color:var(--text-muted)">${esc(actor)}</td>
+                <td>${isAdminEv
+                  ? '<span class="badge badge-medium" style="font-size:9px">🏢 Admin</span>'
+                  : '<span class="badge badge-info" style="font-size:9px">👤 User</span>'}</td>
+                <td>${e.result==='success'
+                  ? '<span style="color:var(--risk-low);font-size:11px">✅</span>'
+                  : '<span style="color:var(--risk-critical);font-size:11px">❌</span>'}</td>
               </tr>`;
             }).join('')}
-            ${sorted.length > 200 ? `<tr><td colspan="6" class="text-muted" style="font-size:11px;text-align:center;padding:8px">Showing 200 of ${sorted.length} grants — oldest grants omitted</td></tr>` : ''}
+            ${auditEvents.length > 100 ? `<tr><td colspan="5" class="text-muted" style="font-size:11px;text-align:center;padding:8px">Showing 100 of ${auditEvents.length} events</td></tr>` : ''}
+            </tbody>
+          </table>
+        </div>` : `
+        <div class="card-body empty-state text-muted">
+          No consent audit events — grant <code>AuditLog.Read.All</code> or click 🧪 to test with mock data.
+        </div>`}
+      </div>
+
+      <!-- Current active grants table -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">🔑 Active Grants Snapshot (${grants.length})</div>
+          <span class="data-source source-live" style="font-size:10px">● oauth2PermissionGrants</span>
+        </div>
+        <div style="padding:4px 14px 0;font-size:11px;color:var(--text-dim)">
+          ℹ️ Grant dates are <strong>not available</strong> from this API — use the audit log above for timeline data.
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>App / Client</th><th>Type</th><th>Scopes</th><th>AI?</th></tr></thead>
+            <tbody>${grants.slice(0, 150).map(g => {
+              const clientSp = spMap.get(g.clientId);
+              const clientName = esc(clientSp?.displayName || g.clientId?.slice(0,18) || '—');
+              const isAi   = clientSp && isAiApp(clientSp);
+              const isAdmin = g.consentType === 'AllPrincipals';
+              const scopeList = (g.scope||'').split(' ').filter(Boolean);
+              const scopeChips = scopeList.slice(0,3).map(s => {
+                const hi = HIGH_RISK_SCOPES.includes(s);
+                return `<span style="display:inline-block;margin:1px;padding:1px 5px;border-radius:3px;font-size:9px;background:${hi?'rgba(248,81,73,.12)':'rgba(56,139,253,.08)'};color:${hi?'var(--risk-high)':'var(--text-muted)'}">${esc(s)}</span>`;
+              }).join('') + (scopeList.length > 3 ? `<span style="font-size:9px;color:var(--text-dim)"> +${scopeList.length-3}</span>` : '');
+              return `<tr style="${isAdmin && isAi ? 'background:rgba(248,81,73,.03)' : isAi ? 'background:rgba(163,113,247,.02)' : ''}">
+                <td>
+                  <strong style="font-size:12px">${clientName}</strong>
+                  ${isAi ? '<span class="badge badge-info" style="font-size:9px;margin-left:3px">🤖 AI</span>' : ''}
+                </td>
+                <td>${isAdmin
+                  ? '<span class="badge badge-medium" style="font-size:9px">🏢 Admin</span>'
+                  : '<span style="font-size:10px;color:var(--text-dim)">👤 User</span>'}</td>
+                <td>${scopeChips || '<span style="opacity:.3;font-size:10px">—</span>'}</td>
+                <td style="text-align:center">${isAi ? '✅' : '<span style="opacity:.2">—</span>'}</td>
+              </tr>`;
+            }).join('')}
+            ${grants.length > 150 ? `<tr><td colspan="4" class="text-muted" style="font-size:11px;text-align:center;padding:8px">Showing 150 of ${grants.length}</td></tr>` : ''}
             </tbody>
           </table>
         </div>
       </div>
-    `;
+    </div>
+  `;
 
-    // Draw chart if we have enough data
-    if (datedGrants.length >= 2 && weekKeys.length >= 2) {
+  // Draw chart
+  if (hasChart) {
+    requestAnimationFrame(() => {
       const canvas = document.getElementById('consent-timeline-chart');
-      if (canvas) {
-        destroyChart('consent-timeline');
-        Chart.defaults.color = '#8b949e';
-        Chart.defaults.borderColor = '#30363d';
-        STATE.charts['consent-timeline'] = new Chart(canvas, {
-          type: 'bar',
-          data: {
-            labels: weekKeys.map(k => k.slice(5)), // MM-DD
-            datasets: [
-              {
-                label: 'All grants',
-                data: values,
-                backgroundColor: weekKeys.map((k, i) =>
-                  spikeWeeks.includes(k) ? 'rgba(240,136,62,.85)' : 'rgba(56,139,253,.65)'
-                ),
-                borderRadius: 3,
-                order: 3,
-              },
-              {
-                label: 'AI apps',
-                data: aiVals,
-                backgroundColor: 'rgba(163,113,247,.75)',
-                borderRadius: 3,
-                order: 2,
-              },
-              {
-                label: 'Admin consent',
-                data: adminVals,
-                backgroundColor: 'rgba(240,136,62,.55)',
-                borderRadius: 3,
-                order: 1,
-              },
-            ],
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-              legend: { display: false },
-              tooltip: {
-                callbacks: {
-                  title: (items) => 'Week of ' + weekKeys[items[0].dataIndex],
-                  afterBody: (items) => {
-                    const wk = weekBuckets[weekKeys[items[0].dataIndex]];
-                    const lines = [`Admin: ${wk.admin}`, `User: ${wk.user}`, `AI: ${wk.ai}`];
-                    if (spikeWeeks.includes(weekKeys[items[0].dataIndex])) lines.push('⚠️ Spike week');
-                    return lines;
-                  },
+      if (!canvas) return;
+      destroyChart('consent-timeline');
+      Chart.defaults.color = '#8b949e';
+      Chart.defaults.borderColor = '#30363d';
+      STATE.charts['consent-timeline'] = new Chart(canvas, {
+        type: 'bar',
+        data: {
+          labels: weekKeys.map(k => k.slice(5)), // MM-DD
+          datasets: [
+            {
+              label: 'All events',
+              data: values,
+              backgroundColor: weekKeys.map(k => spikeWks.includes(k) ? 'rgba(248,81,73,.8)' : 'rgba(56,139,253,.65)'),
+              borderRadius: 3,
+              order: 3,
+            },
+            {
+              label: 'AI apps',
+              data: aiVals,
+              backgroundColor: 'rgba(163,113,247,.8)',
+              borderRadius: 3,
+              order: 2,
+            },
+            {
+              label: 'Admin consent',
+              data: adminVals,
+              backgroundColor: 'rgba(240,136,62,.65)',
+              borderRadius: 3,
+              order: 1,
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              callbacks: {
+                title: items => 'Week of ' + weekKeys[items[0].dataIndex] + (spikeWks.includes(weekKeys[items[0].dataIndex]) ? ' ⚠️ SPIKE' : ''),
+                afterBody: items => {
+                  const wk = weekBuckets[weekKeys[items[0].dataIndex]];
+                  return [`Admin: ${wk.admin}`, `User: ${wk.user}`, `AI: ${wk.ai}`,
+                    ...[...wk.apps].slice(0,3).map(a => '  · ' + a)];
                 },
               },
             },
-            scales: {
-              x: { grid: { display: false }, ticks: { maxRotation: 45, minRotation: 30, font: { size: 9 } } },
-              y: { beginAtZero: true, ticks: { precision: 0, font: { size: 10 } } },
-            },
           },
-        });
-      }
-    }
-
-  } catch (e) {
-    el.innerHTML = permWarn('DelegatedPermissionGrant.ReadWrite.All', e.message);
+          scales: {
+            x: { grid: { display:false }, ticks: { maxRotation:45, minRotation:30, font:{size:9} } },
+            y: { beginAtZero:true, ticks: { precision:0, font:{size:10} } },
+          },
+        },
+      });
+    });
   }
+}
+
+async function loadConsentTimeline() {
+  const el = document.getElementById('consent-content');
+  el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Loading consent data…</div>';
+  try {
+    const [grants, sps, auditEvents] = await Promise.all([
+      fetchOAuth2Grants(), fetchServicePrincipals(), fetchConsentAuditEvents(),
+    ]);
+    const spMap = new Map(sps.map(s => [s.id, s]));
+    renderConsentTimeline(grants, auditEvents, spMap, false);
+  } catch (e) {
+    el.innerHTML = permWarn('DelegatedPermissionGrant.ReadWrite.All / AuditLog.Read.All', e.message);
+  }
+}
+
+async function loadConsentTimelineMock() {
+  const el = document.getElementById('consent-content');
+  if (!el) return;
+  el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Loading mock data…</div>';
+  const [grants, sps] = await Promise.all([fetchOAuth2Grants(), fetchServicePrincipals()]);
+  const spMap = new Map(sps.map(s => [s.id, s]));
+  const mockEvents = generateMockConsentAuditEvents();
+  renderConsentTimeline(grants, mockEvents, spMap, true);
 }
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
