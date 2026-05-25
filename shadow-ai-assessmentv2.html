@@ -6401,64 +6401,170 @@ async function loadMcpServers() {
   try {
     const [sps, grants] = await Promise.all([fetchServicePrincipals(), fetchOAuth2Grants()]);
 
-    // Detect MCP servers: name / description / notes / alternativeNames match MCP pattern,
-    // or known MCP host appIds, or tags include 'mcp'
     const mcpSps = sps.filter(sp => {
       if (MCP_KNOWN_APPIDS.has(sp.appId)) return true;
       if ((sp.tags||[]).some(t => /\bmcp\b/i.test(t))) return true;
-      return MCP_RE.test(sp.displayName||'') ||
-             MCP_RE.test(sp.description||'') ||
-             MCP_RE.test(sp.notes||'') ||
-             (sp.alternativeNames||[]).some(n => MCP_RE.test(n));
+      return MCP_RE.test(sp.displayName||'') || MCP_RE.test(sp.description||'') ||
+             MCP_RE.test(sp.notes||'') || (sp.alternativeNames||[]).some(n => MCP_RE.test(n));
     });
 
-    // Also find SPs that have grants to known MCP hosts
     const mcpHostIds = new Set(mcpSps.map(sp => sp.id));
-    // Any SP with a grant where the resourceId is an MCP host = an MCP client
     const mcpClientSps = sps.filter(sp => !mcpHostIds.has(sp.id) &&
       grants.some(g => g.clientId === sp.id && mcpHostIds.has(g.resourceId))
     );
+    const uniqueMcp = [...new Map([...mcpSps,...mcpClientSps].map(s => [s.id, s])).values()];
 
-    const allMcpRelated = [...mcpSps, ...mcpClientSps];
-    const uniqueMcp = [...new Map(allMcpRelated.map(s => [s.id, s])).values()];
-
-    // Categorise data access by scopes (same categories as data reachability)
     const DATA_CATS = [
-      { key:'mail',       label:'Mail',            icon:'📧', scopes:['Mail.Read','Mail.ReadWrite','Mail.Send','Mail.ReadBasic','MailboxSettings.Read'] },
-      { key:'files',      label:'Files/SharePoint', icon:'📁', scopes:['Files.Read.All','Files.ReadWrite.All','Sites.Read.All','Sites.ReadWrite.All'] },
-      { key:'teams',      label:'Teams',            icon:'💬', scopes:['Chat.Read.All','ChannelMessage.Read.All','TeamMember.Read.All'] },
-      { key:'calendar',   label:'Calendar',         icon:'📅', scopes:['Calendars.Read','Calendars.ReadWrite','Calendars.ReadWrite.Shared'] },
-      { key:'directory',  label:'Directory',        icon:'👥', scopes:['User.Read.All','Directory.Read.All','User.ReadWrite.All'] },
-      { key:'code',       label:'Code/DevOps',      icon:'💻', scopes:['Code.Read.All','Project.Read.All','Commits.Read.All','Build.Read','PullRequest.Read.All'] },
+      { key:'mail',      label:'Mail',             icon:'📧', scopes:['Mail.Read','Mail.ReadWrite','Mail.Send','Mail.ReadBasic','MailboxSettings.Read'] },
+      { key:'files',     label:'Files/SharePoint',  icon:'📁', scopes:['Files.Read.All','Files.ReadWrite.All','Sites.Read.All','Sites.ReadWrite.All'] },
+      { key:'teams',     label:'Teams',             icon:'💬', scopes:['Chat.Read.All','ChannelMessage.Read.All','TeamMember.Read.All'] },
+      { key:'calendar',  label:'Calendar',          icon:'📅', scopes:['Calendars.Read','Calendars.ReadWrite','Calendars.ReadWrite.Shared'] },
+      { key:'directory', label:'Directory',         icon:'👥', scopes:['User.Read.All','Directory.Read.All','User.ReadWrite.All'] },
+      { key:'code',      label:'Code/DevOps',       icon:'💻', scopes:['Code.Read.All','Project.Read.All','Commits.Read.All','Build.Read','PullRequest.Read.All'] },
     ];
 
-    const getDataCats = sp => {
-      const delegated = new Set(grants.filter(g => g.clientId === sp.id).flatMap(g => (g.scope||'').split(' ')));
-      return DATA_CATS.filter(c => c.scopes.some(s => delegated.has(s)));
+    const MS_ORGS = new Set(['f8cdef31-a31e-4b4a-93e4-5f571e91255a','72f988bf-86f1-41af-91ab-2d7cd011db47']);
+    const isThirdParty = sp => !sp.appOwnerOrganizationId || !MS_ORGS.has(sp.appOwnerOrganizationId);
+    const getDataCats  = sp => {
+      const sc = new Set(grants.filter(g => g.clientId === sp.id).flatMap(g => (g.scope||'').split(' ')));
+      return DATA_CATS.filter(c => c.scopes.some(s => sc.has(s)));
+    };
+    const hasAdminGrant = sp => grants.some(g => g.clientId === sp.id && g.consentType === 'AllPrincipals');
+    const riskScore = sp => {
+      const cats = getDataCats(sp);
+      return (isThirdParty(sp) ? 2 : 0) + cats.length + (hasAdminGrant(sp) ? 2 : 0);
     };
 
-    const isThirdParty = sp => {
-      if (!sp.appOwnerOrganizationId) return true;
-      const msOrgs = new Set(['f8cdef31-a31e-4b4a-93e4-5f571e91255a','72f988bf-86f1-41af-91ab-2d7cd011db47']);
-      return !msOrgs.has(sp.appOwnerOrganizationId);
-    };
-
-    const adminConsentCount = grants.filter(g => g.consentType === 'AllPrincipals' && uniqueMcp.some(s => s.id === g.clientId)).length;
+    const adminConsentCount = uniqueMcp.filter(hasAdminGrant).length;
     const thirdPartyCount   = uniqueMcp.filter(isThirdParty).length;
     const broadAccessCount  = uniqueMcp.filter(sp => getDataCats(sp).length >= 3).length;
 
-    const riskScore = sp => {
-      let s = 0;
-      if (isThirdParty(sp)) s += 2;
-      const cats = getDataCats(sp);
-      s += cats.length;
-      const adminGrant = grants.some(g => g.clientId === sp.id && g.consentType === 'AllPrincipals');
-      if (adminGrant) s += 2;
-      return s;
+    // ── Sort + Filter state ──────────────────────────────────────────────────
+    STATE._mcp = STATE._mcp || { filter: 'all', sortKey: 'risk', sortDir: -1 };
+
+    const renderMcpTable = () => {
+      const { filter, sortKey, sortDir } = STATE._mcp;
+
+      // Apply filter
+      let filtered = uniqueMcp;
+      if (filter === 'thirdparty') filtered = uniqueMcp.filter(isThirdParty);
+      else if (filter === 'admin')      filtered = uniqueMcp.filter(hasAdminGrant);
+      else if (filter === 'broad')      filtered = uniqueMcp.filter(sp => getDataCats(sp).length >= 3);
+
+      // Enrich rows
+      let rows = filtered.map(sp => ({
+        sp,
+        cats:  getDataCats(sp),
+        risk:  riskScore(sp),
+        admin: hasAdminGrant(sp),
+        third: isThirdParty(sp),
+      }));
+
+      // Apply sort
+      rows.sort((a, b) => {
+        let va, vb;
+        if (sortKey === 'risk')      { va = a.risk; vb = b.risk; }
+        else if (sortKey === 'name') { va = (a.sp.displayName||'').toLowerCase(); vb = (b.sp.displayName||'').toLowerCase(); }
+        else if (sortKey === 'pub')  { va = (a.sp.publisherName||'zzz').toLowerCase(); vb = (b.sp.publisherName||'zzz').toLowerCase(); }
+        else if (sortKey === 'cats') { va = a.cats.length; vb = b.cats.length; }
+        else if (sortKey === 'consent') {
+          va = a.admin ? 2 : (grants.some(g => g.clientId === a.sp.id) ? 1 : 0);
+          vb = b.admin ? 2 : (grants.some(g => g.clientId === b.sp.id) ? 1 : 0);
+        }
+        else if (sortKey === 'role')   { va = mcpHostIds.has(a.sp.id) ? 1 : 0; vb = mcpHostIds.has(b.sp.id) ? 1 : 0; }
+        else if (sortKey === 'status') { va = a.sp.accountEnabled === false ? 0 : 1; vb = b.sp.accountEnabled === false ? 0 : 1; }
+        else { va = a.risk; vb = b.risk; }
+        if (va < vb) return sortDir;
+        if (va > vb) return -sortDir;
+        return 0;
+      });
+
+      const arrow = key => sortKey === key ? (sortDir === -1 ? ' ↓' : ' ↑') : '';
+      const thStyle = key => `cursor:pointer;user-select:none;white-space:nowrap;${sortKey===key?'color:var(--accent-blue)':''}`;
+      const setSort = key => {
+        if (STATE._mcp.sortKey === key) STATE._mcp.sortDir *= -1;
+        else { STATE._mcp.sortKey = key; STATE._mcp.sortDir = -1; }
+        renderMcpTable();
+      };
+      const setFilter = f => { STATE._mcp.filter = f; renderMcpTable(); };
+
+      // KPI card active style
+      const kpiActive = 'outline:2px solid var(--accent-blue);outline-offset:2px;cursor:pointer;';
+      const kpiBase   = 'cursor:pointer;';
+
+      // Update KPI card active states
+      ['kpi-mcp-all','kpi-mcp-third','kpi-mcp-admin','kpi-mcp-broad'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.outline = '';
+      });
+      const activeCard = { all:'kpi-mcp-all', thirdparty:'kpi-mcp-third', admin:'kpi-mcp-admin', broad:'kpi-mcp-broad' }[filter];
+      const ac = document.getElementById(activeCard);
+      if (ac) ac.style.outline = '2px solid var(--accent-blue)';
+
+      const tbody = document.getElementById('mcp-tbody');
+      const countEl = document.getElementById('mcp-count');
+      if (countEl) countEl.textContent = `${rows.length} of ${uniqueMcp.length}`;
+
+      // Update sort headers
+      ['name','role','pub','cats','consent','risk','status'].forEach(k => {
+        const th = document.getElementById(`mcp-th-${k}`);
+        if (th) {
+          th.style.color = sortKey === k ? 'var(--accent-blue)' : '';
+          th.textContent = {
+            name:'Server / App', role:'Role', pub:'Publisher',
+            cats:'Data Access', consent:'Consent Type', risk:'Risk', status:'Status'
+          }[k] + arrow(k);
+        }
+      });
+
+      if (!tbody) return;
+      if (!rows.length) {
+        tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--text-dim);padding:24px;font-size:12px">
+          No results match the current filter. <a href="#" onclick="STATE._mcp.filter='all';renderMcpTable&&renderMcpTable();return false" style="color:var(--accent-blue)">Clear filter</a>
+        </td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = rows.map(({ sp, cats, risk, admin, third }) => {
+        const spGrants  = grants.filter(g => g.clientId === sp.id);
+        const pub       = esc(sp.publisherName || (sp.appOwnerOrganizationId ? sp.appOwnerOrganizationId.slice(0,8)+'…' : 'Unknown'));
+        const roleLabel = mcpHostIds.has(sp.id) ? '🖥️ MCP Host' : '📡 MCP Client';
+        const riskLabel = risk >= 7 ? '<span class="badge badge-critical">🔴 Critical</span>'
+          : risk >= 5 ? '<span class="badge badge-high">🔴 High</span>'
+          : risk >= 3 ? '<span class="badge badge-medium">🟡 Medium</span>'
+          : '<span class="badge badge-low">🟢 Low</span>';
+        const catChips = cats.map(c =>
+          `<span style="display:inline-block;margin:1px 2px;padding:1px 5px;border-radius:3px;background:rgba(56,139,253,.1);color:var(--accent-blue);font-size:10px">${c.icon} ${c.label}</span>`
+        ).join('') || '<span style="opacity:.4;font-size:11px">—</span>';
+        return `<tr>
+          <td>
+            <strong style="font-size:13px">${esc(sp.displayName||'—')}</strong>
+            ${sp.description ? `<br><span class="text-muted" style="font-size:10px">${esc(sp.description.slice(0,80))}</span>` : ''}
+            <br><span class="mono text-muted" style="font-size:10px">${esc(sp.appId?.slice(0,18)||sp.id?.slice(0,18)||'')}…</span>
+          </td>
+          <td style="font-size:12px;white-space:nowrap">${roleLabel}</td>
+          <td style="font-size:12px">
+            ${third ? `<span style="color:var(--risk-medium);font-size:11px">🏢 ${pub}</span>`
+                    : '<span style="color:var(--accent-blue);font-size:11px">🏢 Microsoft</span>'}
+          </td>
+          <td>${catChips}</td>
+          <td style="font-size:12px">
+            ${admin
+              ? '<span class="badge badge-medium" style="font-size:10px">🔑 Admin (tenant-wide)</span>'
+              : spGrants.length
+                ? '<span class="badge badge-info" style="font-size:10px">👤 User consent</span>'
+                : '<span style="opacity:.4;font-size:11px">No grants</span>'}
+          </td>
+          <td>${riskLabel}</td>
+          <td>${sp.accountEnabled === false
+            ? '<span class="text-critical" style="font-size:12px">🚫 Disabled</span>'
+            : '<span class="text-low" style="font-size:12px">✅ Enabled</span>'}</td>
+        </tr>`;
+      }).join('');
     };
 
-    const rows = uniqueMcp.map(sp => ({ sp, cats: getDataCats(sp), risk: riskScore(sp) }))
-      .sort((a, b) => b.risk - a.risk);
+    // Store renderMcpTable on STATE so KPI onclick can call it
+    STATE._mcpRender = renderMcpTable;
 
     el.innerHTML = `
       <div class="section-header" style="margin-bottom:10px">
@@ -6470,25 +6576,29 @@ async function loadMcpServers() {
       </div>
 
       <div class="kpi-row" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px">
-        <div class="kpi-card info">
+        <div id="kpi-mcp-all" class="kpi-card info" style="cursor:pointer;transition:outline .15s"
+             onclick="STATE._mcp.filter='all'; STATE._mcpRender();" title="Show all MCP servers">
           <div class="kpi-label">MCP-Related SPs</div>
           <div class="kpi-value text-blue">${uniqueMcp.length}</div>
           <div class="kpi-delta">${mcpSps.length} hosts · ${mcpClientSps.length} clients</div>
           <div class="kpi-icon">🔌</div>
         </div>
-        <div class="kpi-card ${thirdPartyCount > 0 ? 'medium' : 'low'}">
+        <div id="kpi-mcp-third" class="kpi-card ${thirdPartyCount > 0 ? 'medium' : 'low'}" style="cursor:pointer;transition:outline .15s"
+             onclick="STATE._mcp.filter='thirdparty'; STATE._mcpRender();" title="Filter: 3rd-party only">
           <div class="kpi-label">3rd-Party Servers</div>
           <div class="kpi-value ${thirdPartyCount > 0 ? 'text-medium' : 'text-low'}">${thirdPartyCount}</div>
           <div class="kpi-delta">Non-Microsoft publishers</div>
           <div class="kpi-icon">🏢</div>
         </div>
-        <div class="kpi-card ${adminConsentCount > 0 ? 'medium' : 'low'}">
+        <div id="kpi-mcp-admin" class="kpi-card ${adminConsentCount > 0 ? 'medium' : 'low'}" style="cursor:pointer;transition:outline .15s"
+             onclick="STATE._mcp.filter='admin'; STATE._mcpRender();" title="Filter: admin-consented only">
           <div class="kpi-label">Admin Consented</div>
           <div class="kpi-value ${adminConsentCount > 0 ? 'text-medium' : 'text-low'}">${adminConsentCount}</div>
           <div class="kpi-delta">Tenant-wide grants</div>
           <div class="kpi-icon">🔑</div>
         </div>
-        <div class="kpi-card ${broadAccessCount > 0 ? 'critical' : 'low'}">
+        <div id="kpi-mcp-broad" class="kpi-card ${broadAccessCount > 0 ? 'critical' : 'low'}" style="cursor:pointer;transition:outline .15s"
+             onclick="STATE._mcp.filter='broad'; STATE._mcpRender();" title="Filter: broad data access (3+ categories)">
           <div class="kpi-label">Broad Data Access</div>
           <div class="kpi-value ${broadAccessCount > 0 ? 'text-critical' : 'text-low'}">${broadAccessCount}</div>
           <div class="kpi-delta">Access to 3+ data categories</div>
@@ -6498,8 +6608,10 @@ async function loadMcpServers() {
 
       <div class="card" style="margin-bottom:16px">
         <div class="card-header">
-          <div class="card-title">🔌 MCP Server Registry (${uniqueMcp.length})</div>
-          <span class="data-source source-derived">⚡ Name / description / tag matching for MCP pattern</span>
+          <div class="card-title">🔌 MCP Server Registry
+            <span id="mcp-count" style="font-weight:400;color:var(--text-muted);font-size:12px;margin-left:8px">${uniqueMcp.length} of ${uniqueMcp.length}</span>
+          </div>
+          <span class="data-source source-derived">⚡ Click a KPI card to filter · click column headers to sort</span>
         </div>
         ${uniqueMcp.length ? `
         <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">
@@ -6509,51 +6621,15 @@ async function loadMcpServers() {
         <div class="table-wrap">
           <table>
             <thead><tr>
-              <th>Server / App</th>
-              <th>Role</th>
-              <th>Publisher</th>
-              <th>Data Access</th>
-              <th>Consent Type</th>
-              <th>Risk</th>
-              <th>Status</th>
+              <th id="mcp-th-name"    onclick="if(STATE._mcp){if(STATE._mcp.sortKey==='name')STATE._mcp.sortDir*=-1;else{STATE._mcp.sortKey='name';STATE._mcp.sortDir=1;}STATE._mcpRender();}"    style="cursor:pointer;user-select:none">Server / App</th>
+              <th id="mcp-th-role"    onclick="if(STATE._mcp){if(STATE._mcp.sortKey==='role')STATE._mcp.sortDir*=-1;else{STATE._mcp.sortKey='role';STATE._mcp.sortDir=-1;}STATE._mcpRender();}"   style="cursor:pointer;user-select:none">Role</th>
+              <th id="mcp-th-pub"     onclick="if(STATE._mcp){if(STATE._mcp.sortKey==='pub')STATE._mcp.sortDir*=-1;else{STATE._mcp.sortKey='pub';STATE._mcp.sortDir=1;}STATE._mcpRender();}"      style="cursor:pointer;user-select:none">Publisher</th>
+              <th id="mcp-th-cats"    onclick="if(STATE._mcp){if(STATE._mcp.sortKey==='cats')STATE._mcp.sortDir*=-1;else{STATE._mcp.sortKey='cats';STATE._mcp.sortDir=-1;}STATE._mcpRender();}"   style="cursor:pointer;user-select:none">Data Access</th>
+              <th id="mcp-th-consent" onclick="if(STATE._mcp){if(STATE._mcp.sortKey==='consent')STATE._mcp.sortDir*=-1;else{STATE._mcp.sortKey='consent';STATE._mcp.sortDir=-1;}STATE._mcpRender();}" style="cursor:pointer;user-select:none">Consent Type</th>
+              <th id="mcp-th-risk"    onclick="if(STATE._mcp){if(STATE._mcp.sortKey==='risk')STATE._mcp.sortDir*=-1;else{STATE._mcp.sortKey='risk';STATE._mcp.sortDir=-1;}STATE._mcpRender();}"   style="cursor:pointer;user-select:none">Risk ↓</th>
+              <th id="mcp-th-status"  onclick="if(STATE._mcp){if(STATE._mcp.sortKey==='status')STATE._mcp.sortDir*=-1;else{STATE._mcp.sortKey='status';STATE._mcp.sortDir=-1;}STATE._mcpRender();}" style="cursor:pointer;user-select:none">Status</th>
             </tr></thead>
-            <tbody>${rows.map(({ sp, cats, risk }) => {
-              const spGrants = grants.filter(g => g.clientId === sp.id);
-              const consentTypes = [...new Set(spGrants.map(g => g.consentType))];
-              const hasAdmin = consentTypes.includes('AllPrincipals');
-              const pub = esc(sp.publisherName || (sp.appOwnerOrganizationId ? sp.appOwnerOrganizationId.slice(0,8) + '…' : 'Unknown'));
-              const isMS = !isThirdParty(sp);
-              const roleLabel = mcpHostIds.has(sp.id) ? '🖥️ MCP Host' : '📡 MCP Client';
-              const riskLabel = risk >= 7 ? '<span class="badge badge-critical">🔴 Critical</span>'
-                : risk >= 5 ? '<span class="badge badge-high">🔴 High</span>'
-                : risk >= 3 ? '<span class="badge badge-medium">🟡 Medium</span>'
-                : '<span class="badge badge-low">🟢 Low</span>';
-              const catChips = cats.map(c =>
-                `<span style="display:inline-block;margin:1px 2px;padding:1px 5px;border-radius:3px;background:rgba(56,139,253,.1);color:var(--accent-blue);font-size:10px">${c.icon} ${c.label}</span>`
-              ).join('') || '<span style="opacity:.4;font-size:11px">—</span>';
-              return `<tr>
-                <td>
-                  <strong style="font-size:13px">${esc(sp.displayName||'—')}</strong>
-                  ${sp.description ? `<br><span class="text-muted" style="font-size:10px">${esc(sp.description.slice(0,80))}</span>` : ''}
-                  <br><span class="mono text-muted" style="font-size:10px">${esc(sp.appId?.slice(0,18)||sp.id?.slice(0,18)||'')}…</span>
-                </td>
-                <td style="font-size:12px;white-space:nowrap">${roleLabel}</td>
-                <td style="font-size:12px">
-                  ${isMS ? '<span style="color:var(--accent-blue);font-size:11px">🏢 Microsoft</span>' : `<span style="color:var(--risk-medium);font-size:11px">🏢 ${pub}</span>`}
-                </td>
-                <td>${catChips}</td>
-                <td style="font-size:12px">
-                  ${hasAdmin
-                    ? '<span class="badge badge-medium" style="font-size:10px">🔑 Admin (tenant-wide)</span>'
-                    : spGrants.length
-                      ? '<span class="badge badge-info" style="font-size:10px">👤 User consent</span>'
-                      : '<span style="opacity:.4;font-size:11px">No grants</span>'}
-                </td>
-                <td>${riskLabel}</td>
-                <td>${sp.accountEnabled === false ? '<span class="text-critical" style="font-size:12px">🚫 Disabled</span>' : '<span class="text-low" style="font-size:12px">✅ Enabled</span>'}</td>
-              </tr>`;
-            }).join('')}
-            </tbody>
+            <tbody id="mcp-tbody"></tbody>
           </table>
         </div>
         <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
@@ -6564,7 +6640,7 @@ async function loadMcpServers() {
           <div class="empty-state">
             <div style="font-size:32px;margin-bottom:8px">🔌</div>
             <div style="font-weight:600;margin-bottom:4px">No MCP servers detected</div>
-            <div class="text-muted" style="font-size:12px">No service principals matching the Model Context Protocol pattern were found. MCP servers registered in this tenant would appear here.</div>
+            <div class="text-muted" style="font-size:12px">No service principals matching the Model Context Protocol pattern were found.</div>
           </div>
         </div>
         `}
@@ -6608,6 +6684,10 @@ async function loadMcpServers() {
         </div>
       </div>
     `;
+
+    // Initial render of the table (with default sort: risk desc)
+    renderMcpTable();
+
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
   }
