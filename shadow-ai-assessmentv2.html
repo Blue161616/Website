@@ -899,7 +899,8 @@ async function fetchConsentAuditEvents() {
 async function fetchLabelPolicies() {
   if (STATE.data.labelPolicies !== undefined) return STATE.data.labelPolicies;
   try {
-    const d = await gget(`${GRAPH}/security/informationProtection/labelPolicies?$select=id,name,description,isEnabled,autoLabeling`);
+    // No $select — fetch all fields so we capture isMandatory / mandatoryLabel if the API exposes them
+    const d = await gget(`${GRAPH}/security/informationProtection/labelPolicies`);
     STATE.data.labelPolicies = d.value || [];
   } catch (e) {
     STATE.data.labelPolicies = [];
@@ -908,25 +909,32 @@ async function fetchLabelPolicies() {
   return STATE.data.labelPolicies;
 }
 
-// Fetches the MIP policy settings from the beta endpoint.
-// The `settings` array contains key-value pairs for DefaultLabelId, DefaultLabelIdForEmail,
-// DefaultLabelIdForMeetings, IsMandatory, RequireDowngradeJustification, etc.
+// Fetches MIP policy settings. Tries three endpoints in order:
+// 1. /beta/informationProtection/policy           — settings[] kv pairs (may 404 on some tenants)
+// 2. /beta/me/informationProtection/policy        — user-scoped variant
+// 3. Falls back to inferring isMandatory from labelPolicies objects (no $select)
 async function fetchMipPolicySettings() {
   if (STATE.data.mipPolicySettings !== undefined) return STATE.data.mipPolicySettings;
+  const normalise = (arr) => {
+    const settings = {};
+    (arr || []).forEach(s => { if (s.key) settings[s.key.toLowerCase()] = s.value; });
+    return settings;
+  };
+  // Try tenant-level policy
   try {
     const d = await gget(`${GRAPH_BETA}/informationProtection/policy`);
-    // Normalise the settings array into a plain object keyed by lowercase name,
-    // so lookups work regardless of whether the API returns IsMandatory vs isMandatory etc.
-    const settings = {};
-    (d.settings || []).forEach(s => {
-      if (s.key) settings[s.key.toLowerCase()] = s.value;
-    });
-    STATE.data.mipPolicySettings = settings;
-    STATE.data.mipPolicySettingsRaw = d.settings || []; // keep raw for debugging
-  } catch (e) {
-    STATE.data.mipPolicySettings = {};
-    STATE.data.mipPolicySettingsError = e.message;
-  }
+    STATE.data.mipPolicySettings = normalise(d.settings);
+    return STATE.data.mipPolicySettings;
+  } catch (_) {}
+  // Try user-scoped policy
+  try {
+    const d = await gget(`${GRAPH_BETA}/me/informationProtection/policy`);
+    STATE.data.mipPolicySettings = normalise(d.settings);
+    return STATE.data.mipPolicySettings;
+  } catch (_) {}
+  // Both endpoints unavailable — return empty (isMandatory will be inferred from label policies)
+  STATE.data.mipPolicySettings = {};
+  STATE.data.mipPolicySettingsUnavailable = true;
   return STATE.data.mipPolicySettings;
 }
 
@@ -5952,15 +5960,21 @@ async function loadSensitivityLabels() {
     // Auto-labeling policies
     const autoLabelPolicies = policies.filter(p => p.autoLabeling?.isEnabled);
 
-    // Default label setting — checks DefaultLabelId (documents) and IsMandatory only.
-    // Keys are stored lowercase. We search for any key containing 'mandatory' since the
-    // exact key name varies (IsMandatory, MandatoryLabel, isMandatoryForAllUsers, etc.)
-    // and we accept any truthy string ('true', 'True', '1') as the value.
+    // Default label setting — checks DefaultLabelId (documents) and IsMandatory.
+    // Source 1: mipPolicySettings kv pairs (keys lowercased, any key containing 'mandatory')
     const defaultLabelIdDoc  = mipSettings['defaultlabelid'];
     const mandatoryEntry     = Object.entries(mipSettings).find(([k]) => k.includes('mandatory'));
-    const isMandatory        = mandatoryEntry
+    const isMandatoryFromMip = mandatoryEntry
       ? ['true','1','yes'].includes(String(mandatoryEntry[1]).toLowerCase())
       : false;
+    // Source 2: label policy objects (fetched without $select — may carry isMandatory directly)
+    const isMandatoryFromPolicy = policies.some(p =>
+      p.isMandatory === true ||
+      p.mandatoryLabel === true ||
+      ['true','1','yes'].includes(String(p.isMandatory ?? '').toLowerCase()) ||
+      ['true','1','yes'].includes(String(p.mandatoryLabel ?? '').toLowerCase())
+    );
+    const isMandatory = isMandatoryFromMip || isMandatoryFromPolicy;
     const defaultLabel      = defaultLabelIdDoc
       ? (labels.find(l => l.id === defaultLabelIdDoc) || { name: 'Configured', id: defaultLabelIdDoc })
       : labels.find(l => l.isDefault);  // fallback to isDefault flag on label object
@@ -6201,11 +6215,6 @@ async function loadSensitivityLabels() {
                 <span style="flex-shrink:0;color:${r.done?'var(--risk-low)':'var(--risk-high)'}">${r.done?'✅':'⚠️'}</span>
                 <span style="color:${r.done?'var(--text-dim)':'var(--text-muted)'}">${esc(r.text)}</span>
               </div>`).join('')}
-              ${!isMandatory && Object.keys(mipSettings).length > 0 ? `
-                <div style="margin-top:6px;font-size:10px;color:var(--text-dim);font-family:monospace;background:var(--bg-secondary);padding:4px 8px;border-radius:4px">
-                  MIP keys: ${esc(Object.keys(mipSettings).join(', ') || '(none)')}
-                </div>` : ''}
-              ${STATE.data.mipPolicySettingsError ? `<div style="font-size:10px;color:var(--risk-medium);margin-top:4px">⚠️ MIP policy fetch failed: ${esc(STATE.data.mipPolicySettingsError)}</div>` : ''}
             </div>
             <div>
               <div style="font-weight:600;margin-bottom:10px;font-size:13px">AI app access controls</div>
