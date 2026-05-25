@@ -319,6 +319,8 @@
       <button class="nav-item" onclick="navigate('compliance',this)"><span class="nav-icon">✅</span>Compliance</button>
       <button class="nav-item" onclick="navigate('users',this)"><span class="nav-icon">👥</span>Users &amp; Groups</button>
       <button class="nav-item" onclick="navigate('protection',this)"><span class="nav-icon">🛡️</span>Protection</button>
+      <button class="nav-item" onclick="navigate('sharing',this)"><span class="nav-icon">🌐</span>External Sharing</button>
+      <button class="nav-item" onclick="navigate('labels',this)"><span class="nav-icon">🏷️</span>Sensitivity Labels</button>
       <button class="nav-item" onclick="navigate('consent',this)"><span class="nav-icon">📅</span>Consent History</button>
       <div class="nav-section-label">Settings</div>
       <button class="nav-item" onclick="navigate('policies',this)"><span class="nav-icon">📋</span>Policies</button>
@@ -399,6 +401,16 @@
       <!-- ══ PROTECTION ══ -->
       <div class="page" id="page-protection">
         <div id="protection-content"><div class="section-loading"><span class="spinner"></span>Loading Defender data…</div></div>
+      </div>
+
+      <!-- ══ EXTERNAL SHARING ══ -->
+      <div class="page" id="page-sharing">
+        <div id="sharing-content"><div class="section-loading"><span class="spinner"></span>Loading external sharing data…</div></div>
+      </div>
+
+      <!-- ══ SENSITIVITY LABELS ══ -->
+      <div class="page" id="page-labels">
+        <div id="labels-content"><div class="section-loading"><span class="spinner"></span>Loading sensitivity labels…</div></div>
       </div>
 
       <!-- ══ MCP SERVERS ══ -->
@@ -720,6 +732,50 @@ async function fetchOAuth2Grants() {
   return STATE.data.grants;
 }
 
+async function fetchSharePointSettings() {
+  if (STATE.data.spSettings !== undefined) return STATE.data.spSettings;
+  try {
+    const d = await gget(`${GRAPH}/admin/sharepoint/settings`);
+    STATE.data.spSettings = d;
+  } catch (e) {
+    STATE.data.spSettings = null;
+    STATE.data.spSettingsError = e.message;
+  }
+  return STATE.data.spSettings;
+}
+
+async function fetchSensitivityLabels() {
+  if (STATE.data.sensitivityLabels !== undefined) return STATE.data.sensitivityLabels;
+  try {
+    const d = await gget(`${GRAPH}/security/informationProtection/sensitivityLabels?$select=id,name,description,priority,tooltip,color,sensitivity,contentFormats,isActive,parent`);
+    STATE.data.sensitivityLabels = (d.value || []).sort((a,b) => (b.sensitivity||b.priority||0) - (a.sensitivity||a.priority||0));
+    STATE.data.sensitivityLabelsSource = 'security';
+  } catch (e) {
+    // Fallback to older endpoint
+    try {
+      const d2 = await gget(`${GRAPH}/informationProtection/policy/labels`);
+      STATE.data.sensitivityLabels = (d2.value || []).sort((a,b) => (b.priority||0) - (a.priority||0));
+      STATE.data.sensitivityLabelsSource = 'policy';
+    } catch (e2) {
+      STATE.data.sensitivityLabels = [];
+      STATE.data.sensitivityLabelsError = e2.message;
+    }
+  }
+  return STATE.data.sensitivityLabels;
+}
+
+async function fetchLabelPolicies() {
+  if (STATE.data.labelPolicies !== undefined) return STATE.data.labelPolicies;
+  try {
+    const d = await gget(`${GRAPH}/security/informationProtection/labelPolicies?$select=id,name,description,isEnabled,autoLabeling`);
+    STATE.data.labelPolicies = d.value || [];
+  } catch (e) {
+    STATE.data.labelPolicies = [];
+    STATE.data.labelPoliciesError = e.message;
+  }
+  return STATE.data.labelPolicies;
+}
+
 async function fetchSignIns() {
   if (STATE.data.signIns) return STATE.data.signIns;
   try {
@@ -976,7 +1032,7 @@ const PAGE_TITLES = {
   dashboard:'Dashboard','shadow-apps':'Shadow AI Apps',models:'AI Models',
   agents:'AI Agents',mcp:'MCP Servers','data-risk':'Data Risk',compliance:'Compliance',
   users:'Users & Groups',alerts:'Security Alerts',policies:'Policies',licenses:'Licenses',
-  protection:'Protection',consent:'Consent History',
+  protection:'Protection',sharing:'External Sharing Exposure',labels:'Sensitivity Label Exposure',consent:'Consent History',
 };
 
 const PAGE_LOADERS = {
@@ -986,6 +1042,8 @@ const PAGE_LOADERS = {
   policies: loadPolicies,
   licenses: loadLicenses,
   protection: loadProtection,
+  sharing: loadExternalSharing,
+  labels: loadSensitivityLabels,
   consent: loadConsentTimeline,
 };
 
@@ -1021,7 +1079,7 @@ function refreshAll() {
   Object.values(STATE.charts).forEach(c => c.destroy());
   STATE.charts = {};
   // reset all page content
-  ['shadow','models','agents','mcp','risk','compliance','users','alerts','policies','licenses','protection','consent'].forEach(k => {
+  ['shadow','models','agents','mcp','risk','compliance','users','alerts','policies','licenses','protection','sharing','labels','consent'].forEach(k => {
     const el = document.getElementById(k + '-content');
     if (el) el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Reloading…</div>';
   });
@@ -4648,6 +4706,7 @@ async function loadAlerts() {
         sev: a.severity||'medium', title: a.title, desc: a.description, icon: '🛡️',
         source: 'Defender' + (a.category ? ' · ' + a.category : '') + (a.status ? ' · ' + a.status : ''),
         url: a.alertWebUrl || null,
+        status: a.status || null,
         classification: a.classification, determination: a.determination,
       })),
     ];
@@ -5435,6 +5494,550 @@ async function loadProtection() {
     `;
   } catch (e) {
     el.innerHTML = permWarn('SecurityAlert.Read.All, Policy.Read.All', e.message);
+  }
+}
+
+// ── EXTERNAL SHARING EXPOSURE ─────────────────────────────────────────────
+
+const FILE_ACCESS_SCOPES  = ['Files.Read','Files.Read.All','Files.ReadWrite','Files.ReadWrite.All',
+  'Sites.Read.All','Sites.ReadWrite.All','Sites.FullControl.All','Sites.Manage.All','Sites.Selected'];
+const FILE_WRITE_SCOPES   = ['Files.ReadWrite','Files.ReadWrite.All','Sites.ReadWrite.All','Sites.FullControl.All','Sites.Manage.All'];
+const SHARING_CAP_INFO = {
+  disabled:                    { label:'✅ External sharing disabled',          risk:'low',      icon:'✅', desc:'No external users can access SharePoint/OneDrive content.' },
+  existingExternalUserSharingOnly:{ label:'ℹ️ Existing external users only',   risk:'low',      icon:'ℹ️', desc:'Sharing limited to external users already in the directory.' },
+  externalUserSharingOnly:     { label:'⚠️ Authenticated external users',       risk:'medium',   icon:'⚠️', desc:'Content can be shared with any authenticated external user via invitation.' },
+  externalUserAndGuestSharing: { label:'🔴 Anyone links enabled',               risk:'high',     icon:'🔴', desc:'Anonymous "Anyone with link" sharing is enabled — AI apps with Files access can read this content.' },
+};
+const LINK_TYPE_INFO = {
+  none:            { label:'No default link',         risk:'low'    },
+  direct:          { label:'🔗 Specific people',      risk:'low'    },
+  internal:        { label:'🏢 Organisation only',    risk:'medium' },
+  anonymousAccess: { label:'🔓 Anyone with the link', risk:'high'   },
+};
+
+async function loadExternalSharing() {
+  const el = document.getElementById('sharing-content');
+  try {
+    const [sps, grants, spSettings] = await Promise.all([
+      fetchServicePrincipals(), fetchOAuth2Grants(), fetchSharePointSettings(),
+    ]);
+    const aiApps  = sps.filter(isAiApp);
+    const agentSps = STATE.data.agentSps || sps.filter(sp => AGENT_KEYWORDS.some(k=>(sp.displayName||'').toLowerCase().includes(k)) || sp.servicePrincipalType==='ServiceIdentity');
+
+    // Which AI apps/agents have Files or Sites access?
+    const fileAiApps = aiApps.filter(sp => getScopesForSp(sp.id, grants).some(s => FILE_ACCESS_SCOPES.includes(s)));
+    const fileAgents = agentSps.filter(sp => getScopesForSp(sp.id, grants).some(s => FILE_ACCESS_SCOPES.includes(s)));
+    const writeApps  = [...new Set([...fileAiApps, ...fileAgents])].filter(sp =>
+      getScopesForSp(sp.id, grants).some(s => FILE_WRITE_SCOPES.includes(s))
+    );
+    const adminConsentFileApps = fileAiApps.filter(sp =>
+      grants.some(g => g.clientId === sp.id && g.consentType === 'AllPrincipals' && FILE_ACCESS_SCOPES.some(s => (g.scope||'').includes(s)))
+    );
+
+    const sharingCap   = spSettings?.sharingCapability;
+    const capInfo      = SHARING_CAP_INFO[sharingCap] || { label: sharingCap || '—', risk:'info', icon:'❓', desc:'Sharing capability could not be determined.' };
+    const defaultLink  = spSettings?.defaultSharingLinkType;
+    const linkInfo     = LINK_TYPE_INFO[defaultLink] || { label: defaultLink || '—', risk:'info' };
+    const anonEnabled  = sharingCap === 'externalUserAndGuestSharing';
+    const isHighRisk   = anonEnabled && fileAiApps.length > 0;
+
+    // Compute overall exposure score
+    const exposureScore = (anonEnabled ? 3 : sharingCap==='externalUserSharingOnly' ? 1 : 0)
+      + (fileAiApps.length > 0 ? 2 : 0)
+      + (adminConsentFileApps.length > 0 ? 2 : 0)
+      + (writeApps.length > 0 ? 1 : 0);
+    const expLevel = exposureScore >= 6 ? 'critical' : exposureScore >= 4 ? 'high' : exposureScore >= 2 ? 'medium' : 'low';
+    const expLabel = { critical:'🔴 Critical', high:'🔴 High', medium:'🟡 Medium', low:'🟢 Low' }[expLevel];
+
+    // Per-app risk rows
+    const allFileApps = [...new Map([...fileAiApps,...fileAgents].map(s=>[s.id,s])).values()];
+    const appRows = allFileApps.map(sp => {
+      const scopes   = getScopesForSp(sp.id, grants).filter(s => FILE_ACCESS_SCOPES.includes(s));
+      const canWrite = scopes.some(s => FILE_WRITE_SCOPES.includes(s));
+      const isAdmin  = grants.some(g => g.clientId===sp.id && g.consentType==='AllPrincipals');
+      const appRisk  = (anonEnabled && isAdmin) ? 'critical'
+                     : (anonEnabled || (isAdmin && canWrite)) ? 'high'
+                     : isAdmin ? 'medium' : 'low';
+      const scopeChips = scopes.map(s => {
+        const risky = FILE_WRITE_SCOPES.includes(s);
+        return `<span style="display:inline-block;margin:1px 2px;padding:1px 6px;border-radius:3px;font-size:10px;
+          background:${risky?'rgba(248,81,73,.12)':'rgba(56,139,253,.08)'};
+          color:${risky?'var(--risk-high)':'var(--accent-blue)'}">${esc(s)}</span>`;
+      }).join('');
+      return { sp, scopes, canWrite, isAdmin, appRisk, scopeChips };
+    }).sort((a,b) => ({'critical':4,'high':3,'medium':2,'low':1}[b.appRisk]||0) - ({'critical':4,'high':3,'medium':2,'low':1}[a.appRisk]||0));
+
+    // SharePoint settings detail rows
+    const settingRows = spSettings ? [
+      { label:'External sharing capability',  value: capInfo.label,                                       risk: capInfo.risk },
+      { label:'Default sharing link type',    value: linkInfo.label,                                      risk: linkInfo.risk },
+      { label:'Default link permission',      value: spSettings.defaultLinkPermission === 'edit' ? '✏️ Edit (write access by default)' : spSettings.defaultLinkPermission === 'view' ? '👁️ View only' : (spSettings.defaultLinkPermission||'—'), risk: spSettings.defaultLinkPermission === 'edit' ? 'high' : 'low' },
+      { label:'External resharing allowed',   value: spSettings.isResharingByExternalUsersEnabled === false ? '✅ Blocked' : spSettings.isResharingByExternalUsersEnabled === true ? '⚠️ Allowed' : '—', risk: spSettings.isResharingByExternalUsersEnabled ? 'medium' : 'low' },
+      { label:'OneDrive sharing',             value: spSettings.isSharingInOneDriveEnabled === false ? '✅ Disabled' : spSettings.isSharingInOneDriveEnabled === true ? '⚠️ Enabled' : '—', risk: spSettings.isSharingInOneDriveEnabled ? 'medium' : 'low' },
+      { label:'Request files links (OneDrive)', value: spSettings.isOneDriveRequestFilesLinkEnabled === true ? '⚠️ Enabled' : spSettings.isOneDriveRequestFilesLinkEnabled === false ? '✅ Disabled' : '—', risk: spSettings.isOneDriveRequestFilesLinkEnabled ? 'medium' : 'low' },
+      { label:'Guest must match invited user', value: spSettings.isRequireAcceptingUserToMatchInvitedUserEnabled ? '✅ Enforced' : '⚠️ Not enforced', risk: spSettings.isRequireAcceptingUserToMatchInvitedUserEnabled ? 'low' : 'medium' },
+    ] : [];
+
+    el.innerHTML = `
+      <div style="position:sticky;top:52px;z-index:80;background:var(--bg-primary);padding-bottom:10px;margin-bottom:4px;border-bottom:1px solid var(--border)">
+        <div class="section-header" style="margin-bottom:10px">
+          <div>
+            <div class="section-title">External Sharing Exposure</div>
+            <div class="section-sub">SharePoint/OneDrive sharing configuration × AI app permission analysis</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            ${riskBadge(expLevel)}
+            <span style="font-size:12px;color:var(--text-muted)">${expLabel} exposure</span>
+            <span class="data-source ${spSettings ? 'source-live' : 'source-derived'}">
+              ${spSettings ? '● admin/sharepoint/settings + grants' : '⚡ Derived from grants only'}
+            </span>
+          </div>
+        </div>
+
+        <div class="kpi-row" style="grid-template-columns:repeat(4,1fr);margin:0">
+          <div class="kpi-card ${capInfo.risk}">
+            <div class="kpi-label">Tenant Sharing Level</div>
+            <div class="kpi-value" style="font-size:16px;line-height:1.3">${capInfo.icon}</div>
+            <div class="kpi-delta" style="font-size:10px">${capInfo.label.replace(/^[✅⚠️🔴ℹ️]\s*/,'')}</div>
+            <div class="kpi-icon">🌐</div>
+          </div>
+          <div class="kpi-card ${fileAiApps.length > 0 ? (anonEnabled ? 'critical' : 'high') : 'low'}">
+            <div class="kpi-label">AI Apps with Files Access</div>
+            <div class="kpi-value ${fileAiApps.length > 0 ? (anonEnabled ? 'text-critical' : 'text-high') : 'text-low'}">${fileAiApps.length}</div>
+            <div class="kpi-delta">${fileAgents.length} agents · ${writeApps.length} with write</div>
+            <div class="kpi-icon">📁</div>
+          </div>
+          <div class="kpi-card ${adminConsentFileApps.length > 0 ? 'critical' : 'low'}">
+            <div class="kpi-label">Admin-Consented File Access</div>
+            <div class="kpi-value ${adminConsentFileApps.length > 0 ? 'text-critical' : 'text-low'}">${adminConsentFileApps.length}</div>
+            <div class="kpi-delta">Tenant-wide Files/Sites grants</div>
+            <div class="kpi-icon">🔑</div>
+          </div>
+          <div class="kpi-card ${linkInfo.risk}">
+            <div class="kpi-label">Default Link Type</div>
+            <div class="kpi-value" style="font-size:16px">🔗</div>
+            <div class="kpi-delta" style="font-size:10px">${linkInfo.label}</div>
+            <div class="kpi-icon">📎</div>
+          </div>
+        </div>
+      </div>
+
+      ${isHighRisk ? `
+      <div style="margin-bottom:16px;padding:12px 16px;border-radius:8px;background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.35);display:flex;align-items:flex-start;gap:12px">
+        <span style="font-size:22px;flex-shrink:0">🔴</span>
+        <div>
+          <div style="font-weight:700;font-size:14px;color:var(--risk-critical);margin-bottom:4px">Critical: Anonymous sharing + tenant-wide AI file access</div>
+          <div style="font-size:12px;color:var(--text-muted)">
+            Your tenant allows "Anyone with link" sharing AND ${adminConsentFileApps.length} AI app${adminConsentFileApps.length!==1?'s':''} have admin-consented access to Files/Sites.
+            This means AI apps can silently read any content users have shared via anonymous links — including externally shared sensitive documents.
+            <strong style="color:var(--text-primary)"> Immediate action recommended.</strong>
+          </div>
+        </div>
+      </div>` : ''}
+
+      <div class="grid-2" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">🌐 SharePoint Sharing Settings</div>
+            <span class="data-source ${spSettings ? 'source-live' : 'source-derived'}" style="font-size:10px">
+              ${spSettings ? '● admin/sharepoint/settings' : '⚡ Not available — needs SharePointTenantSettings.Read.All'}
+            </span>
+          </div>
+          ${spSettings ? `
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Setting</th><th>Value</th><th>Risk</th></tr></thead>
+              <tbody>${settingRows.map(r => `<tr>
+                <td style="font-size:12px;color:var(--text-muted)">${esc(r.label)}</td>
+                <td style="font-size:12px">${esc(r.value)}</td>
+                <td>${riskBadge(r.risk)}</td>
+              </tr>`).join('')}</tbody>
+            </table>
+          </div>
+          <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
+            ℹ️ Source: <code>GET /admin/sharepoint/settings</code> · Requires SharePointTenantSettings.Read.All
+          </div>
+          ` : `
+          <div class="card-body">
+            ${STATE.data.spSettingsError ? permWarn('SharePointTenantSettings.Read.All', STATE.data.spSettingsError) : ''}
+            <div class="empty-state text-muted">SharePoint tenant settings unavailable. Grant <code>SharePointTenantSettings.Read.All</code> admin consent to see external sharing configuration.</div>
+          </div>
+          `}
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">📊 Exposure Risk Matrix</div>
+          </div>
+          <div class="card-body">
+            ${[
+              { label:'Anonymous sharing enabled',               val: anonEnabled,                          risk: anonEnabled?'high':'low' },
+              { label:'AI apps with Files.Read.All',             val: fileAiApps.length > 0,                risk: fileAiApps.length>0?'high':'low', count: fileAiApps.length },
+              { label:'Agents with Files access',                val: fileAgents.length > 0,                risk: fileAgents.length>0?'medium':'low', count: fileAgents.length },
+              { label:'Admin-consented Files access',            val: adminConsentFileApps.length > 0,      risk: adminConsentFileApps.length>0?'critical':'low', count: adminConsentFileApps.length },
+              { label:'AI apps with write access to SharePoint', val: writeApps.length > 0,                 risk: writeApps.length>0?'high':'low', count: writeApps.length },
+              { label:'Default link type is anonymous',          val: defaultLink==='anonymousAccess',      risk: defaultLink==='anonymousAccess'?'high':'low' },
+              { label:'External resharing by guests',            val: spSettings?.isResharingByExternalUsersEnabled===true, risk:'medium' },
+            ].map(r => `
+              <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border-subtle,rgba(48,54,61,.6))">
+                <span style="font-size:12px;color:var(--text-muted)">${esc(r.label)}</span>
+                <div style="display:flex;align-items:center;gap:8px">
+                  ${r.count !== undefined ? `<span style="font-size:11px;color:var(--text-dim)">${r.count}</span>` : ''}
+                  ${r.val === true
+                    ? `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(248,81,73,.1);color:var(--risk-${r.risk})">⚠️ Yes</span>`
+                    : r.val === false
+                    ? `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(63,185,80,.1);color:var(--risk-low)">✅ No</span>`
+                    : `<span style="font-size:11px;color:var(--text-dim)">—</span>`}
+                </div>
+              </div>`).join('')}
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">📁 AI Apps &amp; Agents with SharePoint/OneDrive Access (${allFileApps.length})</div>
+          <span class="data-source source-derived">⚡ Derived from OAuth2 grants</span>
+        </div>
+        ${allFileApps.length ? `
+        <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">
+          These apps have been granted permission to access SharePoint/OneDrive files. Combined with the tenant sharing settings above, they can read (and in some cases write) any content the sharing policy allows.
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>App / Agent</th>
+              <th>File Scopes</th>
+              <th>Consent</th>
+              <th>Write Access</th>
+              <th>Exposure Risk</th>
+            </tr></thead>
+            <tbody>${appRows.map(({sp, scopes, canWrite, isAdmin, appRisk, scopeChips}) => `<tr style="${appRisk==='critical'?'background:rgba(248,81,73,.04)':appRisk==='high'?'background:rgba(240,136,62,.03)':''}">
+              <td>
+                <strong style="font-size:13px">${esc(sp.displayName||'—')}</strong>
+                <span style="font-size:10px;color:var(--text-muted);margin-left:6px">${esc(getAgentType(sp).label || (isAiApp(sp)?'AI App':'SP'))}</span>
+                <br><span class="mono text-muted" style="font-size:10px">${esc((sp.appId||sp.id||'').slice(0,22))}…</span>
+              </td>
+              <td>${scopeChips}</td>
+              <td>${isAdmin
+                ? '<span class="badge badge-critical" style="font-size:10px">🏢 Admin (tenant-wide)</span>'
+                : '<span class="badge badge-medium" style="font-size:10px">👤 User delegated</span>'}</td>
+              <td style="text-align:center">${canWrite
+                ? '<span style="color:var(--risk-high);font-weight:600">✏️ Write</span>'
+                : '<span style="color:var(--risk-low)">👁️ Read</span>'}</td>
+              <td>${riskBadge(appRisk)}</td>
+            </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>` : '<div class="card-body empty-state text-muted">✅ No AI apps or agents have SharePoint/OneDrive file access grants.</div>'}
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">🔐 Remediation Guidance</div>
+        </div>
+        <div class="card-body">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+            <div>
+              <div style="font-weight:600;margin-bottom:10px;font-size:13px">Sharing configuration hardening</div>
+              ${[
+                { done: !anonEnabled,                             text: 'Disable "Anyone with link" sharing (use authenticated sharing only)' },
+                { done: defaultLink !== 'anonymousAccess',        text: 'Set default link type to "Specific people" or "Organisation only"' },
+                { done: !spSettings?.isResharingByExternalUsersEnabled, text: 'Block external users from re-sharing content' },
+                { done: !!spSettings?.isRequireAcceptingUserToMatchInvitedUserEnabled, text: 'Require accepting user to match invited user' },
+                { done: spSettings?.defaultLinkPermission === 'view', text: 'Set default link permission to View-only (not Edit)' },
+              ].map(r => `<div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px;font-size:12px">
+                <span style="flex-shrink:0;color:${r.done?'var(--risk-low)':'var(--risk-high)'}">${r.done?'✅':'⚠️'}</span>
+                <span style="color:${r.done?'var(--text-dim)':'var(--text-muted)'}">${esc(r.text)}</span>
+              </div>`).join('')}
+            </div>
+            <div>
+              <div style="font-weight:600;margin-bottom:10px;font-size:13px">AI app permission hardening</div>
+              ${[
+                { done: adminConsentFileApps.length === 0, text: 'Revoke admin-consented Files.Read.All / Sites.Read.All from AI apps not requiring it' },
+                { done: writeApps.length === 0,            text: 'Revoke write access (Files.ReadWrite.All) from all AI apps — use read-only where possible' },
+                { done: fileAiApps.length === 0,           text: 'Apply Conditional Access policies blocking unknown AI apps from accessing SharePoint' },
+                { done: false,                             text: 'Use Sites.Selected instead of Sites.Read.All to scope SharePoint access to specific sites' },
+                { done: false,                             text: 'Enable SharePoint access reviews for AI apps quarterly' },
+              ].map(r => `<div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px;font-size:12px">
+                <span style="flex-shrink:0;color:${r.done?'var(--risk-low)':'var(--risk-high)'}">${r.done?'✅':'⚠️'}</span>
+                <span style="color:${r.done?'var(--text-dim)':'var(--text-muted)'}">${esc(r.text)}</span>
+              </div>`).join('')}
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  } catch (e) {
+    el.innerHTML = permWarn('Application.Read.All', e.message);
+  }
+}
+
+// ── SENSITIVITY LABEL EXPOSURE ────────────────────────────────────────────
+
+const LABEL_CONTENT_ICONS = { file:'📄', email:'📧', meeting:'📅', schematizedData:'🗃️', site:'🌐', unifiedGroup:'👥', teamwork:'💬' };
+
+// Scopes that give AI apps read access to labeled content
+const LABELED_READ_SCOPES  = ['Files.Read.All','Files.ReadWrite.All','Sites.Read.All','Sites.ReadWrite.All','Mail.Read','Mail.ReadWrite','Mail.Read.Shared','Chat.Read.All'];
+const LABELED_WRITE_SCOPES = ['Files.ReadWrite.All','Sites.ReadWrite.All','Mail.ReadWrite','Files.ReadWrite'];
+
+async function loadSensitivityLabels() {
+  const el = document.getElementById('labels-content');
+  try {
+    const [sps, grants, labels, policies] = await Promise.all([
+      fetchServicePrincipals(), fetchOAuth2Grants(), fetchSensitivityLabels(), fetchLabelPolicies(),
+    ]);
+    const aiApps   = sps.filter(isAiApp);
+    const agentSps = STATE.data.agentSps || sps.filter(sp => AGENT_KEYWORDS.some(k=>(sp.displayName||'').toLowerCase().includes(k)) || sp.servicePrincipalType==='ServiceIdentity');
+
+    // AI apps/agents with read access to labelled content types
+    const appsWithLabeledAccess = [...new Map([...aiApps,...agentSps].map(s=>[s.id,s])).values()].filter(sp =>
+      getScopesForSp(sp.id, grants).some(s => LABELED_READ_SCOPES.includes(s))
+    );
+
+    // Auto-labeling policies
+    const autoLabelPolicies = policies.filter(p => p.autoLabeling?.isEnabled);
+
+    // Label hierarchy (parent → children)
+    const rootLabels     = labels.filter(l => !l.parent?.id);
+    const childLabels    = labels.filter(l =>  l.parent?.id);
+    const childrenByParent = {};
+    childLabels.forEach(l => {
+      const pid = l.parent.id;
+      (childrenByParent[pid] = childrenByParent[pid] || []).push(l);
+    });
+
+    // For each label determine if AI apps can reach it
+    const labelRiskFor = (label) => {
+      const formats = label.contentFormats || [];
+      const reachable = appsWithLabeledAccess.filter(sp => {
+        const scopes = getScopesForSp(sp.id, grants);
+        if (formats.includes('file')  && scopes.some(s => ['Files.Read.All','Files.ReadWrite.All','Sites.Read.All','Sites.ReadWrite.All'].includes(s))) return true;
+        if (formats.includes('email') && scopes.some(s => ['Mail.Read','Mail.ReadWrite','Mail.Read.Shared'].includes(s))) return true;
+        if (formats.includes('teamwork') && scopes.some(s => ['Chat.Read.All','ChannelMessage.Read.All'].includes(s))) return true;
+        return false;
+      });
+      return reachable;
+    };
+
+    const sensitivity = l => l.sensitivity ?? l.priority ?? 0;
+
+    // High-sensitivity labels (top 30% by sensitivity score)
+    const maxSens = labels.reduce((m,l) => Math.max(m, sensitivity(l)), 0);
+    const highSensLabels = labels.filter(l => sensitivity(l) > 0 && sensitivity(l) >= maxSens * 0.6);
+    const criticalExposure = highSensLabels.filter(l => labelRiskFor(l).length > 0);
+
+    el.innerHTML = `
+      <div style="position:sticky;top:52px;z-index:80;background:var(--bg-primary);padding-bottom:10px;margin-bottom:4px;border-bottom:1px solid var(--border)">
+        <div class="section-header" style="margin-bottom:10px">
+          <div>
+            <div class="section-title">Sensitivity Label Exposure</div>
+            <div class="section-sub">Microsoft Purview labels × AI app permission reach analysis</div>
+          </div>
+          <span class="data-source ${labels.length ? 'source-live' : 'source-derived'}">
+            ${labels.length ? `● ${STATE.data.sensitivityLabelsSource==='security'?'security/informationProtection/sensitivityLabels':'informationProtection/policy/labels'}` : '⚡ Labels unavailable'}
+          </span>
+        </div>
+
+        <div class="kpi-row" style="grid-template-columns:repeat(4,1fr);margin:0">
+          <div class="kpi-card info">
+            <div class="kpi-label">Sensitivity Labels</div>
+            <div class="kpi-value text-blue">${labels.length}</div>
+            <div class="kpi-delta">${rootLabels.length} top-level · ${childLabels.length} sub-labels</div>
+            <div class="kpi-icon">🏷️</div>
+          </div>
+          <div class="kpi-card ${criticalExposure.length > 0 ? 'critical' : 'low'}">
+            <div class="kpi-label">High-Sensitivity Exposed</div>
+            <div class="kpi-value ${criticalExposure.length > 0 ? 'text-critical' : 'text-low'}">${criticalExposure.length}</div>
+            <div class="kpi-delta">High-sensitivity labels reachable by AI</div>
+            <div class="kpi-icon">⚠️</div>
+          </div>
+          <div class="kpi-card ${appsWithLabeledAccess.length > 0 ? 'high' : 'low'}">
+            <div class="kpi-label">AI Apps w/ Content Access</div>
+            <div class="kpi-value ${appsWithLabeledAccess.length > 0 ? 'text-high' : 'text-low'}">${appsWithLabeledAccess.length}</div>
+            <div class="kpi-delta">Can read labelled files, mail, or chat</div>
+            <div class="kpi-icon">🤖</div>
+          </div>
+          <div class="kpi-card ${autoLabelPolicies.length > 0 ? 'low' : 'medium'}">
+            <div class="kpi-label">Auto-labeling Policies</div>
+            <div class="kpi-value ${autoLabelPolicies.length > 0 ? 'text-low' : 'text-medium'}">${autoLabelPolicies.length}</div>
+            <div class="kpi-delta">${autoLabelPolicies.length > 0 ? '✅ Auto-labeling active' : '⚠️ No auto-labeling found'}</div>
+            <div class="kpi-icon">🏷️</div>
+          </div>
+        </div>
+      </div>
+
+      ${STATE.data.sensitivityLabelsError ? permWarn('InformationProtectionPolicy.Read.All', STATE.data.sensitivityLabelsError) : ''}
+
+      ${criticalExposure.length > 0 ? `
+      <div style="margin-bottom:16px;padding:12px 16px;border-radius:8px;background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.35)">
+        <div style="font-weight:700;font-size:14px;color:var(--risk-critical);margin-bottom:4px">
+          🔴 ${criticalExposure.length} high-sensitivity label${criticalExposure.length!==1?'s are':' is'} reachable by AI apps
+        </div>
+        <div style="font-size:12px;color:var(--text-muted)">
+          Labels: ${criticalExposure.map(l=>`<strong>${esc(l.name)}</strong>`).join(', ')}.
+          AI apps with Files.Read.All or Mail.Read can access content carrying these labels — even content marked as Highly Confidential.
+        </div>
+      </div>` : ''}
+
+      <div class="grid-2" style="margin-bottom:16px">
+        <!-- Label taxonomy -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">🏷️ Label Taxonomy (${labels.length})</div>
+            <span style="font-size:11px;color:var(--text-dim)">Sorted highest sensitivity first</span>
+          </div>
+          ${labels.length ? `
+          <div style="padding:6px 0">
+            ${rootLabels.map(label => {
+              const children = childrenByParent[label.id] || [];
+              const reachable = labelRiskFor(label);
+              const sens = sensitivity(label);
+              const isHighSens = highSensLabels.some(h => h.id === label.id);
+              const colorDot = label.color ? `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${esc(label.color)};margin-right:5px;vertical-align:middle;border:1px solid rgba(255,255,255,.2)"></span>` : '';
+              const formats = (label.contentFormats||[]).map(f => LABEL_CONTENT_ICONS[f]||f).join(' ');
+              return `
+              <div style="padding:8px 16px;border-bottom:1px solid var(--border-subtle,rgba(48,54,61,.6));${isHighSens && reachable.length?'background:rgba(248,81,73,.04)':''}">
+                <div style="display:flex;align-items:center;justify-content:space-between">
+                  <div>
+                    ${colorDot}<strong style="font-size:13px">${esc(label.name)}</strong>
+                    ${sens > 0 ? `<span class="mono" style="font-size:10px;color:var(--text-dim);margin-left:6px">sensitivity: ${sens}</span>` : ''}
+                    ${formats ? `<span style="font-size:11px;margin-left:8px">${formats}</span>` : ''}
+                    ${isHighSens ? '<span class="badge badge-high" style="font-size:9px;margin-left:6px">High sensitivity</span>' : ''}
+                  </div>
+                  <div style="display:flex;align-items:center;gap:6px">
+                    ${reachable.length > 0
+                      ? `<span style="font-size:10px;padding:2px 8px;border-radius:10px;background:rgba(248,81,73,.12);color:var(--risk-high)">⚠️ ${reachable.length} AI app${reachable.length>1?'s':''} can read</span>`
+                      : '<span style="font-size:10px;color:var(--text-dim)">✅ Not reachable by AI</span>'}
+                  </div>
+                </div>
+                ${label.tooltip || label.description ? `<div style="font-size:11px;color:var(--text-dim);margin-top:2px;padding-left:15px">${esc((label.tooltip||label.description).slice(0,120))}</div>` : ''}
+                ${children.map(sub => {
+                  const subReachable = labelRiskFor(sub);
+                  const subIsHigh = highSensLabels.some(h => h.id === sub.id);
+                  const subDot = sub.color ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${esc(sub.color)};margin-right:4px;vertical-align:middle"></span>` : '';
+                  return `<div style="margin-top:4px;padding:4px 8px 4px 20px;border-left:2px solid var(--border);margin-left:12px;${subIsHigh&&subReachable.length?'background:rgba(248,81,73,.03)':''}">
+                    <div style="display:flex;align-items:center;justify-content:space-between">
+                      <span style="font-size:12px">${subDot}${esc(sub.name)}${subIsHigh?'<span class="badge badge-high" style="font-size:9px;margin-left:6px">High</span>':''}</span>
+                      ${subReachable.length>0 ? `<span style="font-size:10px;color:var(--risk-medium)">⚠️ ${subReachable.length} AI</span>` : '<span style="font-size:10px;color:var(--text-dim)">✅</span>'}
+                    </div>
+                  </div>`;
+                }).join('')}
+              </div>`;
+            }).join('')}
+          </div>` : `
+          <div class="card-body">
+            <div class="empty-state">
+              <div style="font-size:32px;margin-bottom:8px">🏷️</div>
+              <div style="font-weight:600;margin-bottom:4px">No sensitivity labels found</div>
+              <div class="text-muted" style="font-size:12px">Either no Microsoft Purview sensitivity labels are configured in this tenant, or the <code>InformationProtectionPolicy.Read.All</code> permission has not been granted.</div>
+            </div>
+          </div>
+          `}
+        </div>
+
+        <!-- AI app × label exposure matrix -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">🤖 AI App Content Reach</div>
+            <span class="text-muted" style="font-size:11px">Apps that can read labelled content</span>
+          </div>
+          ${appsWithLabeledAccess.length ? `
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>App / Agent</th>
+                <th>Labels Reachable</th>
+                <th>Content Types</th>
+                <th>Risk</th>
+              </tr></thead>
+              <tbody>${appsWithLabeledAccess.map(sp => {
+                const scopes  = getScopesForSp(sp.id, grants);
+                const reachableLabels = labels.filter(l => labelRiskFor(l).some(a => a.id === sp.id));
+                const isHighSensReach = reachableLabels.some(l => highSensLabels.some(h=>h.id===l.id));
+                const contentTypes = [];
+                if (scopes.some(s=>['Files.Read.All','Files.ReadWrite.All','Sites.Read.All','Sites.ReadWrite.All'].includes(s))) contentTypes.push('📄 Files');
+                if (scopes.some(s=>['Mail.Read','Mail.ReadWrite','Mail.Read.Shared'].includes(s))) contentTypes.push('📧 Mail');
+                if (scopes.some(s=>['Chat.Read.All','ChannelMessage.Read.All'].includes(s))) contentTypes.push('💬 Chat');
+                const isAdmin  = grants.some(g=>g.clientId===sp.id&&g.consentType==='AllPrincipals');
+                const spRisk   = isHighSensReach && isAdmin ? 'critical' : isHighSensReach ? 'high' : isAdmin ? 'medium' : 'low';
+                return `<tr style="${spRisk==='critical'?'background:rgba(248,81,73,.04)':spRisk==='high'?'background:rgba(240,136,62,.03)':''}">
+                  <td>
+                    <strong style="font-size:13px">${esc(sp.displayName||'—')}</strong>
+                    ${isAdmin ? '<span class="badge badge-critical" style="font-size:9px;margin-left:4px">Tenant-wide</span>' : ''}
+                  </td>
+                  <td style="font-size:12px">
+                    ${reachableLabels.length > 0
+                      ? `<span style="color:var(--risk-${isHighSensReach?'high':'medium'})">${reachableLabels.length} label${reachableLabels.length>1?'s':''}</span>
+                         ${isHighSensReach ? '<span class="badge badge-high" style="font-size:9px;margin-left:4px">incl. high-sens</span>' : ''}`
+                      : '<span class="text-muted">—</span>'}
+                  </td>
+                  <td style="font-size:12px">${contentTypes.join(' · ') || '—'}</td>
+                  <td>${riskBadge(spRisk)}</td>
+                </tr>`;
+              }).join('')}
+              </tbody>
+            </table>
+          </div>` : '<div class="card-body empty-state text-muted">✅ No AI apps with labelled content access detected.</div>'}
+        </div>
+      </div>
+
+      ${policies.length ? `
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">📋 Label Policies (${policies.length})</div>
+          <span class="data-source source-live" style="font-size:10px">● security/informationProtection/labelPolicies</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Policy Name</th><th>Status</th><th>Auto-labeling</th><th>Description</th></tr></thead>
+            <tbody>${policies.map(p => `<tr>
+              <td><strong style="font-size:13px">${esc(p.name||p.id||'—')}</strong></td>
+              <td>${p.isEnabled ? '<span class="badge badge-low" style="font-size:10px">✅ Enabled</span>' : '<span class="badge badge-critical" style="font-size:10px">🚫 Disabled</span>'}</td>
+              <td>${p.autoLabeling?.isEnabled ? '<span class="badge badge-low" style="font-size:10px">✅ Auto-label on</span>' : '<span style="font-size:11px;opacity:.5">Manual only</span>'}</td>
+              <td style="font-size:11px;color:var(--text-muted)">${esc((p.description||'').slice(0,100))}</td>
+            </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>` : ''}
+
+      <div class="card">
+        <div class="card-header"><div class="card-title">🔐 Sensitivity Label Security Guidance</div></div>
+        <div class="card-body">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+            <div>
+              <div style="font-weight:600;margin-bottom:10px;font-size:13px">Labelling configuration</div>
+              ${[
+                { done: labels.length > 0,                      text: 'Configure Microsoft Purview sensitivity labels for your data classification' },
+                { done: autoLabelPolicies.length > 0,           text: 'Enable auto-labeling policies to classify content without user action' },
+                { done: highSensLabels.length > 0,              text: 'Define high-sensitivity labels (Highly Confidential) with encryption' },
+                { done: false,                                   text: 'Apply mandatory labelling policies so all new documents are labelled' },
+                { done: false,                                   text: 'Enable label analytics to track label usage across SharePoint and Exchange' },
+              ].map(r => `<div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px;font-size:12px">
+                <span style="flex-shrink:0;color:${r.done?'var(--risk-low)':'var(--risk-high)'}">${r.done?'✅':'⚠️'}</span>
+                <span style="color:${r.done?'var(--text-dim)':'var(--text-muted)'}">${esc(r.text)}</span>
+              </div>`).join('')}
+            </div>
+            <div>
+              <div style="font-weight:600;margin-bottom:10px;font-size:13px">AI app access controls</div>
+              ${[
+                { done: criticalExposure.length === 0,           text: 'Ensure no AI apps have unrestricted access to highly sensitive labelled content' },
+                { done: appsWithLabeledAccess.length === 0,      text: 'Use Sites.Selected instead of Sites.Read.All to scope SharePoint access' },
+                { done: false,                                   text: 'Apply DLP policies that block AI app connectors from accessing classified documents' },
+                { done: false,                                   text: 'Require label-awareness in AI app vendor contracts (not processing Confidential content)' },
+                { done: false,                                   text: 'Enable Microsoft Purview AI Hub to track AI interactions with sensitive content' },
+              ].map(r => `<div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px;font-size:12px">
+                <span style="flex-shrink:0;color:${r.done?'var(--risk-low)':'var(--risk-high)'}">${r.done?'✅':'⚠️'}</span>
+                <span style="color:${r.done?'var(--text-dim)':'var(--text-muted)'}">${esc(r.text)}</span>
+              </div>`).join('')}
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  } catch (e) {
+    el.innerHTML = permWarn('InformationProtectionPolicy.Read.All', e.message);
   }
 }
 
