@@ -4562,6 +4562,48 @@ async function loadUsers() {
 
 // ── ALERTS ────────────────────────────────────────────────────────────────
 
+function filterAlerts(sev, statusFilter) {
+  // sev: 'all'|'critical'|'high'|'medium'|'low'|'informational'
+  // statusFilter: 'all'|'new'|'inProgress'|'resolved'|'dismissed'|'derived'
+  if (sev       !== undefined) STATE.alertSevFilter    = sev;
+  if (statusFilter !== undefined) STATE.alertStatusFilter = statusFilter;
+  const sevF    = STATE.alertSevFilter    || 'all';
+  const statF   = STATE.alertStatusFilter || 'all';
+
+  const items   = document.querySelectorAll('#alert-list .alert-item');
+  let visible   = 0;
+  items.forEach(item => {
+    const itemSev  = item.dataset.sev;
+    const itemStat = item.dataset.status;
+    const showSev  = sevF  === 'all' || itemSev  === sevF;
+    const showStat = statF === 'all' || itemStat === statF;
+    const show     = showSev && showStat;
+    item.style.display = show ? '' : 'none';
+    if (show) visible++;
+  });
+
+  // Update severity filter button states
+  document.querySelectorAll('.alert-sev-btn').forEach(btn => {
+    const isActive = btn.dataset.filter === sevF;
+    btn.style.background   = isActive ? btn.dataset.activeBg   : 'transparent';
+    btn.style.color        = isActive ? btn.dataset.activeColor : 'var(--text-muted)';
+    btn.style.borderColor  = isActive ? btn.dataset.activeBorder: 'var(--border)';
+    btn.style.fontWeight   = isActive ? '600' : '400';
+  });
+
+  // Update status filter button states
+  document.querySelectorAll('.alert-stat-btn').forEach(btn => {
+    const isActive = btn.dataset.filter === statF;
+    btn.style.background  = isActive ? 'rgba(56,139,253,.15)' : 'transparent';
+    btn.style.color       = isActive ? 'var(--accent-blue)'   : 'var(--text-muted)';
+    btn.style.borderColor = isActive ? 'rgba(56,139,253,.4)'  : 'var(--border)';
+    btn.style.fontWeight  = isActive ? '600' : '400';
+  });
+
+  const countEl = document.getElementById('alert-visible-count');
+  if (countEl) countEl.textContent = `Showing ${visible} of ${items.length}`;
+}
+
 async function loadAlerts() {
   const el = document.getElementById('alerts-content');
   try {
@@ -4614,42 +4656,123 @@ async function loadAlerts() {
 
     const clsLabel = c => ({ truePositive:'✅ True positive', falsePositive:'🚫 False positive', benignPositive:'ℹ️ Benign', informationalExpectedActivity:'📋 Expected activity' }[c] || (c ? esc(c) : null));
 
+    // Severity counts
+    const sevCounts = { critical:0, high:0, medium:0, low:0, informational:0 };
+    allAlerts.forEach(a => { const k = a.sev?.toLowerCase(); if (k in sevCounts) sevCounts[k]++; else sevCounts.informational++; });
+
+    // Status counts (derived alerts count as 'derived', Defender alerts use their .status)
+    const statCounts = { derived: derived.length };
+    secAlerts.forEach(a => {
+      const s = a.status || 'unknown';
+      statCounts[s] = (statCounts[s] || 0) + 1;
+    });
+
+    // Helper to make a severity filter button
+    const sevBtn = (filter, label, count, bgActive, colorActive, borderActive) =>
+      `<button class="alert-sev-btn" data-filter="${filter}"
+        data-active-bg="${bgActive}" data-active-color="${colorActive}" data-active-border="${borderActive}"
+        onclick="filterAlerts('${filter}')"
+        style="display:inline-flex;align-items:center;gap:5px;padding:5px 12px;border-radius:20px;
+               border:1px solid var(--border);background:transparent;color:var(--text-muted);
+               font-size:12px;cursor:pointer;transition:all .15s;white-space:nowrap">
+        ${label} <span style="font-size:11px;font-weight:700">${count}</span>
+      </button>`;
+
+    // Helper to make a status filter button
+    const statBtn = (filter, label, count, icon) =>
+      `<button class="alert-stat-btn" data-filter="${filter}"
+        onclick="filterAlerts(undefined,'${filter}')"
+        style="display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border-radius:16px;
+               border:1px solid var(--border);background:transparent;color:var(--text-muted);
+               font-size:11px;cursor:pointer;transition:all .15s;white-space:nowrap">
+        ${icon} ${label} <strong style="margin-left:2px">${count}</strong>
+      </button>`;
+
+    // Normalise status string → data-status attribute value
+    const statusAttr = a => a.source ? (a.source.includes('Defender') ? (a.status || 'unknown') : 'derived') : 'derived';
+
     el.innerHTML = `
-      ${STATE.data.securityAlertsError ? (
-          STATE.data.securityAlertsIs500
-            ? `<div class="perm-warn">🔌 <strong>Microsoft Defender XDR is not provisioned in this tenant</strong> — <code>security/alerts_v2</code> returned a 500 Internal Server Error.
-               This is <em>not</em> a permission problem — the API requires Microsoft Defender for Endpoint, Microsoft 365 Defender, or Defender for Cloud Apps to be licensed and onboarded.
-               <br><span style="font-size:11px;opacity:.7">Both the v2 and v1 alert endpoints were tried. Error: ${esc(STATE.data.securityAlertsError.slice(0,150))}</span></div>`
-            : permWarn('SecurityEvents.Read.All', STATE.data.securityAlertsError)
-        ) : STATE.data.securityAlertsV1Fallback
-            ? `<div class="perm-warn" style="border-color:rgba(240,136,62,.4)">⚠️ <strong>Defender XDR alerts_v2 unavailable</strong> — showing alerts from the v1 endpoint instead. Some fields (classification, determination, alertWebUrl) may be missing.</div>`
-            : ''}
-      <div class="section-header">
-        <div class="section-title">Security Alerts</div>
-        <div style="display:flex;align-items:center;gap:12px">
-          <span style="font-size:12px;color:var(--text-muted)">${derived.length} derived · ${secAlerts.length} from Defender${STATE.data.securityAlertsV1Fallback ? ' (v1)' : ''}</span>
-          <span class="data-source source-derived">⚡ Derived from Graph data + Defender</span>
+      <!-- ── Sticky summary bar ───────────────────────────────────────────── -->
+      <div style="position:sticky;top:52px;z-index:80;background:var(--bg-primary);padding-bottom:10px;margin-bottom:4px;border-bottom:1px solid var(--border)">
+
+        ${STATE.data.securityAlertsError ? (
+            STATE.data.securityAlertsIs500
+              ? `<div class="perm-warn" style="margin-bottom:8px">🔌 <strong>Microsoft Defender XDR is not provisioned in this tenant</strong> — <code>security/alerts_v2</code> returned a 500 Internal Server Error.
+                 This is <em>not</em> a permission problem — the API requires Microsoft Defender for Endpoint, Microsoft 365 Defender, or Defender for Cloud Apps to be licensed and onboarded.
+                 <br><span style="font-size:11px;opacity:.7">Both the v2 and v1 alert endpoints were tried. Error: ${esc(STATE.data.securityAlertsError.slice(0,150))}</span></div>`
+              : `<div style="margin-bottom:8px">${permWarn('SecurityEvents.Read.All', STATE.data.securityAlertsError)}</div>`
+          ) : STATE.data.securityAlertsV1Fallback
+              ? `<div class="perm-warn" style="border-color:rgba(240,136,62,.4);margin-bottom:8px">⚠️ <strong>Defender XDR alerts_v2 unavailable</strong> — showing alerts from the v1 endpoint instead. Some fields (classification, determination, alertWebUrl) may be missing.</div>`
+              : ''}
+
+        <div class="section-header" style="margin-bottom:10px">
+          <div>
+            <div class="section-title">Security Alerts</div>
+            <div class="section-sub">${derived.length} derived from Graph · ${secAlerts.length} from Defender${STATE.data.securityAlertsV1Fallback ? ' (v1)' : ''}</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span id="alert-visible-count" style="font-size:11px;color:var(--text-dim)">Showing ${allAlerts.length} of ${allAlerts.length}</span>
+            <span class="data-source source-derived">⚡ Derived from Graph data + Defender</span>
+          </div>
+        </div>
+
+        <!-- Severity filter chips -->
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+          <span style="font-size:11px;color:var(--text-dim);margin-right:2px">Severity:</span>
+          ${sevBtn('all',          'All',                    allAlerts.length,    'rgba(139,148,158,.2)', 'var(--text-primary)',  'rgba(139,148,158,.5)')}
+          ${sevCounts.critical > 0 ? sevBtn('critical',  '🔴 Critical', sevCounts.critical,  'rgba(248,81,73,.18)',  'var(--risk-critical)', 'rgba(248,81,73,.5)')  : ''}
+          ${sevBtn('high',         '🔴 High',                sevCounts.high,      'rgba(240,136,62,.18)', 'var(--risk-high)',     'rgba(240,136,62,.5)')}
+          ${sevBtn('medium',       '🟡 Medium',              sevCounts.medium,    'rgba(227,179,65,.18)', 'var(--risk-medium)',   'rgba(227,179,65,.5)')}
+          ${sevCounts.low > 0 ? sevBtn('low',           '🟢 Low',                sevCounts.low,       'rgba(63,185,80,.15)',  'var(--risk-low)',      'rgba(63,185,80,.4)')  : ''}
+          ${sevCounts.informational > 0 ? sevBtn('informational', 'ℹ️ Info', sevCounts.informational, 'rgba(56,139,253,.15)', 'var(--accent-blue)',  'rgba(56,139,253,.4)') : ''}
+        </div>
+
+        <!-- Status filter chips -->
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <span style="font-size:11px;color:var(--text-dim);margin-right:2px">Status:</span>
+          ${statBtn('all',        'All',          allAlerts.length,              '🔘')}
+          ${statCounts.derived > 0  ? statBtn('derived',    'Derived',     statCounts.derived,     '⚡') : ''}
+          ${statCounts.newAlert > 0 ? statBtn('newAlert',   'New',         statCounts.newAlert,    '🆕') : ''}
+          ${(statCounts.inProgress||0) > 0 ? statBtn('inProgress','In Progress',statCounts.inProgress||0,'🔵') : ''}
+          ${(statCounts.resolved||0) > 0   ? statBtn('resolved',  'Resolved',   statCounts.resolved||0, '✅') : ''}
+          ${(statCounts.dismissed||0) > 0  ? statBtn('dismissed', 'Dismissed',  statCounts.dismissed||0,'🚫') : ''}
+          ${(statCounts.unknown||0) > 0    ? statBtn('unknown',   'Unknown',    statCounts.unknown||0,  '❓') : ''}
         </div>
       </div>
-      <div class="card">
+
+      <!-- ── Alert list ──────────────────────────────────────────────────── -->
+      <div class="card" id="alert-list">
         ${allAlerts.length === 0
           ? '<div class="empty-state">No alerts generated — data may still be loading or permissions missing.</div>'
-          : allAlerts.map(a => `
-          <div class="alert-item">
-            <div class="alert-icon">${a.icon||'⚠️'}</div>
-            <div style="flex:1">
-              <div class="alert-title">${esc(a.title)}${a.url ? ` <a href="${esc(a.url)}" target="_blank" rel="noopener" style="font-size:11px;color:var(--accent-blue);margin-left:6px;text-decoration:none">View in Defender →</a>` : ''}</div>
-              <div class="alert-desc">${esc(a.desc||'')}</div>
-              <div class="alert-meta" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-                <span>${a.source||'Derived from Graph'}</span>
-                ${a.classification ? `<span style="color:var(--text-dim)">· ${clsLabel(a.classification)||esc(a.classification)}</span>` : ''}
-                ${a.determination && a.determination!=='unknown' ? `<span style="color:var(--text-dim)">· ${esc(a.determination)}</span>` : ''}
-              </div>
-            </div>
-            ${riskBadge(a.sev)}
-          </div>`).join('')}
+          : allAlerts.map(a => {
+              const itemStatus = a.source?.includes('Defender') ? (a.status || 'unknown') : 'derived';
+              return `
+              <div class="alert-item" data-sev="${esc(a.sev||'informational')}" data-status="${esc(itemStatus)}">
+                <div class="alert-icon">${a.icon||'⚠️'}</div>
+                <div style="flex:1">
+                  <div class="alert-title">${esc(a.title)}${a.url ? ` <a href="${esc(a.url)}" target="_blank" rel="noopener" style="font-size:11px;color:var(--accent-blue);margin-left:6px;text-decoration:none">View in Defender →</a>` : ''}</div>
+                  <div class="alert-desc">${esc(a.desc||'')}</div>
+                  <div class="alert-meta" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                    <span>${a.source||'Derived from Graph'}</span>
+                    ${a.status && a.status !== 'unknown' ? `<span style="display:inline-flex;align-items:center;gap:3px;padding:1px 7px;border-radius:10px;font-size:10px;background:${ a.status==='resolved'?'rgba(63,185,80,.12)':a.status==='inProgress'?'rgba(56,139,253,.12)':a.status==='dismissed'?'rgba(139,148,158,.1)':'rgba(248,81,73,.1)'};color:${ a.status==='resolved'?'var(--risk-low)':a.status==='inProgress'?'var(--accent-blue)':a.status==='dismissed'?'var(--text-muted)':'var(--risk-high)'}">
+                      ${ a.status==='resolved'?'✅':a.status==='inProgress'?'🔵':a.status==='dismissed'?'🚫':'🆕'} ${esc(a.status)}</span>` : ''}
+                    ${a.classification ? `<span style="color:var(--text-dim)">· ${clsLabel(a.classification)||esc(a.classification)}</span>` : ''}
+                    ${a.determination && a.determination!=='unknown' ? `<span style="color:var(--text-dim)">· ${esc(a.determination)}</span>` : ''}
+                  </div>
+                </div>
+                ${riskBadge(a.sev)}
+              </div>`;
+            }).join('')}
       </div>
     `;
+
+    // Restore any active filter from previous visit to this page
+    if (STATE.alertSevFilter || STATE.alertStatusFilter) {
+      filterAlerts(STATE.alertSevFilter || 'all', STATE.alertStatusFilter || 'all');
+    } else {
+      // Activate "All / All" buttons by default
+      filterAlerts('all', 'all');
+    }
   } catch (e) {
     el.innerHTML = permWarn('Multiple permissions', e.message);
   }
