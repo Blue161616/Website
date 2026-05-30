@@ -168,7 +168,11 @@
     .kpi-label{font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;}
     .kpi-value{font-size:28px;font-weight:700;line-height:1;margin-bottom:4px;}
     .kpi-delta{font-size:11px;color:var(--text-muted);}
+    .kpi-trend{font-size:10px;font-weight:600;margin-top:3px;}
     .kpi-icon{position:absolute;top:14px;right:14px;font-size:22px;opacity:.2;}
+    .action-row{display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid rgba(48,54,61,.5);cursor:pointer;transition:background .15s;}
+    .action-row:last-child{border-bottom:none;}
+    .action-row:hover{background:var(--bg-hover);}
 
     /* ── Grids ── */
     .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px;}
@@ -620,6 +624,33 @@ const HIGH_RISK_SCOPES = [
   'TeamSettings.Read.All','Channel.ReadBasic.All',
   'offline_access',
 ];
+
+// External third-party LLM providers selectable in Copilot Chat / Copilot Studio.
+// The admin toggle itself is NOT exposed by any Graph or Power Platform API, but actual
+// model usage IS observable via sign-in logs, AI service principals, and Defender for
+// Cloud Apps. The AI Models and Compliance pages both infer usage from that evidence
+// via inferExtLlmUsage() so they stay consistent.
+const EXT_LLM_PROVIDERS = [
+  { label: 'Anthropic (Claude)', residency: 'USA',    note: 'USA · GDPR: ❌ No adequate safeguards', match: /anthropic|claude/i },
+  { label: 'xAI (Grok)',         residency: 'USA',    note: 'USA · GDPR: ❌ No adequate safeguards', match: /\bxai\b|grok/i },
+  { label: 'Google (Gemini)',    residency: 'Global', note: 'Global · GDPR: ❌ Data may leave EU',   match: /google|gemini|bard|vertex/i },
+];
+
+// Annotate EXT_LLM_PROVIDERS with a `usage` object inferred from observed evidence.
+// `names`: observed app/model/provider strings; `mcasApps`: MCAS app objects (which
+// also contribute user counts).
+function inferExtLlmUsage(names, mcasApps) {
+  const obsNames = [...new Set((names || []).filter(Boolean))];
+  const apps = mcasApps || [];
+  return EXT_LLM_PROVIDERS.map(p => {
+    const re = p.match;
+    const hits = new Set();
+    let users = 0;
+    obsNames.forEach(n => { if (re.test(n)) hits.add(n); });
+    apps.forEach(a => { const n = a.name || ''; if (re.test(n)) { hits.add(n); users += a.usersCount || 0; } });
+    return { ...p, usage: { detected: hits.size > 0, apps: [...hits], users } };
+  });
+}
 
 // ── State ──────────────────────────────────────────────────────────────────
 
@@ -1485,6 +1516,21 @@ function renderDashSignInChart(buckets) {
   });
 }
 
+// ── Dashboard trend snapshot (persisted per-tenant in localStorage) ──────────
+// Lets the dashboard show "▲/▼ since <date>" deltas vs the previous assessment.
+function dashSnapshotKey() {
+  const tid = STATE.account?.tenantId || STATE.data.org?.id || 'default';
+  return 'shadowai_snap_' + tid;
+}
+function loadDashSnapshot() {
+  try { const raw = localStorage.getItem(dashSnapshotKey()); return raw ? JSON.parse(raw) : null; }
+  catch { return null; }
+}
+function saveDashSnapshot(metrics, extra) {
+  try { localStorage.setItem(dashSnapshotKey(), JSON.stringify({ ts: new Date().toISOString(), metrics, ...extra })); }
+  catch { /* storage unavailable (private mode / quota) — trend just won't show next time */ }
+}
+
 async function loadDashboard() {
   const el = document.getElementById('dash-content');
   try {
@@ -1566,19 +1612,20 @@ async function loadDashboard() {
     const aiModelKeySet = new Set(aiApps.map(sp => { const i = detectModel(sp.displayName); return i.model + '|' + i.provider; }));
     const aiModelCount = aiModelKeySet.size;
     const aiNonGdpr = Array.from(aiModelKeySet).filter(k => { const [,prov] = k.split('|'); return aiApps.some(sp => { const i = detectModel(sp.displayName); return i.provider === prov && !i.gdprOk; }); }).length;
-    const agentIdentities = (STATE.data.agentSps || []).length;
+    const agentIdentities = STATE.data.agentIdentityCount ?? (STATE.data.agentSps || []).length;
     const diag = [
       // Row 1
-      { label:'Users', raw: users.length, filtered: null, ok: !STATE.data.usersError, err: STATE.data.usersError },
-      { label:'Agent Identities', raw: agentIdentities, filtered: null, ok: !STATE.data.agentSpsError, err: STATE.data.agentSpsError },
-      { label:'Shadow AI Apps', raw: mcasAll.length, filtered: mcasUnsanctioned, filteredLabel:'unsanctioned', ok: mcasAll.length > 0, err: null,
+      { label:'Users', raw: users.length, filtered: users.filter(u=>u.accountEnabled).length, filteredLabel:'enabled', ok: !STATE.data.usersError, err: STATE.data.usersError },
+      { label:'Agent Identities', raw: agentIdentities, filtered: riskyAgentsActive, filteredLabel:'with active risk', worse:'up', ok: !STATE.data.agentSpsError, err: STATE.data.agentSpsError,
+        warn: riskyAgentsActive > 0 ? riskyAgentsActive + ' with active risk' : null },
+      { label:'Shadow AI Apps', raw: mcasAll.length, filtered: mcasUnsanctioned, filteredLabel:'unsanctioned', worse:'up', ok: mcasAll.length > 0, err: null,
         warn: mcasUnsanctioned > 0 ? mcasUnsanctioned + ' unsanctioned' : null },
       { label:'Sign-in Events (30d)', raw: signIns.length, filtered: aiSignIns.length, filteredLabel:'AI-related', ok: !STATE.data.signInsError, err: STATE.data.signInsError,
         warn: signIns.length === 0 && !STATE.data.signInsError ? 'Returns 0 if signed-in user lacks Security Reader role' : null },
       // Row 2
-      { label:'Risky Users (P2)', raw: riskyUsers.length, filtered: riskyAiUsers.length, filteredLabel:'active risk', ok: !STATE.data.riskyUsersError, err: STATE.data.riskyUsersError,
+      { label:'Risky Users (P2)', raw: riskyUsers.length, filtered: riskyAiUsers.length, filteredLabel:'active risk', worse:'up', ok: !STATE.data.riskyUsersError, err: STATE.data.riskyUsersError,
         warn: !STATE.data.riskyUsersError && riskyAiUsers.length > 0 ? riskyAiUsers.length + ' user(s) with active risk' : null },
-      { label:'Risky Agents', raw: riskyAgentsDiag.length, filtered: riskyAgentsActive, filteredLabel:'active risk', ok: !STATE.data.riskyAgentsError, err: STATE.data.riskyAgentsError,
+      { label:'Risky Agents', raw: riskyAgentsDiag.length, filtered: riskyAgentsActive, filteredLabel:'active risk', worse:'up', ok: !STATE.data.riskyAgentsError, err: STATE.data.riskyAgentsError,
         warn: !STATE.data.riskyAgentsError && riskyAgentsActive > 0 ? riskyAgentsActive + ' agent(s) with active risk' : null },
       { label:'AI Models', raw: aiModelCount, filtered: aiNonGdpr, filteredLabel:'non-GDPR', ok: aiModelCount > 0, err: null,
         warn: aiNonGdpr > 0 ? aiNonGdpr + ' non-GDPR compliant' : null },
@@ -1597,6 +1644,32 @@ async function loadDashboard() {
       const s = (a.status || '').toLowerCase();
       return a.type === 0 || a.sanctioned === false || s === 'unsanctioned' || s === 'blocked';
     }).length;
+
+    // ── Trend deltas vs previous assessment (localStorage snapshot) ───────────
+    const prevSnap = loadDashSnapshot();
+    const curMetrics = Object.fromEntries(diag.map(d => [d.label, d.raw]));
+    const trendHtml = (d) => {
+      if (!prevSnap?.metrics || !(d.label in prevSnap.metrics)) return '';
+      const diff = d.raw - prevSnap.metrics[d.label];
+      const since = prevSnap.ts ? new Date(prevSnap.ts).toLocaleDateString('en-GB', {day:'numeric', month:'short'}) : 'last scan';
+      if (diff === 0) return `<div class="kpi-trend" style="color:var(--text-dim)">● no change · since ${since}</div>`;
+      const isBad = d.worse === 'up' ? diff > 0 : d.worse === 'down' ? diff < 0 : null;
+      const color = isBad === true ? 'var(--risk-high)' : isBad === false ? 'var(--risk-low)' : 'var(--text-muted)';
+      return `<div class="kpi-trend" style="color:${color}">${diff > 0 ? '▲' : '▼'} ${Math.abs(diff)} · since ${since}</div>`;
+    };
+
+    // ── Top risks & recommended actions (derived from already-computed signals) ─
+    const SEV = { critical:{o:0,label:'Critical'}, high:{o:1,label:'High'}, medium:{o:2,label:'Medium'} };
+    const actions = [];
+    if (highRiskAi.length > 0) actions.push({ sev:'critical', icon:'🔑', title:`${highRiskAi.length} AI app${highRiskAi.length>1?'s':''} hold high-risk OAuth scopes`, desc:'Mail, Files or Calendar access granted to AI apps — review and revoke unneeded grants.', page:'shadow-apps', cta:'Review apps' });
+    if (caP.filter(p=>p.state==='enabled').length === 0) actions.push({ sev:'high', icon:'📋', title:'No Conditional Access policies enforced', desc:'AI app access is not governed by Conditional Access controls.', page:'policies', cta:'Review policies' });
+    if (aiSignIns.length > 0) actions.push({ sev:'high', icon:'🔌', title:'External LLM usage detected', desc:'Third-party AI models are in use — confirm DPA, data residency and per-user scope.', page:'models', cta:'View models' });
+    if (aiNonGdpr > 0) actions.push({ sev:'high', icon:'🌍', title:`${aiNonGdpr} non-GDPR-compliant model${aiNonGdpr>1?'s':''} in use`, desc:'Models processing data outside the EU or without adequate safeguards.', page:'compliance', cta:'GDPR posture' });
+    if (riskyAgentsActive > 0) actions.push({ sev:'high', icon:'⚡', title:`${riskyAgentsActive} agent${riskyAgentsActive>1?'s':''} with active risk`, desc:'Identity Protection flagged these agent identities — investigate.', page:'agents', cta:'Review agents' });
+    if (riskyAiUsers.length > 0) actions.push({ sev:'medium', icon:'⚠️', title:`${riskyAiUsers.length} user${riskyAiUsers.length>1?'s':''} with active risk`, desc:'Risky users may expose corporate data to AI apps.', page:'users', cta:'Review users' });
+    if (mcasUnsanctioned > 0) actions.push({ sev:'medium', icon:'👻', title:`${mcasUnsanctioned} unsanctioned shadow AI app${mcasUnsanctioned>1?'s':''}`, desc:'Discovered via Defender for Cloud Apps — sanction or block.', page:'shadow-apps', cta:'Review' });
+    actions.sort((a,b) => SEV[a.sev].o - SEV[b.sev].o);
+    const topActions = actions.slice(0, 5);
 
     el.innerHTML = `
       <!-- CISO Executive Banner -->
@@ -1624,15 +1697,44 @@ async function loadDashboard() {
         </div>
       </div>
 
+      <!-- Top Risks & Recommended Actions -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">🎯 Top Risks &amp; Recommended Actions</div>
+          <span style="font-size:11px;color:var(--text-muted)">${topActions.length ? topActions.length + ' prioritised · click a row to drill in' : 'no open actions'}</span>
+        </div>
+        <div class="card-body no-pad">
+          ${topActions.length ? topActions.map(a => `
+            <div class="action-row" style="border-left:3px solid var(--risk-${a.sev})" onclick="navigate('${a.page}', document.querySelector('[onclick*=${a.page}]'))">
+              <span style="font-size:18px;flex-shrink:0">${a.icon}</span>
+              <div style="flex:1;min-width:0">
+                <div style="font-size:13px;font-weight:600">${esc(a.title)}</div>
+                <div style="font-size:11px;color:var(--text-muted)">${esc(a.desc)}</div>
+              </div>
+              <span class="badge badge-${a.sev}" style="font-size:10px;flex-shrink:0">${SEV[a.sev].label}</span>
+              <span style="font-size:12px;color:var(--accent-blue);white-space:nowrap;flex-shrink:0">${esc(a.cta)} →</span>
+            </div>`).join('')
+          : `<div style="display:flex;align-items:center;gap:12px;padding:18px 16px">
+              <span style="font-size:22px">✅</span>
+              <div>
+                <div style="font-size:13px;font-weight:600">No critical actions right now</div>
+                <div style="font-size:11px;color:var(--text-muted)">No high-risk AI scopes, external LLM usage, or active agent/user risk detected.</div>
+              </div>
+            </div>`}
+        </div>
+      </div>
+
       <!-- General Statistics KPI cards -->
       <div class="kpi-row" style="margin-bottom:16px">
         ${diag.map(d => {
           const hasWarn  = !!d.warn;
           const hasErr   = !!d.err;
-          const alertCls = hasErr ? 'critical' : hasWarn ? 'medium' : d.filtered !== null ? 'info' : d.raw > 0 ? 'low' : 'medium';
+          // "Loaded successfully" is neutral (info/blue), NOT good (green) — green is
+          // reserved for warnings/errors so a healthy-looking card never masks risk.
+          const alertCls = hasErr ? 'critical' : hasWarn ? 'medium' : 'info';
           const valColor = hasErr ? 'var(--risk-critical)' : hasWarn ? 'var(--risk-medium)' : d.raw > 0 ? 'var(--accent-blue)' : 'var(--text-muted)';
           const icons    = { 'Users':'👥','Risky Users (P2)':'⚠️','Shadow AI Apps':'👻','AI Models':'🤖','Agent Identities':'🪪','Sign-in Events (30d)':'📈','Risky Agents':'⚡','CA Policies':'📋' };
-          const delta    = d.err ? '❌ ' + d.err.slice(0,50) : d.warn ? '⚠️ ' + d.warn : d.filtered !== null ? d.filtered + ' ' + (d.filteredLabel||'') : '✅ OK';
+          const delta    = d.err ? '❌ ' + d.err.slice(0,50) : d.warn ? '⚠️ ' + d.warn : d.filtered !== null ? d.filtered + ' ' + (d.filteredLabel||'') : '● Loaded';
           const isShadow   = d.label === 'Shadow AI Apps';
           const isAgent    = d.label === 'Agent Identities';
           const isSignIns  = d.label === 'Sign-in Events (30d)';
@@ -1640,6 +1742,7 @@ async function loadDashboard() {
             <div class="kpi-label">${esc(d.label)}</div>
             <div class="kpi-value" style="color:${valColor}"${isShadow ? ' id="dash-shadow-count"' : isAgent ? ' id="dash-agent-count"' : isSignIns ? ' id="dash-signins-count"' : ''}>${d.raw}</div>
             <div class="kpi-delta"${isShadow ? ' id="dash-shadow-delta"' : isSignIns ? ' id="dash-signins-delta"' : ''}>${esc(delta)}</div>
+            ${trendHtml(d)}
             <div class="kpi-icon">${icons[d.label]||'📊'}</div>
           </div>`;
         }).join('')}
@@ -1743,6 +1846,9 @@ async function loadDashboard() {
     document.getElementById('alert-badge').textContent = critCount + highCount;
     updateDashShadowKpi();
     updateDashAgentKpi();
+
+    // Persist this run's metrics so the next assessment can show trend deltas.
+    saveDashSnapshot(curMetrics, { secureScore: secScore?.pct ?? null, overallRisk: cisoShadowRisk });
 
     // Background: re-render sign-in chart with targeted, server-side-filtered data
     // so high-volume tenants show the full 30-day history instead of just today.
@@ -2441,25 +2547,12 @@ async function loadModels() {
       agent:  `<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:rgba(57,211,83,.12);color:var(--risk-low);border:1px solid rgba(57,211,83,.3)">Agent</span>`,
     }[s]||'')).join(' ');
 
-    // External LLM provider usage inference. The admin toggle (M365 Admin Center →
-    // "AI providers for other large language models") isn't exposed by any API, but we
-    // DO observe actual usage of these providers' models via sign-in logs, service
-    // principals, and Defender for Cloud Apps — surface that as evidence rather than a
-    // blind manual check.
-    const detectProviderUsage = (re) => {
-      const apps = new Set();
-      let users = 0;
-      Object.keys(modelCounts).forEach(n => { if (re.test(n)) apps.add(n); });
-      aiApps.forEach(a => { const n = a.displayName || ''; if (re.test(n)) apps.add(n); });
-      mcasAiApps.forEach(a => { const n = a.name || ''; if (re.test(n)) { apps.add(n); users += a.usersCount || 0; } });
-      models.forEach(m => { if (re.test(m.provider || '') || re.test(m.model || '')) (m.apps || []).forEach(n => apps.add(n)); });
-      return { detected: apps.size > 0, apps: [...apps].filter(Boolean), users };
-    };
-    const extLlmProviders = [
-      { label: 'Anthropic (Claude)', note: 'USA · GDPR: ❌ No adequate safeguards', match: /anthropic|claude/i },
-      { label: 'xAI (Grok)',         note: 'USA · GDPR: ❌ No adequate safeguards', match: /\bxai\b|grok/i },
-      { label: 'Google (Gemini)',    note: 'Global · GDPR: ❌ Data may leave EU',   match: /google|gemini|bard|vertex/i },
-    ].map(p => ({ ...p, usage: detectProviderUsage(p.match) }));
+    // External LLM provider usage inference (shared with the Compliance page).
+    const extLlmProviders = inferExtLlmUsage([
+      ...Object.keys(modelCounts),
+      ...aiApps.map(a => a.displayName),
+      ...models.flatMap(m => [m.model, m.provider, ...(m.apps || [])]),
+    ], mcasAiApps);
     const anyExtLlmUsage = extLlmProviders.some(p => p.usage.detected);
 
     el.innerHTML = `
@@ -4517,6 +4610,15 @@ async function loadCompliance() {
     const gdprCompliant = gdprModels.length > 0 && nonCompliantModels.length === 0;
     const gdprClass = gdprModels.length === 0 ? 'info' : gdprCompliant ? 'low' : 'critical';
 
+    // External LLM provider usage inference (shared with the AI Models page).
+    // Uses the cached MCAS app list when available for user counts.
+    const extLlmProviders = inferExtLlmUsage([
+      ...Object.keys(modelSigninCounts),
+      ...aiApps.map(a => a.displayName),
+      ...gdprModels.flatMap(m => [m.model, m.provider, ...(m.apps || [])]),
+    ], STATE.data.mcasApps || []);
+    const anyExtLlmUsage = extLlmProviders.some(p => p.usage.detected);
+
     el.innerHTML = `
       ${STATE.data.caError ? permWarn('Policy.Read.All', STATE.data.caError) : ''}
       <div class="section-header">
@@ -4624,27 +4726,33 @@ async function loadCompliance() {
       <div class="card">
         <div class="card-header">
           <div class="card-title">🔌 External LLM Providers for Copilot Studio</div>
-          <span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.12);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">⚠️ Manual check required — not available via API</span>
+          ${anyExtLlmUsage
+            ? `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(248,81,73,.12);color:var(--risk-critical);border:1px solid rgba(248,81,73,.3)">🔴 Usage detected</span>`
+            : `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.12);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">⚠️ Manual check required — toggle not in API</span>`}
         </div>
         <div class="card-body">
           <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px">
-            Admins can allow users to connect to third-party LLMs inside Copilot Chat and Copilot Studio. When enabled, prompts and organisation data may be sent to non-EU providers, breaking GDPR compliance. Microsoft does not expose this setting via Graph or Power Platform APIs.
+            Admins can allow users to connect to third-party LLMs inside Copilot Chat and Copilot Studio. When enabled, prompts and organisation data may be sent to non-EU providers, breaking GDPR compliance. Microsoft does not expose the toggle via Graph or Power Platform APIs, but actual model usage is detected from sign-in logs and Defender for Cloud Apps data.
           </p>
-          ${[
-            { provider: 'Anthropic (Claude)', residency: 'USA', gdpr: false },
-            { provider: 'xAI (Grok)',         residency: 'USA', gdpr: false },
-            { provider: 'Google (Gemini)',     residency: 'Global', gdpr: false },
-          ].map(p => `
+          ${anyExtLlmUsage ? `<div style="font-size:12px;color:var(--risk-critical);margin-bottom:12px;padding:8px 12px;border-radius:6px;background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.25)">🔴 <strong>Usage observed in your tenant.</strong> Models from the highlighted provider(s) appear in your telemetry — confirm the toggle and per-user access scope in the admin center.</div>` : ''}
+          ${extLlmProviders.map(p => {
+            const u = p.usage;
+            const evidence = u.detected
+              ? `<div style="font-size:10px;color:var(--risk-critical);margin-top:3px">🔎 Seen as: ${esc(u.apps.slice(0,3).join(', '))}${u.apps.length>3?` +${u.apps.length-3} more`:''}${u.users?` · ${u.users} user${u.users!==1?'s':''}`:''}</div>`
+              : '';
+            const badge = u.detected
+              ? `<span title="${esc(u.apps.join(', '))}" style="font-size:11px;padding:2px 10px;border-radius:10px;background:rgba(248,81,73,.12);color:var(--risk-critical);border:1px solid rgba(248,81,73,.35);white-space:nowrap">🔴 Usage detected</span>`
+              : `<a href="https://admin.microsoft.com/#/Settings/Copilot" target="_blank" style="font-size:11px;padding:2px 10px;border-radius:10px;background:rgba(240,136,62,.1);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25);text-decoration:none;white-space:nowrap">⚠️ Verify in Admin Center →</a>`;
+            return `
             <div style="display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid rgba(48,54,61,.4)">
               <div>
-                <span style="font-size:12px;font-weight:600;color:var(--text-primary)">${esc(p.provider)}</span>
-                <span style="font-size:11px;color:var(--text-muted);margin-left:8px">${esc(p.residency)} · GDPR ❌</span>
+                <span style="font-size:12px;font-weight:600;color:var(--text-primary)">${esc(p.label)}</span>
+                <span style="font-size:11px;color:var(--text-muted);margin-left:8px">${esc(p.note)}</span>
+                ${evidence}
               </div>
-              <a href="https://admin.microsoft.com/#/Settings/Copilot" target="_blank"
-                style="font-size:11px;padding:2px 10px;border-radius:10px;background:rgba(240,136,62,.1);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25);text-decoration:none">
-                ⚠️ Verify in Admin Center →
-              </a>
-            </div>`).join('')}
+              ${badge}
+            </div>`;
+          }).join('')}
           <div style="margin-top:12px;font-size:11px;color:var(--text-dim)">
             📍 M365 Admin Center → Settings → Copilot → <em>AI providers for other large language models</em>
           </div>
