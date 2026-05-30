@@ -3376,21 +3376,48 @@ function renderBlueprintTable() {
 
   const loading   = !agentOwnersSponsors;
   const linked    = agentLinkedAgents || {};
-  const key = STATE.bpSortKey || 'linked';
+  const key = STATE.bpSortKey || 'gap';   // default: governance gaps (ownerless + risky + many linked) first
   const dir = STATE.bpSortDir || 'desc';
 
   const bpSps = agentSps.filter(sp => getAgentType(sp).type === 'blueprint');
 
+  // Risk per blueprint (riskScore scans grants) — reused by sort, the Access column, and the gap score.
+  const riskByBp = new Map(bpSps.map(sp => [sp.id, riskScore(sp, agentGrants||[])]));
+  const isOwnerless = sp => {
+    const os = agentOwnersSponsors?.[sp.id];
+    return !(os?.owners?.length) && !(os?.sponsors?.length);
+  };
+
   const getVal = (sp, k) => {
     if (k === 'name')    return (sp.displayName||'').toLowerCase();
     if (k === 'linked')  return (linked[sp.id]||[]).length;
+    if (k === 'access')  return RISK_ORDER[riskByBp.get(sp.id)] ?? -1;
     if (k === 'owners')  return (agentOwnersSponsors?.[sp.id]?.owners?.length||0) + (agentOwnersSponsors?.[sp.id]?.sponsors?.length||0);
     if (k === 'status')  return sp.accountEnabled ? 1 : 0;
     if (k === 'created') return sp.createdDateTime || '';
+    // Governance-gap composite: ownerless dominates, then risk, then linked-identity count.
+    if (k === 'gap')     return (isOwnerless(sp) ? 1000 : 0) + (RISK_ORDER[riskByBp.get(sp.id)] ?? 0) * 100 + (linked[sp.id]||[]).length;
     return 0;
   };
 
   const sorted = sortRows(bpSps, key, dir, getVal);
+
+  // Ownership-gap insight banner (only meaningful once owners/sponsors have loaded).
+  const bannerEl = document.getElementById('bp-ownership-banner');
+  if (bannerEl) {
+    if (loading || !bpSps.length) {
+      bannerEl.innerHTML = '';
+    } else {
+      const ownerless = bpSps.filter(isOwnerless);
+      const pct = Math.round(ownerless.length / bpSps.length * 100);
+      const ownerlessLinked = ownerless.reduce((n, sp) => n + (linked[sp.id]||[]).length, 0);
+      bannerEl.innerHTML = ownerless.length === 0
+        ? `<div style="padding:9px 14px;margin-bottom:12px;border-radius:8px;background:rgba(63,185,80,.07);border:1px solid rgba(63,185,80,.25);font-size:12px;color:var(--risk-low)">✅ Every agent blueprint has an owner or sponsor.</div>`
+        : `<div style="padding:9px 14px;margin-bottom:12px;border-radius:8px;background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.28);font-size:12px;color:var(--text-muted)">
+             ⚠️ <strong style="color:var(--risk-high)">${ownerless.length} of ${bpSps.length} blueprints (${pct}%) have no owner or sponsor</strong> — no one is accountable for their ${ownerlessLinked} linked agent ${ownerlessLinked === 1 ? 'identity' : 'identities'} &amp; access. Sorted ownerless-first below.
+           </div>`;
+    }
+  }
 
   const principalAppIds = STATE.data.blueprintPrincipalAppIds || new Set();
 
@@ -3405,14 +3432,19 @@ function renderBlueprintTable() {
       : '';
     const riskyInfo = STATE.data.riskyAgentMap?.get(sp.id);
     const riskyBadge = riskyInfo ? `<span class="badge badge-critical" style="font-size:10px;margin-left:6px" title="Risky agent · ${riskyInfo.riskState||''}">⚡ ${riskyInfo.riskLevel||'risk'}</span>` : '';
+    const ws = AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants||[]).includes(s));
+    const accessCell = `${riskBadge(riskByBp.get(sp.id))}${ws.length
+      ? `<br><span title="${esc(ws.join(', '))}" class="text-critical" style="font-size:10px">✍️ ${ws.length} write scope${ws.length>1?'s':''}</span>`
+      : ''}`;
     return `<tr${hasPrincipal ? ' style="background:rgba(163,113,247,.04)"' : ''}${riskyInfo ? ' style="background:rgba(248,81,73,.05)"' : ''}>
       <td>${agentSpCell(sp)}${principalBadge}${riskyBadge}</td>
       <td>${linkedCell}</td>
+      <td>${accessCell}</td>
       <td>${agentOwnerCell(agentOwnersSponsors?.[sp.id], loading, 'both-warn-owner')}</td>
       <td>${sp.accountEnabled ? statusBadge('enabled') : statusBadge('disabled')}</td>
       <td class="mono text-muted" style="font-size:11px">${sp.createdDateTime ? new Date(sp.createdDateTime).toLocaleDateString() : '—'}</td>
     </tr>`;
-  }).join('') || '<tr><td colspan="5" class="empty-state text-muted">No agent blueprints found</td></tr>';
+  }).join('') || '<tr><td colspan="6" class="empty-state text-muted">No agent blueprints found</td></tr>';
 
   applySortIndicators('blueprint-table', key, dir);
 }
@@ -4049,11 +4081,13 @@ async function loadAgents() {
             <div class="card-title">📋 Agent Blueprints (${bpSps.length}${STATE.data.blueprintScopeOk === false ? ' ⚠️' : ''})</div>
             <span class="text-muted" style="font-size:11px">Templates that define shared identity &amp; access for agent identities${STATE.data.blueprintScopeOk === false ? ' · GA endpoint unavailable — showing tag-based results only' : ''}</span>
           </div>
+          <div style="padding:0 16px"><div id="bp-ownership-banner"></div></div>
           <div class="table-wrap">
             <table id="blueprint-table">
               <thead><tr>
                 ${th('Blueprint Name','name','sortBlueprintTable')}
                 ${th('Linked Identities','linked','sortBlueprintTable')}
+                ${th('Access','access','sortBlueprintTable')}
                 ${th('Owner / Sponsor','owners','sortBlueprintTable')}
                 ${th('Status','status','sortBlueprintTable')}
                 ${th('Created','created','sortBlueprintTable')}
