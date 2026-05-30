@@ -770,7 +770,7 @@ function detectModel(name) {
   return entry || { model: 'Unknown', provider: name, residency: 'Unknown', training: 'Unknown', gdprOk: false, risk: 'medium' };
 }
 
-function riskScore(sp, grants) {
+function riskScore(sp, grants = []) {
   const info = detectModel(sp.displayName || '');
   let score = { critical: 4, high: 3, medium: 2, low: 1 }[info.risk] || 2;
   // boost if high-risk scopes granted
@@ -1416,6 +1416,45 @@ async function fetchSecureScore() {
 
 // ── DASHBOARD ─────────────────────────────────────────────────────────────
 
+// Bucket sign-in events into the last `days` calendar days (UTC), tracking
+// per-day event counts and unique users. Shared by the initial dashboard
+// render and the background targeted re-render.
+function buildDailySignInBuckets(signIns, days = 30) {
+  const todayUTC = new Date(); todayUTC.setUTCHours(0, 0, 0, 0);
+  const buckets = Array.from({ length: days }, (_, i) => {
+    const d = new Date(todayUTC.getTime() - (days - 1 - i) * 86400000);
+    return { label: d.toLocaleDateString('en', { month: 'short', day: 'numeric' }), count: 0, users: new Set() };
+  });
+  (signIns || []).forEach(s => {
+    const day = new Date(s.createdDateTime); day.setUTCHours(0, 0, 0, 0);
+    const idx = Math.round((todayUTC.getTime() - day.getTime()) / 86400000);
+    if (idx >= 0 && idx < days) {
+      buckets[days - 1 - idx].count++;
+      if (s.userPrincipalName) buckets[days - 1 - idx].users.add(s.userPrincipalName);
+    }
+  });
+  return buckets;
+}
+
+// (Re)render the dashboard sign-in bar chart from pre-built day buckets.
+function renderDashSignInChart(buckets) {
+  destroyChart('dash-signins');
+  const canvas = document.getElementById('dash-signins-chart');
+  if (!canvas) return;
+  STATE.charts['dash-signins'] = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: buckets.map(b => b.label),
+      datasets: [
+        { label: 'Sign-ins', data: buckets.map(b => b.count), backgroundColor: 'rgba(56,139,253,.6)', borderRadius: 3 },
+        { label: 'Unique users', data: buckets.map(b => b.users.size), backgroundColor: 'rgba(163,113,247,.5)', borderRadius: 3 },
+      ],
+    },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom', labels: { boxWidth: 10, padding: 10 } } },
+      scales: { x: { grid: { display: false }, ticks: { font: { size: 10 } } }, y: { beginAtZero: true, grid: { color: 'rgba(48,54,61,.5)' } } } },
+  });
+}
+
 async function loadDashboard() {
   const el = document.getElementById('dash-content');
   try {
@@ -1478,26 +1517,16 @@ async function loadDashboard() {
     if (caP.length === 0) riskPts += 10;
     const overallRisk = Math.min(riskPts, 99);
 
-    const critCount = aiApps.filter(sp => riskScore(sp, grants) === 'critical').length;
-    const highCount = aiApps.filter(sp => riskScore(sp, grants) === 'high').length;
-    const medCount  = aiApps.filter(sp => riskScore(sp, grants) === 'medium').length;
-    const lowCount  = aiApps.filter(sp => riskScore(sp, grants) === 'low').length;
+    // Compute each app's risk once (riskScore scans all OAuth grants) and reuse
+    // it for the counts, the donut, the sort, and the table below.
+    const riskByApp = new Map(aiApps.map(sp => [sp.id, riskScore(sp, grants)]));
+    const critCount = aiApps.filter(sp => riskByApp.get(sp.id) === 'critical').length;
+    const highCount = aiApps.filter(sp => riskByApp.get(sp.id) === 'high').length;
+    const medCount  = aiApps.filter(sp => riskByApp.get(sp.id) === 'medium').length;
+    const lowCount  = aiApps.filter(sp => riskByApp.get(sp.id) === 'low').length;
 
     // sign-in timeline (last 30 days bucketed by calendar day, UTC)
-    const days = 30;
-    const todayUTC = new Date(); todayUTC.setUTCHours(0,0,0,0);
-    const buckets = Array.from({length: days}, (_, i) => {
-      const d = new Date(todayUTC.getTime() - (days-1-i)*86400000);
-      return { label: d.toLocaleDateString('en', {month:'short',day:'numeric'}), count: 0, users: new Set() };
-    });
-    aiSignIns.forEach(s => {
-      const signinDay = new Date(s.createdDateTime); signinDay.setUTCHours(0,0,0,0);
-      const idx = Math.round((todayUTC.getTime() - signinDay.getTime()) / 86400000);
-      if (idx >= 0 && idx < days) {
-        buckets[days-1-idx].count++;
-        if (s.userPrincipalName) buckets[days-1-idx].users.add(s.userPrincipalName);
-      }
-    });
+    const buckets = buildDailySignInBuckets(aiSignIns, 30);
 
     // Diagnostics: what each API actually returned
     const riskyAgentsDiag = STATE.data.riskyAgents || [];
@@ -1642,9 +1671,9 @@ async function loadDashboard() {
             <thead><tr><th>Application</th><th>Publisher</th><th>Risk</th><th>Grants</th><th>High-Risk Scopes</th></tr></thead>
             <tbody>${[...aiApps].sort((a,b) => {
                 const ord = {critical:4,high:3,medium:2,low:1};
-                return (ord[riskScore(b,grants)]||0) - (ord[riskScore(a,grants)]||0);
+                return (ord[riskByApp.get(b.id)]||0) - (ord[riskByApp.get(a.id)]||0);
               }).slice(0,8).map(sp => {
-              const r = riskScore(sp, grants);
+              const r = riskByApp.get(sp.id);
               const hrs = highRiskScopesFor(sp.id, grants);
               const grantCount = grants.filter(g => g.clientId === sp.id).length;
               return `<tr>
@@ -1662,22 +1691,10 @@ async function loadDashboard() {
     `;
 
     // Charts
-    destroyChart('dash-signins');
-    destroyChart('dash-risk-donut');
     Chart.defaults.color = '#8b949e';
     Chart.defaults.borderColor = '#30363d';
-    STATE.charts['dash-signins'] = new Chart(document.getElementById('dash-signins-chart'), {
-      type: 'bar',
-      data: {
-        labels: buckets.map(b => b.label),
-        datasets: [
-          { label: 'Sign-ins', data: buckets.map(b => b.count), backgroundColor: 'rgba(56,139,253,.6)', borderRadius: 3 },
-          { label: 'Unique users', data: buckets.map(b => b.users.size), backgroundColor: 'rgba(163,113,247,.5)', borderRadius: 3 },
-        ],
-      },
-      options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom',labels:{boxWidth:10,padding:10}}},
-        scales:{x:{grid:{display:false},ticks:{font:{size:10}}}, y:{beginAtZero:true,grid:{color:'rgba(48,54,61,.5)'}}} },
-    });
+    destroyChart('dash-risk-donut');
+    renderDashSignInChart(buckets);
     const CAT_COLORS = { Identity:'#a371f7', Data:'#39d353', Device:'#388bfd', Apps:'#e3b341' };
     STATE.charts['dash-risk-donut'] = new Chart(document.getElementById('dash-risk-donut'), {
       type: 'doughnut',
@@ -1701,20 +1718,6 @@ async function loadDashboard() {
     // so high-volume tenants show the full 30-day history instead of just today.
     fetchAiSignInsForChart(aiApps).then(targeted => {
       if (!targeted) return;
-      const days = 30;
-      const todayUTC2 = new Date(); todayUTC2.setUTCHours(0,0,0,0);
-      const buckets2 = Array.from({length: days}, (_, i) => {
-        const d = new Date(todayUTC2.getTime() - (days-1-i)*86400000);
-        return { label: d.toLocaleDateString('en', {month:'short',day:'numeric'}), count: 0, users: new Set() };
-      });
-      targeted.forEach(s => {
-        const signinDay2 = new Date(s.createdDateTime); signinDay2.setUTCHours(0,0,0,0);
-        const idx = Math.round((todayUTC2.getTime() - signinDay2.getTime()) / 86400000);
-        if (idx >= 0 && idx < days) {
-          buckets2[days-1-idx].count++;
-          if (s.userPrincipalName) buckets2[days-1-idx].users.add(s.userPrincipalName);
-        }
-      });
 
       // Update the Sign-in Events KPI card to reflect the targeted AI count
       const totalAiSignIns = targeted.length;
@@ -1727,21 +1730,7 @@ async function loadDashboard() {
 
       // Only re-render chart if targeted data differs from the initial keyword-filtered set
       if (targeted === STATE.data.signIns) return;
-      destroyChart('dash-signins');
-      const canvas = document.getElementById('dash-signins-chart');
-      if (!canvas) return;
-      STATE.charts['dash-signins'] = new Chart(canvas, {
-        type: 'bar',
-        data: {
-          labels: buckets2.map(b => b.label),
-          datasets: [
-            { label: 'Sign-ins', data: buckets2.map(b => b.count), backgroundColor: 'rgba(56,139,253,.6)', borderRadius: 3 },
-            { label: 'Unique users', data: buckets2.map(b => b.users.size), backgroundColor: 'rgba(163,113,247,.5)', borderRadius: 3 },
-          ],
-        },
-        options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom',labels:{boxWidth:10,padding:10}}},
-          scales:{x:{grid:{display:false},ticks:{font:{size:10}}}, y:{beginAtZero:true,grid:{color:'rgba(48,54,61,.5)'}}} },
-      });
+      renderDashSignInChart(buildDailySignInBuckets(targeted, 30));
     }).catch(() => {});
   } catch (e) {
     el.innerHTML = `<div class="perm-warn">⚠️ Could not load dashboard: ${esc(e.message)}</div>`;
@@ -1939,8 +1928,9 @@ async function loadShadowApps() {
 }
 
 function renderSpFallbackApps(el, aiApps, grants, mcasErrMsg) {
-  const critCount = aiApps.filter(sp => riskScore(sp, grants) === 'critical').length;
-  const highCount = aiApps.filter(sp => riskScore(sp, grants) === 'high').length;
+  const riskByApp = new Map(aiApps.map(sp => [sp.id, riskScore(sp, grants)]));
+  const critCount = aiApps.filter(sp => riskByApp.get(sp.id) === 'critical').length;
+  const highCount = aiApps.filter(sp => riskByApp.get(sp.id) === 'high').length;
   const hrApps    = aiApps.filter(sp => highRiskScopesFor(sp.id, grants).length > 0);
 
   el.innerHTML = `
@@ -1998,9 +1988,9 @@ function renderSpFallbackApps(el, aiApps, grants, mcasErrMsg) {
           </tr></thead>
           <tbody>${[...aiApps].sort((a, b) => {
             const ord = { critical:4, high:3, medium:2, low:1 };
-            return (ord[riskScore(b, grants)] || 0) - (ord[riskScore(a, grants)] || 0);
+            return (ord[riskByApp.get(b.id)] || 0) - (ord[riskByApp.get(a.id)] || 0);
           }).map(sp => {
-            const r    = riskScore(sp, grants);
+            const r    = riskByApp.get(sp.id);
             const mi   = detectModel(sp.displayName || '');
             const hrs  = highRiskScopesFor(sp.id, grants);
             const ct   = grants.find(g => g.clientId === sp.id)?.consentType;
@@ -3052,10 +3042,14 @@ function renderIdentityTable() {
       (() => { const t = getAgentType(sp).type; return t === 'copilot-studio' || t === 'ai-foundry'; })();
   });
 
+  // Compute each agent's risk once (riskScore scans all grants) and reuse it
+  // for the sort comparator and the row render below.
+  const riskByApp = new Map(idSps.map(sp => [sp.id, riskScore(sp, agentGrants||[])]));
+
   const getVal = (sp, k) => {
     if (k === 'name')      return (sp.displayName||'').toLowerCase();
     if (k === 'blueprint') return (parentMap[sp.id]?.blueprintName||'').toLowerCase();
-    if (k === 'risk')      return RISK_ORDER[riskScore(sp, agentGrants||[])] ?? -1;
+    if (k === 'risk')      return RISK_ORDER[riskByApp.get(sp.id)] ?? -1;
     if (k === 'write')     return AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants||[]).includes(s)).length;
     if (k === 'consent')   return agentGrants?.find(g=>g.clientId===sp.id)?.consentType || '';
     if (k === 'owners')    return (agentOwnersSponsors?.[sp.id]?.owners?.length||0) + (agentOwnersSponsors?.[sp.id]?.sponsors?.length||0);
@@ -3066,7 +3060,7 @@ function renderIdentityTable() {
   const sorted = sortRows(idSps, key, dir, getVal);
 
   tbody.innerHTML = sorted.map(sp => {
-    const r   = riskScore(sp, agentGrants||[]);
+    const r   = riskByApp.get(sp.id);
     const ws  = AGENT_WRITE_SCOPES.filter(s => getScopesForSp(sp.id, agentGrants||[]).includes(s));
     const ct  = agentGrants?.find(g=>g.clientId===sp.id)?.consentType || '—';
     const parent = parentMap[sp.id];
@@ -6511,7 +6505,7 @@ async function loadMcpServers() {
       // Apply sort
       rows.sort((a, b) => {
         let va, vb;
-        if (sortKey === 'risk')      { va = a.risk; vb = b.risk; }
+        if (sortKey === 'risk')      { va = RISK_ORDER[a.risk] ?? -1; vb = RISK_ORDER[b.risk] ?? -1; }
         else if (sortKey === 'name') { va = (a.sp.displayName||'').toLowerCase(); vb = (b.sp.displayName||'').toLowerCase(); }
         else if (sortKey === 'pub')  { va = (a.sp.publisherName||'zzz').toLowerCase(); vb = (b.sp.publisherName||'zzz').toLowerCase(); }
         else if (sortKey === 'cats') { va = a.cats.length; vb = b.cats.length; }
@@ -6521,7 +6515,7 @@ async function loadMcpServers() {
         }
         else if (sortKey === 'role')   { va = mcpHostIds.has(a.sp.id) ? 1 : 0; vb = mcpHostIds.has(b.sp.id) ? 1 : 0; }
         else if (sortKey === 'status') { va = a.sp.accountEnabled === false ? 0 : 1; vb = b.sp.accountEnabled === false ? 0 : 1; }
-        else { va = a.risk; vb = b.risk; }
+        else { va = RISK_ORDER[a.risk] ?? -1; vb = RISK_ORDER[b.risk] ?? -1; }
         if (va < vb) return sortDir;
         if (va > vb) return -sortDir;
         return 0;
@@ -7134,11 +7128,10 @@ async function fetchMcasAppUsers(app) {
       const resp = await gget(url);
       const users = resp.value || (Array.isArray(resp) ? resp : []);
       if (users.length) {
-        console.debug('[MCAS /users sample]', users[0]);
         for (const u of users) _mergeUser(userMap, u);
         continue; // got data — skip strategy 2 for this stream
       }
-    } catch (e) { console.warn('[fetchMcasAppUsers] /users endpoint failed:', e.message); }
+    } catch { /* /users endpoint unavailable — fall through to strategy 2 */ }
 
     // ── Strategy 2: $expand=userActivity, filter client-side ───────────────
     try {
@@ -7146,10 +7139,9 @@ async function fetchMcasAppUsers(app) {
       const resp = await gget(url);
       const detail = (resp.value || []).find(a => String(a.id) === String(app.appId) || a.displayName === app.name);
       if (detail?.userActivity?.length) {
-        console.debug('[MCAS userActivity sample]', detail.userActivity[0]);
         for (const u of detail.userActivity) _mergeUser(userMap, u);
       }
-    } catch (e) { console.warn('[fetchMcasAppUsers] $expand fallback failed:', e.message); }
+    } catch { /* $expand fallback unavailable for this stream */ }
   }
 
   if (userMap.size > 0) {
