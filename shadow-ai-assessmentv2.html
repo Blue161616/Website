@@ -1944,6 +1944,22 @@ function mcasRiskColor(score) {
   return 'var(--risk-low)';
 }
 
+// Human-readable "time ago" for a date string. Returns null if unparseable.
+function mcasRelTime(d) {
+  if (!d) return null;
+  const t = new Date(d).getTime();
+  if (isNaN(t)) return null;
+  const days = Math.floor((Date.now() - t) / 86400000);
+  if (days <= 0) return 'today';
+  if (days === 1) return 'yesterday';
+  if (days < 7)   return days + ' days ago';
+  if (days < 14)  return 'last week';
+  if (days < 30)  return Math.floor(days / 7) + ' weeks ago';
+  if (days < 60)  return 'last month';
+  if (days < 365) return Math.floor(days / 30) + ' months ago';
+  return Math.floor(days / 365) + 'y ago';
+}
+
 // Tags may be strings OR objects like {id, name, isEditable}
 function mcasTagNames(app) {
   return (app.tags || []).map(t =>
@@ -2244,12 +2260,25 @@ function renderMcasApps(el, apps, mcasUrl) {
   const unsanctioned = apps.filter(isUnsanctioned);
   const highRisk     = apps.filter(a => { const s = getScore(a); return s != null && s <= 4; });
   const totalUsers   = apps.reduce((s,a) => s + (a.usersCount ?? a.users ?? a.userCount ?? 0), 0);
+  const totalUpload  = apps.reduce((s,a) => s + (a.trafficUploadedBytes ?? 0), 0);
+  const unsUpload    = unsanctioned.reduce((s,a) => s + (a.trafficUploadedBytes ?? 0), 0);
 
-  const sortKey = STATE.mcasSortKey ?? 'status';
-  const sortDir = STATE.mcasSortDir ?? 'asc';
+  // Composite shadow-AI risk: unsanctioned dominates, then low trust score, then how
+  // much data is being uploaded to the app (the exfiltration signal).
+  const riskRank = a => {
+    const sc = getScore(a);
+    const trust = sc == null ? 5 : sc;                 // 0–10, higher = safer
+    const upl = a.trafficUploadedBytes ?? 0;
+    return (isUnsanctioned(a) ? 1000 : 0) + (10 - trust) * 50 + Math.min(Math.log10(upl + 1) * 12, 120);
+  };
+
+  // Default to risk-ranked (worst first) so the dangerous apps surface without clicking.
+  const sortKey = STATE.mcasSortKey ?? 'risk';
+  const sortDir = STATE.mcasSortDir ?? (sortKey === 'risk' ? 'desc' : 'asc');
 
   const sortVal = (a, key) => {
     switch (key) {
+      case 'risk':    return riskRank(a);
       case 'name':    return (a.name ?? '').toLowerCase();
       case 'status':  return isUnsanctioned(a) ? 0 : isSanctioned(a) ? 2 : 1;
       case 'score':   return getScore(a) ?? -1;
@@ -2292,7 +2321,7 @@ function renderMcasApps(el, apps, mcasUrl) {
       </div>
     </div>
 
-    <div class="kpi-row">
+    <div class="kpi-row" style="grid-template-columns:repeat(5,1fr)">
       <div class="kpi-card info">
         <div class="kpi-label">Generative AI Apps</div>
         <div class="kpi-value text-blue">${apps.length}</div>
@@ -2306,10 +2335,16 @@ function renderMcasApps(el, apps, mcasUrl) {
         <div class="kpi-icon">🚫</div>
       </div>
       <div class="kpi-card high">
-        <div class="kpi-label">High Risk (score ≤ 4)</div>
+        <div class="kpi-label">Low Trust (score ≤ 4)</div>
         <div class="kpi-value text-high">${highRisk.length}</div>
-        <div class="kpi-delta">MDCA risk score out of 10</div>
+        <div class="kpi-delta">MDCA app score · 10 = safest</div>
         <div class="kpi-icon">⚠️</div>
+      </div>
+      <div class="kpi-card ${unsUpload > 0 ? 'critical' : 'high'}">
+        <div class="kpi-label">Uploaded to GenAI (30d)</div>
+        <div class="kpi-value ${unsUpload > 0 ? 'text-critical' : 'text-high'}">${fmtBytes(totalUpload)}</div>
+        <div class="kpi-delta">Data sent to AI apps${unsUpload > 0 ? ` · ${fmtBytes(unsUpload)} to unsanctioned` : ''}</div>
+        <div class="kpi-icon">📤</div>
       </div>
       <div class="kpi-card medium">
         <div class="kpi-label">Total Users (30d)</div>
@@ -2322,7 +2357,7 @@ function renderMcasApps(el, apps, mcasUrl) {
     <div class="card">
       <div class="card-header">
         <div class="card-title">App Inventory</div>
-        <span style="font-size:11px;color:var(--text-muted)">${sorted.length} apps · click column headers to sort</span>
+        <span style="font-size:11px;color:var(--text-muted)">${sorted.length} apps · ${sortKey === 'risk' ? 'sorted by risk' : 'sorted by ' + sortKey} · click headers to re-sort · score 10 = safest</span>
       </div>
       <div class="table-wrap">
         <table>
@@ -2330,13 +2365,13 @@ function renderMcasApps(el, apps, mcasUrl) {
             <tr>
               ${th('name','App')}
               ${th('status','Status')}
-              ${th('score','Risk Score')}
+              ${th('score','Cloud App Score')}
               ${th('users','Users')}
-              ${th('upload','Upload')}
-              ${th('download','Download')}
-              ${th('tx','Transactions')}
-              ${th('devices','Devices')}
+              ${th('upload','↑ Upload')}
+              ${th('download','↓ Download')}
+              ${th('tx','Activity')}
               ${th('last','Last Seen')}
+              <th>Review</th>
             </tr>
           </thead>
           <tbody>${(STATE._mcasRowMap = {}, sorted).map((a, idx) => {
@@ -2366,11 +2401,20 @@ function renderMcasApps(el, apps, mcasUrl) {
               <td style="font-weight:600">${users > 0
                 ? `<span class="users-link" onclick="event.stopPropagation();showAppUsers(${idx},this)" title="Click to see users">${users.toLocaleString()} 👤</span>`
                 : '0'}</td>
-              <td class="text-muted">${fmtBytes(upload)}</td>
-              <td class="text-muted">${fmtBytes(download)}</td>
-              <td class="text-muted">${tx ? tx.toLocaleString() : '—'}</td>
-              <td class="text-muted">${devices ? devices.toLocaleString() : '—'}</td>
-              <td class="mono text-muted">${last ? new Date(last).toLocaleDateString() : '—'}</td>
+              <td>${upload > 0
+                ? `<span style="font-weight:700;color:${upload >= 1e6 ? 'var(--risk-high)' : 'var(--risk-medium)'}">↑ ${fmtBytes(upload)}</span>`
+                : '<span class="text-muted">—</span>'}</td>
+              <td class="text-muted">${download > 0 ? '↓ ' + fmtBytes(download) : '—'}</td>
+              <td class="text-muted" style="font-size:12px">${(tx || devices)
+                ? `${tx ? tx.toLocaleString() + ' tx' : ''}${tx && devices ? ' · ' : ''}${devices ? devices + ' dev' : ''}`
+                : '—'}</td>
+              <td>${(() => {
+                const rel = mcasRelTime(last);
+                if (!rel) return '<span class="text-muted">—</span>';
+                const active = Math.floor((Date.now() - new Date(last).getTime()) / 86400000) <= 7;
+                return `<span title="${last ? new Date(last).toLocaleDateString() : ''}" style="font-size:12px;white-space:nowrap;color:${active ? 'var(--risk-low)' : 'var(--text-muted)'}">${active ? '● ' : ''}${rel}</span>`;
+              })()}</td>
+              <td><a href="https://security.microsoft.com/cloudapps/discovery" target="_blank" rel="noopener" title="Open Microsoft Defender → Cloud Apps → Cloud Discovery → Discovered apps, then select &quot;${esc(name)}&quot;" style="font-size:11px;color:var(--accent-blue);text-decoration:none;white-space:nowrap">Review ↗</a></td>
             </tr>`;
           }).join('') || '<tr><td colspan="9" class="empty-state text-muted">No Generative AI apps discovered</td></tr>'}
           </tbody>
