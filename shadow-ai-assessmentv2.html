@@ -7739,6 +7739,76 @@ function _renderPopoverNoUsers(app) {
 }
 
 // ── M365 COPILOT USAGE PAGE ──────────────────────────────────────────────────
+// M365 Copilot capabilities that expand the data / attack surface (flagged amber).
+const COPILOT_SURFACE = [
+  { re:/copilot studio|copilotstudio/i, note:'Custom agents can call connectors & external APIs' },
+  { re:/graph connector|connector/i,    note:'Ingests external / third-party data into the Copilot index' },
+  { re:/business chat|bizchat/i,        note:'Web grounding (Bing) — prompts may leave the EU Data Boundary' },
+  { re:/plugin|\bapps\b/i,              note:'Third-party apps / plugins can act on user data' },
+];
+
+// Render service-plan chips, flagging the ones that widen Copilot's exposure surface.
+function copilotCapabilityChips(servicePlans) {
+  let surfaceCount = 0;
+  const chips = (servicePlans || []).map(p => {
+    const rawName = p.servicePlanName || '';
+    const name = rawName.replace(/_/g, ' ').replace(/m365 copilot /i,'').replace(/microsoft 365 copilot/i,'M365 Copilot');
+    const active = (p.provisioningStatus || '').toLowerCase() === 'success';
+    const surf = active ? COPILOT_SURFACE.find(s => s.re.test(rawName) || s.re.test(name)) : null;
+    if (surf) surfaceCount++;
+    const color = !active ? 'var(--text-dim)' : surf ? 'var(--risk-medium)' : 'var(--risk-low)';
+    const bg    = !active ? 'rgba(139,148,158,.1)' : surf ? 'rgba(240,136,62,.1)' : 'rgba(63,185,80,.1)';
+    const bd    = !active ? 'rgba(139,148,158,.2)' : surf ? 'rgba(240,136,62,.3)' : 'rgba(63,185,80,.3)';
+    const icon  = !active ? '○' : surf ? '⚠' : '✓';
+    const title = surf ? ` title="${esc(surf.note)}"` : '';
+    return `<span${title} style="padding:4px 10px;border-radius:20px;font-size:11px;font-family:ui-monospace,monospace;background:${bg};color:${color};border:1px solid ${bd}${surf ? ';cursor:help' : ''}">${icon} ${esc(name)}</span>`;
+  }).join('');
+  return { chips, surfaceCount };
+}
+
+// Copilot's #1 real risk is oversharing — it surfaces whatever a user can already
+// access. This checklist cross-references the controls assessed on other pages.
+function copilotReadinessHtml(labels, mip, spSettings) {
+  const labelCount = (labels || []).length;
+  const hasDefault = !!(mip && mip['defaultlabelid']) || (labels || []).some(l => l.isDefault);
+  const share      = (spSettings?.sharingCapability ?? '').toString();
+  const shareKnown = !!spSettings && share !== '';
+  const shareOpen  = /externalUserAndGuestSharing|anyone/i.test(share);
+  const items = [
+    { state: labelCount > 0 ? 'ok' : 'warn', label: 'Sensitivity labels configured', page: 'labels',
+      detail: labelCount > 0 ? `${labelCount} label${labelCount !== 1 ? 's' : ''} — gate what Copilot can surface & auto-label`
+                             : 'No labels — Copilot can surface unclassified content freely' },
+    { state: hasDefault ? 'ok' : 'warn', label: 'Default sensitivity label set', page: 'labels',
+      detail: hasDefault ? 'New content is labelled by default' : 'No default label — new files start unclassified' },
+    { state: !shareKnown ? 'unknown' : shareOpen ? 'warn' : 'ok', label: 'SharePoint external sharing restricted', page: 'sharing',
+      detail: !shareKnown ? 'Not assessed yet — open External Sharing'
+                          : shareOpen ? `"${esc(share)}" — broad sharing amplifies Copilot oversharing`
+                                      : `"${esc(share)}" — limits Copilot oversharing exposure` },
+  ];
+  const row = it => {
+    const cfg = { ok:['var(--risk-low)','✅'], warn:['var(--risk-high)','⚠️'], unknown:['var(--text-dim)','ℹ️'] }[it.state];
+    return `<div onclick="navigate('${it.page}', document.querySelector('[onclick*=${it.page}]'))" style="display:flex;align-items:flex-start;gap:10px;padding:10px 0;border-bottom:1px solid rgba(48,54,61,.5);cursor:pointer">
+      <span style="color:${cfg[0]};flex-shrink:0">${cfg[1]}</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px;font-weight:600">${esc(it.label)}</div>
+        <div style="font-size:11px;color:var(--text-muted)">${it.detail}</div>
+      </div>
+      <span style="font-size:11px;color:var(--accent-blue);white-space:nowrap">View →</span>
+    </div>`;
+  };
+  return `
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-header">
+        <div class="card-title">🛡️ Copilot Data-Exposure Readiness</div>
+        <span style="font-size:11px;color:var(--text-muted)">Copilot surfaces what users can already access — these controls limit oversharing</span>
+      </div>
+      <div class="card-body" style="padding:6px 16px 12px">
+        ${items.map(row).join('')}
+        <div style="font-size:11px;color:var(--text-dim);margin-top:10px">Related Copilot controls: <a onclick="navigate('models', document.querySelector('[onclick*=models]'))" style="color:var(--accent-blue);cursor:pointer">Web grounding · External LLM providers · Flex routing →</a> · <a onclick="navigate('agents', document.querySelector('[onclick*=agents]'))" style="color:var(--accent-blue);cursor:pointer">Copilot Studio agents →</a></div>
+      </div>
+    </div>`;
+}
+
 async function loadCopilotUsage() {
   const el = document.getElementById('copilot-content');
   el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Loading Copilot usage data…</div>';
@@ -7759,6 +7829,15 @@ async function loadCopilotUsage() {
       const licensed  = !!copilotSku && copilotSku.capabilityStatus !== 'Suspended';
       const seats     = copilotSku ? (copilotSku.prepaidUnits?.enabled || copilotSku.consumedUnits || 0) : 0;
       const consumed  = copilotSku ? (copilotSku.consumedUnits || 0) : 0;
+
+      // Security-relevant config that's available WITHOUT Reports.Read.All (cached if
+      // already loaded elsewhere) — keeps the page useful when usage data is missing.
+      const [rLabels, rMip, rSp] = await Promise.all([
+        fetchSensitivityLabels().catch(() => []),
+        fetchMipPolicySettings().catch(() => ({})),
+        fetchSharePointSettings().catch(() => null),
+      ]);
+      const cap = licensed ? copilotCapabilityChips(copilotSku.servicePlans) : { chips:'', surfaceCount:0 };
 
       el.innerHTML = `
         <div class="section-header">
@@ -7788,10 +7867,14 @@ async function loadCopilotUsage() {
             <div class="kpi-delta">${licensed ? `${consumed} assigned · ${seats - consumed} available` : 'N/A'}</div>
             <div class="kpi-icon">👥</div>
           </div>
-          <div class="kpi-card info">
+          <div class="kpi-card ${usage.errorCode === 'forbidden' ? 'medium' : 'info'}">
             <div class="kpi-label">Active Users</div>
-            <div class="kpi-value text-blue">—</div>
-            <div class="kpi-delta">Requires Reports.Read.All</div>
+            <div class="kpi-value text-blue">${usage.errorCode === 'nodata' ? '0' : '—'}</div>
+            <div class="kpi-delta">${usage.errorCode === 'nodata'
+              ? 'no usage recorded yet (≤48 h delay)'
+              : usage.errorCode === 'forbidden'
+                ? '🔒 Reports.Read.All not in token'
+                : 'Reports.Read.All required'}</div>
             <div class="kpi-icon">📊</div>
           </div>
         </div>
@@ -7799,22 +7882,16 @@ async function loadCopilotUsage() {
         ${licensed ? `
         <div class="card" style="margin-bottom:16px">
           <div class="card-header">
-            <div class="card-title">📦 Included Copilot Apps</div>
-            <span style="font-size:11px;color:var(--text-muted)">Service plans in ${esc(copilotSku.skuPartNumber)}</span>
+            <div class="card-title">📦 Included Copilot Capabilities</div>
+            <span style="font-size:11px;color:${cap.surfaceCount > 0 ? 'var(--risk-medium)' : 'var(--text-muted)'}">${cap.surfaceCount > 0 ? `⚠ ${cap.surfaceCount} expand the attack surface` : 'Service plans in ' + esc(copilotSku.skuPartNumber)}</span>
           </div>
           <div class="card-body" style="padding:14px;display:flex;flex-wrap:wrap;gap:6px">
-            ${(copilotSku.servicePlans || []).map(p => {
-              const name = (p.servicePlanName || '').replace(/_/g, ' ').replace(/m365 copilot /i,'').replace(/microsoft 365 copilot/i,'M365 Copilot');
-              const active = (p.provisioningStatus || '').toLowerCase() === 'success';
-              return `<span style="padding:4px 10px;border-radius:20px;font-size:11px;font-family:ui-monospace,monospace;
-                background:${active ? 'rgba(63,185,80,.1)' : 'rgba(139,148,158,.1)'};
-                color:${active ? 'var(--risk-low)' : 'var(--text-dim)'};
-                border:1px solid ${active ? 'rgba(63,185,80,.3)' : 'rgba(139,148,158,.2)'}">
-                ${active ? '✓' : '○'} ${esc(name)}
-              </span>`;
-            }).join('')}
+            ${cap.chips}
           </div>
-        </div>` : ''}
+          ${cap.surfaceCount > 0 ? `<div style="padding:0 14px 12px;font-size:11px;color:var(--text-dim)">⚠ = capability that widens data/attack surface (custom agents, external connectors, web grounding, plugins). Hover a chip for details.</div>` : ''}
+        </div>
+
+        ${copilotReadinessHtml(rLabels, rMip, rSp)}` : ''}
 
         <div class="card" style="margin-bottom:16px">
           <div class="card-header">
