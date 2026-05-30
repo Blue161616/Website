@@ -4985,6 +4985,27 @@ async function loadCompliance() {
     ], STATE.data.mcasApps || []);
     const anyExtLlmUsage = extLlmProviders.some(p => p.usage.detected);
 
+    // EU Data Boundary covers M365 data AT REST. AI model inferencing (non-EU models,
+    // external LLMs, Flex Routing) can still leave the EU even when at-rest data doesn't.
+    const aiLeavesEu = nonCompliantModels.length > 0 || anyExtLlmUsage;
+    // Transparent basis for each model's GDPR verdict (static reference — see note under table).
+    const gdprBasis = m => {
+      if (m.gdprOk) {
+        if (/\beu\b|europe/i.test(m.residency || '') && !/usa|global|china/i.test(m.residency || '')) return 'EU region';
+        if (/microsoft/i.test(m.provider || '')) return 'Microsoft DPA · EU option';
+        return 'Vendor DPA / SCCs';
+      }
+      if (/china|russia|north korea|iran/i.test(m.residency || '')) return 'No EU adequacy · high-risk jurisdiction';
+      return 'No adequacy mechanism';
+    };
+    // AI Governance Score drivers (for the KPI tooltip — makes the heuristic transparent).
+    const govDrivers = [
+      `Conditional Access policies +${enabledCa.length > 5 ? 30 : enabledCa.length * 4}`,
+      `AI-specific CA policy +${aiBlockCa.length > 0 ? 30 : 0}`,
+      `Security Defaults +${secDefaults.isEnabled ? 20 : 0}`,
+      `App registration restricted +${!authPolicy.defaultUserRolePermissions?.allowedToCreateApps ? 20 : 0}`,
+    ].join(' · ');
+
     el.innerHTML = `
       ${STATE.data.caError ? permWarn('Policy.Read.All', STATE.data.caError) : ''}
       <div class="section-header">
@@ -4998,12 +5019,16 @@ async function loadCompliance() {
           <div class="kpi-delta">${gdprModels.length===0?'No AI models detected yet':`${compliantModels.length}/${gdprModels.length} models EU-compliant${nonCompliantModels.length?' · '+nonCompliantModels.map(m=>m.model).join(', ')+' non-compliant':''}`}</div>
           <div class="kpi-icon">🇪🇺</div>
         </div>
-        <div class="kpi-card ${tenantRegion?.regionScope==='EU'?'low':tenantRegion?'medium':'info'}">
+        <div class="kpi-card ${tenantRegion?.regionScope!=='EU'?(tenantRegion?'medium':'info'):aiLeavesEu?'medium':'low'}">
           <div class="kpi-label">EU Data Boundary</div>
-          <div class="kpi-value" style="font-size:22px;color:${tenantRegion?.regionScope==='EU'?'var(--risk-low)':tenantRegion?.regionScope?'var(--risk-medium)':'var(--text-muted)'}">
+          <div class="kpi-value" style="font-size:22px;color:${tenantRegion?.regionScope==='EU'?(aiLeavesEu?'var(--risk-medium)':'var(--risk-low)'):tenantRegion?.regionScope?'var(--risk-medium)':'var(--text-muted)'}">
             ${tenantRegion?.regionScope==='EU'?'✅ In EU':tenantRegion?.regionScope?'⚠️ Outside EU':'—'}
           </div>
-          <div class="kpi-delta">${tenantRegion?.regionScope==='EU'?'Tenant data stays within EU GDPR boundary':tenantRegion?.regionScope?'Data may leave EU — check residency':'Region data unavailable'}</div>
+          <div class="kpi-delta">${tenantRegion?.regionScope==='EU'
+            ? (aiLeavesEu
+                ? 'M365 data at rest in EU — but AI inferencing leaves EU (see GDPR table / Flex Routing)'
+                : 'M365 data at rest stays within the EU GDPR boundary')
+            : tenantRegion?.regionScope?'Data may leave EU — check residency':'Region data unavailable'}</div>
           <div class="kpi-icon">🛡️</div>
         </div>
         <div class="kpi-card info">
@@ -5012,10 +5037,10 @@ async function loadCompliance() {
           <div class="kpi-delta">${esc(org.countryLetterCode||'—')} · ${esc(tenantRegion?.preferredData || tenantRegion?.regionScope || '—')}</div>
           <div class="kpi-icon">🌍</div>
         </div>
-        <div class="kpi-card ${govScore>=70?'low':govScore>=40?'medium':'critical'}">
+        <div class="kpi-card ${govScore>=70?'low':govScore>=40?'medium':'critical'}" title="Score drivers — ${esc(govDrivers)}" style="cursor:help">
           <div class="kpi-label">AI Governance Score</div>
           <div class="kpi-value" style="color:${scoreColor(govScore)}">${govScore}%</div>
-          <div class="kpi-delta">${aiBlockCa.length} AI-specific CA policies</div>
+          <div class="kpi-delta">${aiBlockCa.length} AI-specific CA policies${secDefaults.isEnabled ? '' : ' · ⚠️ Security Defaults off'}</div>
           <div class="kpi-icon">🤖</div>
         </div>
       </div>
@@ -5028,17 +5053,18 @@ async function loadCompliance() {
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Model</th><th>Provider</th><th>Data Residency</th><th>Trains on Prompts</th><th>Risk Level</th><th>Sign-in Events</th><th>GDPR Compliance</th></tr></thead>
+            <thead><tr><th>Model</th><th>Provider</th><th>Data Residency</th><th>Trains on Prompts</th><th>Risk Level</th><th>Detected via</th><th>GDPR Compliance</th></tr></thead>
             <tbody>${gdprModels.sort((a,b) => (a.gdprOk===b.gdprOk?0:a.gdprOk?1:-1) || b.calls-a.calls).map(m => `<tr style="${!m.gdprOk?'background:rgba(248,81,73,.04)':''}">
               <td><strong>${esc(m.model)}</strong></td>
               <td class="text-muted">${esc(m.provider)}</td>
               <td class="mono text-muted" style="font-size:12px">${esc(m.residency)}</td>
               <td>${m.training==='Yes'?'<span class="text-critical">⚠️ Yes</span>':m.training==='No'?'<span class="text-low">✅ No</span>':'<span class="text-medium">⚡ '+esc(m.training)+'</span>'}</td>
               <td>${riskBadge(m.risk||'medium')}</td>
-              <td style="font-weight:600">${m.calls||'—'}</td>
+              <td style="font-size:11px;color:var(--text-muted)">${m.calls>0?`📈 ${m.calls} sign-in${m.calls!==1?'s':''}`:'🔍 SP / Discovery'}</td>
               <td>${m.gdprOk
                 ? '<span class="badge badge-low">✅ Compliant</span>'
-                : '<span class="badge badge-critical">❌ Non-compliant</span>'}</td>
+                : '<span class="badge badge-critical">❌ Non-compliant</span>'}
+                <br><span style="font-size:10px;color:var(--text-dim)">${esc(gdprBasis(m))}</span></td>
             </tr>`).join('')}
             </tbody>
           </table>
@@ -5046,6 +5072,7 @@ async function loadCompliance() {
         ${nonCompliantModels.length ? `<div style="padding:10px 14px;font-size:12px;color:var(--risk-high);border-top:1px solid var(--border)">
           ⚠️ Non-compliant models: ${nonCompliantModels.map(m=>`<strong>${esc(m.model)}</strong> (${esc(m.residency)})`).join(', ')} — data processed outside EU without adequate GDPR safeguards.
         </div>` : `<div style="padding:10px 14px;font-size:12px;color:var(--risk-low);border-top:1px solid var(--border)">✅ All detected AI models are GDPR-compliant.</div>`}
+        <div style="padding:6px 14px 10px;font-size:10px;color:var(--text-dim)">ℹ️ GDPR status is from a static residency/safeguard reference — verify against each vendor's current DPA &amp; Microsoft subprocessor list (e.g. Anthropic became a Microsoft subprocessor in Jan 2026, which can change Claude's status when used via Copilot/Azure).</div>
       </div>` : ''}
 
       <div class="grid-2">
@@ -5075,10 +5102,8 @@ async function loadCompliance() {
               { label: 'Security Defaults', value: secDefaults.isEnabled ? '✅ Enabled' : '❌ Disabled', risk: !secDefaults.isEnabled },
             { label: 'Users can register apps', value: authPolicy.defaultUserRolePermissions?.allowedToCreateApps ? '⚠️ Yes (risk)' : '✅ No', risk: authPolicy.defaultUserRolePermissions?.allowedToCreateApps },
             { label: 'Guest invite permission', value: esc(authPolicy.allowInvitesFrom||'—'), risk: authPolicy.allowInvitesFrom && authPolicy.allowInvitesFrom !== 'adminsAndGuestInviters' },
-            { label: 'Org name', value: esc(org.displayName||'—'), risk: false },
             { label: 'Country', value: esc(org.countryLetterCode||'—'), risk: false },
             { label: 'On-prem sync', value: org.onPremisesSyncEnabled ? '⚠️ Hybrid (AD sync)' : '✅ Cloud-only', risk: org.onPremisesSyncEnabled },
-            { label: 'Domains', value: esc((org.verifiedDomains||[]).map(d=>d.id).join(', ')||'—'), risk: false },
             { label: 'Permission grant policies', value: grantPolicies.map(p=>esc(p.displayName||p.id)).join(', ')||'—', risk: grantPolicies.some(p=>(p.id||'').includes('user-default')) },
           ].map(row => `
             <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(48,54,61,.4)">
