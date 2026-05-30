@@ -6978,7 +6978,17 @@ async function loadMcpServers() {
     ];
 
     const MS_ORGS = new Set(['f8cdef31-a31e-4b4a-93e4-5f571e91255a','72f988bf-86f1-41af-91ab-2d7cd011db47']);
-    const isThirdParty = sp => !sp.appOwnerOrganizationId || !MS_ORGS.has(sp.appOwnerOrganizationId);
+    const ownTenantId = (STATE.data.org?.id || STATE.account?.tenantId || '').toLowerCase();
+    // Publisher origin: 'microsoft' | 'internal' (your own tenant — custom-built) | 'external' | 'unknown'
+    const publisherOrigin = sp => {
+      const org = (sp.appOwnerOrganizationId || '').toLowerCase();
+      if (!org) return 'unknown';
+      if (MS_ORGS.has(org)) return 'microsoft';
+      if (ownTenantId && org === ownTenantId) return 'internal';
+      return 'external';
+    };
+    // "Third party" for risk/KPI = genuinely external (not Microsoft, not your own tenant).
+    const isThirdParty = sp => publisherOrigin(sp) === 'external';
     const getDataCats  = sp => {
       const sc = new Set(grants.filter(g => g.clientId === sp.id).flatMap(g => (g.scope||'').split(' ')));
       return DATA_CATS.filter(c => c.scopes.some(s => sc.has(s)));
@@ -6990,7 +7000,8 @@ async function loadMcpServers() {
     };
 
     const adminConsentCount = uniqueMcp.filter(hasAdminGrant).length;
-    const thirdPartyCount   = uniqueMcp.filter(isThirdParty).length;
+    const thirdPartyCount   = uniqueMcp.filter(isThirdParty).length;             // genuinely external
+    const internalCount     = uniqueMcp.filter(sp => publisherOrigin(sp) === 'internal').length; // custom, your tenant
     const broadAccessCount  = uniqueMcp.filter(sp => getDataCats(sp).length >= 3).length;
 
     // ── Sort + Filter state ──────────────────────────────────────────────────
@@ -7017,7 +7028,7 @@ async function loadMcpServers() {
       // Apply sort
       rows.sort((a, b) => {
         let va, vb;
-        if (sortKey === 'risk')      { va = RISK_ORDER[a.risk] ?? -1; vb = RISK_ORDER[b.risk] ?? -1; }
+        if (sortKey === 'risk')      { va = a.risk; vb = b.risk; /* numeric 0–6+ score, not a level string */ }
         else if (sortKey === 'name') { va = (a.sp.displayName||'').toLowerCase(); vb = (b.sp.displayName||'').toLowerCase(); }
         else if (sortKey === 'pub')  { va = (a.sp.publisherName||'zzz').toLowerCase(); vb = (b.sp.publisherName||'zzz').toLowerCase(); }
         else if (sortKey === 'cats') { va = a.cats.length; vb = b.cats.length; }
@@ -7027,7 +7038,7 @@ async function loadMcpServers() {
         }
         else if (sortKey === 'role')   { va = mcpHostIds.has(a.sp.id) ? 1 : 0; vb = mcpHostIds.has(b.sp.id) ? 1 : 0; }
         else if (sortKey === 'status') { va = a.sp.accountEnabled === false ? 0 : 1; vb = b.sp.accountEnabled === false ? 0 : 1; }
-        else { va = RISK_ORDER[a.risk] ?? -1; vb = RISK_ORDER[b.risk] ?? -1; }
+        else { va = a.risk; vb = b.risk; /* numeric 0–6+ score, not a level string */ }
         if (va < vb) return sortDir;
         if (va > vb) return -sortDir;
         return 0;
@@ -7081,8 +7092,18 @@ async function loadMcpServers() {
 
       tbody.innerHTML = rows.map(({ sp, cats, risk, admin, third }) => {
         const spGrants  = grants.filter(g => g.clientId === sp.id);
-        const pub       = esc(sp.publisherName || (sp.appOwnerOrganizationId ? sp.appOwnerOrganizationId.slice(0,8)+'…' : 'Unknown'));
-        const roleLabel = mcpHostIds.has(sp.id) ? '🖥️ MCP Host' : '📡 MCP Client';
+        const pubName   = sp.publisherName || (sp.appOwnerOrganizationId ? sp.appOwnerOrganizationId.slice(0,8)+'…' : '');
+        const pubCfg    = {
+          microsoft: ['var(--accent-blue)', '🏢 Microsoft'],
+          internal:  ['var(--risk-low)',    '🏠 This tenant (custom)'],
+          external:  ['var(--risk-medium)', '🏢 External' + (pubName ? ' · ' + esc(pubName) : ' org')],
+          unknown:   ['var(--text-dim)',    '❔ Unknown publisher'],
+        }[publisherOrigin(sp)];
+        // Name hint: a service principal whose name says "client" is an MCP client, even
+        // though it matched the MCP name pattern (which lands it in the host set).
+        const isClientByName = /\bclient\b/i.test(sp.displayName || '');
+        const roleLabel = (mcpHostIds.has(sp.id) && !isClientByName) ? '🖥️ MCP Host' : '📡 MCP Client';
+        const reviewUrl = `https://entra.microsoft.com/#view/Microsoft_AAD_IAM/ManagedAppMenuBlade/~/Permissions/objectId/${sp.id}/appId/${sp.appId}`;
         const riskLabel = risk >= 7 ? '<span class="badge badge-critical">🔴 Critical</span>'
           : risk >= 5 ? '<span class="badge badge-high">🔴 High</span>'
           : risk >= 3 ? '<span class="badge badge-medium">🟡 Medium</span>'
@@ -7095,11 +7116,11 @@ async function loadMcpServers() {
             <strong style="font-size:13px">${esc(sp.displayName||'—')}</strong>
             ${sp.description ? `<br><span class="text-muted" style="font-size:10px">${esc(sp.description.slice(0,80))}</span>` : ''}
             <br><span class="mono text-muted" style="font-size:10px">${esc(sp.appId?.slice(0,18)||sp.id?.slice(0,18)||'')}…</span>
+            <a href="${reviewUrl}" target="_blank" rel="noopener" title="Review this service principal & its grants in Entra" style="font-size:10px;color:var(--accent-blue);text-decoration:none;margin-left:8px">Review ↗</a>
           </td>
           <td style="font-size:12px;white-space:nowrap">${roleLabel}</td>
           <td style="font-size:12px">
-            ${third ? `<span style="color:var(--risk-medium);font-size:11px">🏢 ${pub}</span>`
-                    : '<span style="color:var(--accent-blue);font-size:11px">🏢 Microsoft</span>'}
+            <span style="color:${pubCfg[0]};font-size:11px">${pubCfg[1]}</span>
           </td>
           <td>${catChips}</td>
           <td style="font-size:12px">
@@ -7138,10 +7159,10 @@ async function loadMcpServers() {
           <div class="kpi-icon">🔌</div>
         </div>
         <div id="kpi-mcp-third" class="kpi-card ${thirdPartyCount > 0 ? 'medium' : 'low'}" style="cursor:pointer;transition:outline .15s"
-             onclick="STATE._mcp.filter='thirdparty'; STATE._mcpRender();" title="Filter: 3rd-party only">
-          <div class="kpi-label">3rd-Party Servers</div>
+             onclick="STATE._mcp.filter='thirdparty'; STATE._mcpRender();" title="Filter: external (third-party) servers only">
+          <div class="kpi-label">External Servers</div>
           <div class="kpi-value ${thirdPartyCount > 0 ? 'text-medium' : 'text-low'}">${thirdPartyCount}</div>
-          <div class="kpi-delta">Non-Microsoft publishers</div>
+          <div class="kpi-delta">Outside your tenant${internalCount > 0 ? ` · ${internalCount} internal/custom` : ''}</div>
           <div class="kpi-icon">🏢</div>
         </div>
         <div id="kpi-mcp-admin" class="kpi-card ${adminConsentCount > 0 ? 'medium' : 'low'}" style="cursor:pointer;transition:outline .15s"
