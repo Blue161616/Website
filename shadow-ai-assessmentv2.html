@@ -961,10 +961,13 @@ async function fetchAutoLabelingPolicies() {
   return STATE.data.autoLabelingPolicies;
 }
 
-// Fetches MIP policy settings. Tries three endpoints in order:
-// 1. /beta/informationProtection/policy           — settings[] kv pairs (may 404 on some tenants)
-// 2. /beta/me/informationProtection/policy        — user-scoped variant
-// 3. Falls back to inferring isMandatory from labelPolicies objects (no $select)
+// Fetches MIP label-policy settings, normalised into a lower-cased key→value map.
+// Tries endpoints in order:
+// 1. /beta/me/security/informationProtection/labelPolicySettings  — modern Purview
+//    endpoint (same namespace as the working me/security labels call). Carries the
+//    defaultLabel relationship plus isMandatory / isDowngradeJustificationRequired.
+// 2. /beta/security/informationProtection/labelPolicySettings     — org/service-principal variant
+// 3. /beta/informationProtection/policy + /beta/me/...            — legacy AIP settings[] kv pairs
 async function fetchMipPolicySettings() {
   if (STATE.data.mipPolicySettings !== undefined) return STATE.data.mipPolicySettings;
   const normalise = (arr) => {
@@ -972,19 +975,46 @@ async function fetchMipPolicySettings() {
     (arr || []).forEach(s => { if (s.key) settings[s.key.toLowerCase()] = s.value; });
     return settings;
   };
-  // Try tenant-level policy
-  try {
-    const d = await gget(`${GRAPH_BETA}/informationProtection/policy`);
-    STATE.data.mipPolicySettings = normalise(d.settings);
-    return STATE.data.mipPolicySettings;
-  } catch (_) {}
-  // Try user-scoped policy
-  try {
-    const d = await gget(`${GRAPH_BETA}/me/informationProtection/policy`);
-    STATE.data.mipPolicySettings = normalise(d.settings);
-    return STATE.data.mipPolicySettings;
-  } catch (_) {}
-  // Both endpoints unavailable — return empty (isMandatory will be inferred from label policies)
+
+  // 1+2. Modern labelPolicySettings — expand the defaultLabel relationship so we get
+  //      the default label id and name directly (not just a setting GUID).
+  for (const base of [
+    `${GRAPH_BETA}/me/security/informationProtection/labelPolicySettings?$expand=defaultLabel`,
+    `${GRAPH_BETA}/security/informationProtection/labelPolicySettings?$expand=defaultLabel`,
+  ]) {
+    try {
+      const d = await gget(base);
+      const items = d.value || (d.id !== undefined ? [d] : []);
+      // Collapse the collection: first setting that carries each value wins.
+      const settings = {};
+      for (const s of items) {
+        const dl = s.defaultLabel;
+        if (dl?.id && settings['defaultlabelid'] === undefined) {
+          settings['defaultlabelid']   = dl.id;
+          settings['defaultlabelname'] = dl.name || dl.displayName || null;
+        }
+        if (s.isMandatory !== undefined && settings['ismandatory'] === undefined)
+          settings['ismandatory'] = s.isMandatory;
+        if (s.isDowngradeJustificationRequired !== undefined && settings['isdowngradejustificationrequired'] === undefined)
+          settings['isdowngradejustificationrequired'] = s.isDowngradeJustificationRequired;
+      }
+      STATE.data.mipPolicySettings = settings;
+      STATE.data.mipPolicySettingsSource = base.includes('/me/') ? 'me/security/labelPolicySettings' : 'security/labelPolicySettings';
+      return STATE.data.mipPolicySettings;
+    } catch (_) {}
+  }
+
+  // 3. Legacy AIP tenant-level / user-scoped policy (settings[] kv pairs)
+  for (const path of ['informationProtection/policy', 'me/informationProtection/policy']) {
+    try {
+      const d = await gget(`${GRAPH_BETA}/${path}`);
+      STATE.data.mipPolicySettings = normalise(d.settings);
+      STATE.data.mipPolicySettingsSource = path;
+      return STATE.data.mipPolicySettings;
+    } catch (_) {}
+  }
+
+  // All endpoints unavailable — return empty (isMandatory will be inferred from label policies)
   STATE.data.mipPolicySettings = {};
   STATE.data.mipPolicySettingsUnavailable = true;
   return STATE.data.mipPolicySettings;
@@ -6095,28 +6125,39 @@ async function loadSensitivityLabels() {
       getScopesForSp(sp.id, grants).some(s => LABELED_READ_SCOPES.includes(s))
     );
 
-    // Auto-labeling policies — two sources combined:
-    // 1. Standalone auto-labeling policies (Purview "Auto-labeling policies" section)
-    // 2. Label publishing policies that have embedded autoLabeling rules enabled
+    // Auto-labeling signals visible to Microsoft Graph. NOTE: tenant-level Purview
+    // "Auto-labeling policies" (autoSensitivityLabelPolicy) are NOT exposed as a Graph
+    // resource — they're only reachable via Security & Compliance PowerShell
+    // (Get-AutoSensitivityLabelPolicy). So we surface the two Graph-visible signals:
+    //   1. Label publishing policies that carry embedded autoLabeling rules
+    //   2. Individual labels configured with "auto-labeling for files and emails"
     const autoLabelFromPublishing = policies.filter(p => p.autoLabeling?.isEnabled);
+    const autoLabelFromLabels     = labels.filter(l => l.autoLabeling &&
+      (l.autoLabeling.sensitiveTypeIds?.length || l.autoLabeling.message));
     const autoLabelPolicies = autoLabelPoliciesRaw.length > 0
       ? autoLabelPoliciesRaw   // dedicated endpoint returned data → use it
-      : autoLabelFromPublishing; // fallback to embedded rules in publishing policies
+      : [...autoLabelFromPublishing, ...autoLabelFromLabels]; // Graph-visible embedded signals
 
-    // Default label setting — DefaultLabelId from mipPolicySettings, with isDefault flag as fallback
+    // Default label setting — defaultLabelId from mipPolicySettings (resolved against the
+    // label list, then the name returned by the policy itself), with the per-label isDefault
+    // flag as a final fallback.
     const defaultLabelIdDoc  = mipSettings['defaultlabelid'];
     const defaultLabel      = defaultLabelIdDoc
-      ? (labels.find(l => l.id === defaultLabelIdDoc) || { name: 'Configured', id: defaultLabelIdDoc })
+      ? (labels.find(l => l.id === defaultLabelIdDoc) || { name: mipSettings['defaultlabelname'] || 'Configured', id: defaultLabelIdDoc })
       : labels.find(l => l.isDefault);  // fallback to isDefault flag on label object
     const hasDefaultLabel  = !!defaultLabel;
     const defaultLabelName = defaultLabel?.name || null;
+    // Mandatory labelling — read from policy settings when available (boolean | undefined)
+    const isMandatoryDoc   = mipSettings['ismandatory'];
     // Determine if we actually have enough data to make a compliant/non-compliant judgement.
-    // The me/security beta endpoint (source='me/security') does not expose isDefault on labels,
-    // and the mipPolicy beta endpoint is unavailable in some tenants — in those cases we show
-    // "Unable to determine" rather than a misleading "Non-compliant".
+    // The me/security beta labels endpoint does not expose isDefault on labels, so we rely on
+    // having successfully read the label-policy settings (which authoritatively report the
+    // default label, or its absence) — otherwise we show "Unknown" rather than a misleading
+    // "Non-compliant".
     const canDetermineDefault =
-      defaultLabelIdDoc !== undefined ||                          // mipSettings returned a value
-      STATE.data.sensitivityLabelsSource === 'security' ||        // admin endpoint has isDefault
+      defaultLabelIdDoc !== undefined ||                          // policy returned a default label id
+      !!STATE.data.mipPolicySettingsSource ||                     // policy settings read OK (absence = no default)
+      STATE.data.sensitivityLabelsSource === 'security' ||        // admin labels endpoint has isDefault
       labels.some(l => l.isDefault !== undefined);               // labels carry the isDefault field
 
     // Label hierarchy (parent → children)
@@ -6206,8 +6247,8 @@ async function loadSensitivityLabels() {
             if (unavailable && autoLabelPolicies.length === 0) return `
             <div class="kpi-card info">
               <div class="kpi-label">Auto-labeling Policies</div>
-              <div class="kpi-value" style="font-size:13px;font-weight:700;margin-top:4px"><span style="color:var(--text-muted)">ℹ️ Unknown</span></div>
-              <div class="kpi-delta" style="font-size:10px">Requires additional permissions</div>
+              <div class="kpi-value" style="font-size:13px;font-weight:700;margin-top:4px"><span style="color:var(--text-muted)">ℹ️ N/A via Graph</span></div>
+              <div class="kpi-delta" style="font-size:10px;line-height:1.5">Not exposed by Graph — verify in Purview or via <code style="font-size:9px">Get-AutoSensitivityLabelPolicy</code></div>
               <div class="kpi-icon">🏷️</div>
             </div>`;
             return `
@@ -6390,12 +6431,18 @@ async function loadSensitivityLabels() {
             </div>
           </div>
 
-          <!-- Manual verification section -->
-          <div style="border-top:1px solid var(--border);padding-top:16px">
-            <div style="font-weight:600;font-size:13px;margin-bottom:4px">📋 Manual verification required</div>
-            <div style="font-size:11px;color:var(--text-muted);margin-bottom:14px">The following policy settings cannot be read via Microsoft Graph API. Verify them directly in the Microsoft Purview portal or via PowerShell.</div>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-
+          <!-- Policy settings: resolved via Graph where possible, manual verification otherwise -->
+          ${(() => {
+            const defaultResolved = canDetermineDefault;
+            const mandatoryResolved = isMandatoryDoc !== undefined;
+            const bothResolved = defaultResolved && mandatoryResolved;
+            const resolvedCard = (icon, title, valueHtml, sourceLabel) => `
+              <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:14px">
+                <div style="font-weight:600;font-size:12px;margin-bottom:6px">${icon} ${title}</div>
+                <div style="font-size:13px;font-weight:700;margin-bottom:6px">${valueHtml}</div>
+                <div class="data-source source-live" style="font-size:10px">● Read from ${esc(sourceLabel)}</div>
+              </div>`;
+            const defaultManualCard = `
               <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:14px">
                 <div style="font-weight:600;font-size:12px;margin-bottom:6px">🎯 Default label for documents</div>
                 <div style="font-size:11px;color:var(--text-muted);margin-bottom:10px">Check whether a default sensitivity label is applied to new documents.</div>
@@ -6406,8 +6453,8 @@ async function loadSensitivityLabels() {
                 <div style="font-size:11px;margin-bottom:4px;color:var(--text-dim)"><strong>PowerShell:</strong></div>
                 <code style="display:block;font-size:10px;background:var(--bg-hover);padding:6px 8px;border-radius:4px;color:var(--accent-blue);word-break:break-all">Connect-IPPSSession<br>Get-LabelPolicy | Select Name,Settings</code>
                 <div style="font-size:10px;color:var(--text-muted);margin-top:6px">Look for <code style="font-size:10px">defaultlabelid</code> in the Settings output.</div>
-              </div>
-
+              </div>`;
+            const mandatoryManualCard = `
               <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:14px">
                 <div style="font-weight:600;font-size:12px;margin-bottom:6px">🔒 Mandatory labelling</div>
                 <div style="font-size:11px;color:var(--text-muted);margin-bottom:10px">Check whether users are required to apply a label before saving documents or sending emails.</div>
@@ -6418,10 +6465,34 @@ async function loadSensitivityLabels() {
                 <div style="font-size:11px;margin-bottom:4px;color:var(--text-dim)"><strong>PowerShell:</strong></div>
                 <code style="display:block;font-size:10px;background:var(--bg-hover);padding:6px 8px;border-radius:4px;color:var(--accent-blue);word-break:break-all">Connect-IPPSSession<br>Get-LabelPolicy | Select Name,Settings</code>
                 <div style="font-size:10px;color:var(--text-muted);margin-top:6px">Look for <code style="font-size:10px">mandatory</code> = <code style="font-size:10px">true</code> in the Settings output.</div>
-              </div>
-
+              </div>`;
+            const defaultCardHtml = defaultResolved
+              ? resolvedCard('🎯', 'Default label for documents',
+                  hasDefaultLabel
+                    ? `<span style="color:var(--risk-low)">✅ ${esc(defaultLabelName)}</span>`
+                    : `<span style="color:var(--risk-high)">⚠️ No default label set</span>`,
+                  STATE.data.mipPolicySettingsSource || 'sensitivity labels')
+              : defaultManualCard;
+            const mandatoryCardHtml = mandatoryResolved
+              ? resolvedCard('🔒', 'Mandatory labelling',
+                  isMandatoryDoc
+                    ? `<span style="color:var(--risk-low)">✅ Required</span>`
+                    : `<span style="color:var(--risk-high)">⚠️ Not required</span>`,
+                  STATE.data.mipPolicySettingsSource || 'policy settings')
+              : mandatoryManualCard;
+            const intro = bothResolved
+              ? 'Default label and mandatory labelling were read directly from the Purview label-policy settings.'
+              : 'Some policy settings could not be read via Microsoft Graph. Verify the remaining items in the Microsoft Purview portal or via PowerShell.';
+            return `
+          <div style="border-top:1px solid var(--border);padding-top:16px">
+            <div style="font-weight:600;font-size:13px;margin-bottom:4px">📋 Label policy settings${bothResolved ? '' : ' — partial manual verification'}</div>
+            <div style="font-size:11px;color:var(--text-muted);margin-bottom:14px">${intro}</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+              ${defaultCardHtml}
+              ${mandatoryCardHtml}
             </div>
-          </div>
+          </div>`;
+          })()}
         </div>
       </div>
     `;
