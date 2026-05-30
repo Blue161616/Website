@@ -2509,6 +2509,38 @@ function renderCredentialHygieneHtml() {
 
 // ── AI MODELS ─────────────────────────────────────────────────────────────
 
+// Shadow-AI-aware risk level for a detected model. Starts from the static per-model
+// risk, then escalates on the factors that actually matter for data exposure:
+// high-risk jurisdiction (hard override), training on prompts, no EU adequacy,
+// unmanaged/shadow detection (Cloud Discovery only), and unknown residency.
+// Returns { level, reasons } — reasons feed the badge tooltip.
+function modelRiskLevel(m) {
+  const res   = (m.residency || '').toLowerCase();
+  const train = (m.training  || '').toLowerCase();
+  const sources  = m.sources ? [...m.sources] : [];
+  const onlyMcas = sources.length > 0 && sources.every(s => s === 'mcas');
+
+  // Hard override: prompts/data processed in a high-risk jurisdiction.
+  if (/china|russia|north korea|iran|belarus/.test(res)) {
+    return { level: 'critical', reasons: ['data residency in a high-risk jurisdiction'] };
+  }
+
+  let score = { low:1, medium:2, high:3, critical:4 }[m.risk] || 2;
+  const reasons = [];
+  if (train === 'yes') { score += 1; reasons.push('trains on prompts'); }
+
+  let soft = 0;
+  if (onlyMcas)                      { soft++; reasons.push('unmanaged · Cloud Discovery only'); }
+  if (/opt-?out|varies/.test(train)) { soft++; reasons.push('may train on prompts'); }
+  if (m.gdprOk === false)            { soft++; reasons.push('no EU adequacy'); }
+  if (!res || res === 'unknown')     { soft++; reasons.push('unknown data residency'); }
+  if (soft >= 2) score += 1;   // multiple compounding risks → one level up
+  if (soft >= 4) score += 1;   // many compounding risks → another level
+
+  const level = ['', 'low', 'medium', 'high', 'critical'][Math.min(4, Math.max(1, score))];
+  return { level, reasons };
+}
+
 function sortModelTable(key) {
   if (STATE.modelSortKey === key) STATE.modelSortDir = STATE.modelSortDir === 'asc' ? 'desc' : 'asc';
   else { STATE.modelSortKey = key; STATE.modelSortDir = key === 'model' || key === 'provider' || key === 'residency' ? 'asc' : 'desc'; }
@@ -2519,7 +2551,7 @@ function renderModelTable() {
   const tbody = document.getElementById('model-risk-tbody');
   if (!tbody) return;
   const models = STATE.data.modelList || [];
-  const key = STATE.modelSortKey || null;
+  const key = STATE.modelSortKey || 'risk';   // default: highest risk first
   const dir = STATE.modelSortDir || 'desc';
   const RISK_ORD = { critical:4, high:3, medium:2, low:1 };
   const TRAIN_ORD = { Yes:3, 'Opt-out':2, Unknown:1, No:0 };
@@ -2532,7 +2564,7 @@ function renderModelTable() {
     else if (key === 'residency')  { av = a.residency.toLowerCase(); bv = b.residency.toLowerCase(); }
     else if (key === 'training')   { av = TRAIN_ORD[a.training]??0;  bv = TRAIN_ORD[b.training]??0; }
     else if (key === 'gdprOk')     { av = a.gdprOk ? 1 : 0;          bv = b.gdprOk ? 1 : 0; }
-    else if (key === 'risk')       { av = RISK_ORD[a.risk]??0;        bv = RISK_ORD[b.risk]??0; }
+    else if (key === 'risk')       { av = RISK_ORD[modelRiskLevel(a).level]??0; bv = RISK_ORD[modelRiskLevel(b).level]??0; }
     else return 0;
     return dir === 'asc' ? (av > bv ? 1 : av < bv ? -1 : 0) : (av < bv ? 1 : av > bv ? -1 : 0);
   });
@@ -2546,15 +2578,21 @@ function renderModelTable() {
     return badges.join(' ');
   };
 
-  tbody.innerHTML = sorted.slice(0, 20).map(m => '<tr>'
-    + '<td><strong>' + esc(m.model) + '</strong></td>'
-    + '<td class="text-muted">' + esc(m.provider) + '</td>'
-    + '<td class="mono">' + esc(m.residency) + '</td>'
-    + '<td>' + (m.training==='Yes' ? '<span class="text-critical">⚠️ Yes</span>' : m.training==='No' ? '<span class="text-low">✅ No</span>' : '<span class="text-medium">⚡ ' + esc(m.training) + '</span>') + '</td>'
-    + '<td>' + (m.gdprOk ? '<span class="text-low">✅</span>' : '<span class="text-critical">❌</span>') + '</td>'
-    + '<td>' + riskBadge(m.risk) + '</td>'
-    + '<td>' + srcBadgeInline(m.sources) + (m.mcasUsers ? '<span class="text-muted" style="font-size:10px;margin-left:4px">' + m.mcasUsers + ' users</span>' : '') + '</td>'
-    + '</tr>').join('') || '<tr><td colspan="7" class="empty-state text-muted">No model data available</td></tr>';
+  tbody.innerHTML = sorted.slice(0, 20).map(m => {
+    const rk = modelRiskLevel(m);
+    const riskCell = rk.reasons.length
+      ? `<span title="Risk drivers: ${esc(rk.reasons.join(' · '))}" style="cursor:help">${riskBadge(rk.level)}</span>`
+      : riskBadge(rk.level);
+    return '<tr>'
+      + '<td><strong>' + esc(m.model) + '</strong></td>'
+      + '<td class="text-muted">' + esc(m.provider) + '</td>'
+      + '<td class="mono">' + esc(m.residency) + '</td>'
+      + '<td>' + (m.training==='Yes' ? '<span class="text-critical">⚠️ Yes</span>' : m.training==='No' ? '<span class="text-low">✅ No</span>' : '<span class="text-medium">⚡ ' + esc(m.training) + '</span>') + '</td>'
+      + '<td>' + (m.gdprOk ? '<span class="text-low">✅</span>' : '<span class="text-critical">❌</span>') + '</td>'
+      + '<td>' + riskCell + '</td>'
+      + '<td>' + srcBadgeInline(m.sources) + (m.mcasUsers ? '<span class="text-muted" style="font-size:10px;margin-left:4px">' + m.mcasUsers + ' users</span>' : '') + '</td>'
+      + '</tr>';
+  }).join('') || '<tr><td colspan="7" class="empty-state text-muted">No model data available</td></tr>';
 
   // Update sort indicators
   ['model','provider','residency','training','gdprOk','risk'].forEach(k => {
