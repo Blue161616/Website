@@ -2441,6 +2441,27 @@ async function loadModels() {
       agent:  `<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:rgba(57,211,83,.12);color:var(--risk-low);border:1px solid rgba(57,211,83,.3)">Agent</span>`,
     }[s]||'')).join(' ');
 
+    // External LLM provider usage inference. The admin toggle (M365 Admin Center →
+    // "AI providers for other large language models") isn't exposed by any API, but we
+    // DO observe actual usage of these providers' models via sign-in logs, service
+    // principals, and Defender for Cloud Apps — surface that as evidence rather than a
+    // blind manual check.
+    const detectProviderUsage = (re) => {
+      const apps = new Set();
+      let users = 0;
+      Object.keys(modelCounts).forEach(n => { if (re.test(n)) apps.add(n); });
+      aiApps.forEach(a => { const n = a.displayName || ''; if (re.test(n)) apps.add(n); });
+      mcasAiApps.forEach(a => { const n = a.name || ''; if (re.test(n)) { apps.add(n); users += a.usersCount || 0; } });
+      models.forEach(m => { if (re.test(m.provider || '') || re.test(m.model || '')) (m.apps || []).forEach(n => apps.add(n)); });
+      return { detected: apps.size > 0, apps: [...apps].filter(Boolean), users };
+    };
+    const extLlmProviders = [
+      { label: 'Anthropic (Claude)', note: 'USA · GDPR: ❌ No adequate safeguards', match: /anthropic|claude/i },
+      { label: 'xAI (Grok)',         note: 'USA · GDPR: ❌ No adequate safeguards', match: /\bxai\b|grok/i },
+      { label: 'Google (Gemini)',    note: 'Global · GDPR: ❌ Data may leave EU',   match: /google|gemini|bard|vertex/i },
+    ].map(p => ({ ...p, usage: detectProviderUsage(p.match) }));
+    const anyExtLlmUsage = extLlmProviders.some(p => p.usage.detected);
+
     el.innerHTML = `
       ${STATE.data.signInsError ? permWarn('AuditLog.Read.All', STATE.data.signInsError) : ''}
       <div class="section-header">
@@ -2491,25 +2512,34 @@ async function loadModels() {
       <div class="card" style="margin-bottom:16px">
         <div class="card-header">
           <div class="card-title">🔌 External LLM Providers (Copilot Studio)</div>
-          <span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.12);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">⚠️ Manual check required</span>
+          ${anyExtLlmUsage
+            ? `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(248,81,73,.12);color:var(--risk-critical);border:1px solid rgba(248,81,73,.3)">🔴 Usage detected</span>`
+            : `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.12);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">⚠️ Manual check required</span>`}
         </div>
         <div class="card-body">
           <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px">
-            Microsoft 365 allows admins to enable third-party LLM providers (Anthropic Claude, xAI Grok, etc.) for use inside Copilot Chat and Copilot Studio. When enabled, organisation data may be sent to non-EU providers — directly affecting GDPR compliance. This setting is not exposed via any public API and must be checked manually.
+            Microsoft 365 allows admins to enable third-party LLM providers (Anthropic Claude, xAI Grok, etc.) for use inside Copilot Chat and Copilot Studio. When enabled, organisation data may be sent to non-EU providers — directly affecting GDPR compliance. The admin toggle itself is not exposed via any public API, but actual model usage is detected from your sign-in logs and Defender for Cloud Apps data.
           </p>
+          ${anyExtLlmUsage ? `<div style="font-size:12px;color:var(--risk-critical);margin-bottom:14px;padding:8px 12px;border-radius:6px;background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.25)">🔴 <strong>Usage observed in your tenant.</strong> Models from the highlighted provider(s) appear in your sign-in / Defender for Cloud Apps data, so they're being used — confirm the toggle and per-user access scope in the admin center.</div>` : ''}
           <div style="display:flex;flex-direction:column;gap:8px">
-            ${[
-              { label: 'Anthropic (Claude)', note: 'USA · GDPR: ❌ No adequate safeguards', risk: true },
-              { label: 'xAI (Grok)', note: 'USA · GDPR: ❌ No adequate safeguards', risk: true },
-              { label: 'Google (Gemini)', note: 'Global · GDPR: ❌ Data may leave EU', risk: true },
-            ].map(p => `
-              <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-radius:6px;background:var(--bg-secondary);border:1px solid var(--border)">
+            ${extLlmProviders.map(p => {
+              const u = p.usage;
+              const evidence = u.detected
+                ? `<div style="font-size:10px;color:var(--risk-critical);margin-top:3px">🔎 Seen as: ${esc(u.apps.slice(0,3).join(', '))}${u.apps.length>3?` +${u.apps.length-3} more`:''}${u.users?` · ${u.users} user${u.users!==1?'s':''}`:''}</div>`
+                : '';
+              const badge = u.detected
+                ? `<span title="${esc(u.apps.join(', '))}" style="font-size:11px;padding:3px 10px;border-radius:10px;background:rgba(248,81,73,.12);color:var(--risk-critical);border:1px solid rgba(248,81,73,.35);white-space:nowrap">🔴 Usage detected</span>`
+                : `<a href="https://admin.microsoft.com/#/Settings/Copilot" target="_blank" style="font-size:11px;padding:3px 10px;border-radius:10px;background:rgba(240,136,62,.1);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25);text-decoration:none;white-space:nowrap">⚠️ Check in Admin Center</a>`;
+              return `
+              <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-radius:6px;background:var(--bg-secondary);border:1px solid ${u.detected ? 'rgba(248,81,73,.3)' : 'var(--border)'}">
                 <div>
                   <span style="font-size:13px;font-weight:600">${esc(p.label)}</span>
                   <span style="font-size:11px;color:var(--text-muted);margin-left:10px">${esc(p.note)}</span>
+                  ${evidence}
                 </div>
-                <span style="font-size:11px;padding:3px 10px;border-radius:10px;background:rgba(240,136,62,.1);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">⚠️ Check in Admin Center</span>
-              </div>`).join('')}
+                ${badge}
+              </div>`;
+            }).join('')}
           </div>
           <div style="margin-top:14px;padding:10px 12px;border-radius:6px;background:rgba(56,139,253,.06);border:1px solid rgba(56,139,253,.2);font-size:12px;color:var(--text-muted)">
             🔗 <strong>Where to check:</strong>
