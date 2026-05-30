@@ -415,7 +415,6 @@
       <button class="nav-item" onclick="navigate('sharing',this)"><span class="nav-icon">🌐</span>External Sharing</button>
       <button class="nav-item" onclick="navigate('labels',this)"><span class="nav-icon">🏷️</span>Sensitivity Labels</button>
       <button class="nav-item" onclick="navigate('data-risk',this)"><span class="nav-icon">🔐</span>Data Risk</button>
-      <button class="nav-item" onclick="navigate('consent',this)"><span class="nav-icon">📅</span>Consent History</button>
       <div class="nav-section-label">Compliance &amp; Governance</div>
       <button class="nav-item" onclick="navigate('compliance',this)"><span class="nav-icon">✅</span>Compliance</button>
       <button class="nav-item" onclick="navigate('protection',this)"><span class="nav-icon">🛡️</span>Agent 365 Protections</button>
@@ -1365,9 +1364,9 @@ function destroyChart(key) {
 
 const PAGE_TITLES = {
   dashboard:'Dashboard','shadow-apps':'Shadow AI Apps',models:'AI Models',
-  agents:'AI Agents','data-risk':'Data Risk',compliance:'Compliance',
+  agents:'AI Agents','data-risk':'Data Risk & Consent',compliance:'Compliance',
   users:'AI Users & Agent Users',alerts:'AI & Agent Security Alerts',policies:'Policies',licenses:'Licenses',
-  protection:'Agent 365 Protections',sharing:'External Sharing Exposure',labels:'Sensitivity Label Exposure',consent:'Consent History',
+  protection:'Agent 365 Protections',sharing:'External Sharing Exposure',labels:'Sensitivity Label Exposure',
   copilot:'M365 Copilot Usage',
 };
 
@@ -1380,7 +1379,6 @@ const PAGE_LOADERS = {
   protection: loadProtection,
   sharing: loadExternalSharing,
   labels: loadSensitivityLabels,
-  consent: loadConsentTimeline,
   copilot: loadCopilotUsage,
 };
 
@@ -3581,7 +3579,7 @@ function renderClassicTable() {
     if (k === 'name')     return (sp.displayName||'').toLowerCase();
     if (k === 'type')     return isEntraAgent(sp) ? 0 : 1;
     if (k === 'usage')    return e ? { HIGH:2, MEDIUM:1, LOW:0 }[e.usage] ?? 1 : -1;
-    if (k === 'activity') return e?.lastActivity || '';
+    if (k === 'activity') return e?.lastActivity || sp.signInActivity?.lastSignInDateTime || sp.signInActivity?.lastNonInteractiveSignInDateTime || '';
     if (k === 'perms')    return e?.permCount ?? -1;
     if (k === 'highpriv') return e?.highPrivRoles?.length ?? 0;
     if (k === 'owners')   return (agentOwnersSponsors?.[sp.id]?.owners?.length||0) + (agentOwnersSponsors?.[sp.id]?.sponsors?.length||0);
@@ -3620,9 +3618,24 @@ function renderClassicTable() {
     const riskyBadge = riskyInfo ? `<span class="badge badge-critical" style="font-size:10px;margin-left:6px" title="Risky agent · ${riskyInfo.riskState||''}">⚡ ${riskyInfo.riskLevel||'risk'}</span>` : '';
 
     const usageCell  = enriching ? `<span class="text-muted" style="font-size:11px">…</span>` : usageBadge(e?.usage || 'MEDIUM');
-    const actCell    = enriching ? `<span class="text-muted" style="font-size:11px">…</span>`
-                     : e?.lastActivity ? `<span style="font-size:11px">${new Date(e.lastActivity).toLocaleDateString()}</span>`
-                     : `<span style="opacity:.4">—</span>`;
+    // Last activity / sign-in: combine last sign-in date + staleness (dormant / never-signed-in · age),
+    // same signals as the Stale-Orphaned section.
+    const actCell = (() => {
+      if (enriching) return `<span class="text-muted" style="font-size:11px">…</span>`;
+      const sia = sp.signInActivity;
+      const lastSignIn = e?.lastActivity || sia?.lastSignInDateTime || sia?.lastNonInteractiveSignInDateTime || null;
+      if (lastSignIn) {
+        const d = new Date(lastSignIn);
+        const days = Math.floor((Date.now() - d.getTime()) / 86400000);
+        const dormant = days >= 90;
+        const rel = days <= 0 ? 'today' : days === 1 ? 'yesterday' : days + 'd ago';
+        return `<span style="font-size:11px">${d.toLocaleDateString()}</span>
+          <br><span style="font-size:10px;color:${dormant ? 'var(--risk-medium)' : 'var(--text-dim)'}">${rel}${dormant ? ' · 💤 dormant' : ''}</span>`;
+      }
+      const created = sp.createdDateTime ? new Date(sp.createdDateTime) : null;
+      const ageDays = created ? Math.floor((Date.now() - created.getTime()) / 86400000) : null;
+      return `<span class="badge badge-medium" style="font-size:10px" title="No interactive or non-interactive sign-in recorded for this agent">🚫 Never signed in${ageDays != null ? ` · ${ageDays}d old` : ''}</span>`;
+    })();
     const permCell   = enriching ? `<span class="text-muted" style="font-size:11px">…</span>`
                      : `<span style="font-size:12px;color:${(e?.permCount||0)>0?'var(--text-primary)':'var(--text-dim)'}">${e?.permCount ?? 0}</span>`;
     const privCell   = enriching ? `<span class="text-muted" style="font-size:11px">…</span>`
@@ -4163,7 +4176,7 @@ async function loadAgents() {
                 ${th('Agent / App','name','sortClassicTable')}
                 ${th('Type','type','sortClassicTable')}
                 ${th('Usage','usage','sortClassicTable')}
-                ${th('Last Activity','activity','sortClassicTable')}
+                ${th('Last Activity / Sign-in','activity','sortClassicTable')}
                 ${th('Permissions','perms','sortClassicTable')}
                 ${th('High Priv','highpriv','sortClassicTable')}
                 ${th('Owner','owners','sortClassicTable')}
@@ -4595,8 +4608,24 @@ async function fetchAgentAppPerms(agentSps, allSps) {
   return result;
 }
 
+// Tab switcher for the Data Risk page (Data Reachability + folded-in Consent Timeline).
+function showDataRiskTab(name) {
+  const reach = name !== 'consent';
+  const reachEl = document.getElementById('dr-tab-reach');
+  const consentEl = document.getElementById('dr-tab-consent');
+  if (reachEl) reachEl.style.display = reach ? '' : 'none';
+  if (consentEl) consentEl.style.display = reach ? 'none' : '';
+  document.getElementById('dr-tab-btn-reach')?.classList.toggle('active', reach);
+  document.getElementById('dr-tab-btn-consent')?.classList.toggle('active', !reach);
+  if (!reach && !STATE._consentFoldedLoaded) {
+    STATE._consentFoldedLoaded = true;
+    loadConsentTimeline().catch(e => console.error('Consent load error', e));
+  }
+}
+
 async function loadDataRisk() {
   const el = document.getElementById('risk-content');
+  STATE._consentFoldedLoaded = false;  // reset folded consent tab on each Data Risk load
   try {
     const [sps, grants, signIns, riskyUsers, riskyAgents] = await Promise.all([
       fetchServicePrincipals(), fetchOAuth2Grants(), fetchSignIns(), fetchRiskyUsers(), fetchRiskyAgents()
@@ -4887,6 +4916,7 @@ async function loadDataRisk() {
         ${permTable(classicPermRows, 'No classic AI service principals found')}
       </div>
     `;
+    showDataRiskTab('reach');
   } catch (e) {
     el.innerHTML = permWarn('Multiple permissions', e.message);
   }
