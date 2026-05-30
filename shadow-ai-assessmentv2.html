@@ -3219,34 +3219,74 @@ async function fetchAgentAuditLog() {
   });
   const normalizeAudit = e => ({ ...e, _source: 'audit', _raw: e });
 
-  try {
-    // Primary: beta signIns endpoint — service principal sign-ins where agentType = AgentIdentity
-    const siSel = 'id,createdDateTime,appDisplayName,appId,resourceDisplayName,status,riskLevelDuringSignIn,riskState,agent,signInEventTypes';
-    const siResp = await gget(
-      `${GRAPH_BETA}/auditLogs/signIns` +
-      `?$filter=signInEventTypes/any(t: t eq 'servicePrincipal') and agent/agentType eq 'AgentIdentity'` +
-      `&$top=200&$select=${siSel}`,
-      true
-    ).catch(() => null);
+  // Classify a Graph error so the UI can explain *why* there's no data.
+  const classify = msg => /403|forbidden|authorization/i.test(msg) ? 'forbidden'
+    : /400|bad request|not supported|invalid filter|could not find a property|parsing query/i.test(msg) ? 'unsupported'
+    : 'error';
+  let lastErr = null, lastCode = null;
+  const note = e => { lastErr = e.message; lastCode = classify(e.message || ''); };
 
-    if (siResp?.value?.length) {
-      STATE.data.agentAuditLog = siResp.value.map(normalizeSignIn);
+  const agentSps    = STATE.data.agentSps || [];
+  const agentAppIds = [...new Set(agentSps.map(s => s.appId).filter(Boolean))];
+  const agentSpIds  = new Set(agentSps.map(s => s.id).filter(Boolean));
+
+  // ── Strategy 1: preview signIns filter (richest where the schema is live) ──
+  try {
+    const siSel = 'id,createdDateTime,appDisplayName,appId,resourceDisplayName,status,riskLevelDuringSignIn,riskState,agent,signInEventTypes';
+    const r = await gget(
+      `${GRAPH_BETA}/auditLogs/signIns?$filter=signInEventTypes/any(t: t eq 'servicePrincipal') and agent/agentType eq 'AgentIdentity'&$top=200&$select=${siSel}`,
+      true
+    );
+    if (r?.value?.length) {
+      STATE.data.agentAuditLog = r.value.map(normalizeSignIn);
+      STATE.data.agentAuditLogSource = 'signIns · agent identity';
       return STATE.data.agentAuditLog;
     }
+  } catch (e) { note(e); }
 
-    // Fallback: directoryAudits filtered by agentType on targetResources
-    const auSel = 'id,activityDateTime,activityDisplayName,category,result,resultReason,initiatedBy,targetResources';
-    const auResp = await gget(
-      `${GRAPH}/auditLogs/directoryAudits` +
-      `?$filter=targetResources/any(t: t/agentType ne 'notAgentic')` +
-      `&$orderby=activityDateTime desc&$top=200&$count=true&$select=${auSel}`,
-      true
-    ).catch(() => null);
-    STATE.data.agentAuditLog = (auResp?.value || []).map(normalizeAudit);
-  } catch (e) {
-    STATE.data.agentAuditLog = [];
-    STATE.data.agentAuditLogError = e.message;
+  // ── Strategy 2: stable schema — SP sign-ins for the known agent appIds ──
+  if (agentAppIds.length) {
+    const sel = 'id,createdDateTime,appDisplayName,appId,resourceDisplayName,status,riskLevelDuringSignIn,riskState';
+    const collected = [];
+    for (let i = 0; i < agentAppIds.length; i += 15) {
+      const idFilter = agentAppIds.slice(i, i + 15).map(id => `appId eq '${id}'`).join(' or ');
+      try {
+        const r = await gget(
+          `${GRAPH_BETA}/auditLogs/signIns?$filter=signInEventTypes/any(t: t eq 'servicePrincipal') and (${idFilter})&$top=100&$select=${sel}`,
+          true
+        );
+        if (r?.value) collected.push(...r.value);
+      } catch (e) { note(e); }
+    }
+    if (collected.length) {
+      const seen = new Set();
+      STATE.data.agentAuditLog = collected
+        .filter(e => { if (seen.has(e.id)) return false; seen.add(e.id); return true; })
+        .map(normalizeSignIn)
+        .sort((a, b) => new Date(b.activityDateTime) - new Date(a.activityDateTime));
+      STATE.data.agentAuditLogSource = 'signIns · agent service principals';
+      return STATE.data.agentAuditLog;
+    }
   }
+
+  // ── Strategy 3: directory lifecycle audits, client-filtered to agent targets ──
+  try {
+    const auSel = 'id,activityDateTime,activityDisplayName,category,result,resultReason,initiatedBy,targetResources';
+    const r = await gget(`${GRAPH}/auditLogs/directoryAudits?$orderby=activityDateTime desc&$top=200&$select=${auSel}`, true);
+    const ev = (r?.value || []).filter(e =>
+      (e.targetResources || []).some(t => agentSpIds.has(t.id)) || /\bagent/i.test(e.activityDisplayName || '')
+    );
+    if (ev.length) {
+      STATE.data.agentAuditLog = ev.map(normalizeAudit);
+      STATE.data.agentAuditLogSource = 'directoryAudits · agent lifecycle';
+      return STATE.data.agentAuditLog;
+    }
+  } catch (e) { note(e); }
+
+  // Nothing found — record why so the UI can be specific.
+  STATE.data.agentAuditLog = [];
+  STATE.data.agentAuditLogError = lastErr;
+  STATE.data.agentAuditLogCode  = lastErr ? lastCode : 'noevents';
   return STATE.data.agentAuditLog;
 }
 
@@ -4131,7 +4171,7 @@ async function loadAgents() {
         <div class="card">
           <div class="card-header">
             <div class="card-title">🕐 Agent Identity Audit Log</div>
-            <span class="data-source source-live">● auditLogs/directoryAudits · category: AgentIdentity</span>
+            <span id="audit-src" class="data-source source-live">● sign-ins + directory audits</span>
           </div>
           <div id="audit-log-body" class="card-body">
             <div class="empty-state text-muted">Loading audit events…</div>
@@ -4156,13 +4196,21 @@ async function loadAgents() {
       const auditEl = document.getElementById('audit-log-body');
       const kpiAuditVal = document.getElementById('kpi-audit-val');
       if (kpiAuditVal) kpiAuditVal.textContent = events.length;
+      const srcEl = document.getElementById('audit-src');
+      if (srcEl && STATE.data.agentAuditLogSource) srcEl.textContent = '● ' + STATE.data.agentAuditLogSource;
       if (!auditEl) return;
-      if (STATE.data.agentAuditLogError && !events.length) {
-        auditEl.innerHTML = permWarn('AuditLog.Read.All', STATE.data.agentAuditLogError);
-        return;
-      }
       if (!events.length) {
-        auditEl.innerHTML = '<div class="empty-state text-muted">No AgentIdentity audit events found. Requires AuditLog.Read.All and recent agent activity.</div>';
+        const code = STATE.data.agentAuditLogCode;
+        const agentN = STATE.data.agentSps?.length || 0;
+        if (code === 'forbidden') {
+          auditEl.innerHTML = permWarn('AuditLog.Read.All', STATE.data.agentAuditLogError || 'Access denied (403)')
+            + '<div style="font-size:11px;color:var(--text-dim);padding:6px 4px 0">Sign out and back in to refresh the token, then ensure a reader role (Reports Reader / Global Reader) is assigned.</div>';
+        } else if (code === 'unsupported') {
+          auditEl.innerHTML = '<div class="empty-state text-muted">Agent-identity audit filters aren\'t available in this tenant\'s Graph yet (preview schema), and no agent sign-in or lifecycle events were found in the current window.</div>';
+        } else {
+          auditEl.innerHTML = `<div class="empty-state text-muted">No agent sign-in or lifecycle events in the audit window.<br>
+            <span style="font-size:11px;color:var(--text-dim)">Agent identities often don't sign in interactively, so this can read 0 even with ${agentN} agent${agentN!==1?'s':''} present. Runtime usage (which agent did what) lives in the Purview unified audit, which needs the AuditLogsQuery.Read.All scope.</span></div>`;
+        }
         return;
       }
       const actIcon = op => {
