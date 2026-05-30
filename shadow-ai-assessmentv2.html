@@ -1516,6 +1516,29 @@ function renderDashSignInChart(buckets) {
   });
 }
 
+// Aggregate the 30 daily buckets into 7-day groups (last group may be partial).
+// Used for low-volume tenants where 30 single-day bars look sparse/noisy.
+function groupBucketsWeekly(daily) {
+  const groups = [];
+  for (let i = 0; i < daily.length; i += 7) {
+    const chunk = daily.slice(i, i + 7);
+    const users = new Set();
+    let count = 0;
+    chunk.forEach(b => { count += b.count; b.users.forEach(u => users.add(u)); });
+    const endDay = chunk[chunk.length - 1].label.replace(/^[A-Za-z]+\s/, ''); // strip month from end label
+    groups.push({ label: `${chunk[0].label}–${endDay}`, count, users });
+  }
+  return groups;
+}
+
+// Choose daily vs weekly buckets based on how sparse the activity is. Returns the
+// display buckets plus a `weekly` flag so the chart title can reflect the grouping.
+function dashSignInDisplayBuckets(signIns) {
+  const daily = buildDailySignInBuckets(signIns, 30);
+  const weekly = daily.filter(b => b.count > 0).length <= 8; // ≤8 active days ⇒ too sparse for daily
+  return { buckets: weekly ? groupBucketsWeekly(daily) : daily, weekly };
+}
+
 // ── Dashboard trend snapshot (persisted per-tenant in localStorage) ──────────
 // Lets the dashboard show "▲/▼ since <date>" deltas vs the previous assessment.
 function dashSnapshotKey() {
@@ -1602,7 +1625,7 @@ async function loadDashboard() {
     const lowCount  = aiApps.filter(sp => riskByApp.get(sp.id) === 'low').length;
 
     // sign-in timeline (last 30 days bucketed by calendar day, UTC)
-    const buckets = buildDailySignInBuckets(aiSignIns, 30);
+    const { buckets, weekly: signinsWeekly } = dashSignInDisplayBuckets(aiSignIns);
 
     // Diagnostics: what each API actually returned
     const riskyAgentsDiag = STATE.data.riskyAgents || [];
@@ -1671,6 +1694,21 @@ async function loadDashboard() {
     actions.sort((a,b) => SEV[a.sev].o - SEV[b.sev].o);
     const topActions = actions.slice(0, 5);
 
+    // ── Assessment coverage / blind-spots ─────────────────────────────────────
+    // Surfaces which telemetry feeds actually returned data, so the reader knows what
+    // the assessment could NOT see (a 0/error feed silently weakens every finding).
+    const coverage = [
+      { label:'Service Principals',           ok: !STATE.data.spError,         err: STATE.data.spError },
+      { label:'OAuth Grants',                 ok: !STATE.data.grantsError,     err: STATE.data.grantsError, partial: !!STATE.data.grantsNote },
+      { label:'Sign-in Logs',                 ok: !STATE.data.signInsError,    err: STATE.data.signInsError, partial: !STATE.data.signInsError && signIns.length === 0 },
+      { label:'Defender for Cloud Apps',      ok: Array.isArray(STATE.data.mcasApps) && STATE.data.mcasApps.length > 0 },
+      { label:'Identity Protection · Users',  ok: !STATE.data.riskyUsersError,  err: STATE.data.riskyUsersError },
+      { label:'Identity Protection · Agents', ok: !STATE.data.riskyAgentsError, err: STATE.data.riskyAgentsError, partial: STATE.data.riskyAgentsUsedFallback },
+      { label:'Microsoft Secure Score',       ok: !!STATE.data.secureScore },
+      { label:'Conditional Access',           ok: !STATE.data.caError,         err: STATE.data.caError },
+    ];
+    const covConnected = coverage.filter(c => c.ok && !c.partial).length;
+
     el.innerHTML = `
       <!-- CISO Executive Banner -->
       <div class="card" style="margin-bottom:16px;border-left:4px solid ${cisoRiskColor}">
@@ -1695,6 +1733,29 @@ async function loadDashboard() {
               + '<span style="font-size:13px;font-weight:700;color:' + m.color + '">' + esc(m.value) + '</span>'
               + '</div>').join('')}
         </div>
+      </div>
+
+      <!-- Assessment Coverage / Blind-spots -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">🛰️ Assessment Coverage</div>
+          <span style="font-size:11px;color:var(--text-muted)">${covConnected}/${coverage.length} data sources fully connected</span>
+        </div>
+        <div class="card-body" style="display:flex;flex-wrap:wrap;gap:8px">
+          ${coverage.map(c => {
+            const state = c.err ? 'err' : c.partial ? 'partial' : c.ok ? 'ok' : 'none';
+            const cfg = {
+              ok:      ['var(--risk-low)',      '●', 'Connected'],
+              partial: ['var(--risk-medium)',   '◐', 'Partial / limited'],
+              err:     ['var(--risk-critical)', '○', 'Unavailable'],
+              none:    ['var(--text-dim)',      '○', 'No data / not connected'],
+            }[state];
+            return `<span title="${esc(c.err ? c.err.slice(0,140) : cfg[2])}" style="display:inline-flex;align-items:center;gap:6px;font-size:11px;padding:4px 10px;border-radius:20px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-muted)">
+              <span style="color:${cfg[0]};font-size:12px;line-height:1">${cfg[1]}</span>${esc(c.label)}
+            </span>`;
+          }).join('')}
+        </div>
+        ${coverage.some(c => !c.ok || c.partial) ? `<div style="padding:0 16px 12px;font-size:11px;color:var(--text-dim)">○ / ◐ marked sources are blind spots — findings may be incomplete for those areas (missing role, licence, or service not provisioned).</div>` : ''}
       </div>
 
       <!-- Top Risks & Recommended Actions -->
@@ -1752,7 +1813,7 @@ async function loadDashboard() {
       <div class="grid-2-1">
         <div class="card">
           <div class="card-header">
-            <div class="card-title">AI App Sign-ins (last 30 days)</div>
+            <div class="card-title">AI App Sign-ins (last 30 days) <span id="dash-signins-mode" style="font-size:10px;color:var(--text-dim);font-weight:400">· ${signinsWeekly ? 'weekly' : 'daily'}</span></div>
             <span class="data-source source-live">● Live</span>
           </div>
           <div class="card-body">
@@ -1866,7 +1927,10 @@ async function loadDashboard() {
 
       // Only re-render chart if targeted data differs from the initial keyword-filtered set
       if (targeted === STATE.data.signIns) return;
-      renderDashSignInChart(buildDailySignInBuckets(targeted, 30));
+      const disp = dashSignInDisplayBuckets(targeted);
+      renderDashSignInChart(disp.buckets);
+      const modeEl = document.getElementById('dash-signins-mode');
+      if (modeEl) modeEl.textContent = '· ' + (disp.weekly ? 'weekly' : 'daily');
     }).catch(() => {});
   } catch (e) {
     el.innerHTML = `<div class="perm-warn">⚠️ Could not load dashboard: ${esc(e.message)}</div>`;
