@@ -577,6 +577,7 @@ const AI_KEYWORDS = [
   'perplexity','you.com','phind',
   'deepl',
   'deepseek',
+  'ollama','openrouter','open router','openclaw','open claw','lm studio','localai','librechat','jan ai',
   'huggingface','hugging face',
   'character.ai','character ai',
   'cohere',
@@ -611,6 +612,12 @@ const APP_MODEL_MAP = [
   { pattern:/replicate/i,        model:'Various',           provider:'Replicate',  residency:'USA',           training:'Varies',  gdprOk:false, risk:'high' },
   { pattern:/elevenlabs/i,       model:'ElevenLabs',        provider:'ElevenLabs', residency:'USA',           training:'Yes',     gdprOk:false, risk:'medium' },
   { pattern:/runway/i,           model:'Gen-2',             provider:'Runway',     residency:'USA',           training:'Yes',     gdprOk:false, risk:'medium' },
+  // ── Shadow / unmanaged AI tooling commonly seen in Cloud Discovery ──
+  { pattern:/openrouter|open router/i,    model:'Multi-provider proxy',    provider:'OpenRouter',   residency:'Global (multi-provider)', training:'Varies',  gdprOk:false, risk:'high' },
+  { pattern:/ollama/i,                    model:'Local LLM (self-hosted)', provider:'Ollama',       residency:'Local / self-hosted',     training:'No',      gdprOk:true,  risk:'medium' },
+  { pattern:/openclaw|open claw/i,        model:'Unknown (external client)', provider:'OpenClaw',   residency:'Unknown',                 training:'Unknown', gdprOk:false, risk:'high' },
+  { pattern:/lm studio|localai|\bjan\b/i, model:'Local LLM (self-hosted)', provider:'Local runtime',residency:'Local / self-hosted',     training:'No',      gdprOk:true,  risk:'medium' },
+  { pattern:/librechat/i,                 model:'Multi-provider chat UI',  provider:'LibreChat',    residency:'Varies',                  training:'Varies',  gdprOk:false, risk:'high' },
 ];
 
 // OAuth scopes that are high-risk to grant to external AI apps
@@ -2669,15 +2676,70 @@ async function loadModels() {
     ], mcasAiApps);
     const anyExtLlmUsage = extLlmProviders.some(p => p.usage.detected);
 
+    // ── Shadow-AI risk roll-ups for the KPI strip ─────────────────────────────
+    const isManagedModel   = m => m.provider === 'Microsoft';
+    const isUnmanagedModel = m => { const s = [...m.sources]; return s.length > 0 && s.every(x => x === 'mcas'); };
+    const kpiTotal     = models.length;
+    const kpiExternal  = models.filter(m => !isManagedModel(m)).length;
+    const kpiUnmanaged = models.filter(isUnmanagedModel).length;
+    const kpiNonGdpr   = models.filter(m => !m.gdprOk).length;
+    const kpiTrains    = models.filter(m => /^(yes|opt-?out|varies)/i.test(m.training || '')).length;
+
+    // ── Data-residency distribution (covers ALL detection sources, not just sign-ins) ─
+    const residencyBucket = m => {
+      const r = (m.residency || '').toLowerCase();
+      if (!r || r === 'unknown') return 'Unknown';
+      if (/local|on-?device|self-?hosted/.test(r)) return 'Local';
+      if (/\beu\b|europe/.test(r) && !/usa|global|china|\bau\b|au\+/.test(r)) return 'EU';
+      return 'Outside EU';
+    };
+    const RES_ORDER = ['EU','Local','Outside EU','Unknown'];
+    const resCounts = { EU:0, Local:0, 'Outside EU':0, Unknown:0 };
+    models.forEach(m => { resCounts[residencyBucket(m)]++; });
+
     el.innerHTML = `
       ${STATE.data.signInsError ? permWarn('AuditLog.Read.All', STATE.data.signInsError) : ''}
       <div class="section-header">
-        <div class="section-title">AI Model Usage</div>
+        <div class="section-title">AI Models in Use — Shadow &amp; Sanctioned</div>
         <span class="data-source source-live">● Sign-in logs · Service principals${mcasAiApps.length ? ' · Defender for Cloud Apps' : ''}</span>
       </div>
+
+      <div class="kpi-row" style="grid-template-columns:repeat(5,1fr);margin-bottom:16px">
+        <div class="kpi-card info">
+          <div class="kpi-label">Models in Use</div>
+          <div class="kpi-value text-blue">${kpiTotal}</div>
+          <div class="kpi-delta">distinct AI models detected</div>
+          <div class="kpi-icon">🤖</div>
+        </div>
+        <div class="kpi-card ${kpiExternal > 0 ? 'high' : 'low'}">
+          <div class="kpi-label">External / Shadow</div>
+          <div class="kpi-value ${kpiExternal > 0 ? 'text-high' : 'text-low'}">${kpiExternal}</div>
+          <div class="kpi-delta">non-Microsoft providers</div>
+          <div class="kpi-icon">🌐</div>
+        </div>
+        <div class="kpi-card ${kpiUnmanaged > 0 ? 'critical' : 'low'}">
+          <div class="kpi-label">Unmanaged (Shadow)</div>
+          <div class="kpi-value ${kpiUnmanaged > 0 ? 'text-critical' : 'text-low'}">${kpiUnmanaged}</div>
+          <div class="kpi-delta">MCAS-only · no Entra app / sign-in</div>
+          <div class="kpi-icon">👻</div>
+        </div>
+        <div class="kpi-card ${kpiNonGdpr > 0 ? 'high' : 'low'}">
+          <div class="kpi-label">Non-GDPR</div>
+          <div class="kpi-value ${kpiNonGdpr > 0 ? 'text-high' : 'text-low'}">${kpiNonGdpr}</div>
+          <div class="kpi-delta">no adequate EU safeguards</div>
+          <div class="kpi-icon">🇪🇺</div>
+        </div>
+        <div class="kpi-card ${kpiTrains > 0 ? 'medium' : 'low'}">
+          <div class="kpi-label">Train on Prompts</div>
+          <div class="kpi-value ${kpiTrains > 0 ? 'text-medium' : 'text-low'}">${kpiTrains}</div>
+          <div class="kpi-delta">prompts may train the model</div>
+          <div class="kpi-icon">🧠</div>
+        </div>
+      </div>
+
       <div class="grid-2">
         <div class="card">
-          <div class="card-header"><div class="card-title">Models by Sign-in Events (30d)</div></div>
+          <div class="card-header"><div class="card-title">Data Residency of Models in Use</div><span class="text-muted" style="font-size:11px">all detection sources</span></div>
           <div class="card-body">
             <div class="chart-container" style="height:220px"><canvas id="models-bar"></canvas></div>
           </div>
@@ -2697,7 +2759,7 @@ async function loadModels() {
       </div>
 
       <div class="card">
-        <div class="card-header"><div class="card-title">Sign-in Events by AI App (30d)</div></div>
+        <div class="card-header"><div class="card-title">Sign-in Events by AI App (30d)</div><span class="text-muted" style="font-size:11px">Entra-authenticated apps only · shadow apps appear under Shadow AI Apps</span></div>
         <div class="table-wrap">
           <table>
             <thead><tr><th>App / Service</th><th>Sign-in Count</th><th>Underlying Model</th><th>Data Residency</th><th>Risk</th></tr></thead>
@@ -2851,20 +2913,27 @@ async function loadModels() {
 
     renderModelTable();
 
-    // Chart
+    // Chart — data-residency distribution across ALL detected models (sign-ins,
+    // service principals AND Cloud Discovery), so shadow models aren't hidden the way
+    // a sign-in-only chart hides everything that doesn't authenticate through Entra.
     destroyChart('models-bar');
-    if (modelRows.length) {
-      const colors = ['#f85149','#ff7b72','#f0883e','#e3b341','#3fb950','#388bfd','#a371f7'];
-      STATE.charts['models-bar'] = new Chart(document.getElementById('models-bar'), {
-        type: 'bar',
-        data: {
-          labels: modelRows.slice(0,8).map(([n])=>n.length>20?n.slice(0,18)+'…':n),
-          datasets:[{label:'Sign-ins',data:modelRows.slice(0,8).map(([,c])=>c),
-            backgroundColor:modelRows.slice(0,8).map((_,i)=>colors[i%colors.length]+'bb'),borderRadius:4}],
-        },
-        options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
-          scales:{x:{grid:{display:false},ticks:{font:{size:10}}},y:{grid:{color:'rgba(48,54,61,.5)'}}}},
-      });
+    {
+      const RES_COLORS = { EU:'#3fb950', Local:'#388bfd', 'Outside EU':'#f85149', Unknown:'#8b949e' };
+      const resLabels = RES_ORDER.filter(k => resCounts[k] > 0);
+      const canvas = document.getElementById('models-bar');
+      if (resLabels.length && canvas) {
+        STATE.charts['models-bar'] = new Chart(canvas, {
+          type: 'doughnut',
+          data: {
+            labels: resLabels.map(k => `${k} (${resCounts[k]})`),
+            datasets: [{ data: resLabels.map(k => resCounts[k]), backgroundColor: resLabels.map(k => RES_COLORS[k]), borderWidth: 0 }],
+          },
+          options: { responsive:true, maintainAspectRatio:false, cutout:'58%',
+            plugins:{ legend:{ position:'right', labels:{ boxWidth:10, padding:10, font:{size:11} } } } },
+        });
+      } else if (canvas) {
+        canvas.parentElement.innerHTML = '<div class="empty-state text-muted" style="padding:40px">No models detected</div>';
+      }
     }
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
