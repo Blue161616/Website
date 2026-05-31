@@ -418,9 +418,8 @@
       <div class="nav-section-label">Compliance &amp; Governance</div>
       <button class="nav-item" onclick="navigate('compliance',this)"><span class="nav-icon">✅</span>Compliance</button>
       <button class="nav-item" onclick="navigate('protection',this)"><span class="nav-icon">🛡️</span>Agent 365 Protections</button>
-      <button class="nav-item" onclick="navigate('users',this)"><span class="nav-icon">👥</span>AI Users &amp; Agents</button>
+      <button class="nav-item" onclick="navigate('users',this)"><span class="nav-icon">👥</span>AI &amp; Agent Users</button>
       <div class="nav-section-label">Settings</div>
-      <button class="nav-item" onclick="navigate('policies',this)"><span class="nav-icon">📋</span>Policies</button>
       <button class="nav-item" onclick="navigate('licenses',this)"><span class="nav-icon">🪪</span>Licenses</button>
     </nav>
     <div class="sidebar-footer">
@@ -494,10 +493,6 @@
         <div id="alerts-content"><div class="section-loading"><span class="spinner"></span>Loading alerts…</div></div>
       </div>
 
-      <!-- ══ POLICIES ══ -->
-      <div class="page" id="page-policies">
-        <div id="policies-content"><div class="section-loading"><span class="spinner"></span>Loading policies…</div></div>
-      </div>
 
       <!-- ══ LICENSES ══ -->
       <div class="page" id="page-licenses">
@@ -1365,7 +1360,7 @@ function destroyChart(key) {
 const PAGE_TITLES = {
   dashboard:'Dashboard','shadow-apps':'Shadow AI Apps',models:'AI Models',
   agents:'AI Agents','data-risk':'Data Risk & Consent',compliance:'Compliance',
-  users:'AI Users & Agent Users',alerts:'AI & Agent Security Alerts',policies:'Policies',licenses:'Licenses',
+  users:'AI & Agent Users',alerts:'AI & Agent Security Alerts',licenses:'Licenses',
   protection:'Agent 365 Protections',sharing:'External Sharing Exposure',labels:'Sensitivity Label Exposure',
   copilot:'M365 Copilot Usage',
 };
@@ -1374,7 +1369,6 @@ const PAGE_LOADERS = {
   dashboard: loadDashboard, 'shadow-apps': loadShadowApps,
   models: loadModels, agents: loadAgents, 'data-risk': loadDataRisk,
   compliance: loadCompliance, users: loadUsers, alerts: loadAlerts,
-  policies: loadPolicies,
   licenses: loadLicenses,
   protection: loadProtection,
   sharing: loadExternalSharing,
@@ -1414,7 +1408,7 @@ function refreshAll() {
   Object.values(STATE.charts).forEach(c => c.destroy());
   STATE.charts = {};
   // reset all page content
-  ['shadow','models','agents','mcp','copilot','risk','compliance','users','alerts','policies','licenses','protection','sharing','labels','consent'].forEach(k => {
+  ['shadow','models','agents','copilot','risk','compliance','users','alerts','licenses','protection','sharing','labels'].forEach(k => {
     const el = document.getElementById(k + '-content');
     if (el) el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Reloading…</div>';
   });
@@ -1572,9 +1566,12 @@ function saveDashSnapshot(metrics, extra) {
 async function loadDashboard() {
   const el = document.getElementById('dash-content');
   try {
-    const [sps, grants, signIns, users, riskyUsers, caP] = await Promise.all([
+    const [sps, grants, signIns, users, riskyUsers, caP, skus, spSettings, labels] = await Promise.all([
       fetchServicePrincipals(), fetchOAuth2Grants(), fetchSignIns(),
       fetchUsers(), fetchRiskyUsers(), fetchCAPolicies(),
+      fetchSubscribedSkus().catch(() => []),
+      fetchSharePointSettings().catch(() => null),
+      fetchSensitivityLabels().catch(() => []),
       fetchSecureScore().catch(() => null),
       fetchRiskyAgents().catch(() => []),
       // Fetch cloud discovery in parallel so the shadow KPI is correct on first load.
@@ -1651,9 +1648,48 @@ async function loadDashboard() {
     const aiModelCount = aiModelKeySet.size;
     const aiNonGdpr = Array.from(aiModelKeySet).filter(k => { const [,prov] = k.split('|'); return aiApps.some(sp => { const i = detectModel(sp.displayName); return i.provider === prov && !i.gdprOk; }); }).length;
     const agentIdentities = STATE.data.agentIdentityCount ?? (STATE.data.agentSps || []).length;
+
+    // ── Licensing & protection coverage (CISO entitlement view) ───────────────
+    const hasE7Agent = !!agent365Sku(skus);
+    const hasP2      = !!skuLicensed(skus, /AAD_PREMIUM_P2/i);
+    const hasCopilot = !!skuLicensed(skus, /COPILOT/i);
+    // Agent Conditional Access enforcement (enforced vs report-only)
+    const isAgentCa = p => {
+      const u = p.conditions?.users || {};
+      return (u.includeUsers||[]).includes('AllAgentIdUsers') || (u.includeAgents||[]).length > 0 || isAiCaPolicy(p);
+    };
+    const agentCa = caP.filter(isAgentCa);
+    const agentCaEnforced = agentCa.filter(p => p.state === 'enabled').length;
+
+    // ── Data oversharing — real signals (labels reachable by AI + external sharing) ──
+    const OVERSHARE_SCOPES = ['Files.Read.All','Files.ReadWrite.All','Sites.Read.All','Sites.ReadWrite.All','Mail.Read','Mail.ReadWrite'];
+    const fileAiApps = aiApps.filter(sp => getScopesForSp(sp.id, grants).some(s => OVERSHARE_SCOPES.includes(s)));
+    const anonSharing = spSettings?.sharingCapability === 'externalUserAndGuestSharing';
+    const labelSens = l => l.sensitivity ?? l.priority ?? 0;
+    const maxLabelSens = (labels||[]).reduce((m,l) => Math.max(m, labelSens(l)), 0);
+    const highSensLabels = (labels||[]).filter(l => labelSens(l) > 0 && labelSens(l) >= maxLabelSens * 0.6);
+    const highSensReachable = (highSensLabels.length > 0 && fileAiApps.length > 0) ? highSensLabels.length : 0;
+
+    // ── Agent governance — dormant (from sign-in activity) + ownerless (if cached) ──
+    const agentSpForGov = sps.filter(sp => sp.servicePrincipalType === 'ServiceIdentity' || AGENT_KEYWORDS.some(k => (sp.displayName||'').toLowerCase().includes(k)));
+    const dormantAgents = agentSpForGov.filter(sp => {
+      const sia = sp.signInActivity;
+      const ref = sia?.lastSignInDateTime || sia?.lastNonInteractiveSignInDateTime || sp.createdDateTime;
+      return ref ? (Date.now() - new Date(ref).getTime()) / 86400000 >= 90 : false;
+    }).length;
+    let ownerlessBp = 0, totalBp = 0;
+    if (STATE.data.agentSps && STATE.data.agentOwnersSponsors) {
+      const bp = STATE.data.agentSps.filter(sp => getAgentType(sp).type === 'blueprint');
+      totalBp = bp.length;
+      ownerlessBp = bp.filter(sp => { const os = STATE.data.agentOwnersSponsors[sp.id]; return !(os?.owners?.length) && !(os?.sponsors?.length); }).length;
+    }
+
+    // ── AI users (people touching AI or flagged risky) for the re-pointed KPI ──
+    const aiUserCount = new Set([...aiUsers, ...riskyAiUsers.map(u => u.userPrincipalName)].filter(Boolean)).size;
+
     const diag = [
       // Row 1
-      { label:'Users', raw: users.length, filtered: users.filter(u=>u.accountEnabled).length, filteredLabel:'enabled', ok: !STATE.data.usersError, err: STATE.data.usersError },
+      { label:'AI Users', raw: aiUserCount, filtered: riskyAiUsers.length, filteredLabel:'risky', ok: !STATE.data.usersError, err: STATE.data.usersError },
       { label:'Agent Identities', raw: agentIdentities, filtered: riskyAgentsActive, filteredLabel:'with active risk', worse:'up', ok: !STATE.data.agentSpsError, err: STATE.data.agentSpsError,
         warn: riskyAgentsActive > 0 ? riskyAgentsActive + ' with active risk' : null },
       { label:'Shadow AI Apps', raw: mcasAll.length, filtered: mcasUnsanctioned, filteredLabel:'unsanctioned', worse:'up', ok: mcasAll.length > 0, err: null,
@@ -1667,7 +1703,8 @@ async function loadDashboard() {
         warn: !STATE.data.riskyAgentsError && riskyAgentsActive > 0 ? riskyAgentsActive + ' agent(s) with active risk' : null },
       { label:'AI Models', raw: aiModelCount, filtered: aiNonGdpr, filteredLabel:'non-GDPR', ok: aiModelCount > 0, err: null,
         warn: aiNonGdpr > 0 ? aiNonGdpr + ' non-GDPR compliant' : null },
-      { label:'CA Policies', raw: caP.length, filtered: caP.filter(p=>p.state==='enabled').length, filteredLabel:'enabled', ok: !STATE.data.caError, err: STATE.data.caError },
+      { label:'Agent CA Coverage', raw: agentCaEnforced, filtered: agentCa.length, filteredLabel:'agent policies', worse:'down', ok: !STATE.data.caError, err: STATE.data.caError,
+        warn: agentCa.length > 0 && agentCaEnforced === 0 ? 'agent CA report-only · not enforced' : null },
     ];
 
     // CISO banner metrics
@@ -1676,7 +1713,8 @@ async function loadDashboard() {
     const cisoNonEuApps    = aiApps.filter(sp => !detectModel(sp.displayName).gdprOk).length;
     const cisoDataRes      = cisoNonEuApps > 5 ? 'High' : cisoNonEuApps > 1 ? 'Medium' : cisoNonEuApps > 0 ? 'Low' : 'Safe';
     const cisoDataResColor = { High:'var(--risk-high)', Medium:'var(--risk-medium)', Low:'var(--risk-low)', Safe:'var(--risk-low)' }[cisoDataRes];
-    const cisoSensitive    = highRiskAi.length > 3 ? 'High' : highRiskAi.length > 0 ? 'Medium' : 'Low';
+    const cisoSensitive    = (highSensReachable > 0 || (anonSharing && fileAiApps.length > 0)) ? 'High'
+                           : (fileAiApps.length > 0 || highRiskAi.length > 0) ? 'Medium' : 'Low';
     const cisoSensColor    = { High:'var(--risk-high)', Medium:'var(--risk-medium)', Low:'var(--risk-low)' }[cisoSensitive];
     const cisoUnsanctioned = (STATE.data.mcasApps || []).filter(a => {
       const s = (a.status || '').toLowerCase();
@@ -1700,12 +1738,20 @@ async function loadDashboard() {
     const SEV = { critical:{o:0,label:'Critical'}, high:{o:1,label:'High'}, medium:{o:2,label:'Medium'} };
     const actions = [];
     if (highRiskAi.length > 0) actions.push({ sev:'critical', icon:'🔑', title:`${highRiskAi.length} AI app${highRiskAi.length>1?'s':''} hold high-risk OAuth scopes`, desc:'Mail, Files or Calendar access granted to AI apps — review and revoke unneeded grants.', page:'shadow-apps', cta:'Review apps' });
-    if (caP.filter(p=>p.state==='enabled').length === 0) actions.push({ sev:'high', icon:'📋', title:'No Conditional Access policies enforced', desc:'AI app access is not governed by Conditional Access controls.', page:'policies', cta:'Review policies' });
+    if (caP.filter(p=>p.state==='enabled').length === 0) actions.push({ sev:'high', icon:'📋', title:'No Conditional Access policies enforced', desc:'AI app access is not governed by Conditional Access controls.', page:'protection', cta:'Agent 365 Protections' });
     if (aiSignIns.length > 0) actions.push({ sev:'high', icon:'🔌', title:'External LLM usage detected', desc:'Third-party AI models are in use — confirm DPA, data residency and per-user scope.', page:'models', cta:'View models' });
     if (aiNonGdpr > 0) actions.push({ sev:'high', icon:'🌍', title:`${aiNonGdpr} non-GDPR-compliant model${aiNonGdpr>1?'s':''} in use`, desc:'Models processing data outside the EU or without adequate safeguards.', page:'compliance', cta:'GDPR posture' });
     if (riskyAgentsActive > 0) actions.push({ sev:'high', icon:'⚡', title:`${riskyAgentsActive} agent${riskyAgentsActive>1?'s':''} with active risk`, desc:'Identity Protection flagged these agent identities — investigate.', page:'agents', cta:'Review agents' });
     if (riskyAiUsers.length > 0) actions.push({ sev:'medium', icon:'⚠️', title:`${riskyAiUsers.length} user${riskyAiUsers.length>1?'s':''} with active risk`, desc:'Risky users may expose corporate data to AI apps.', page:'users', cta:'Review users' });
     if (mcasUnsanctioned > 0) actions.push({ sev:'medium', icon:'👻', title:`${mcasUnsanctioned} unsanctioned shadow AI app${mcasUnsanctioned>1?'s':''}`, desc:'Discovered via Defender for Cloud Apps — sanction or block.', page:'shadow-apps', cta:'Review' });
+    // Data oversharing (real signals from Purview labels × external sharing)
+    if (highSensReachable > 0) actions.push({ sev:'critical', icon:'🏷️', title:`${highSensReachable} high-sensitivity label${highSensReachable>1?'s':''} reachable by AI apps`, desc:'AI apps with Files/Mail access can read Confidential/Restricted-labelled content.', page:'labels', cta:'Label exposure' });
+    else if (anonSharing && fileAiApps.length > 0) actions.push({ sev:'high', icon:'🌐', title:'Anonymous sharing + AI file access', desc:'"Anyone with link" sharing is on and AI apps can read SharePoint/OneDrive files.', page:'sharing', cta:'External sharing' });
+    // Licensing / enforcement gaps (can we even mitigate?)
+    if (!hasE7Agent || !hasP2) actions.push({ sev:'high', icon:'🪪', title:'Agent protection licensing gap', desc:`${!hasE7Agent ? 'No Microsoft 365 E7 / Agent 365 license' : 'No Entra ID P2'} — agent protections aren't fully available or compliant.`, page:'protection', cta:'Agent 365 Protections' });
+    if (agentCa.length > 0 && agentCaEnforced === 0) actions.push({ sev:'high', icon:'🛡️', title:'Agent CA policies are report-only', desc:`${agentCa.length} agent-targeted CA polic${agentCa.length>1?'ies are':'y is'} not enforced — controls don't actually block.`, page:'protection', cta:'Agent 365 Protections' });
+    // Agent governance (dormant / ownerless)
+    if (dormantAgents > 0 || ownerlessBp > 0) actions.push({ sev:'medium', icon:'💤', title:'Agent governance gaps', desc:`${dormantAgents} dormant agent identit${dormantAgents!==1?'ies':'y'}${ownerlessBp > 0 ? ` · ${ownerlessBp} of ${totalBp} blueprints ownerless` : ''} — decommission unused agents & assign owners.`, page:'agents', cta:'Review agents' });
     actions.sort((a,b) => SEV[a.sev].o - SEV[b.sev].o);
     const topActions = actions.slice(0, 5);
 
@@ -1748,6 +1794,27 @@ async function loadDashboard() {
               + '<span style="font-size:13px;font-weight:700;color:' + m.color + '">' + esc(m.value) + '</span>'
               + '</div>').join('')}
         </div>
+      </div>
+
+      <!-- Licensing & Protection Coverage -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">🪪 Licensing &amp; Protection Coverage</div>
+          <span style="font-size:11px;color:var(--text-muted)">Can we mitigate? — entitlements &amp; enforcement</span>
+        </div>
+        <div class="card-body" style="display:flex;flex-wrap:wrap;gap:8px">
+          ${[
+            { ok: hasE7Agent,          label: 'Microsoft 365 E7 / Agent 365',     need: 'agent protections' },
+            { ok: hasP2,               label: 'Entra ID P2',                       need: 'risky agents & users detection' },
+            { ok: hasCopilot,          label: 'Microsoft 365 Copilot',             need: 'Copilot governance' },
+            { ok: agentCaEnforced > 0, label: 'Agents covered by enforced CA',     need: 'block controls', warn: agentCa.length > 0 && agentCaEnforced === 0 },
+          ].map(c => {
+            const state = c.ok ? 'ok' : (c.warn ? 'warn' : 'no');
+            const cfg = { ok:['var(--risk-low)','✅'], warn:['var(--risk-medium)','◐'], no:['var(--risk-critical)','❌'] }[state];
+            return `<span title="Required for ${esc(c.need)}" style="display:inline-flex;align-items:center;gap:6px;font-size:11px;padding:4px 10px;border-radius:20px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-muted)"><span style="color:${cfg[0]};font-size:12px;line-height:1">${cfg[1]}</span>${esc(c.label)}</span>`;
+          }).join('')}
+        </div>
+        ${(!hasE7Agent || !hasP2 || (agentCa.length > 0 && agentCaEnforced === 0)) ? `<div style="padding:0 16px 12px;font-size:11px;color:var(--text-dim)">❌ / ◐ items limit what you can mitigate — agent protections need Microsoft 365 E7 or Agent 365; risky-agent/user detection needs Entra P2; agent CA policies must be <strong>enforced</strong> (not report-only) to block.</div>` : ''}
       </div>
 
       <!-- Assessment Coverage / Blind-spots -->
@@ -1809,7 +1876,7 @@ async function loadDashboard() {
           // reserved for warnings/errors so a healthy-looking card never masks risk.
           const alertCls = hasErr ? 'critical' : hasWarn ? 'medium' : 'info';
           const valColor = hasErr ? 'var(--risk-critical)' : hasWarn ? 'var(--risk-medium)' : d.raw > 0 ? 'var(--accent-blue)' : 'var(--text-muted)';
-          const icons    = { 'Users':'👥','Risky Users (P2)':'⚠️','Shadow AI Apps':'👻','AI Models':'🤖','Agent Identities':'🪪','Sign-in Events (30d)':'📈','Risky Agents':'⚡','CA Policies':'📋' };
+          const icons    = { 'AI Users':'👥','Risky Users (P2)':'⚠️','Shadow AI Apps':'👻','AI Models':'🤖','Agent Identities':'🪪','Sign-in Events (30d)':'📈','Risky Agents':'⚡','Agent CA Coverage':'🔐' };
           const delta    = d.err ? '❌ ' + d.err.slice(0,50) : d.warn ? '⚠️ ' + d.warn : d.filtered !== null ? d.filtered + ' ' + (d.filteredLabel||'') : '● Loaded';
           const isShadow   = d.label === 'Shadow AI Apps';
           const isAgent    = d.label === 'Agent Identities';
@@ -5412,7 +5479,7 @@ async function loadUsers() {
       ${STATE.data.usersError ? permWarn('User.Read.All', STATE.data.usersError) : ''}
       <div class="section-header" style="margin-bottom:14px">
         <div>
-          <div class="section-title">AI Users &amp; Agent Users</div>
+          <div class="section-title">AI &amp; Agent Users</div>
           <div class="section-sub">Users who touch AI — AI-app users, agent (service) identities, and Identity-Protection-flagged users · ${aiUsers.length} of ${users.length} directory users</div>
         </div>
         <span class="data-source source-derived">⚡ Sign-ins × Identity Protection</span>
@@ -5982,6 +6049,24 @@ const AI_LICENSE_FLAGS = [
   { test: s => /SPE_E5|ENTERPRISEPREMIUM/i.test(s), label:'M365 E5',   color:'#3fb950', icon:'⭐' },
 ];
 
+// Find an Enabled SKU matching a pattern on its part number OR a bundled service plan.
+function skuLicensed(skus, re) {
+  return (skus || []).find(s => s.capabilityStatus === 'Enabled' &&
+    (re.test(s.skuPartNumber || '') || (s.servicePlans || []).some(p => re.test(p.servicePlanName || ''))));
+}
+
+// Agent 365 entitlement — robust across the many Microsoft 365 E7 plan variants
+// (EEA · no-Teams · HUB · seat-min …) and a standalone Agent 365 SKU. E7 bundles
+// Agent 365 + Copilot + Entra Suite, so we match the E7 family by part number AND
+// fall back to the Agent 365 service plan (which E7 also carries).
+function agent365Sku(skus) {
+  return (skus || []).find(s => s.capabilityStatus === 'Enabled' && (
+    (/E7/.test(s.skuPartNumber || '') && /(?:MICROSOFT_?365|M365|SPE|ENTERPRISE)/i.test(s.skuPartNumber || '')) ||
+    /AGENT_?365/i.test(s.skuPartNumber || '') ||
+    (s.servicePlans || []).some(p => /AGENT_?365/i.test(p.servicePlanName || ''))
+  ));
+}
+
 function getAiLicenseFlag(sku) {
   const part = sku.skuPartNumber || '';
   const hasAiPlan = (sku.servicePlans || []).some(p =>
@@ -6176,10 +6261,16 @@ async function loadProtection() {
   const el = document.getElementById('protection-content');
   el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Loading protection data…</div>';
   try {
-    const [caP, idpStats] = await Promise.all([
+    const [caP, idpStats, skus] = await Promise.all([
       fetchCAPolicies(),
       fetchIdProtectionAgentStats(),
+      fetchSubscribedSkus(),
     ]);
+
+    // Agent 365 protections require a Microsoft 365 E7 (any variant) or a standalone Agent 365 license.
+    const a365sku = agent365Sku(skus);
+    const agentLicensed = !!a365sku;
+    const agentLicName  = a365sku?.skuPartNumber || null;
 
     // ── Agent-targeted CA policies ────────────────────────────────────────
     const enabledCa = caP.filter(p => p.state === 'enabled');
@@ -6239,6 +6330,16 @@ async function loadProtection() {
         </div>
         <span class="data-source source-live">● Entra · Defender XDR</span>
       </div>
+
+      ${agentLicensed
+        ? `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.28);font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">✅</span>
+            <div><strong style="color:var(--risk-low)">Licensed for Agent 365 protections</strong> — <span class="mono" style="font-size:11px">${esc(agentLicName)}</span> detected. The Entra &amp; Defender protections below are available to configure.</div>
+          </div>`
+        : `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.3);font-size:12px;color:var(--text-muted);display:flex;align-items:flex-start;gap:10px">
+            <span style="font-size:18px">⚠️</span>
+            <div><strong style="color:var(--risk-critical)">No Microsoft 365 E7 or Agent 365 license detected.</strong> The protections below — ID Protection for agents, Conditional Access for agents, and Defender inventory/runtime — require <strong>Microsoft 365 E7</strong> or a standalone <strong>Agent 365</strong> license. Without one, these features are <strong>not available and the tenant is non-compliant</strong> for agent protection. See the Licenses page.</div>
+          </div>`}
 
       <div style="display:flex;align-items:center;gap:10px;margin:4px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--border)">
         <span style="font-size:13px;font-weight:700;color:var(--accent-blue)">🔵 Microsoft Entra ID</span>
