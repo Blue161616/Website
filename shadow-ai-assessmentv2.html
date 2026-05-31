@@ -1028,7 +1028,9 @@ async function fetchAutoLabelingPolicies() {
 // Default label activity, Mandatory labelling enforcement, and Auto-labeling events (last 30d).
 async function fetchLabelPolicyKql() {
   if (STATE.data.labelPolicyKql !== undefined) return STATE.data.labelPolicyKql;
-  const kql = [
+  // InformationProtectionEvents is only available in tenants with Purview audit integration;
+  // fall back to CloudAppEvents (universally available in Defender XDR) when it errors.
+  const kqlIPE = [
     'InformationProtectionEvents',
     '| where Timestamp > ago(30d)',
     '| summarize',
@@ -1037,27 +1039,41 @@ async function fetchLabelPolicyKql() {
     '    MandatoryCount = countif(ActionSource == "Mandatory"),',
     '    TotalEvents    = count()',
   ].join(' ');
+  const kqlCAE = [
+    'CloudAppEvents',
+    '| where Timestamp > ago(30d)',
+    '| where ActionType has_any("Label","Sensitivity")',
+    '| extend _raw = tostring(RawEventData)',
+    '| summarize',
+    '    AutoCount      = countif(_raw has_any("Automatic","AutoApply")),',
+    '    DefaultCount   = countif(_raw has "DefaultLabel"),',
+    '    MandatoryCount = countif(_raw has "Mandatory"),',
+    '    TotalEvents    = count()',
+  ].join(' ');
   const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
   if (!token) { STATE.data.labelPolicyKql = { ok: false, code: 'forbidden' }; return STATE.data.labelPolicyKql; }
-  try {
-    const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
-      method: 'POST',
-      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ Query: kql, Timespan: 'P30D' }),
-    });
-    if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + t.slice(0, 200)); }
-    const data = await r.json();
-    const row = (data.results || [])[0] || {};
-    STATE.data.labelPolicyKql = {
-      ok: true,
-      autoCount:      row.AutoCount      || 0,
-      defaultCount:   row.DefaultCount   || 0,
-      mandatoryCount: row.MandatoryCount || 0,
-      totalEvents:    row.TotalEvents    || 0,
-    };
-  } catch (e) {
-    STATE.data.labelPolicyKql = { ok: false, error: e.message };
+  const post = (kql) => fetch(`${GRAPH}/security/runHuntingQuery`, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ Query: kql, Timespan: 'P30D' }),
+  });
+  for (const [kql, src] of [[kqlIPE, 'InformationProtectionEvents'], [kqlCAE, 'CloudAppEvents']]) {
+    try {
+      const r = await post(kql);
+      if (!r.ok) continue;
+      const data = await r.json();
+      const row = (data.results || [])[0] || {};
+      STATE.data.labelPolicyKql = {
+        ok: true, src,
+        autoCount:      row.AutoCount      || 0,
+        defaultCount:   row.DefaultCount   || 0,
+        mandatoryCount: row.MandatoryCount || 0,
+        totalEvents:    row.TotalEvents    || 0,
+      };
+      return STATE.data.labelPolicyKql;
+    } catch (_) {}
   }
+  STATE.data.labelPolicyKql = { ok: false, error: 'label KQL unavailable' };
   return STATE.data.labelPolicyKql;
 }
 // Fetches MIP label-policy settings, normalised into a lower-cased key→value map.
@@ -7391,12 +7407,15 @@ async function loadSensitivityLabels() {
                 <code style="display:block;font-size:10px;background:var(--bg-hover);padding:6px 8px;border-radius:4px;color:var(--accent-blue);word-break:break-all">Connect-IPPSSession<br>Get-LabelPolicy | Select Name,Settings</code>
                 <div style="font-size:10px;color:var(--text-muted);margin-top:6px">Look for <code style="font-size:10px">mandatory</code> = <code style="font-size:10px">true</code> in the Settings output.</div>
               </div>`;
+            const _kqlSrc = kqlPolicy?.src || 'KQL';
             const kqlDefaultCard = kqlPolicy?.ok
               ? resolvedCard('🎯', 'Default label for documents',
                   kqlPolicy.defaultCount > 0
                     ? `<span style="color:var(--risk-low)">✅ Compliant (${kqlPolicy.defaultCount} events in 30d)</span>`
-                    : `<span style="color:var(--risk-high)">⚠️ Non-compliant — no default label activity</span>`,
-                  'InformationProtectionEvents · KQL')
+                    : kqlPolicy.totalEvents > 0
+                      ? `<span style="color:var(--risk-high)">⚠️ Non-compliant — no default label activity</span>`
+                      : `<span style="color:var(--text-muted)">ℹ️ No label events in 30 days — verify in Purview</span>`,
+                  _kqlSrc + ' · KQL')
               : defaultManualCard;
             const defaultCardHtml = defaultResolved
               ? resolvedCard('🎯', 'Default label for documents',
@@ -7409,8 +7428,10 @@ async function loadSensitivityLabels() {
               ? resolvedCard('🔒', 'Mandatory labelling',
                   kqlPolicy.mandatoryCount > 0
                     ? `<span style="color:var(--risk-low)">✅ Compliant (${kqlPolicy.mandatoryCount} events in 30d)</span>`
-                    : `<span style="color:var(--risk-high)">⚠️ Non-compliant — not enforced</span>`,
-                  'InformationProtectionEvents · KQL')
+                    : kqlPolicy.totalEvents > 0
+                      ? `<span style="color:var(--risk-high)">⚠️ Non-compliant — not enforced</span>`
+                      : `<span style="color:var(--text-muted)">ℹ️ No label events in 30 days — verify in Purview</span>`,
+                  _kqlSrc + ' · KQL')
               : mandatoryManualCard;
             const mandatoryCardHtml = mandatoryResolved
               ? resolvedCard('🔒', 'Mandatory labelling',
@@ -7423,8 +7444,8 @@ async function loadSensitivityLabels() {
               ? resolvedCard('🤖', 'Auto-labeling policies',
                   kqlPolicy.autoCount > 0
                     ? `<span style="color:var(--risk-low)">✅ Active (${kqlPolicy.autoCount} events in 30d)</span>`
-                    : `<span style="color:var(--text-muted)">ℹ️ No activity in 30 days</span>`,
-                  'InformationProtectionEvents · KQL')
+                    : `<span style="color:var(--text-muted)">ℹ️ No auto-label activity in 30 days</span>`,
+                  _kqlSrc + ' · KQL')
               : `<div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:14px"><div style="font-weight:600;font-size:12px;margin-bottom:6px">🤖 Auto-labeling policies</div><div style="font-size:11px;color:var(--text-muted)">Not exposed by Graph — verify in Purview or via <code style="font-size:10px">Get-AutoSensitivityLabelPolicy</code></div></div>`;
             const intro = kqlPolicy?.ok
               ? `Policy settings checked via KQL (InformationProtectionEvents, last 30 days)${(defaultResolved || mandatoryResolved) ? ' and Purview label-policy settings.' : '.'}`
