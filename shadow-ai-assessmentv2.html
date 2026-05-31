@@ -558,6 +558,13 @@ const GRAPH_SCOPES = [
   'https://graph.microsoft.com/SharePointTenantSettings.Read.All',
 ];
 
+// Optional/incremental scopes — NOT requested in the core sign-in token (several are
+// admin-consent-required and would break silent token acquisition for everyone).
+// Requested per-feature on demand, and included in the admin-consent URL so they can be granted.
+const OPTIONAL_SCOPES = [
+  'https://graph.microsoft.com/ThreatHunting.Read.All',  // Defender Advanced Hunting (AIAgentsInfo)
+];
+
 // Known AI app patterns for detection (case-insensitive)
 const AI_KEYWORDS = [
   'openai','chatgpt','gpt-4','gpt-3','gpt4','gpt3',
@@ -689,7 +696,7 @@ function adminConsent() {
   // v2.0 adminconsent endpoint — correctly handles all delegated scopes including
   // IdentityRiskyServicePrincipal.Read.All and CloudApp-Discovery.Read.All
   // (the v1.0 /adminconsent endpoint silently drops some v2-only scopes)
-  const allScopes = ['openid', 'offline_access', ...GRAPH_SCOPES]
+  const allScopes = ['openid', 'offline_access', ...GRAPH_SCOPES, ...OPTIONAL_SCOPES]
     .map(s => s.replace('https://graph.microsoft.com/', ''))
     .join(' ');
   const url = 'https://login.microsoftonline.com/organizations/v2.0/adminconsent'
@@ -1260,6 +1267,43 @@ async function fetchIdProtectionAgentStats() {
     STATE.data.idProtectionAgentStatsError = e.message;
   }
   return STATE.data.idProtectionAgentStats;
+}
+
+// Defender XDR "Security for AI agents" — read the live agent inventory/posture via the
+// Advanced Hunting AIAgentsInfo table (Graph security/runHuntingQuery, ThreatHunting.Read.All).
+// Connector/toggle state isn't a settings API, but agents returning here ⇒ it's connected.
+async function fetchAiAgentInventory() {
+  if (STATE.data.aiAgentInv !== undefined) return STATE.data.aiAgentInv;
+  const kql = 'AIAgentsInfo | summarize arg_max(Timestamp, *) by AIAgentId | where AgentStatus != "Deleted" | summarize Agents=count() by RegistrySource';
+  try {
+    // Incremental consent: acquire the hunting scope silently only — never pop up here, so a
+    // missing consent degrades gracefully (shows "needs ThreatHunting.Read.All") instead of
+    // disrupting the app. Admin grants it via "Re-run Admin Consent" (OPTIONAL_SCOPES).
+    let token;
+    try {
+      const app = await getMsal();
+      const res = await app.acquireTokenSilent({ scopes: OPTIONAL_SCOPES, account: STATE.account });
+      token = res.accessToken;
+    } catch {
+      STATE.data.aiAgentInv = { ok: false, rows: [], total: 0, code: 'forbidden', error: 'ThreatHunting.Read.All not consented' };
+      return STATE.data.aiAgentInv;
+    }
+    const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ Query: kql, Timespan: 'P30D' }),
+    });
+    if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + t.slice(0, 200)); }
+    const data = await r.json();
+    const rows = data.results || [];
+    const total = rows.reduce((s, x) => s + (x.Agents ?? x['count_'] ?? 0), 0);
+    STATE.data.aiAgentInv = { ok: true, rows, total };
+  } catch (e) {
+    const msg = e.message || '';
+    STATE.data.aiAgentInv = { ok: false, rows: [], total: 0, error: msg,
+      code: /403|forbidden|authorization/i.test(msg) ? 'forbidden' : /400|bad request|failed to resolve|semantic|recognize/i.test(msg) ? 'unsupported' : 'error' };
+  }
+  return STATE.data.aiAgentInv;
 }
 
 async function fetchGrantPolicies() {
@@ -6062,9 +6106,18 @@ function skuLicensed(skus, re) {
 function agent365Sku(skus) {
   return (skus || []).find(s => s.capabilityStatus === 'Enabled' && (
     (/E7/.test(s.skuPartNumber || '') && /(?:MICROSOFT_?365|M365|SPE|ENTERPRISE)/i.test(s.skuPartNumber || '')) ||
-    /AGENT_?365/i.test(s.skuPartNumber || '') ||
+    /AGENT_?365|AGENT_FRONTIER/i.test(s.skuPartNumber || '') ||
     (s.servicePlans || []).some(p => /AGENT_?365/i.test(p.servicePlanName || ''))
   ));
+}
+
+// Agent-protection service plans bundled in E7 / Agent 365 / Agent Frontier. A SKU can be
+// assigned (licensed) while these plans are still provisioningStatus "Disabled" (not active).
+const AGENT_PROTECTION_PLAN_RE = /AGENT_365\b|DEFENDER_FOR_AI|_FOR_AGENTS|FOR_ASSISTIVE_AGENTS/i;
+function agentProtectionPlanStatus(sku) {
+  const plans = (sku?.servicePlans || []).filter(p => AGENT_PROTECTION_PLAN_RE.test(p.servicePlanName || ''));
+  const active = plans.filter(p => (p.provisioningStatus || '').toLowerCase() === 'success').length;
+  return { total: plans.length, active, disabled: plans.length - active };
 }
 
 function getAiLicenseFlag(sku) {
@@ -6261,16 +6314,18 @@ async function loadProtection() {
   const el = document.getElementById('protection-content');
   el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Loading protection data…</div>';
   try {
-    const [caP, idpStats, skus] = await Promise.all([
+    const [caP, idpStats, skus, aiAgentInv] = await Promise.all([
       fetchCAPolicies(),
       fetchIdProtectionAgentStats(),
       fetchSubscribedSkus(),
+      fetchAiAgentInventory(),
     ]);
 
-    // Agent 365 protections require a Microsoft 365 E7 (any variant) or a standalone Agent 365 license.
+    // Agent 365 protections require a Microsoft 365 E7 (any variant), Agent 365, or Agent Frontier license.
     const a365sku = agent365Sku(skus);
     const agentLicensed = !!a365sku;
     const agentLicName  = a365sku?.skuPartNumber || null;
+    const agentPlans    = agentProtectionPlanStatus(a365sku);  // licensed vs actually provisioned
 
     // ── Agent-targeted CA policies ────────────────────────────────────────
     const enabledCa = caP.filter(p => p.state === 'enabled');
@@ -6331,14 +6386,19 @@ async function loadProtection() {
         <span class="data-source source-live">● Entra · Defender XDR</span>
       </div>
 
-      ${agentLicensed
-        ? `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.28);font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:10px">
-            <span style="font-size:18px">✅</span>
-            <div><strong style="color:var(--risk-low)">Licensed for Agent 365 protections</strong> — <span class="mono" style="font-size:11px">${esc(agentLicName)}</span> detected. The Entra &amp; Defender protections below are available to configure.</div>
-          </div>`
-        : `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.3);font-size:12px;color:var(--text-muted);display:flex;align-items:flex-start;gap:10px">
+      ${!agentLicensed
+        ? `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.3);font-size:12px;color:var(--text-muted);display:flex;align-items:flex-start;gap:10px">
             <span style="font-size:18px">⚠️</span>
-            <div><strong style="color:var(--risk-critical)">No Microsoft 365 E7 or Agent 365 license detected.</strong> The protections below — ID Protection for agents, Conditional Access for agents, and Defender inventory/runtime — require <strong>Microsoft 365 E7</strong> or a standalone <strong>Agent 365</strong> license. Without one, these features are <strong>not available and the tenant is non-compliant</strong> for agent protection. See the Licenses page.</div>
+            <div><strong style="color:var(--risk-critical)">No Microsoft 365 E7 / Agent 365 / Agent Frontier license detected.</strong> The protections below — ID Protection for agents, Conditional Access for agents, and Defender inventory/runtime — require one of these licenses. Without it, these features are <strong>not available and the tenant is non-compliant</strong> for agent protection. See the Licenses page.</div>
+          </div>`
+        : (agentPlans.total > 0 && agentPlans.disabled > 0)
+        ? `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;background:rgba(240,136,62,.08);border:1px solid rgba(240,136,62,.3);font-size:12px;color:var(--text-muted);display:flex;align-items:flex-start;gap:10px">
+            <span style="font-size:18px">◐</span>
+            <div><strong style="color:var(--risk-medium)">Licensed but not fully provisioned</strong> — <span class="mono" style="font-size:11px">${esc(agentLicName)}</span> is assigned, but <strong>${agentPlans.disabled} of ${agentPlans.total}</strong> agent-protection service plans are still <strong>Disabled</strong> (e.g. Defender for AI, Information Protection / DLP for agents, ID Governance for agents). The licence covers them, but they must be <strong>enabled</strong> before they actually protect agents. ${agentPlans.active}/${agentPlans.total} active.</div>
+          </div>`
+        : `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.28);font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">✅</span>
+            <div><strong style="color:var(--risk-low)">Licensed for Agent 365 protections</strong> — <span class="mono" style="font-size:11px">${esc(agentLicName)}</span> detected${agentPlans.total > 0 ? ` · ${agentPlans.active}/${agentPlans.total} agent-protection plans active` : ''}. The Entra &amp; Defender protections below are available to configure.</div>
           </div>`}
 
       <div style="display:flex;align-items:center;gap:10px;margin:4px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--border)">
@@ -6478,8 +6538,36 @@ async function loadProtection() {
               <div style="display:flex;flex-direction:column;gap:8px">${rows.map(defRow).join('')}</div>
             </div>
           </div>`;
-        return card('🗂️', 'AI Agent Inventory &amp; Posture',
-          'Defender XDR discovers AI agents (Copilot Studio, Azure AI Foundry) and surfaces misconfigurations &amp; exposure. The <strong>Security for AI agents</strong> toggle and connector status are not exposed via Graph — verify in the Defender portal.',
+        // Live AI agent inventory via Advanced Hunting (AIAgentsInfo) — connector/toggle
+        // state is inferred from agents being returned.
+        const inv = aiAgentInv || { ok:false, rows:[], total:0 };
+        const liveBlock = inv.ok
+          ? `<div class="card" style="margin-bottom:16px">
+              <div class="card-header">
+                <div class="card-title">🗂️ AI Agent Inventory (live)</div>
+                <span class="data-source source-live" style="font-size:10px">● security/runHuntingQuery · AIAgentsInfo</span>
+              </div>
+              <div class="card-body">
+                <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
+                  <div><div style="font-size:11px;color:var(--text-muted)">Agents discovered</div><div style="font-size:28px;font-weight:700;color:var(--accent-blue);line-height:1">${inv.total}</div></div>
+                  <div style="width:1px;background:var(--border);height:40px"></div>
+                  <div style="flex:1;min-width:0">
+                    <div style="font-size:11px;color:var(--text-muted);margin-bottom:5px">By source · Security for AI: ${inv.total > 0 ? '<span style="color:var(--risk-low)">✅ Connected (inferred)</span>' : '<span style="color:var(--text-dim)">no agents returned</span>'}</div>
+                    <div style="display:flex;flex-wrap:wrap;gap:6px">${inv.rows.length ? inv.rows.map(r => `<span class="badge badge-info" style="font-size:10px">${esc(r.RegistrySource || 'Unknown')}: ${r.Agents ?? r['count_'] ?? 0}</span>`).join('') : '<span class="text-muted" style="font-size:11px">—</span>'}</div>
+                  </div>
+                </div>
+                <div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Live from the <code>AIAgentsInfo</code> Advanced Hunting table (RegistrySource <code>A365</code> = Agent 365). Connector/toggle status is inferred from agents being returned.</div>
+              </div>
+            </div>`
+          : `<div style="margin-bottom:16px;padding:10px 14px;border-radius:8px;background:rgba(56,139,253,.06);border:1px solid rgba(56,139,253,.2);font-size:12px;color:var(--text-muted)">
+              ${inv.code === 'forbidden'
+                ? '🔒 <strong>Live agent inventory needs <code>ThreatHunting.Read.All</code>.</strong> Sign out & back in (or re-run admin consent) to read Defender’s <code>AIAgentsInfo</code> table via Advanced Hunting — it will then replace the manual checks below with the live inventory.'
+                : inv.code === 'unsupported'
+                  ? 'ℹ️ The <code>AIAgentsInfo</code> Advanced Hunting table isn’t available in this tenant yet (Security for AI agents not onboarded / preview not enabled). Verify the configuration below in the Defender portal.'
+                  : 'ℹ️ Live agent inventory unavailable via Advanced Hunting — verify the configuration below in the Defender portal.'}
+            </div>`;
+        return liveBlock + card('🗂️', 'AI Agent Inventory &amp; Posture — Configuration',
+          'These connectors feed the inventory above. The <strong>Security for AI agents</strong> toggle and connector status are configuration that isn’t exposed via Graph — verify in the Defender portal.',
           [
             { label: 'Security for AI agents toggle',           note: 'Enables agent inventory, behaviour monitoring & alerts · must be ON' },
             { label: 'Copilot Studio — AI security posture',    note: 'Connects Copilot Studio agents for exposure & posture visibility' },
