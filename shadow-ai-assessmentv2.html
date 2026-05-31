@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -1288,7 +1288,14 @@ async function fetchIdProtectionAgentStats() {
 // Connector/toggle state isn't a settings API, but agents returning here ⇒ it's connected.
 async function fetchAiAgentInventory() {
   if (STATE.data.aiAgentInv !== undefined) return STATE.data.aiAgentInv;
-  const kql = 'AIAgentsInfo | summarize arg_max(Timestamp, *) by AIAgentId | where AgentStatus != "Deleted" | summarize Agents=count() by RegistrySource';
+  const kql = [
+    'let latest = AIAgentsInfo | summarize arg_max(Timestamp, *) by AIAgentId | where AgentStatus != "Deleted";',
+    'latest | summarize Total=count(),',
+    '  BySource_PowerPlatform=countif(RegistrySource=="PowerPlatform"),',
+    '  BySource_A365=countif(RegistrySource=="A365"),',
+    '  NoAuth=countif(UserAuthenticationType=="None"),',
+    '  MakerCreds=countif(AgentToolsDetails has "author")',
+  ].join(' ');
   // Incremental consent: silent-only token for the hunting scope (no popup).
   const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
   if (!token) {
@@ -1304,8 +1311,17 @@ async function fetchAiAgentInventory() {
     if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + t.slice(0, 200)); }
     const data = await r.json();
     const rows = data.results || [];
-    const total = rows.reduce((s, x) => s + (x.Agents ?? x['count_'] ?? 0), 0);
-    STATE.data.aiAgentInv = { ok: true, rows, total };
+    const row = rows[0] || {};
+    const total = row.Total || 0;
+    STATE.data.aiAgentInv = {
+      ok: true, rows, total,
+      noAuth:     row.NoAuth     || 0,
+      makerCreds: row.MakerCreds || 0,
+      bySource: {
+        PowerPlatform: row.BySource_PowerPlatform || 0,
+        A365:          row.BySource_A365          || 0,
+      },
+    };
   } catch (e) {
     const msg = e.message || '';
     STATE.data.aiAgentInv = { ok: false, rows: [], total: 0, error: msg,
@@ -6581,9 +6597,18 @@ async function loadProtection() {
               <div style="display:flex;flex-direction:column;gap:8px">${rows.map(defRow).join('')}</div>
             </div>
           </div>`;
-        // Live AI agent inventory via Advanced Hunting (AIAgentsInfo) — connector/toggle
-        // state is inferred from agents being returned.
+        // Live AI agent inventory via Advanced Hunting (AIAgentsInfo).
+        // connected = toggle confirmed ON (agents returned). Drives what we hide below.
         const inv = aiAgentInv || { ok:false, rows:[], total:0 };
+        const connected = inv.ok && inv.total > 0;
+
+        const statCell = (label, value, color, sub) => `
+          <div>
+            <div style="font-size:11px;color:var(--text-muted);margin-bottom:2px">${label}</div>
+            <div style="font-size:22px;font-weight:700;color:${color};line-height:1">${value}</div>
+            <div style="font-size:10px;color:var(--text-dim);margin-top:2px">${sub}</div>
+          </div>`;
+
         const liveBlock = inv.ok
           ? `<div class="card" style="margin-bottom:16px">
               <div class="card-header">
@@ -6591,31 +6616,64 @@ async function loadProtection() {
                 <span class="data-source source-live" style="font-size:10px">● security/runHuntingQuery · AIAgentsInfo</span>
               </div>
               <div class="card-body">
-                <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
-                  <div><div style="font-size:11px;color:var(--text-muted)">Agents discovered</div><div style="font-size:28px;font-weight:700;color:var(--accent-blue);line-height:1">${inv.total}</div></div>
-                  <div style="width:1px;background:var(--border);height:40px"></div>
-                  <div style="flex:1;min-width:0">
-                    <div style="font-size:11px;color:var(--text-muted);margin-bottom:5px">By source · Security for AI: ${inv.total > 0 ? '<span style="color:var(--risk-low)">✅ Connected (inferred)</span>' : '<span style="color:var(--text-dim)">no agents returned</span>'}</div>
-                    <div style="display:flex;flex-wrap:wrap;gap:6px">${inv.rows.length ? inv.rows.map(r => `<span class="badge badge-info" style="font-size:10px">${esc(r.RegistrySource || 'Unknown')}: ${r.Agents ?? r['count_'] ?? 0}</span>`).join('') : '<span class="text-muted" style="font-size:11px">—</span>'}</div>
+                <div style="margin-bottom:14px">
+                  ${connected
+                    ? `<span style="display:inline-flex;align-items:center;gap:8px;padding:6px 16px;border-radius:8px;background:rgba(63,185,80,.12);border:1px solid rgba(63,185,80,.3);font-size:13px;font-weight:700;color:var(--risk-low)">✅ Security for AI agents — Connected</span>
+                       <span style="font-size:11px;color:var(--text-muted);margin-left:10px">inferred from ${inv.total} active agent${inv.total !== 1 ? 's' : ''} in AIAgentsInfo</span>`
+                    : `<span style="display:inline-flex;align-items:center;gap:8px;padding:6px 16px;border-radius:8px;background:rgba(100,116,139,.1);border:1px solid var(--border);font-size:13px;font-weight:700;color:var(--text-dim)">○ No agents returned — toggle may be OFF</span>`}
+                </div>
+                <div style="display:flex;align-items:flex-start;gap:20px;flex-wrap:wrap">
+                  ${statCell(
+                    inv.noAuth > 0 ? '⚠️ No Authentication' : 'No Authentication',
+                    inv.noAuth,
+                    inv.noAuth > 0 ? 'var(--risk-critical)' : 'var(--risk-low)',
+                    'UserAuthenticationType = None'
+                  )}
+                  <div style="width:1px;background:var(--border);height:48px;flex-shrink:0"></div>
+                  ${statCell(
+                    inv.makerCreds > 0 ? '⚠️ Maker Credentials' : 'Maker Credentials',
+                    inv.makerCreds,
+                    inv.makerCreds > 0 ? 'var(--risk-medium)' : 'var(--risk-low)',
+                    'Actions using author credentials'
+                  )}
+                  <div style="width:1px;background:var(--border);height:48px;flex-shrink:0"></div>
+                  <div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">By source</div>
+                    <div style="display:flex;flex-wrap:wrap;gap:4px">
+                      ${inv.bySource.A365 > 0 ? `<span class="badge badge-info" style="font-size:10px">Agent 365: ${inv.bySource.A365}</span>` : ''}
+                      ${inv.bySource.PowerPlatform > 0 ? `<span class="badge badge-info" style="font-size:10px">Power Platform: ${inv.bySource.PowerPlatform}</span>` : ''}
+                      ${!inv.bySource.A365 && !inv.bySource.PowerPlatform ? '<span class="text-muted" style="font-size:11px">—</span>' : ''}
+                    </div>
                   </div>
                 </div>
-                <div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Live from the <code>AIAgentsInfo</code> Advanced Hunting table (RegistrySource <code>A365</code> = Agent 365). Connector/toggle status is inferred from agents being returned.</div>
+                <div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Live from the <code>AIAgentsInfo</code> Advanced Hunting table (P30D). No-auth agents are publicly accessible — review with owners. Maker-credential agents embed the creator's account in actions.</div>
               </div>
             </div>`
           : `<div style="margin-bottom:16px;padding:10px 14px;border-radius:8px;background:rgba(56,139,253,.06);border:1px solid rgba(56,139,253,.2);font-size:12px;color:var(--text-muted)">
               ${inv.code === 'forbidden'
-                ? '🔒 <strong>Live agent inventory needs <code>ThreatHunting.Read.All</code>.</strong> Sign out & back in (or re-run admin consent) to read Defender’s <code>AIAgentsInfo</code> table via Advanced Hunting — it will then replace the manual checks below with the live inventory.'
+                ? '🔒 <strong>Live agent inventory needs <code>ThreatHunting.Read.All</code>.</strong> Sign out &amp; back in (or re-run admin consent) to read Defender&#39;s <code>AIAgentsInfo</code> table via Advanced Hunting — it will then replace the manual checks below with the live inventory.'
                 : inv.code === 'unsupported'
-                  ? 'ℹ️ The <code>AIAgentsInfo</code> Advanced Hunting table isn’t available in this tenant yet (Security for AI agents not onboarded / preview not enabled). Verify the configuration below in the Defender portal.'
+                  ? 'ℹ️ The <code>AIAgentsInfo</code> Advanced Hunting table isn&#39;t available in this tenant yet (Security for AI agents not onboarded / preview not enabled). Verify the configuration below in the Defender portal.'
                   : 'ℹ️ Live agent inventory unavailable via Advanced Hunting — verify the configuration below in the Defender portal.'}
             </div>`;
+
+        // When connected, the toggle is confirmed ON — hide that manual row.
+        const postureRows = connected
+          ? [
+              { label: 'Copilot Studio — AI security posture',    note: 'Connects Copilot Studio agents for exposure & posture visibility' },
+              { label: 'Microsoft Foundry — AI security posture', note: 'Connects Azure AI Foundry workloads for security recommendations' },
+            ]
+          : [
+              { label: 'Security for AI agents toggle',           note: 'Enables agent inventory, behaviour monitoring & alerts · must be ON' },
+              { label: 'Copilot Studio — AI security posture',    note: 'Connects Copilot Studio agents for exposure & posture visibility' },
+              { label: 'Microsoft Foundry — AI security posture', note: 'Connects Azure AI Foundry workloads for security recommendations' },
+            ];
+
         return liveBlock + card('🗂️', 'AI Agent Inventory &amp; Posture — Configuration',
-          'These connectors feed the inventory above. The <strong>Security for AI agents</strong> toggle and connector status are configuration that isn’t exposed via Graph — verify in the Defender portal.',
-          [
-            { label: 'Security for AI agents toggle',           note: 'Enables agent inventory, behaviour monitoring & alerts · must be ON' },
-            { label: 'Copilot Studio — AI security posture',    note: 'Connects Copilot Studio agents for exposure & posture visibility' },
-            { label: 'Microsoft Foundry — AI security posture', note: 'Connects Azure AI Foundry workloads for security recommendations' },
-          ])
+          connected
+            ? '✅ <strong>Security for AI agents toggle confirmed ON</strong> (agents returned by Advanced Hunting). Verify the connector statuses below in the Defender portal.'
+            : 'These connectors feed the inventory above. The <strong>Security for AI agents</strong> toggle and connector status are configuration that isn&#39;t exposed via Graph — verify in the Defender portal.',
+          postureRows)
         + card('⏱️', 'Real-time Protection (Agent Runtime)',
           'Monitors agent action requests at runtime and raises alerts for data leakage, prompt injection, poisoning &amp; jailbreak. Not exposed via Graph — verify in the Defender portal.',
           [
