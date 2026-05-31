@@ -84,6 +84,26 @@
   .progress { margin-top:8px; font-size:12px; }
   .err { color:var(--danger); background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.3); padding:12px 16px; border-radius:6px; margin:16px 32px; font-size:13px; white-space:pre-wrap; }
   footer { padding:16px 32px; color:var(--muted); font-size:12px; border-top:1px solid var(--border); }
+
+  /* Attack-path panel */
+  button.xpath { background:rgba(239,68,68,0.12); color:#ef4444; border:1px solid rgba(239,68,68,0.3); margin-top:8px; padding:4px 10px; font-size:11px; }
+  button.xpath:hover { background:rgba(239,68,68,0.2); border-color:#ef4444; color:#ef4444; }
+  .detail-row td { background:#0b0b18 !important; padding:0; border-bottom:2px solid var(--accent-2); }
+  .detail-row:hover td { background:#0b0b18 !important; }
+  .xpanel { padding:20px 24px; }
+  .xpanel h4 { margin:0 0 6px; font-size:14px; color:var(--danger); display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .xpanel h4 .xtag { font-size:11px; color:var(--muted); font-weight:500; font-family:ui-monospace,Consolas,monospace; }
+  .xauth { font-size:11px; color:var(--warn); background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.25); border-radius:5px; padding:6px 10px; margin:0 0 16px; line-height:1.5; }
+  .xgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(290px,1fr)); gap:20px; }
+  .xsec h5 { margin:0 0 8px; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--accent); }
+  .xlist { margin:0; padding-left:18px; font-size:12.5px; line-height:1.7; color:var(--text); }
+  .xlist li { margin-bottom:4px; }
+  .xlist code, .xmuted code { background:var(--panel-2); padding:1px 5px; border-radius:3px; font-size:11.5px; color:#f97316; font-family:ui-monospace,Consolas,monospace; }
+  .xmuted { font-size:12.5px; color:var(--muted); line-height:1.7; margin:0 0 8px; }
+  .xwarn { font-size:12.5px; color:var(--warn); line-height:1.6; margin:0 0 6px; }
+  .mitre-wrap { display:flex; flex-wrap:wrap; gap:6px; }
+  .mitre { font-size:11px; background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.25); color:#fca5a5; padding:3px 8px; border-radius:5px; }
+  .mitre strong { color:#ef4444; }
 </style>
 </head>
 <body>
@@ -327,6 +347,7 @@
     clearError(); persistConfig();
     try {
       msalInstance = buildMsal();
+      await msalInstance.initialize();
       await msalInstance.handleRedirectPromise();
       var result = await msalInstance.loginPopup({ scopes: GRAPH_SCOPES, prompt: 'select_account' });
       account = result.account;
@@ -367,6 +388,17 @@
       next = data['@odata.nextLink'] || null;
     }
     return out;
+  }
+
+  async function graphBatch(requests, token){
+    var res = await fetch('https://graph.microsoft.com/v1.0/$batch', {
+      method: 'POST',
+      headers: { 'Authorization':'Bearer '+token, 'Content-Type':'application/json', 'Accept':'application/json' },
+      body: JSON.stringify({ requests: requests })
+    });
+    if(!res.ok){ var t = await res.text(); throw new Error('Batch '+res.status+'\n'+t); }
+    var data = await res.json();
+    return data.responses || [];
   }
 
   // -------------------- Audit --------------------
@@ -519,6 +551,42 @@
       });
     });
 
+    // Batch-fetch app registrations for allowPublicClient + redirect URIs
+    setMsg('Fetching app registration details…', '0 / ' + results.length);
+    var appRegsByAppId = {};
+    for(var ai=0; ai<results.length; ai+=BATCH_MAX){
+      var aSlice = results.slice(ai, ai+BATCH_MAX);
+      var aRequests = aSlice.map(function(r){
+        return { id: r.id, method:'GET',
+          url:'/applications?$filter='+encodeURIComponent("appId eq '"+r.appId+"'")+'&$select=id,appId,allowPublicClient,isFallbackPublicClient,web,spa,publicClient' };
+      });
+      try {
+        var aResponses = await graphBatch(aRequests, token);
+        aResponses.forEach(function(resp){
+          if(resp.status===200 && resp.body && resp.body.value && resp.body.value[0]){
+            var app = resp.body.value[0];
+            appRegsByAppId[app.appId] = app;
+          }
+        });
+      } catch(e){}
+      setMsg('Fetching app registration details…', Math.min(ai+BATCH_MAX, results.length)+' / '+results.length);
+    }
+    results.forEach(function(r){
+      var reg = appRegsByAppId[r.appId];
+      if(reg){
+        r.allowPublicClient = !!(reg.allowPublicClient || reg.isFallbackPublicClient);
+        r.implicitGrant = !!(reg.web && reg.web.implicitGrantSettings &&
+          (reg.web.implicitGrantSettings.enableAccessTokenIssuance || reg.web.implicitGrantSettings.enableIdTokenIssuance));
+        var uris = [];
+        if(reg.web && reg.web.redirectUris) uris = uris.concat(reg.web.redirectUris);
+        if(reg.spa && reg.spa.redirectUris) uris = uris.concat(reg.spa.redirectUris);
+        if(reg.publicClient && reg.publicClient.redirectUris) uris = uris.concat(reg.publicClient.redirectUris);
+        r.redirectUris = uris;
+      } else {
+        r.allowPublicClient = false; r.implicitGrant = false; r.redirectUris = [];
+      }
+    });
+
     cache.results = results;
     clearMsg();
     updateDashboard();
@@ -589,7 +657,8 @@
         }).join('');
       }
       return '<tr>'
-        + '<td><div class="app-name"><a href="' + escHtml(r.portalUrl) + '" target="_blank" rel="noopener">' + escHtml(r.displayName) + '</a></div><div class="appid">' + escHtml(r.appId) + '</div></td>'
+        + '<td><div class="app-name"><a href="' + escHtml(r.portalUrl) + '" target="_blank" rel="noopener">' + escHtml(r.displayName) + '</a></div><div class="appid">' + escHtml(r.appId) + '</div>'
+        + '<button class="xpath" data-xpath="' + r.id + '">' + (r.allowPublicClient ? '⚠️ ' : '') + '▼ Attack Path</button></td>'
         + '<td>' + sevBadge + '</td>'
         + '<td>' + capHtml + '</td>'
         + '<td><div class="raw-perms">' + permsHtml + '</div></td>'
@@ -624,6 +693,213 @@
     a.click();
   }
 
+  // -------------------- Attack Path --------------------
+  var MITRE_MAP = {
+    'Directory.Read.All':                [{id:'T1087.004',name:'Account Discovery: Cloud Account',tactic:'Discovery'},{id:'T1069.003',name:'Permission Groups Discovery: Cloud Groups',tactic:'Discovery'}],
+    'Directory.ReadWrite.All':           [{id:'T1087.004',name:'Account Discovery: Cloud Account',tactic:'Discovery'},{id:'T1069.003',name:'Permission Groups Discovery: Cloud Groups',tactic:'Discovery'}],
+    'User.Read.All':                     [{id:'T1087.004',name:'Account Discovery: Cloud Account',tactic:'Discovery'}],
+    'Group.Read.All':                    [{id:'T1069.003',name:'Permission Groups Discovery: Cloud Groups',tactic:'Discovery'}],
+    'RoleManagement.Read.All':           [{id:'T1069.003',name:'Permission Groups Discovery: Cloud Groups',tactic:'Discovery'},{id:'T1078.004',name:'Valid Accounts: Cloud Accounts',tactic:'Initial Access'}],
+    'PrivilegedAccess.Read.AzureAD':     [{id:'T1069.003',name:'Permission Groups Discovery: Cloud Groups',tactic:'Discovery'}],
+    'AuditLog.Read.All':                 [{id:'T1562.008',name:'Impair Defenses: Disable or Modify Cloud Logs',tactic:'Defense Evasion'}],
+    'Policy.Read.All':                   [{id:'T1562.007',name:'Impair Defenses: Disable or Modify Cloud Firewall',tactic:'Defense Evasion'}],
+    'Policy.ReadWrite.ConditionalAccess':[{id:'T1562.007',name:'Impair Defenses: Disable or Modify Cloud Firewall',tactic:'Defense Evasion'}],
+    'IdentityRiskyUser.Read.All':        [{id:'T1078.004',name:'Valid Accounts: Cloud Accounts',tactic:'Initial Access'},{id:'T1580',name:'Cloud Infrastructure Discovery',tactic:'Discovery'}],
+    'Mail.Read':                         [{id:'T1114.002',name:'Email Collection: Remote Email Collection',tactic:'Collection'}],
+    'Mail.ReadWrite':                    [{id:'T1114.002',name:'Email Collection: Remote Email Collection',tactic:'Collection'},{id:'T1565.001',name:'Data Manipulation: Stored Data Manipulation',tactic:'Impact'}],
+    'Mail.Send':                         [{id:'T1534',name:'Internal Spearphishing',tactic:'Lateral Movement'}],
+    'Files.Read.All':                    [{id:'T1213.002',name:'Data from SharePoint',tactic:'Collection'}],
+    'Files.ReadWrite.All':               [{id:'T1213.002',name:'Data from SharePoint',tactic:'Collection'},{id:'T1565.001',name:'Data Manipulation: Stored Data Manipulation',tactic:'Impact'}],
+    'Sites.Read.All':                    [{id:'T1213.002',name:'Data from SharePoint',tactic:'Collection'}],
+    'Sites.ReadWrite.All':               [{id:'T1213.002',name:'Data from SharePoint',tactic:'Collection'}],
+    'Chat.Read.All':                     [{id:'T1213',name:'Data from Information Repositories',tactic:'Collection'}],
+    'Chat.ReadWrite.All':                [{id:'T1213',name:'Data from Information Repositories',tactic:'Collection'}],
+    'ChannelMessage.Read.All':           [{id:'T1213',name:'Data from Information Repositories',tactic:'Collection'}],
+    'Application.Read.All':              [{id:'T1526',name:'Cloud Service Discovery',tactic:'Discovery'}],
+    'Application.ReadWrite.All':         [{id:'T1526',name:'Cloud Service Discovery',tactic:'Discovery'}],
+    'DelegatedPermissionGrant.Read.All': [{id:'T1526',name:'Cloud Service Discovery',tactic:'Discovery'}],
+    'SecurityEvents.Read.All':           [{id:'T1580',name:'Cloud Infrastructure Discovery',tactic:'Discovery'}],
+    'SecurityIncident.Read.All':         [{id:'T1580',name:'Cloud Infrastructure Discovery',tactic:'Discovery'}],
+    'UserAuthenticationMethod.Read.All': [{id:'T1589.001',name:'Gather Victim Identity Information: Credentials',tactic:'Reconnaissance'}],
+    'DeviceManagementApps.Read.All':     [{id:'T1526',name:'Cloud Service Discovery',tactic:'Discovery'}],
+  };
+
+  var ESCALATION_MAP = {
+    'AuditLog.Read.All':              'Mine sign-in logs for accounts using legacy auth or lacking MFA registration → select low-resistance targets',
+    'Policy.Read.All':                'Identify CA policy exclusions and named location bypass conditions → discover per-app auth requirement gaps',
+    'IdentityRiskyUser.Read.All':     'Retrieve Microsoft-flagged compromised accounts → ready-made high-value target list',
+    'RoleManagement.Read.All':        'Enumerate all privileged role holders (Global Admin, Privileged Auth Admin, etc.) → map escalation targets',
+    'PrivilegedAccess.Read.AzureAD':  'List PIM-eligible role assignments → identify accounts one activation away from admin rights',
+    'Directory.Read.All':             'Enumerate group memberships and CA exclusion groups → find weakly-protected lateral movement paths',
+    'Mail.Read':                      'Access inboxes for password-reset/MFA-setup emails → enable account takeover via intercepted flows',
+    'Mail.Send':                      'Send mail as any user → enables spearphishing from a trusted internal address',
+    'Files.Read.All':                 'Access all SharePoint/OneDrive content → identify credential stores, deploy scripts, and sensitive files at scale',
+    'Sites.ReadWrite.All':            'Modify SharePoint content org-wide → document poisoning or script injection into shared resources',
+    'SecurityEvents.Read.All':        'Real-time defender alert visibility → time lateral movement to avoid detection windows',
+    'Application.ReadWrite.All':      'Modify other app registrations (add credentials, alter redirect URIs) → persistent backdoor creation in a different app',
+    'UserAuthenticationMethod.Read.All':'Enumerate every MFA method per user → identify SMS/phone MFA accounts for SIM-swap targeting',
+    'DelegatedPermissionGrant.Read.All': 'Enumerate all admin-consented grants → find additional high-privilege token acquisition paths',
+  };
+
+  var BLAST_RADIUS = {
+    privilege: 'Full map of privileged accounts across Entra ID, PIM, and Entitlement Management — identification of escalation targets, pivot paths, and the complete admin attack surface.',
+    identity:  'All users (with contact data), groups, devices, and org structure — enables comprehensive org-graph construction for targeted social engineering and lateral movement planning.',
+    security:  'Defender visibility map: CA gaps, MFA exclusions, sign-in anomaly thresholds, and active security incidents — enables targeted, low-detection-probability operation planning.',
+    content:   'Mail, files, calendar, and Teams messages across all users — direct data exfiltration channel for sensitive documents, credentials in email, and real-time communication interception.',
+    apps:      'Full app landscape, OAuth grant map, and device management — identification of additional over-privileged apps or service accounts for further OAuth token acquisition.',
+  };
+
+  function redirectRisk(uri){
+    if(!uri) return null;
+    if(/\*/.test(uri)) return {level:'critical', reason:'Wildcard in redirect URI — authorization codes can be redirected to any matching host'};
+    if(/^http:\/\/(?!localhost[:/]|localhost$|127\.0\.0\.1[:/]|127\.0\.0\.1$|::1)/i.test(uri))
+      return {level:'high', reason:'Non-localhost HTTP redirect — authorization code delivered over cleartext channel'};
+    if(/localhost|127\.0\.0\.1|::1/i.test(uri))
+      return {level:'medium', reason:'Localhost redirect URI — acceptable in development; should be removed from production registrations'};
+    return null;
+  }
+
+  function buildAttackPath(r){
+    var publicClient = r.allowPublicClient || false;
+    var implicitGrant = r.implicitGrant || false;
+    var redirectUris  = r.redirectUris  || [];
+
+    // Collect all granted scopes (delegated + app roles)
+    var allScopes = [];
+    r.delegatedDetail.forEach(function(d){
+      d.scopes.split(/[\s,]+/).filter(Boolean).forEach(function(s){ allScopes.push(s); });
+    });
+    if(r.appPermissions){
+      r.appPermissions.forEach(function(p){ if(p.roleValue) allScopes.push(p.roleValue); });
+    }
+
+    // Auth-surface warnings
+    var authWarnings = [];
+    if(publicClient)   authWarnings.push('<strong>allowPublicClient = true</strong> — device code flow, ROPC, and native app token flows are enabled without requiring a client secret.');
+    if(implicitGrant)  authWarnings.push('<strong>Implicit grant enabled</strong> — access tokens issued directly from /authorize. Tokens are visible in browser history and server logs.');
+    var redirectRisks = [];
+    redirectUris.forEach(function(uri){
+      var risk = redirectRisk(uri);
+      if(risk) redirectRisks.push({uri: uri, risk: risk});
+    });
+
+    // MITRE techniques from granted scopes
+    var mitreById = {};
+    allScopes.forEach(function(scope){
+      (MITRE_MAP[scope]||[]).forEach(function(t){ mitreById[t.id] = t; });
+    });
+    if(publicClient){
+      mitreById['T1528'] = {id:'T1528', name:'Steal Application Access Token', tactic:'Credential Access'};
+      if(!mitreById['T1078.004']) mitreById['T1078.004'] = {id:'T1078.004', name:'Valid Accounts: Cloud Accounts', tactic:'Initial Access'};
+    }
+    var mitreTechs = Object.keys(mitreById).sort().map(function(k){ return mitreById[k]; });
+
+    // Blast radius categories
+    var seenCats = {}, blastCats = [];
+    r.caps.forEach(function(c){ if(!seenCats[c.cap.cat]){ seenCats[c.cap.cat]=true; blastCats.push(c.cap.cat); } });
+
+    // Escalation pivots
+    var seenEsc = {}, escalations = [];
+    allScopes.forEach(function(s){
+      if(ESCALATION_MAP[s] && !seenEsc[s]){ seenEsc[s]=true; escalations.push({scope:s, path:ESCALATION_MAP[s]}); }
+    });
+
+    // Remediation
+    var rems = [];
+    if(publicClient)   rems.push('Set <code>allowPublicClient = false</code> in the app registration unless device-code or native-app flows are explicitly required.');
+    if(implicitGrant)  rems.push('Disable implicit grant (access token issuance) in the app registration — migrate to authorization code + PKCE.');
+    redirectRisks.forEach(function(rr){
+      var clip = rr.uri.length > 60 ? rr.uri.slice(0,60)+'…' : rr.uri;
+      rems.push('Remove or restrict redirect URI <code>'+escHtml(clip)+'</code> — '+rr.risk.reason+'.');
+    });
+    if(r.delegatedDetail.some(function(d){ return d.consentType==='AllPrincipals'; }))
+      rems.push('Evaluate whether AllPrincipals (tenant-wide) consent is required — restrict to per-user consent where possible to limit blast radius on compromise.');
+    if(!r.isFirstPartyMicrosoft && r.accessLevel >= 3)
+      rems.push('Review whether this third-party app genuinely requires these permissions — apply least-privilege and revoke unused grants via Entra ID &rsaquo; Enterprise applications.');
+    if(blastCats.indexOf('content') !== -1)
+      rems.push('Apply Microsoft Purview sensitivity labels and DLP policies to reduce the data surface accessible via compromised OAuth tokens.');
+    if(!rems.length)
+      rems.push('No critical configuration issues detected — continue monitoring consent grants and rotate any app credentials on a regular schedule.');
+
+    // Build sections
+    var authSection = '';
+    if(authWarnings.length || redirectRisks.length){
+      var parts = authWarnings.map(function(w){ return '⚠️ '+w; });
+      redirectRisks.forEach(function(rr){
+        var icon = rr.risk.level==='critical'?'🔴':rr.risk.level==='high'?'🟠':'🟡';
+        var clip = rr.uri.length > 55 ? rr.uri.slice(0,55)+'…' : rr.uri;
+        parts.push(icon+' Redirect URI <code>'+escHtml(clip)+'</code>: '+escHtml(rr.risk.reason));
+      });
+      authSection = '<div class="xauth">'+parts.join('<br>')+'</div>';
+    }
+
+    var blastHtml = blastCats.length
+      ? '<ul class="xlist">'+blastCats.map(function(cat){
+          return '<li><strong>'+cat.charAt(0).toUpperCase()+cat.slice(1)+':</strong> '+(BLAST_RADIUS[cat]||cat)+'</li>';
+        }).join('')+'</ul>'
+      : '<p class="xmuted">No recognized capability categories.</p>';
+
+    var escHtml2 = escalations.length
+      ? '<ul class="xlist">'+escalations.map(function(e){
+          return '<li><code>'+escHtml(e.scope)+'</code> — '+escHtml(e.path)+'</li>';
+        }).join('')+'</ul>'
+      : '<p class="xmuted">No specific escalation pivots identified for the granted scopes.</p>';
+
+    var mitreHtml = mitreTechs.length
+      ? '<div class="mitre-wrap">'+mitreTechs.map(function(t){
+          var url = 'https://attack.mitre.org/techniques/'+t.id.replace('.','/');
+          return '<a class="mitre" href="'+url+'" target="_blank" rel="noopener" title="'+escHtml(t.tactic)+'">'
+            +'<strong>'+escHtml(t.id)+'</strong> '+escHtml(t.name)+'</a>';
+        }).join('')+'</div>'
+      : '<p class="xmuted">No MITRE techniques mapped for the granted scopes.</p>';
+
+    var remHtml = '<ul class="xlist">'+rems.map(function(rem){ return '<li>'+rem+'</li>'; }).join('')+'</ul>';
+
+    var pubBadge = publicClient
+      ? ' <span style="font-size:11px;padding:2px 7px;border-radius:4px;background:rgba(239,68,68,0.15);color:var(--danger);border:1px solid rgba(239,68,68,0.3);vertical-align:middle">⚠️ Public client</span>'
+      : '';
+
+    return '<div class="xpanel">'
+      +'<h4>🎯 Exploitation Path — '+escHtml(r.displayName)+pubBadge
+      +'<span style="font-size:11px;font-weight:400;margin-left:12px;color:var(--muted)">'+escHtml(r.appId)+'</span></h4>'
+      +authSection
+      +'<div class="xgrid">'
+      +'<div class="xsec"><h5>💥 Blast Radius</h5>'+blastHtml+'</div>'
+      +'<div class="xsec"><h5>⬆️ Escalation Pivots</h5>'+escHtml2+'</div>'
+      +'<div class="xsec"><h5>🛡️ Remediation</h5>'+remHtml+'</div>'
+      +'</div>'
+      +'<div style="margin-top:16px"><div class="xsec"><h5>🔴 MITRE ATT&amp;CK Techniques</h5>'+mitreHtml+'</div></div>'
+      +'</div>';
+  }
+
+  function toggleXPath(rowId){
+    var detailId = 'xrow-'+rowId;
+    var existing = document.getElementById(detailId);
+    var btn = document.querySelector('[data-xpath="'+rowId+'"]');
+    if(existing){
+      existing.remove();
+      if(btn){
+        var r2 = (cache.results||[]).find(function(x){ return x.id===rowId; });
+        btn.textContent = (r2 && r2.allowPublicClient ? '⚠️ ' : '')+'▼ Attack Path';
+      }
+      return;
+    }
+    if(!btn) return;
+    var tr = btn.closest('tr');
+    if(!tr) return;
+    var r = (cache.results||[]).find(function(x){ return x.id===rowId; });
+    if(!r) return;
+    var detailTr = document.createElement('tr');
+    detailTr.id = detailId;
+    detailTr.className = 'detail-row';
+    var td = document.createElement('td');
+    td.colSpan = 6;
+    td.innerHTML = buildAttackPath(r);
+    detailTr.appendChild(td);
+    tr.parentNode.insertBefore(detailTr, tr.nextSibling);
+    btn.textContent = (r.allowPublicClient ? '⚠️ ' : '')+'▲ Hide Path';
+  }
+
   // -------------------- Wire up --------------------
   el('btn-consent').addEventListener('click', startAdminConsent);
   el('btn-signin').addEventListener('click', signIn);
@@ -641,6 +917,12 @@
       else { sortState.key = key; sortState.dir = key === 'accessLevel' ? -1 : 1; }
       render();
     });
+  });
+  el('rows').addEventListener('click', function(e){
+    var btn = e.target.closest('.xpath');
+    if(!btn) return;
+    var rowId = btn.getAttribute('data-xpath');
+    if(rowId) toggleXPath(rowId);
   });
 })();
 </script>
