@@ -1842,6 +1842,10 @@ async function loadDashboard() {
     const riskyAgentsActive = riskyAgentsDiag.filter(a => a.riskLevel && a.riskLevel !== 'none').length;
     const mcasAll = STATE.data.mcasApps || [];
     const mcasUnsanctioned = mcasAll.filter(a => { const s = (a.status||'').toLowerCase(); return a.type===0 || a.sanctioned===false || s==='unsanctioned' || s==='blocked'; }).length;
+    // MDCA category breakdown — Model Provider & MCP Server are strong external-LLM signals.
+    const mcasModelProviders = mcasAll.filter(a => aiCatBucket(a.category) === 'model');
+    const mcasMcpServers     = mcasAll.filter(a => aiCatBucket(a.category) === 'mcp');
+    const mcasModelUpload    = mcasModelProviders.reduce((s,a) => s + (a.trafficUploadedBytes ?? 0), 0);
     const aiModelKeySet = new Set(aiApps.map(sp => { const i = detectModel(sp.displayName); return i.model + '|' + i.provider; }));
     const aiModelCount = aiModelKeySet.size;
     const aiNonGdpr = Array.from(aiModelKeySet).filter(k => { const [,prov] = k.split('|'); return aiApps.some(sp => { const i = detectModel(sp.displayName); return i.provider === prov && !i.gdprOk; }); }).length;
@@ -1918,6 +1922,36 @@ async function loadDashboard() {
       const s = (a.status || '').toLowerCase();
       return a.type === 0 || a.sanctioned === false || s === 'unsanctioned' || s === 'blocked';
     }).length;
+    // External LLM usage = interactive sign-ins to AI apps OR a discovered Model Provider API.
+    const cisoExternalLlm  = (aiSignIns.length > 0 || mcasModelProviders.length > 0);
+
+    // ── "Why" context for each executive-summary item (evidence behind the rating) ──
+    const plural = (n, s, p) => n === 1 ? s : (p ?? s + 's');
+    const cisoWhyShadow = (() => {
+      const bits = [];
+      if (critCount || highCount) bits.push(`${critCount} critical · ${highCount} high-risk of ${aiApps.length} AI ${plural(aiApps.length,'app')}`);
+      else if (aiApps.length) bits.push(`${aiApps.length} AI ${plural(aiApps.length,'app')} detected`);
+      if (mcasUnsanctioned) bits.push(`${mcasUnsanctioned} unsanctioned in Defender`);
+      if (highRiskAi.length) bits.push(`${highRiskAi.length} with high-risk OAuth scopes`);
+      return bits.join(' · ') || 'No AI apps detected';
+    })();
+    const cisoWhyLlm = (() => {
+      const bits = [];
+      if (mcasModelProviders.length) bits.push(`${mcasModelProviders.length} model-provider ${plural(mcasModelProviders.length,'API')}${mcasModelUpload > 0 ? ` (↑${fmtBytes(mcasModelUpload)})` : ''}`);
+      if (mcasMcpServers.length) bits.push(`${mcasMcpServers.length} MCP ${plural(mcasMcpServers.length,'server')}`);
+      if (aiSignIns.length) bits.push(`${aiModelCount} ${plural(aiModelCount,'model')} · ${aiUsers.length} ${plural(aiUsers.length,'user')} · ${aiSignIns.length} sign-ins (30d)`);
+      return bits.join(' · ') || 'No third-party LLM traffic or sign-ins in 30d';
+    })();
+    const cisoWhyDataRes = cisoNonEuApps > 0
+      ? `${cisoNonEuApps} AI ${plural(cisoNonEuApps,'app')} using non-EU / non-GDPR-adequate ${plural(cisoNonEuApps,'model')}`
+      : 'All detected models EU- or GDPR-adequate';
+    const cisoWhySensitive = (() => {
+      const bits = [];
+      if (highSensReachable) bits.push(`${highSensReachable} high-sensitivity ${plural(highSensReachable,'label')} reachable by AI apps`);
+      if (fileAiApps.length) bits.push(`${fileAiApps.length} AI ${plural(fileAiApps.length,'app')} with Files/Mail access`);
+      if (anonSharing) bits.push('anonymous "anyone with link" sharing on');
+      return bits.join(' · ') || 'No AI apps hold file or mail access';
+    })();
 
     // ── Trend deltas vs previous assessment (localStorage snapshot) ───────────
     const prevSnap = loadDashSnapshot();
@@ -1983,13 +2017,16 @@ async function loadDashboard() {
         </div>
         <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--border);border-top:1px solid var(--border)">
           ${[
-            { label:'Shadow AI Risk',          value: cisoShadowRisk,                                                                       color: cisoRiskColor },
-            { label:'External LLM Usage',      value: aiSignIns.length > 0 ? 'Detected' : 'None detected',                                 color: aiSignIns.length > 0 ? 'var(--risk-medium)' : 'var(--risk-low)' },
-            { label:'Data Residency Risk',     value: cisoDataRes,                                                                          color: cisoDataResColor },
-            { label:'Sensitive Data Exposure', value: cisoSensitive,                                                                        color: cisoSensColor },
-          ].map(m => '<div style="background:var(--bg-card);padding:14px 18px;display:flex;justify-content:space-between;align-items:center">'
-              + '<span style="font-size:12px;color:var(--text-muted)">' + esc(m.label) + '</span>'
-              + '<span style="font-size:13px;font-weight:700;color:' + m.color + '">' + esc(m.value) + '</span>'
+            { label:'Shadow AI Risk',          value: cisoShadowRisk,                                       color: cisoRiskColor,                                              why: cisoWhyShadow,    page:'shadow-apps' },
+            { label:'External LLM Usage',      value: cisoExternalLlm ? 'Detected' : 'None detected',       color: cisoExternalLlm ? 'var(--risk-medium)' : 'var(--risk-low)', why: cisoWhyLlm,       page:'models' },
+            { label:'Data Residency Risk',     value: cisoDataRes,                                          color: cisoDataResColor,                                           why: cisoWhyDataRes,   page:'compliance' },
+            { label:'Sensitive Data Exposure', value: cisoSensitive,                                        color: cisoSensColor,                                              why: cisoWhySensitive, page:'labels' },
+          ].map(m => '<div onclick="navigate(\'' + m.page + '\', document.querySelector(\'[onclick*=' + m.page + ']\'))" style="background:var(--bg-card);padding:14px 18px;display:flex;justify-content:space-between;align-items:flex-start;gap:16px;cursor:pointer">'
+              + '<div style="min-width:0">'
+              +   '<div style="font-size:12px;color:var(--text-muted)">' + esc(m.label) + '</div>'
+              +   '<div style="font-size:11px;color:var(--text-dim);margin-top:3px;line-height:1.45">' + esc(m.why) + '</div>'
+              + '</div>'
+              + '<span style="font-size:13px;font-weight:700;color:' + m.color + ';white-space:nowrap">' + esc(m.value) + '</span>'
               + '</div>').join('')}
         </div>
       </div>
