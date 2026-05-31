@@ -776,19 +776,20 @@ async function getTokenFor(scopes) {
 
 // ── Graph helpers ──────────────────────────────────────────────────────────
 
-async function gget(url, consistency = false) {
+async function gget(url, consistency = false, extraHeaders = null) {
   const token = await getToken();
   const headers = { Authorization: 'Bearer ' + token };
   if (consistency) headers['ConsistencyLevel'] = 'eventual';
+  if (extraHeaders) Object.assign(headers, extraHeaders);
   const r = await fetch(url, { headers });
   if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + r.statusText + ': ' + t.slice(0, 300)); }
   return r.json();
 }
 
-async function ggetAll(url, maxPages = 5, consistency = false) {
+async function ggetAll(url, maxPages = 5, consistency = false, extraHeaders = null) {
   let items = [], next = url;
   for (let i = 0; i < maxPages && next; i++) {
-    const d = await gget(next, consistency);
+    const d = await gget(next, consistency, extraHeaders);
     if (d.value) items = items.concat(d.value);
     next = d['@odata.nextLink'] || null;
   }
@@ -1775,7 +1776,7 @@ async function loadDashboard() {
       // Runs silently — failure just means we fall back to SP-based count.
       STATE.data.mcasApps === undefined
         ? fetchMcasAppsFromGraph().then(all => {
-            const genAi = all.filter(a => /generative.?ai|genai/i.test(a.category || ''));
+            const genAi = all.filter(a => isAiAppCategory(a.category));
             STATE.data.mcasApps = genAi.length ? genAi : all;
             STATE.data.mcasTotal = all.length;
             STATE.data.mcasFilteredToGenAi = genAi.length > 0;
@@ -2266,6 +2267,10 @@ function mcasSanctionBadge(app) {
 
 const MCAS_CAT_MAP = {
   SAASDB_CATEGORY_GENERATIVE_AI: 'Generative AI',
+  generativeAi: 'Generative AI',
+  aiModelProvider: 'AI · Model Provider',
+  mcpServer: 'AI · MCP Server',
+  clientAiApp: 'AI · Client App',
   SAASDB_CATEGORY_COLLABORATION: 'Collaboration',
   SAASDB_CATEGORY_CLOUD_STORAGE: 'Cloud Storage',
   SAASDB_CATEGORY_CODING_AND_DEVELOPMENT: 'Development',
@@ -2280,6 +2285,13 @@ function fmtCategory(raw) {
   if (!raw) return '';
   return MCAS_CAT_MAP[raw] || raw.replace(/^SAASDB_CATEGORY_/i,'').replace(/_/g,' ');
 }
+
+// MDCA app categories treated as "AI" for Shadow AI discovery.
+// generativeAi is GA; aiModelProvider / mcpServer / clientAiApp are evolvable-enum
+// members the discovery API only returns with the
+// `Prefer: include-unknown-enum-members` request header (otherwise → unknownFutureValue).
+const AI_APP_CATEGORY_RE = /generative.?ai|genai|aimodelprovider|mcpserver|clientaiapp/i;
+function isAiAppCategory(cat) { return AI_APP_CATEGORY_RE.test(cat || ''); }
 
 function fmtBytes(b) {
   if (!b) return '—';
@@ -2318,14 +2330,19 @@ async function fetchMcasAppsFromGraph() {
     try {
       // Try with $expand=userActivity to capture per-user traffic data in one call.
       // If the endpoint doesn't support the expand, fall back to plain fetch.
+      // Prefer header surfaces evolvable-enum categories (aiModelProvider, mcpServer,
+      // clientAiApp) instead of collapsing them to unknownFutureValue.
+      const aiEnumHdr = { Prefer: 'include-unknown-enum-members' };
       let resp;
       try {
         resp = await gget(
-          `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${stream.id}/microsoft.graph.security.aggregatedAppsDetails(period=duration'P30D')?$top=500&$expand=userActivity`
+          `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${stream.id}/microsoft.graph.security.aggregatedAppsDetails(period=duration'P30D')?$top=500&$expand=userActivity`,
+          false, aiEnumHdr
         );
       } catch {
         resp = await gget(
-          `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${stream.id}/microsoft.graph.security.aggregatedAppsDetails(period=duration'P30D')?$top=500`
+          `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${stream.id}/microsoft.graph.security.aggregatedAppsDetails(period=duration'P30D')?$top=500`,
+          false, aiEnumHdr
         );
       }
       (resp.value || []).forEach(a => {
@@ -2402,7 +2419,7 @@ async function loadShadowApps() {
   try {
     const all = await fetchMcasAppsFromGraph();
     STATE.data.mcasTotal = all.length;
-    const genAi = all.filter(a => /generative.?ai|genai/i.test(a.category || ''));
+    const genAi = all.filter(a => isAiAppCategory(a.category));
     STATE.data.mcasApps = genAi.length ? genAi : all;
     STATE.data.mcasFilteredToGenAi = genAi.length > 0;
     STATE.data.mcasUrl = 'Microsoft Graph (CloudApp-Discovery.Read.All)';
@@ -2589,12 +2606,12 @@ function renderMcasApps(el, apps, mcasUrl) {
   el.innerHTML = `
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
       <div>
-        <div class="section-title">Generative AI — Discovered Apps</div>
+        <div class="section-title">AI Apps — Discovered</div>
         <div class="section-sub">
           Source: Defender for Cloud Apps · <span class="mono">${esc(mcasUrl)}</span>
           ${STATE.data.mcasFilteredToGenAi
-            ? ` · Generative AI category (${STATE.data.mcasTotal} total apps scanned)`
-            : ` · all categories (${STATE.data.mcasTotal} total apps — Generative AI filter returned nothing)`}
+            ? ` · Generative AI + Model Provider + MCP Server categories (${STATE.data.mcasTotal} total apps scanned)`
+            : ` · all categories (${STATE.data.mcasTotal} total apps — AI category filter returned nothing)`}
         </div>
       </div>
       <div style="display:flex;gap:8px;align-items:center">
@@ -2882,7 +2899,7 @@ async function loadModels() {
     const mcasPromise = STATE.data.mcasApps !== undefined
       ? Promise.resolve(STATE.data.mcasApps)
       : fetchMcasAppsFromGraph().then(all => {
-          const genAi = all.filter(a => /generative.?ai|genai/i.test(a.category || ''));
+          const genAi = all.filter(a => isAiAppCategory(a.category));
           STATE.data.mcasApps = genAi.length ? genAi : all;
           STATE.data.mcasTotal = all.length;
           return STATE.data.mcasApps;
@@ -8594,54 +8611,6 @@ async function loadCopilotUsage() {
         </div>
 
         ${copilotReadinessHtml(rLabels, rMip, rSp)}` : ''}
-
-        <div class="card" style="margin-bottom:16px">
-          <div class="card-header">
-            <div class="card-title">⚠️ Usage Data Unavailable</div>
-          </div>
-          <div class="card-body" style="padding:20px">
-            ${usage.errorCode === 'nodata' ? `
-              <div style="display:flex;align-items:flex-start;gap:14px">
-                <div style="font-size:36px;line-height:1">📭</div>
-                <div>
-                  <div style="font-size:13px;font-weight:600;margin-bottom:6px">No Copilot usage data yet</div>
-                  <p style="font-size:12px;color:var(--text-muted);line-height:1.7;margin:0">
-                    Microsoft 365 Copilot is licensed in this tenant but no usage has been recorded yet,
-                    or the data is still being processed (reports can take up to <strong>48 hours</strong> to appear after first use).
-                    Once users start using Copilot in Teams, Word, Outlook or other apps, this page will populate automatically.
-                  </p>
-                </div>
-              </div>
-            ` : `
-            <p style="font-size:13px;color:var(--text-muted);margin-bottom:16px">
-              <code style="background:var(--bg-hover);padding:2px 6px;border-radius:4px">Reports.Read.All</code>
-              is granted but the current token does not include it yet.
-              You are a <strong>Global Administrator</strong> — just <strong>sign out and sign back in</strong> to get a fresh token.
-              If it still fails, the Microsoft Reports API also requires one of these Entra roles:
-            </p>
-            <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px">
-              ${['Global Administrator','Reports Reader','Global Reader','Usage Summary Reports Reader'].map(r =>
-                `<span style="padding:4px 10px;border-radius:20px;background:rgba(56,139,253,.1);color:var(--accent-blue);border:1px solid rgba(56,139,253,.3);font-size:11px;font-family:ui-monospace,monospace">${r}</span>`
-              ).join('')}
-            </div>
-            <div style="border-top:1px solid var(--border);padding-top:16px">
-              <div style="font-size:12px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px">Quick fix</div>
-              <ol style="font-size:12px;color:var(--text-muted);line-height:2.2;padding-left:18px;margin:0">
-                <li><strong>Sign out and sign back in</strong> — this refreshes the token to include Reports.Read.All</li>
-                <li>If still failing: check M365 Admin Center → Settings → Org settings → Reports → ensure "Display concealed user/group info" is OFF</li>
-              </ol>
-              <div style="margin-top:16px;display:flex;gap:10px;align-items:center">
-                <button class="btn btn-primary" onclick="signOut()" style="font-size:12px;padding:7px 16px">
-                  ↩ Sign out &amp; sign in again
-                </button>
-                <button class="btn btn-secondary" onclick="adminConsent()" style="font-size:12px;padding:7px 16px">
-                  🔑 Re-run Admin Consent
-                </button>
-              </div>
-            </div>
-            `}
-          </div>
-        </div>
       `;
       return;
     }
