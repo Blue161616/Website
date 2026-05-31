@@ -2293,6 +2293,25 @@ function fmtCategory(raw) {
 const AI_APP_CATEGORY_RE = /generative.?ai|genai|aimodelprovider|mcpserver|clientaiapp/i;
 function isAiAppCategory(cat) { return AI_APP_CATEGORY_RE.test(cat || ''); }
 
+// Group an MDCA category into a filter bucket for the Shadow AI Apps page.
+function aiCatBucket(cat) {
+  const c = (cat || '').toLowerCase();
+  if (/aimodelprovider/.test(c)) return 'model';
+  if (/mcpserver/.test(c))       return 'mcp';
+  if (/generative.?ai|genai|clientaiapp/.test(c)) return 'genai';
+  return 'other';
+}
+const AI_CAT_FILTERS = [
+  { key: 'genai', label: '🤖 Generative AI' },
+  { key: 'model', label: '🧠 Model Provider' },
+  { key: 'mcp',   label: '🔌 MCP Server' },
+  { key: 'other', label: '📦 Other' },
+];
+function mcasFilterBy(key) {
+  STATE.mcasCatFilter = key;
+  renderMcasApps(document.getElementById('shadow-content'), STATE.data.mcasApps, STATE.data.mcasUrl);
+}
+
 function fmtBytes(b) {
   if (!b) return '—';
   if (b >= 1e9) return (b/1e9).toFixed(1) + ' GB';
@@ -2553,16 +2572,25 @@ function renderMcasApps(el, apps, mcasUrl) {
            tags.some(t => t.includes('sanction') && !t.includes('un'));
   };
 
-  const unsanctioned = apps.filter(isUnsanctioned);
-  const highRisk     = apps.filter(a => { const s = getScore(a); return s != null && s <= 4; });
+  // Category filter (All / Generative AI / Model Provider / MCP Server / Other).
+  // Counts come from the full set; KPIs + table reflect the active filter.
+  const activeFilter = STATE.mcasCatFilter ?? 'all';
+  const catCount = { genai: 0, model: 0, mcp: 0, other: 0 };
+  apps.forEach(a => { catCount[aiCatBucket(a.category)]++; });
+  const viewApps = activeFilter === 'all'
+    ? apps
+    : apps.filter(a => aiCatBucket(a.category) === activeFilter);
+
+  const unsanctioned = viewApps.filter(isUnsanctioned);
+  const highRisk     = viewApps.filter(a => { const s = getScore(a); return s != null && s <= 4; });
   // Apps with activity in the last 7 days = live shadow-AI usage (accurate from lastSeen).
   const isActive7d = a => {
     const last = a.lastUsed ?? a.lastSeen;
     const t = last ? new Date(last).getTime() : NaN;
     return !isNaN(t) && (Date.now() - t) / 86400000 <= 7;
   };
-  const activeApps   = apps.filter(isActive7d).length;
-  const totalUpload  = apps.reduce((s,a) => s + (a.trafficUploadedBytes ?? 0), 0);
+  const activeApps   = viewApps.filter(isActive7d).length;
+  const totalUpload  = viewApps.reduce((s,a) => s + (a.trafficUploadedBytes ?? 0), 0);
   const unsUpload    = unsanctioned.reduce((s,a) => s + (a.trafficUploadedBytes ?? 0), 0);
 
   // Composite shadow-AI risk: unsanctioned dominates, then low trust score, then how
@@ -2593,7 +2621,7 @@ function renderMcasApps(el, apps, mcasUrl) {
       default:        return 0;
     }
   };
-  const sorted = [...apps].sort((a, b) => {
+  const sorted = [...viewApps].sort((a, b) => {
     const va = sortVal(a, sortKey), vb = sortVal(b, sortKey);
     const cmp = typeof va === 'string' ? va.localeCompare(vb) : va - vb;
     return sortDir === 'asc' ? cmp : -cmp;
@@ -2625,9 +2653,9 @@ function renderMcasApps(el, apps, mcasUrl) {
 
     <div class="kpi-row" style="grid-template-columns:repeat(5,1fr)">
       <div class="kpi-card info">
-        <div class="kpi-label">Generative AI Apps</div>
-        <div class="kpi-value text-blue">${apps.length}</div>
-        <div class="kpi-delta">of ${STATE.data.mcasTotal||'?'} total discovered</div>
+        <div class="kpi-label">${activeFilter === 'all' ? 'AI Apps' : (AI_CAT_FILTERS.find(f => f.key === activeFilter)?.label.replace(/^\S+\s/, '') || 'AI Apps')}</div>
+        <div class="kpi-value text-blue">${viewApps.length}</div>
+        <div class="kpi-delta">${activeFilter === 'all' ? `of ${STATE.data.mcasTotal||'?'} total discovered` : `of ${apps.length} AI apps`}</div>
         <div class="kpi-icon">🤖</div>
       </div>
       <div class="kpi-card critical">
@@ -2643,7 +2671,7 @@ function renderMcasApps(el, apps, mcasUrl) {
         <div class="kpi-icon">⚠️</div>
       </div>
       <div class="kpi-card ${unsUpload > 0 ? 'critical' : 'high'}">
-        <div class="kpi-label">Uploaded to GenAI (30d)</div>
+        <div class="kpi-label">Uploaded to AI (30d)</div>
         <div class="kpi-value ${unsUpload > 0 ? 'text-critical' : 'text-high'}">${fmtBytes(totalUpload)}</div>
         <div class="kpi-delta">Data sent to AI apps${unsUpload > 0 ? ` · ${fmtBytes(unsUpload)} to unsanctioned` : ''}</div>
         <div class="kpi-icon">📤</div>
@@ -2651,9 +2679,19 @@ function renderMcasApps(el, apps, mcasUrl) {
       <div class="kpi-card ${activeApps > 0 ? 'medium' : 'low'}">
         <div class="kpi-label">Active (last 7 days)</div>
         <div class="kpi-value text-medium">${activeApps}</div>
-        <div class="kpi-delta">${apps.length - activeApps} dormant · of ${apps.length} GenAI app${apps.length !== 1 ? 's' : ''}</div>
+        <div class="kpi-delta">${viewApps.length - activeApps} dormant · of ${viewApps.length} AI app${viewApps.length !== 1 ? 's' : ''}</div>
         <div class="kpi-icon">🟢</div>
       </div>
+    </div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;align-items:center">
+      <span style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;margin-right:2px">Filter</span>
+      <button class="btn ${activeFilter === 'all' ? 'btn-primary' : 'btn-ghost'}" style="font-size:12px;padding:5px 12px"
+        onclick="mcasFilterBy('all')">All <span style="opacity:.65">${apps.length}</span></button>
+      ${AI_CAT_FILTERS.filter(f => catCount[f.key] > 0).map(f =>
+        `<button class="btn ${activeFilter === f.key ? 'btn-primary' : 'btn-ghost'}" style="font-size:12px;padding:5px 12px"
+          onclick="mcasFilterBy('${f.key}')">${f.label} <span style="opacity:.65">${catCount[f.key]}</span></button>`
+      ).join('')}
     </div>
 
     <div class="card">
