@@ -565,8 +565,9 @@ const GRAPH_SCOPES = [
 // admin-consent-required and would break silent token acquisition for everyone).
 // Requested per-feature on demand, and included in the admin-consent URL so they can be granted.
 const OPTIONAL_SCOPES = [
-  'https://graph.microsoft.com/ThreatHunting.Read.All',     // Defender Advanced Hunting (AIAgentsInfo)
-  'https://graph.microsoft.com/CopilotPolicySettings.Read', // Copilot policy settings (web grounding etc.)
+  'https://graph.microsoft.com/ThreatHunting.Read.All',       // Defender Advanced Hunting (AIAgentsInfo)
+  'https://graph.microsoft.com/CopilotPolicySettings.Read',   // Copilot policy settings (web grounding etc.)
+  'https://graph.microsoft.com/ProtectionScopes.Compute.User', // Purview DLP/collection scope for the signed-in user
 ];
 
 // Known AI app patterns for detection (case-insensitive)
@@ -1460,6 +1461,37 @@ async function fetchWebGroundingSetting() {
   return STATE.data.webGrounding;
 }
 
+// Purview DLP / collection-policy COVERAGE for AI interactions.
+// The Purview data-security & governance "protectionScopes/compute" API (v1.0) returns the
+// policy scopes that apply to the signed-in user for upload/download activities. It does NOT
+// expose policy definitions (those are PowerShell-only) — but a non-empty scope means DLP or
+// collection policies are active for this user, and the executionMode / policyActions reveal
+// whether enforcement is real-time (inline) and whether any action blocks/restricts.
+async function fetchDlpProtectionScope() {
+  if (STATE.data.dlpScope !== undefined) return STATE.data.dlpScope;
+  const token = await getTokenFor(['https://graph.microsoft.com/ProtectionScopes.Compute.User']);
+  if (!token) { STATE.data.dlpScope = { ok: false, code: 'forbidden' }; return STATE.data.dlpScope; }
+  try {
+    const r = await fetch(`${GRAPH}/me/dataSecurityAndGovernance/protectionScopes/compute`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ activities: 'uploadText,downloadText,uploadFile,downloadFile' }),
+    });
+    if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + t.slice(0, 200)); }
+    const data = await r.json();
+    const scopes = data.value || [];
+    const inline = scopes.some(s => s.executionMode === 'evaluateInline');
+    const actions = scopes.flatMap(s => s.policyActions || []);
+    const blocking = actions.some(a => /restrictAccess|block/i.test(a.action || a.restrictionAction || a['@odata.type'] || ''));
+    STATE.data.dlpScope = { ok: true, scopes, total: scopes.length, configured: scopes.length > 0, inline, blocking };
+  } catch (e) {
+    const msg = e.message || '';
+    STATE.data.dlpScope = { ok: false, error: msg,
+      code: /403|forbidden|authorization/i.test(msg) ? 'forbidden' : /404|422|400|not.?found|resolve/i.test(msg) ? 'unsupported' : 'error' };
+  }
+  return STATE.data.dlpScope;
+}
+
 async function fetchGrantPolicies() {
   if (STATE.data.grantPolicies) return STATE.data.grantPolicies;
   try {
@@ -2030,7 +2062,7 @@ async function loadDashboard() {
             { label:'Sensitive Data Exposure', value: cisoSensitive,                                        color: cisoSensColor,                                              why: cisoWhySensitive, page:'labels' },
           ].map(m => '<div onclick="navigate(\'' + m.page + '\', document.querySelector(\'[onclick*=' + m.page + ']\'))" style="background:var(--bg-card);padding:14px 18px;display:flex;justify-content:space-between;align-items:flex-start;gap:16px;cursor:pointer">'
               + '<div style="min-width:0">'
-              +   '<div style="font-size:12px;color:var(--text-muted)">' + esc(m.label) + '</div>'
+              +   '<div style="font-size:12px;font-weight:700;color:var(--text-primary)">' + esc(m.label) + '</div>'
               +   '<div style="font-size:11px;color:var(--text-dim);margin-top:3px;line-height:1.45">' + esc(m.why) + '</div>'
               + '</div>'
               + '<span style="font-size:13px;font-weight:700;color:' + m.color + ';white-space:nowrap">' + esc(m.value) + '</span>'
@@ -5311,10 +5343,10 @@ async function loadDataRisk() {
 async function loadCompliance() {
   const el = document.getElementById('compliance-content');
   try {
-    const [caP, org, grantPolicies, sps, signIns, tenantRegion, webGrounding] = await Promise.all([
+    const [caP, org, grantPolicies, sps, signIns, tenantRegion, webGrounding, , dlpScope] = await Promise.all([
       fetchCAPolicies(), fetchOrg(), fetchGrantPolicies(),
       fetchServicePrincipals(), fetchSignIns(), fetchTenantRegion(),
-      fetchWebGroundingSetting(), fetchAiAgentInventory(),
+      fetchWebGroundingSetting(), fetchAiAgentInventory(), fetchDlpProtectionScope(),
     ]);
     const authPolicy = STATE.data.authPolicy || {};
     const secDefaults = STATE.data.secDefaults || {};
@@ -5615,6 +5647,51 @@ async function loadCompliance() {
             📍 M365 Admin Center → Copilot → Settings → <em>Web search for Copilot</em>
             &nbsp;·&nbsp;
             <a href="https://learn.microsoft.com/en-us/copilot/microsoft-365/manage-public-web-access" target="_blank" style="color:var(--accent-blue)">Documentation →</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">🛡️ Purview DLP for AI — Coverage</div>
+          ${dlpScope?.ok
+            ? (dlpScope.configured
+                ? `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(63,185,80,.12);color:var(--risk-low);border:1px solid rgba(63,185,80,.3)">✅ DLP policies active</span>`
+                : `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.12);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">⚠️ No DLP scope returned</span>`)
+            : `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.12);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">${dlpScope?.code === 'forbidden' ? '🔒 Needs ProtectionScopes.Compute.User' : dlpScope?.code === 'unsupported' ? 'ℹ️ Not onboarded' : '⚠️ Manual check required'}</span>`}
+        </div>
+        <div class="card-body">
+          <p style="font-size:12px;color:var(--text-muted);margin-bottom:14px">
+            Microsoft Purview <strong>Data Loss Prevention</strong> can warn or block users from sending sensitive data to AI apps (e.g. blocking pasted secrets into ChatGPT, or restricting Microsoft 365 Copilot prompts by sensitivity label). This is a <strong>coverage signal</strong>: it reads whether DLP / collection policies are active for the signed-in user via the Purview <code>protectionScopes/compute</code> API — it does <em>not</em> expose the policy definitions (those are PowerShell-only).
+          </p>
+          ${dlpScope?.ok
+            ? `<div style="padding:9px 12px;border-radius:6px;background:${dlpScope.configured ? 'rgba(63,185,80,.08)' : 'rgba(240,136,62,.08)'};border:1px solid ${dlpScope.configured ? 'rgba(63,185,80,.25)' : 'rgba(240,136,62,.25)'};font-size:12px;color:var(--text-muted)">
+                ${dlpScope.configured ? '✅' : '⚠️'} <strong style="color:${dlpScope.configured ? 'var(--risk-low)' : 'var(--risk-medium)'}">${dlpScope.configured
+                    ? `DLP / collection policies apply to this user (${dlpScope.total} scope${dlpScope.total !== 1 ? 's' : ''}).`
+                    : 'No DLP or collection policy scope returned for this user.'}</strong>
+                ${dlpScope.configured
+                    ? `${dlpScope.inline ? 'Includes <strong>real-time (inline)</strong> evaluation. ' : 'Offline evaluation only. '}${dlpScope.blocking ? 'At least one policy <strong>blocks/restricts</strong> activity.' : 'No blocking action in scope.'}`
+                    : 'Either no DLP policy targets this account, or the tenant isn’t onboarded to Purview data security for AI.'}
+                <span class="data-source source-live" style="font-size:10px;margin-left:6px">● /me/dataSecurityAndGovernance/protectionScopes/compute</span>
+              </div>`
+            : `<div style="display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid rgba(48,54,61,.4)">
+                <div>
+                  <span style="font-size:12px;font-weight:600;color:var(--text-primary)">DLP-for-AI coverage unknown</span>
+                  <span style="font-size:11px;color:var(--text-muted);margin-left:8px">${dlpScope?.code === 'forbidden'
+                      ? 'Grant the scope and re-run admin consent to read live coverage.'
+                      : dlpScope?.code === 'unsupported'
+                        ? 'Tenant not onboarded to Purview data security for AI (preview).'
+                        : 'Could not read protection scope.'}</span>
+                </div>
+                <a href="https://purview.microsoft.com/datasecurityposturemanagement" target="_blank"
+                  style="font-size:11px;padding:2px 10px;border-radius:10px;background:rgba(240,136,62,.1);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25);text-decoration:none">
+                  ${dlpScope?.code === 'forbidden' ? '🔒 Grant ProtectionScopes.Compute.User' : '⚠️ Check in Purview →'}
+                </a>
+              </div>`}
+          <div style="margin-top:12px;font-size:11px;color:var(--text-dim)">
+            📍 Purview portal → Data Loss Prevention → Policies (<em>Microsoft 365 Copilot</em> &amp; <em>Devices / generative-AI</em> locations). Policy definitions are managed via <code>Get-DlpCompliancePolicy</code> (Security &amp; Compliance PowerShell).
+            &nbsp;·&nbsp;
+            <a href="https://learn.microsoft.com/en-us/purview/dlp-microsoft365-copilot-location-learn-about" target="_blank" style="color:var(--accent-blue)">Documentation →</a>
           </div>
         </div>
       </div>
