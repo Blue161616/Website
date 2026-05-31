@@ -1289,17 +1289,12 @@ async function fetchIdProtectionAgentStats() {
 async function fetchAiAgentInventory() {
   if (STATE.data.aiAgentInv !== undefined) return STATE.data.aiAgentInv;
   const kql = [
-    'let latest = AIAgentsInfo | summarize arg_max(Timestamp, *) by AIAgentId | where AgentStatus != "Deleted";',
-    'let makerIds = latest | mv-expand detail = AgentToolsDetails | where detail.action.connectionProperties.mode == "Maker" | distinct AIAgentId;',
-    'latest',
-    '| extend _Src   = tostring(column_ifexists("RegistrySource", ""))',
-    '| extend _Auth  = tostring(column_ifexists("UserAuthenticationType", ""))',
-    '| extend _IsMaker = AIAgentId in (makerIds)',
-    '| summarize Total=count(),',
-    '    BySource_PowerPlatform=countif(_Src=="PowerPlatform"),',
-    '    BySource_A365=countif(_Src=="A365"),',
-    '    NoAuth=countif(_Auth=="None"),',
-    '    MakerCreds=countif(_IsMaker)',
+    'AIAgentsInfo',
+    '| summarize arg_max(Timestamp, *) by AIAgentId',
+    '| where AgentStatus != "Deleted"',
+    '| extend _Auth = tostring(column_ifexists("UserAuthenticationType", ""))',
+    '| extend _IsMaker = tostring(AgentToolsDetails) contains_cs "Maker"',
+    '| summarize Total=count(), NoAuth=countif(_Auth=="None"), MakerCreds=countif(_IsMaker)',
   ].join(' ');
   // Incremental consent: silent-only token for the hunting scope (no popup).
   const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
@@ -1322,42 +1317,7 @@ async function fetchAiAgentInventory() {
       ok: true, rows, total,
       noAuth:     row.NoAuth     || 0,
       makerCreds: row.MakerCreds || 0,
-      bySource: {
-        PowerPlatform: row.BySource_PowerPlatform || 0,
-        A365:          row.BySource_A365          || 0,
-      },
-      eudbNonCompliant: 0, eudbRows: [],
     };
-    // --- Query 2: GDPR/EUDB model compliance (Copilot Studio agents, P30D) ---
-    const kql2 = [
-      'AIAgentsInfo',
-      '| summarize arg_max(Timestamp, *) by AIAgentId',
-      '| where AgentStatus != "Deleted"',
-      '| extend _Platform = tostring(column_ifexists("Platform", "Copilot Studio"))',
-      '| where _Platform == "Copilot Studio"',
-      '| extend _RawInfo = tostring(column_ifexists("RawAgentInfo", ""))',
-      '| extend ModelNameHint = extract(@"modelNameHint:\\s*([A-Za-z0-9_\\-\\.]+)", 1, _RawInfo)',
-      '| extend HintLower = tolower(ModelNameHint)',
-      '| extend Provider = case(',
-      '    HintLower startswith "sonnet" or HintLower startswith "haiku" or HintLower startswith "opus", "Anthropic",',
-      '    HintLower startswith "gpt" or HintLower startswith "o1" or HintLower startswith "o3", "OpenAI (Microsoft-hosted)",',
-      '    isempty(ModelNameHint), "Environment default",',
-      '    "Other"',
-      '  )',
-      '| project AIAgentName, Provider, ModelNameHint, EnvironmentId, CreatorAccountUpn',
-      '| sort by Provider asc, AIAgentName asc',
-    ].join('\n');
-    const r2 = await fetch(`${GRAPH}/security/runHuntingQuery`, {
-      method: 'POST',
-      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ Query: kql2, Timespan: 'P30D' }),
-    });
-    if (r2.ok) {
-      const d2 = await r2.json();
-      const eudbRows = d2.results || [];
-      STATE.data.aiAgentInv.eudbRows = eudbRows;
-      STATE.data.aiAgentInv.eudbNonCompliant = eudbRows.filter(r => r.Provider === 'Anthropic').length;
-    }
   } catch (e) {
     const msg = e.message || '';
     STATE.data.aiAgentInv = { ok: false, rows: [], total: 0, error: msg,
@@ -6636,7 +6596,7 @@ async function loadProtection() {
         // Live AI agent inventory via Advanced Hunting (AIAgentsInfo).
         // connected = toggle confirmed ON (agents returned). Drives what we hide below.
         const inv = aiAgentInv || { ok:false, rows:[], total:0 };
-        const connected = inv.ok && inv.total > 0;
+        const connected = inv.ok;
 
         const statCell = (label, value, color, sub) => `
           <div>
@@ -6672,37 +6632,9 @@ async function loadProtection() {
                     inv.makerCreds > 0 ? 'var(--risk-medium)' : 'var(--risk-low)',
                     'Actions using author credentials'
                   )}
-                                    ${statCell(
-                    (inv.eudbNonCompliant || 0) > 0 ? '⚠️ GDPR Non-Compliant' : 'GDPR Non-Compliant',
-                    inv.eudbNonCompliant || 0,
-                    (inv.eudbNonCompliant || 0) > 0 ? 'var(--risk-critical)' : 'var(--risk-low)',
-                    'Anthropic (Claude) — out of EUDB'
-                  )}
-                  <div style="width:1px;background:var(--border);height:48px;flex-shrink:0"></div>
-<div style="width:1px;background:var(--border);height:48px;flex-shrink:0"></div>
-                  <div>
-                    <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">By source</div>
-                    <div style="display:flex;flex-wrap:wrap;gap:4px">
-                      ${inv.bySource.A365 > 0 ? `<span class="badge badge-info" style="font-size:10px">Agent 365: ${inv.bySource.A365}</span>` : ''}
-                      ${inv.bySource.PowerPlatform > 0 ? `<span class="badge badge-info" style="font-size:10px">Power Platform: ${inv.bySource.PowerPlatform}</span>` : ''}
-                      ${!inv.bySource.A365 && !inv.bySource.PowerPlatform ? '<span class="text-muted" style="font-size:11px">—</span>' : ''}
-                    </div>
-                  </div>
                 </div>
-                                ${(inv.eudbNonCompliant || 0) > 0 ? `
-                <div style="margin-top:10px;padding:8px 10px;border-radius:6px;background:rgba(248,81,73,.06);border:1px solid rgba(248,81,73,.2)">
-                  <div style="font-size:11px;font-weight:700;color:var(--risk-critical);margin-bottom:6px">⚠️ ${inv.eudbNonCompliant} Copilot Studio agent${inv.eudbNonCompliant !== 1 ? 's use' : ' uses'} an Anthropic (Claude) model — data is processed outside the EU Data Boundary</div>
-                  <div style="display:flex;flex-direction:column;gap:3px;max-height:140px;overflow-y:auto">
-                    ${(inv.eudbRows || []).filter(r => r.Provider === 'Anthropic').map(r =>
-                      '<div style="display:flex;align-items:baseline;gap:6px;font-size:11px">' +
-                      '<span style="color:var(--text-main);font-weight:600;flex-shrink:0">' + (r.AIAgentName || '(unnamed)') + '</span>' +
-                      '<span style="color:var(--text-dim);font-size:10px;margin-left:6px">' + (r.ModelNameHint || '') + '</span>' +
-                      '<span style="color:var(--text-dim);font-size:10px;margin-left:auto">' + (r.CreatorAccountUpn || '') + '</span>' +
-                      '</div>'
-                    ).join('')}
-                  </div>
-                </div>` : ''}
-<div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Live from the <code>AIAgentsInfo</code> Advanced Hunting table (P30D). No-auth agents are publicly accessible — review with owners. Maker-credential agents embed the creator's account in actions. GDPR column flags Copilot Studio agents whose <code>modelNameHint</code> points to an Anthropic model processed outside the EU Data Boundary.</div>
+
+<div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Live from the <code>AIAgentsInfo</code> Advanced Hunting table (P30D). No-auth agents are publicly accessible — review with owners. Maker-credential agents embed the creator's account in actions.</div>
               </div>
             </div>`
           : `<div style="margin-bottom:16px;padding:10px 14px;border-radius:8px;background:rgba(56,139,253,.06);border:1px solid rgba(56,139,253,.2);font-size:12px;color:var(--text-muted)">
