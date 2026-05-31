@@ -304,6 +304,9 @@
       <button class="btn btn-primary" id="btn-signin" onclick="signIn()">
         <span style="font-size:16px;line-height:1">⊞</span> Sign in with Microsoft
       </button>
+      <button class="btn btn-ghost" onclick="adminConsent()" title="Grant tenant-wide admin consent for all required + optional permissions (you must be a Global Administrator)">
+        🔑 Grant / re-run admin consent
+      </button>
     </div>
 
     <div class="login-divider"></div>
@@ -562,7 +565,8 @@ const GRAPH_SCOPES = [
 // admin-consent-required and would break silent token acquisition for everyone).
 // Requested per-feature on demand, and included in the admin-consent URL so they can be granted.
 const OPTIONAL_SCOPES = [
-  'https://graph.microsoft.com/ThreatHunting.Read.All',  // Defender Advanced Hunting (AIAgentsInfo)
+  'https://graph.microsoft.com/ThreatHunting.Read.All',     // Defender Advanced Hunting (AIAgentsInfo)
+  'https://graph.microsoft.com/CopilotPolicySettings.Read', // Copilot policy settings (web grounding etc.)
 ];
 
 // Known AI app patterns for detection (case-insensitive)
@@ -758,6 +762,16 @@ async function getToken() {
     const r = await app.acquireTokenPopup({ scopes: GRAPH_SCOPES });
     return r.accessToken;
   }
+}
+
+// Acquire a token for an incremental/optional scope SILENTLY ONLY (never pops up), so a
+// missing consent degrades gracefully instead of disrupting the app. Returns null on failure.
+async function getTokenFor(scopes) {
+  try {
+    const app = await getMsal();
+    const r = await app.acquireTokenSilent({ scopes, account: STATE.account });
+    return r.accessToken;
+  } catch { return null; }
 }
 
 // ── Graph helpers ──────────────────────────────────────────────────────────
@@ -1275,19 +1289,13 @@ async function fetchIdProtectionAgentStats() {
 async function fetchAiAgentInventory() {
   if (STATE.data.aiAgentInv !== undefined) return STATE.data.aiAgentInv;
   const kql = 'AIAgentsInfo | summarize arg_max(Timestamp, *) by AIAgentId | where AgentStatus != "Deleted" | summarize Agents=count() by RegistrySource';
+  // Incremental consent: silent-only token for the hunting scope (no popup).
+  const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
+  if (!token) {
+    STATE.data.aiAgentInv = { ok: false, rows: [], total: 0, code: 'forbidden', error: 'ThreatHunting.Read.All not consented' };
+    return STATE.data.aiAgentInv;
+  }
   try {
-    // Incremental consent: acquire the hunting scope silently only — never pop up here, so a
-    // missing consent degrades gracefully (shows "needs ThreatHunting.Read.All") instead of
-    // disrupting the app. Admin grants it via "Re-run Admin Consent" (OPTIONAL_SCOPES).
-    let token;
-    try {
-      const app = await getMsal();
-      const res = await app.acquireTokenSilent({ scopes: OPTIONAL_SCOPES, account: STATE.account });
-      token = res.accessToken;
-    } catch {
-      STATE.data.aiAgentInv = { ok: false, rows: [], total: 0, code: 'forbidden', error: 'ThreatHunting.Read.All not consented' };
-      return STATE.data.aiAgentInv;
-    }
     const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
@@ -1304,6 +1312,29 @@ async function fetchAiAgentInventory() {
       code: /403|forbidden|authorization/i.test(msg) ? 'forbidden' : /400|bad request|failed to resolve|semantic|recognize/i.test(msg) ? 'unsupported' : 'error' };
   }
   return STATE.data.aiAgentInv;
+}
+
+// Web Grounding (Copilot web search) IS readable via the Copilot policy settings API —
+// it's the supported setting id microsoft.copilot.allowwebsearch.
+// (External LLM providers & Flex Routing are NOT exposed by any API.)
+async function fetchWebGroundingSetting() {
+  if (STATE.data.webGrounding !== undefined) return STATE.data.webGrounding;
+  const token = await getTokenFor(['https://graph.microsoft.com/CopilotPolicySettings.Read']);
+  if (!token) { STATE.data.webGrounding = { ok: false, code: 'forbidden' }; return STATE.data.webGrounding; }
+  try {
+    const r = await fetch(`${GRAPH_BETA}/copilot/admin/policySettings/microsoft.copilot.allowwebsearch`, { headers: { Authorization: 'Bearer ' + token } });
+    if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + t.slice(0, 150)); }
+    const d = await r.json();
+    // value: null = not configured (default: web search ON). A string otherwise.
+    const v = (d.value == null) ? null : String(d.value);
+    const enabled = v == null ? true : !/disable|false|off|^0$|blocked/i.test(v);
+    STATE.data.webGrounding = { ok: true, value: v, configured: v != null, enabled };
+  } catch (e) {
+    const msg = e.message || '';
+    STATE.data.webGrounding = { ok: false, error: msg,
+      code: /403|forbidden|authorization/i.test(msg) ? 'forbidden' : /404|422/.test(msg) ? 'unsupported' : 'error' };
+  }
+  return STATE.data.webGrounding;
 }
 
 async function fetchGrantPolicies() {
@@ -5038,9 +5069,10 @@ async function loadDataRisk() {
 async function loadCompliance() {
   const el = document.getElementById('compliance-content');
   try {
-    const [caP, org, grantPolicies, sps, signIns, tenantRegion] = await Promise.all([
+    const [caP, org, grantPolicies, sps, signIns, tenantRegion, webGrounding] = await Promise.all([
       fetchCAPolicies(), fetchOrg(), fetchGrantPolicies(),
       fetchServicePrincipals(), fetchSignIns(), fetchTenantRegion(),
+      fetchWebGroundingSetting(),
     ]);
     const authPolicy = STATE.data.authPolicy || {};
     const secDefaults = STATE.data.secDefaults || {};
@@ -5295,26 +5327,37 @@ async function loadCompliance() {
       <div class="card">
         <div class="card-header">
           <div class="card-title">🌐 Web Grounding (Copilot for Microsoft 365)</div>
-          <span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.12);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">⚠️ Manual check required — not available via API</span>
+          ${webGrounding?.ok
+            ? (webGrounding.enabled
+                ? `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(248,81,73,.12);color:var(--risk-critical);border:1px solid rgba(248,81,73,.3)">🔴 Web search ${webGrounding.configured ? 'enabled' : 'on (default)'}</span>`
+                : `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(63,185,80,.12);color:var(--risk-low);border:1px solid rgba(63,185,80,.3)">✅ Web search disabled</span>`)
+            : `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.12);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">${webGrounding?.code === 'forbidden' ? '🔒 Needs CopilotPolicySettings.Read' : '⚠️ Manual check required'}</span>`}
         </div>
         <div class="card-body">
           <p style="font-size:12px;color:var(--text-muted);margin-bottom:14px">
-            When <strong>Web grounding</strong> is enabled, Copilot for Microsoft 365 sends user queries to <strong>Bing</strong> to supplement responses with web content. Bing is operated outside the EU Data Boundary — meaning prompts (including potentially sensitive organisational context) may be processed in the USA. This setting is <strong>on by default</strong> and is not exposed via any public API or Graph endpoint.
+            When <strong>Web grounding</strong> is enabled, Copilot for Microsoft 365 sends user queries to <strong>Bing</strong> to supplement responses with web content. Bing is operated outside the EU Data Boundary — prompts may be processed in the USA. ${webGrounding?.ok ? 'Read live from the Copilot policy <code>microsoft.copilot.allowwebsearch</code>.' : 'On by default.'}
           </p>
-          ${[
-            { state: 'Enabled (default)', impact: 'Queries sent to Bing — data may leave EU Data Boundary', gdpr: false },
-            { state: 'Disabled',          impact: 'Copilot answers from Microsoft 365 data only — stays within EU', gdpr: true },
-          ].map(p => `
-            <div style="display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid rgba(48,54,61,.4)">
-              <div>
-                <span style="font-size:12px;font-weight:600;color:var(--text-primary)">${esc(p.state)}</span>
-                <span style="font-size:11px;color:var(--text-muted);margin-left:8px">${esc(p.impact)} · GDPR ${p.gdpr ? '✅ Safe' : '❌ Risk'}</span>
-              </div>
-              <a href="https://admin.microsoft.com/#/copilot/settings" target="_blank"
-                style="font-size:11px;padding:2px 10px;border-radius:10px;background:rgba(240,136,62,.1);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25);text-decoration:none">
-                ⚠️ Check in Admin Center →
-              </a>
-            </div>`).join('')}
+          ${webGrounding?.ok
+            ? `<div style="padding:9px 12px;border-radius:6px;background:${webGrounding.enabled ? 'rgba(248,81,73,.08)' : 'rgba(63,185,80,.08)'};border:1px solid ${webGrounding.enabled ? 'rgba(248,81,73,.25)' : 'rgba(63,185,80,.25)'};font-size:12px;color:var(--text-muted)">
+                ${webGrounding.enabled ? '🔴' : '✅'} <strong style="color:${webGrounding.enabled ? 'var(--risk-critical)' : 'var(--risk-low)'}">Web search ${webGrounding.configured ? (webGrounding.enabled ? 'Enabled' : 'Disabled') : 'not configured (default = enabled)'}.</strong>
+                ${webGrounding.enabled ? 'Prompts may be sent to Bing outside the EU Data Boundary — GDPR risk.' : 'Copilot answers from Microsoft 365 data only — stays within EU.'}
+                ${webGrounding.value != null ? `<span style="font-size:10px;color:var(--text-dim)"> · policy value: <code>${esc(webGrounding.value)}</code></span>` : ''}
+                <span class="data-source source-live" style="font-size:10px;margin-left:6px">● beta/copilot/admin/policySettings</span>
+              </div>`
+            : [
+                { state: 'Enabled (default)', impact: 'Queries sent to Bing — data may leave EU Data Boundary', gdpr: false },
+                { state: 'Disabled',          impact: 'Copilot answers from Microsoft 365 data only — stays within EU', gdpr: true },
+              ].map(p => `
+              <div style="display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid rgba(48,54,61,.4)">
+                <div>
+                  <span style="font-size:12px;font-weight:600;color:var(--text-primary)">${esc(p.state)}</span>
+                  <span style="font-size:11px;color:var(--text-muted);margin-left:8px">${esc(p.impact)} · GDPR ${p.gdpr ? '✅ Safe' : '❌ Risk'}</span>
+                </div>
+                <a href="https://admin.microsoft.com/#/copilot/settings" target="_blank"
+                  style="font-size:11px;padding:2px 10px;border-radius:10px;background:rgba(240,136,62,.1);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25);text-decoration:none">
+                  ${webGrounding?.code === 'forbidden' ? '🔒 Grant CopilotPolicySettings.Read' : '⚠️ Check in Admin Center →'}
+                </a>
+              </div>`).join('')}
           <div style="margin-top:12px;font-size:11px;color:var(--text-dim)">
             📍 M365 Admin Center → Copilot → Settings → <em>Web search for Copilot</em>
             &nbsp;·&nbsp;
