@@ -1290,11 +1290,16 @@ async function fetchAiAgentInventory() {
   if (STATE.data.aiAgentInv !== undefined) return STATE.data.aiAgentInv;
   const kql = [
     'let latest = AIAgentsInfo | summarize arg_max(Timestamp, *) by AIAgentId | where AgentStatus != "Deleted";',
-    'latest | summarize Total=count(),',
-    '  BySource_PowerPlatform=countif(RegistrySource=="PowerPlatform"),',
-    '  BySource_A365=countif(RegistrySource=="A365"),',
-    '  NoAuth=countif(UserAuthenticationType=="None"),',
-    '  MakerCreds=countif(AgentToolsDetails has "author")',
+    'let makerIds = latest | mv-expand detail = AgentToolsDetails | where detail.action.connectionProperties.mode == "Maker" | distinct AIAgentId;',
+    'latest',
+    '| extend _Src   = tostring(column_ifexists("RegistrySource", ""))',
+    '| extend _Auth  = tostring(column_ifexists("UserAuthenticationType", ""))',
+    '| extend _IsMaker = AIAgentId in (makerIds)',
+    '| summarize Total=count(),',
+    '    BySource_PowerPlatform=countif(_Src=="PowerPlatform"),',
+    '    BySource_A365=countif(_Src=="A365"),',
+    '    NoAuth=countif(_Auth=="None"),',
+    '    MakerCreds=countif(_IsMaker)',
   ].join(' ');
   // Incremental consent: silent-only token for the hunting scope (no popup).
   const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
@@ -1321,7 +1326,38 @@ async function fetchAiAgentInventory() {
         PowerPlatform: row.BySource_PowerPlatform || 0,
         A365:          row.BySource_A365          || 0,
       },
+      eudbNonCompliant: 0, eudbRows: [],
     };
+    // --- Query 2: GDPR/EUDB model compliance (Copilot Studio agents, P30D) ---
+    const kql2 = [
+      'AIAgentsInfo',
+      '| summarize arg_max(Timestamp, *) by AIAgentId',
+      '| where AgentStatus != "Deleted"',
+      '| extend _Platform = tostring(column_ifexists("Platform", "Copilot Studio"))',
+      '| where _Platform == "Copilot Studio"',
+      '| extend _RawInfo = tostring(column_ifexists("RawAgentInfo", ""))',
+      '| extend ModelNameHint = extract(@"modelNameHint:\\s*([A-Za-z0-9_\\-\\.]+)", 1, _RawInfo)',
+      '| extend HintLower = tolower(ModelNameHint)',
+      '| extend Provider = case(',
+      '    HintLower startswith "sonnet" or HintLower startswith "haiku" or HintLower startswith "opus", "Anthropic",',
+      '    HintLower startswith "gpt" or HintLower startswith "o1" or HintLower startswith "o3", "OpenAI (Microsoft-hosted)",',
+      '    isempty(ModelNameHint), "Environment default",',
+      '    "Other"',
+      '  )',
+      '| project AIAgentName, Provider, ModelNameHint, EnvironmentId, CreatorAccountUpn',
+      '| sort by Provider asc, AIAgentName asc',
+    ].join('\n');
+    const r2 = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ Query: kql2, Timespan: 'P30D' }),
+    });
+    if (r2.ok) {
+      const d2 = await r2.json();
+      const eudbRows = d2.results || [];
+      STATE.data.aiAgentInv.eudbRows = eudbRows;
+      STATE.data.aiAgentInv.eudbNonCompliant = eudbRows.filter(r => r.Provider === 'Anthropic').length;
+    }
   } catch (e) {
     const msg = e.message || '';
     STATE.data.aiAgentInv = { ok: false, rows: [], total: 0, error: msg,
