@@ -824,6 +824,26 @@ function detectModel(name) {
   return entry || { model: 'Unknown', provider: name, residency: 'Unknown', training: 'Unknown', gdprOk: false, risk: 'medium' };
 }
 
+// Map AIAgentsInfo modelNameHint values to model metadata for the risk table.
+function hintToModelInfo(hint) {
+  if (!hint) return null;
+  const h = hint.toLowerCase();
+  if (h.startsWith('sonnet'))   return { model:'Claude 3.5 Sonnet', provider:'Anthropic',  residency:'USA',          training:'No',      gdprOk:false, risk:'medium' };
+  if (h.startsWith('haiku'))    return { model:'Claude Haiku',       provider:'Anthropic',  residency:'USA',          training:'No',      gdprOk:false, risk:'medium' };
+  if (h.startsWith('opus'))     return { model:'Claude Opus',        provider:'Anthropic',  residency:'USA',          training:'No',      gdprOk:false, risk:'medium' };
+  if (h.startsWith('gpt-4') || h.startsWith('gpt4')) return { model:'GPT-4o',  provider:'OpenAI', residency:'USA/EU/AU+', training:'Opt-out', gdprOk:true,  risk:'medium' };
+  if (h.startsWith('gpt-3') || h.startsWith('gpt3')) return { model:'GPT-3.5', provider:'OpenAI', residency:'USA/EU/AU+', training:'Opt-out', gdprOk:true,  risk:'medium' };
+  if (h.startsWith('o1') || h.startsWith('o3'))      return { model:'OpenAI o-series', provider:'OpenAI', residency:'USA/EU/AU+', training:'Opt-out', gdprOk:true, risk:'medium' };
+  if (h.startsWith('gemini'))   return { model:'Gemini',             provider:'Google',     residency:'Global',       training:'Opt-out', gdprOk:false, risk:'medium' };
+  if (h.startsWith('mistral'))  return { model:'Mistral Large',      provider:'Mistral AI', residency:'EU',           training:'No',      gdprOk:true,  risk:'medium' };
+  if (h.startsWith('llama'))    return { model:'Llama',              provider:'Meta',       residency:'USA',          training:'No',      gdprOk:false, risk:'medium' };
+  if (h.startsWith('deepseek')) return { model:'DeepSeek R1',        provider:'DeepSeek',   residency:'China',        training:'Yes',     gdprOk:false, risk:'critical' };
+  if (h.startsWith('command'))  return { model:'Command R+',         provider:'Cohere',     residency:'USA/EU',       training:'Opt-out', gdprOk:false, risk:'medium' };
+  // Fallback: try APP_MODEL_MAP pattern matching
+  const entry = APP_MODEL_MAP.find(e => e.pattern.test(hint));
+  return entry ? { ...entry } : null;
+}
+
 function riskScore(sp, grants = []) {
   const info = detectModel(sp.displayName || '');
   let score = { critical: 4, high: 3, medium: 2, low: 1 }[info.risk] || 2;
@@ -1389,7 +1409,25 @@ async function fetchAiAgentInventory() {
       mcpCount:      row.McpCount      || 0,
       hardCodedCount: row.HardCodedCount || 0,
       genOrchCount:   row.GenOrchCount   || 0,
+      modelHints: [],
     };
+    // Second query: per-model breakdown, used to enrich the AI Models risk table.
+    try {
+      const kqlM = [
+        'AIAgentsInfo',
+        '| summarize arg_max(Timestamp, *) by AIAgentId',
+        '| where AgentStatus != "Deleted"',
+        '| extend _hint = tolower(extract(@"modelNameHint:\\s*([A-Za-z0-9_\\-\\.]+)", 1, tostring(column_ifexists("RawAgentInfo", ""))))',
+        '| where isnotempty(_hint)',
+        '| summarize AgentCount=count() by ModelHint=_hint',
+      ].join(' ');
+      const r2 = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ Query: kqlM, Timespan: 'P30D' }),
+      });
+      if (r2.ok) STATE.data.aiAgentInv.modelHints = (await r2.json()).results || [];
+    } catch { /* best-effort */ }
   } catch (e) {
     const msg = e.message || '';
     STATE.data.aiAgentInv = { ok: false, rows: [], total: 0, error: msg,
@@ -2928,6 +2966,20 @@ async function loadModels() {
       modelMap[key].agentCount = (modelMap[key].agentCount || 0) + 1;
       agentModelRows.push({ sp, blueprint: agentParentMap[sp.id], mi });
     });
+
+    // ── AIAgentsInfo model hints ───────────────────────────────────────────────
+    // Merge models detected via KQL (AIAgentsInfo.modelNameHint) into the risk table.
+    const _aiInv = STATE.data.aiAgentInv;
+    if (_aiInv?.ok && _aiInv.modelHints?.length) {
+      _aiInv.modelHints.forEach(({ ModelHint, AgentCount }) => {
+        const mi = hintToModelInfo(ModelHint);
+        if (!mi) return;
+        const key = mi.model + '|' + mi.provider;
+        if (!modelMap[key]) modelMap[key] = { ...mi, apps: [], calls: 0, sources: new Set(), mcasUsers: 0, mcasTraffic: 0, agentCount: 0 };
+        modelMap[key].sources.add('agent');
+        modelMap[key].agentCount = (modelMap[key].agentCount || 0) + (AgentCount || 1);
+      });
+    }
 
     const models = Object.values(modelMap).sort((a,b)=>b.calls - a.calls || (b.agentCount||0) - (a.agentCount||0) || b.mcasUsers - a.mcasUsers);
     STATE.data.modelList = models;
