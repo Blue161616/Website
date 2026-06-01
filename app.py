@@ -7,13 +7,31 @@ Run with elevated privileges for full scan capabilities:
 Install dependencies:
   pip install flask flask-cors python-nmap apscheduler
 
-Install nmap binary:
+Scan pipeline (masscan → nmap → nuclei):
+  masscan and nuclei are OPTIONAL external binaries (not pip packages). When
+  present they extend the pipeline; when absent the scanner degrades gracefully
+  to nmap-only. masscan speeds up CIDR/range discovery, then nmap does service
+  detection on just the discovered host:ports; nuclei then runs web vuln
+  templates against discovered HTTP/HTTPS services.
+
+Install nmap binary (required):
   Windows : https://nmap.org/download.html  (Windows installer, add to PATH)
   Linux   : sudo apt install nmap  /  sudo yum install nmap
   macOS   : brew install nmap
+
+Install masscan (optional — fast range discovery; needs Npcap on Windows):
+  Windows : build from https://github.com/robertdavidgraham/masscan, or place
+            masscan.exe in PATH / C:\\masscan\\
+  Linux   : sudo apt install masscan
+  macOS   : brew install masscan
+
+Install nuclei (optional — web vulnerability scanning):
+  Any OS  : download the release binary from
+            https://github.com/projectdiscovery/nuclei/releases (add to PATH),
+            or: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 """
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response, stream_with_context
 from flask_cors import CORS
 import nmap
 import threading
@@ -23,6 +41,8 @@ import os
 import shutil
 import json
 import sqlite3
+import subprocess
+import tempfile
 import urllib.request
 import urllib.parse
 import time
@@ -130,13 +150,68 @@ def init_db():
                 PRIMARY KEY (kind, key)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_hosts_scan  ON hosts(scan_id);
-            CREATE INDEX IF NOT EXISTS idx_hosts_host  ON hosts(host);
-            CREATE INDEX IF NOT EXISTS idx_ports_host  ON ports(host_id);
+            CREATE TABLE IF NOT EXISTS findings (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                host_id     INTEGER NOT NULL,
+                scan_id     TEXT NOT NULL,
+                template_id TEXT,
+                name        TEXT,
+                severity    TEXT,
+                matched_at  TEXT,
+                description TEXT,
+                reference   TEXT,
+                tags        TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS tls_certs (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                host_id        INTEGER NOT NULL,
+                scan_id        TEXT NOT NULL,
+                port           INTEGER,
+                subject        TEXT,
+                issuer         TEXT,
+                not_after      TEXT,
+                days_left      INTEGER,
+                self_signed    INTEGER,
+                expired        INTEGER,
+                expiring       INTEGER,
+                weak_protocols TEXT,
+                grade          TEXT,
+                issues         TEXT,
+                risk           TEXT
+            );
+
+            -- Triage: operator-suppressed items (false positive / accepted /
+            -- remediated). Keyed by host so triage persists across scans.
+            CREATE TABLE IF NOT EXISTS suppressions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                host       TEXT NOT NULL,
+                kind       TEXT NOT NULL,   -- 'port' | 'finding'
+                key        TEXT NOT NULL,   -- '3389/tcp' | nuclei template-id
+                state      TEXT NOT NULL,   -- 'false_positive'|'accepted_risk'|'remediated'
+                note       TEXT DEFAULT '',
+                created_at TEXT,
+                UNIQUE(host, kind, key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_hosts_scan       ON hosts(scan_id);
+            CREATE INDEX IF NOT EXISTS idx_hosts_host       ON hosts(host);
+            CREATE INDEX IF NOT EXISTS idx_ports_host       ON ports(host_id);
+            CREATE INDEX IF NOT EXISTS idx_findings_host    ON findings(host_id);
+            CREATE INDEX IF NOT EXISTS idx_tls_host         ON tls_certs(host_id);
+            CREATE INDEX IF NOT EXISTS idx_suppress_host    ON suppressions(host);
         ''')
-        # Migrate existing DBs that predate the label column
+        # Migrate existing DBs that predate later columns
         try:
             conn.execute("ALTER TABLE scans ADD COLUMN label TEXT DEFAULT ''")
+        except Exception:
+            pass  # column already exists
+        try:
+            conn.execute("ALTER TABLE hosts ADD COLUMN finding_count INTEGER DEFAULT 0")
+        except Exception:
+            pass  # column already exists
+        try:
+            conn.execute("ALTER TABLE hosts ADD COLUMN nuclei_meta TEXT DEFAULT ''")
         except Exception:
             pass  # column already exists
 
@@ -167,6 +242,83 @@ def _nmap_installed() -> bool:
     if shutil.which('nmap'):
         return True
     return any(os.path.isfile(p) for p in _NMAP_COMMON_PATHS)
+
+
+# ── masscan / nuclei binary detection (optional pipeline stages) ─────────────
+# Both are external binaries (not pip). When absent the pipeline silently skips
+# the corresponding stage, so these helpers must never raise.
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Windows masscan builds (e.g. MasscanForWindows) ship as masscan64.exe /
+# masscan32.exe, so we try those names too — including dropped next to app.py.
+_MASSCAN_NAMES = ['masscan', 'masscan64', 'masscan32']
+_MASSCAN_COMMON_PATHS = [
+    r'C:\masscan\masscan.exe',
+    r'C:\masscan\masscan64.exe',
+    r'C:\masscan\masscan32.exe',
+    r'C:\Program Files\masscan\masscan.exe',
+    '/usr/bin/masscan',
+    '/usr/local/bin/masscan',
+    '/opt/homebrew/bin/masscan',
+]
+
+_NUCLEI_NAMES = ['nuclei']
+_NUCLEI_COMMON_PATHS = [
+    os.path.expandvars(r'%USERPROFILE%\go\bin\nuclei.exe'),
+    r'C:\nuclei\nuclei.exe',
+    os.path.expanduser('~/go/bin/nuclei'),
+    '/usr/bin/nuclei',
+    '/usr/local/bin/nuclei',
+    '/opt/homebrew/bin/nuclei',
+]
+
+def _find_binary(names, common_paths: list) -> str | None:
+    """Locate an external binary by trying, in order: each candidate name on
+    PATH, then explicit common install paths, then the application's own
+    directory (so the binary can simply be dropped next to app.py)."""
+    if isinstance(names, str):
+        names = [names]
+    for n in names:                       # 1) PATH (which appends .exe on Windows)
+        found = shutil.which(n)
+        if found:
+            return found
+    for p in common_paths:                # 2) known install locations
+        if os.path.isfile(p):
+            return p
+    for n in names:                       # 3) alongside app.py
+        for ext in ('', '.exe'):
+            cand = os.path.join(APP_DIR, n + ext)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+MASSCAN_PATH = _find_binary(_MASSCAN_NAMES, _MASSCAN_COMMON_PATHS)
+NUCLEI_PATH  = _find_binary(_NUCLEI_NAMES,  _NUCLEI_COMMON_PATHS)
+
+def _masscan_installed() -> bool:
+    return MASSCAN_PATH is not None
+
+def _nuclei_installed() -> bool:
+    return NUCLEI_PATH is not None
+
+def _binary_version(path: str | None) -> str:
+    """Best-effort `<bin> --version` → short version string ('' if unavailable)."""
+    if not path:
+        return ''
+    try:
+        proc = subprocess.run([path, '--version'], capture_output=True,
+                              text=True, timeout=8)
+        lines = (proc.stdout or proc.stderr or '').strip().splitlines()
+        if not lines:
+            return ''
+        import re
+        # Strip ANSI colour codes and a leading log tag like "[INF] " that tools
+        # such as nuclei emit on their --version line.
+        out = re.sub(r'\x1b\[[0-9;]*m', '', lines[0]).strip()
+        out = re.sub(r'^\[[A-Z]{2,4}\]\s*', '', out)
+        return out
+    except Exception:
+        return ''
 
 
 # ── Risk tables ────────────────────────────────────────────────────────────
@@ -214,10 +366,17 @@ SCAN_PRESETS = {
     'ping':          '-sn -Pn -T4',
     'quick':         '-sT -F -Pn -T4',
     'remote_access': '-sV -Pn -T4',
+    'web':           '-sV -Pn -T4',
     'service':       '-sV -Pn -T4',
     'full':          '-sV -O -Pn -T4 --version-intensity 5',
     'vuln':          '-sV -Pn -T4 --script=vuln',
     'custom':        None,
+}
+
+# Scan types that force a fixed port list regardless of the UI ports field.
+PRESET_PORTS = {
+    'remote_access': '22,3389,5985,5986',
+    'web':           '80,443',
 }
 
 DEFAULT_PORTS = (
@@ -225,6 +384,36 @@ DEFAULT_PORTS = (
     '1433,1521,2375,2376,3306,3389,4444,5432,5900,'
     '5985,5986,6379,7001,8080,8443,8888,9200,10250,27017,27018'
 )
+
+# ── Pipeline tuning ──────────────────────────────────────────────────────────
+MASSCAN_RATE    = 1000             # packets/sec for the masscan discovery stage
+MASSCAN_TIMEOUT = 600              # seconds — hard cap on a single masscan run
+NUCLEI_SEVERITY = 'medium,high,critical'
+NUCLEI_TIMEOUT  = 900              # seconds — hard cap on a single nuclei run
+
+# Ports we treat as web services for the nuclei stage (in addition to any port
+# whose nmap service name contains 'http').
+WEB_PORTS    = {80, 443, 8080, 8443, 8000, 8888, 8081, 9443, 3000, 5000}
+_HTTPS_PORTS = {443, 8443, 9443}
+
+def _is_web(port: int, service: str) -> bool:
+    return port in WEB_PORTS or 'http' in (service or '').lower()
+
+def _url_for(host: str, port: int, service: str) -> str:
+    svc = (service or '').lower()
+    scheme = 'https' if port in _HTTPS_PORTS or 'https' in svc or 'ssl' in svc else 'http'
+    return f'{scheme}://{host}:{port}'
+
+def _is_range(target: str) -> bool:
+    """CIDR (10.0.0.0/24) or dash range (10.0.0.1-50) — worth a masscan sweep."""
+    return '/' in target or '-' in target
+
+# Ports/services to inspect for TLS (cert expiry + weak protocols/ciphers).
+TLS_PORTS = {443, 8443, 9443, 993, 995, 465, 990, 636, 989, 992, 5061, 8883}
+
+def _is_tls(port: int, service: str) -> bool:
+    svc = (service or '').lower()
+    return port in TLS_PORTS or 'https' in svc or 'ssl' in svc or 'tls' in svc
 
 
 def _utcnow():
@@ -264,9 +453,25 @@ def _build_args(raw_args: str, force_pn: bool) -> str:
     return ' '.join(cleaned)
 
 
+# ── Triage / suppression ─────────────────────────────────────────────────────
+def _suppressed_keys(host: str, kind: str) -> set:
+    """Return the set of suppressed keys (e.g. '3389/tcp') for a host + kind."""
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                'SELECT key FROM suppressions WHERE host=? AND kind=?', (host, kind)
+            ).fetchall()
+        return {r['key'] for r in rows}
+    except Exception as e:
+        print(f'[suppress] lookup error: {e}')
+        return set()
+
+
 # ── Change detection ───────────────────────────────────────────────────────
 def detect_changes(host_ip: str, current_scan_id: str, open_ports: list) -> dict:
-    """Compare current open ports against the most recent previous scan of this host."""
+    """Compare current open ports against the most recent previous scan of this host.
+    Operator-suppressed ports are excluded from 'new', so accepted/known-good
+    ports never re-alert."""
     try:
         with get_db() as conn:
             prev = conn.execute('''
@@ -284,12 +489,15 @@ def detect_changes(host_ip: str, current_scan_id: str, open_ports: list) -> dict
                 (prev['id'],)
             ).fetchall()
 
+        suppressed = _suppressed_keys(host_ip, 'port')   # {'3389/tcp', ...}
         prev_set  = {(r['port'], r['proto']) for r in prev_rows}
         curr_set  = {(p['port'], p['proto']) for p in open_ports}
         new_keys  = curr_set - prev_set
         gone_keys = prev_set - curr_set
 
-        new_ports    = [p for p in open_ports if (p['port'], p['proto']) in new_keys]
+        new_ports    = [p for p in open_ports
+                        if (p['port'], p['proto']) in new_keys
+                        and f"{p['port']}/{p['proto']}" not in suppressed]
         closed_ports = [{'port': k[0], 'proto': k[1]} for k in gone_keys]
 
         return {'new_ports': new_ports, 'closed_ports': closed_ports, 'is_new_host': False}
@@ -328,8 +536,8 @@ def persist_scan_to_db(job: dict):
                     INSERT INTO hosts
                       (scan_id, host, input, hostname, state, os, os_accuracy,
                        open_count, critical_count, risk, scanned_at, error,
-                       new_ports, closed_ports, is_new_host)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       new_ports, closed_ports, is_new_host, finding_count, nuclei_meta)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ''', (
                     job['id'],
                     h.get('host', ''), h.get('input', ''), h.get('hostname', ''),
@@ -340,8 +548,44 @@ def persist_scan_to_db(job: dict):
                     json.dumps(h.get('new_ports', [])),
                     json.dumps(h.get('closed_ports', [])),
                     1 if h.get('is_new_host') else 0,
+                    h.get('finding_count', 0),
+                    json.dumps(h['nuclei']) if h.get('nuclei') else '',
                 ))
                 host_id = cur.lastrowid
+
+                for fnd in h.get('findings', []):
+                    conn.execute('''
+                        INSERT INTO findings
+                          (host_id, scan_id, template_id, name, severity,
+                           matched_at, description, reference, tags)
+                        VALUES (?,?,?,?,?,?,?,?,?)
+                    ''', (
+                        host_id, job['id'],
+                        fnd.get('template_id', ''), fnd.get('name', ''),
+                        fnd.get('severity', ''), fnd.get('matched_at', ''),
+                        fnd.get('description', ''), fnd.get('reference', ''),
+                        fnd.get('tags', ''),
+                    ))
+
+                for c in h.get('tls', []):
+                    conn.execute('''
+                        INSERT INTO tls_certs
+                          (host_id, scan_id, port, subject, issuer, not_after,
+                           days_left, self_signed, expired, expiring,
+                           weak_protocols, grade, issues, risk)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ''', (
+                        host_id, job['id'],
+                        c.get('port'), c.get('subject', ''), c.get('issuer', ''),
+                        c.get('not_after', ''), c.get('days_left'),
+                        1 if c.get('self_signed') else 0,
+                        1 if c.get('expired') else 0,
+                        1 if c.get('expiring') else 0,
+                        json.dumps(c.get('weak_protocols', [])),
+                        c.get('grade', ''),
+                        json.dumps(c.get('issues', [])),
+                        c.get('risk', 'info'),
+                    ))
 
                 for p in h.get('ports', []):
                     conn.execute('''
@@ -370,6 +614,22 @@ def _job_from_db(scan_id: str) -> dict | None:
             results = []
             for h in hosts:
                 ports = conn.execute('SELECT * FROM ports WHERE host_id=? ORDER BY port', (h['id'],)).fetchall()
+                findings = conn.execute('SELECT * FROM findings WHERE host_id=? ORDER BY id', (h['id'],)).fetchall()
+                tls_rows = conn.execute('SELECT * FROM tls_certs WHERE host_id=? ORDER BY port', (h['id'],)).fetchall()
+                tls = [{
+                    'port':           t['port'],
+                    'subject':        t['subject'],
+                    'issuer':         t['issuer'],
+                    'not_after':      t['not_after'],
+                    'days_left':      t['days_left'],
+                    'self_signed':    bool(t['self_signed']),
+                    'expired':        bool(t['expired']),
+                    'expiring':       bool(t['expiring']),
+                    'weak_protocols': json.loads(t['weak_protocols'] or '[]'),
+                    'grade':          t['grade'],
+                    'issues':         json.loads(t['issues'] or '[]'),
+                    'risk':           t['risk'],
+                } for t in tls_rows]
                 results.append({
                     'host':           h['host'],
                     'input':          h['input'],
@@ -385,7 +645,11 @@ def _job_from_db(scan_id: str) -> dict | None:
                     'new_ports':      json.loads(h['new_ports']   or '[]'),
                     'closed_ports':   json.loads(h['closed_ports'] or '[]'),
                     'is_new_host':    bool(h['is_new_host']),
+                    'finding_count':  h['finding_count'] if 'finding_count' in h.keys() else len(findings),
+                    'nuclei':         (json.loads(h['nuclei_meta']) if 'nuclei_meta' in h.keys() and h['nuclei_meta'] else None),
                     'ports':          [dict(p) for p in ports],
+                    'findings':       [dict(f) for f in findings],
+                    'tls':            tls,
                 })
             return {
                 'id':           scan['id'],
@@ -416,6 +680,7 @@ CACHE_TTL = {
     'geoip':      30 * 86400,   # IP geolocation is fairly stable
     'internetdb':      86400,   # Shodan snapshot — refresh daily
     'kev':              3600,   # CISA KEV catalog — hourly
+    'epss':            86400,   # FIRST.org EPSS — recomputed daily
 }
 
 def _cache_get_many(kind: str, keys: list, ttl_seconds: float) -> dict:
@@ -459,6 +724,72 @@ def _cache_put_many(kind: str, mapping: dict):
         print(f'[cache] put error: {e}')
 
 
+# ── Exploit-likelihood enrichment (EPSS + KEV) ───────────────────────────────
+# CVSS says how bad a flaw *could* be; EPSS (FIRST.org) estimates the probability
+# it will be exploited in the next 30 days, and CISA KEV lists what *is* being
+# exploited now. Together they turn a wall of CVEs into a real priority order.
+_KEV_SET_CACHE: dict = {'data': None, 'ts': 0}
+
+def _kev_cve_set() -> set:
+    """Return the set of all CVE IDs in the CISA KEV catalog (cached)."""
+    now = time.time()
+    if _KEV_SET_CACHE['data'] is not None and now - _KEV_SET_CACHE['ts'] < CACHE_TTL['kev']:
+        return _KEV_SET_CACHE['data']
+    db = _cache_get_many('kev', ['cve_set'], CACHE_TTL['kev']).get('cve_set')
+    if db:
+        s = set(db)
+        _KEV_SET_CACHE.update(data=s, ts=now)
+        return s
+    try:
+        req = urllib.request.Request(
+            'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json',
+            headers={'User-Agent': 'nmap-scanner/1.0', 'Accept': 'application/json'}
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            raw = json.loads(resp.read())
+        s = {(v.get('cveID') or '').upper()
+             for v in raw.get('vulnerabilities', []) if v.get('cveID')}
+        _KEV_SET_CACHE.update(data=s, ts=now)
+        _cache_put_many('kev', {'cve_set': sorted(s)})
+        return s
+    except Exception as e:
+        print(f'[kev] cve-set fetch error: {e}')
+        return _KEV_SET_CACHE['data'] or set()
+
+
+def _fetch_epss(cve_ids: list) -> dict:
+    """Return {CVE-ID: {epss, percentile}} from FIRST.org EPSS (cache-aware).
+    CVEs with no EPSS data are simply absent from the result."""
+    if not cve_ids:
+        return {}
+    out = dict(_cache_get_many('epss', cve_ids, CACHE_TTL['epss']))
+    to_fetch = [c for c in cve_ids if c not in out]
+    fetched = {}
+    for i in range(0, len(to_fetch), 100):            # EPSS API accepts a CSV list
+        chunk = to_fetch[i:i + 100]
+        try:
+            url = ('https://api.first.org/data/v1/epss?cve='
+                   + urllib.parse.quote(','.join(chunk)))
+            req = urllib.request.Request(
+                url, headers={'User-Agent': 'nmap-scanner/1.0', 'Accept': 'application/json'})
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                d = json.loads(resp.read())
+            for row in d.get('data', []):
+                cid = (row.get('cve') or '').upper()
+                if not cid:
+                    continue
+                rec = {
+                    'epss':       round(float(row.get('epss') or 0), 4),
+                    'percentile': round(float(row.get('percentile') or 0), 4),
+                }
+                out[cid] = rec
+                fetched[cid] = rec
+        except Exception as e:
+            print(f'[epss] {e}')
+    _cache_put_many('epss', fetched)
+    return out
+
+
 # ── In-memory job retention ──────────────────────────────────────────────────
 # Completed/cancelled jobs are persisted to SQLite and remain reachable via the
 # DB fallback in api_get_scan, so we only keep the most recent few in memory to
@@ -475,19 +806,354 @@ def _prune_jobs():
         JOBS.pop(job['id'], None)
 
 
+# ── masscan stage ────────────────────────────────────────────────────────────
+def _run_masscan(target: str, ports: str) -> dict | None:
+    """Fast port discovery on a CIDR/range. Returns {ip: [open_port_ints]}.
+
+    Returns None on any failure so the caller falls back to scanning the full
+    range with nmap. An empty dict means masscan ran cleanly but found nothing.
+    """
+    if not MASSCAN_PATH:
+        return None
+    cmd = [MASSCAN_PATH, target, '-p', ports,
+           '--rate', str(MASSCAN_RATE), '-oJ', '-']
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=MASSCAN_TIMEOUT)
+    except Exception as e:
+        print(f'[masscan] {target}: {e}')
+        return None
+    if proc.returncode != 0 and not proc.stdout.strip():
+        print(f'[masscan] {target}: exit {proc.returncode} {proc.stderr.strip()[:200]}')
+        return None
+
+    # masscan -oJ emits a JSON array; trailing comma / partial lines are common,
+    # so parse defensively line-by-line as well as whole-document.
+    out: dict = {}
+    def _ingest(records):
+        for rec in records:
+            ip = rec.get('ip')
+            for p in rec.get('ports', []):
+                if ip and p.get('status') == 'open' and p.get('port'):
+                    out.setdefault(ip, [])
+                    if p['port'] not in out[ip]:
+                        out[ip].append(p['port'])
+    try:
+        _ingest(json.loads(proc.stdout))
+    except Exception:
+        for line in proc.stdout.splitlines():
+            line = line.strip().rstrip(',')
+            if not line.startswith('{'):
+                continue
+            try:
+                _ingest([json.loads(line)])
+            except Exception:
+                pass
+    return out
+
+
+# ── nuclei stage ─────────────────────────────────────────────────────────────
+_NUCLEI_TEMPLATES_READY = False
+
+def _ensure_nuclei_templates():
+    """Install nuclei's template set once if it's missing.
+
+    We run scans with -duc (disable update check) to avoid a network round-trip
+    on every scan, but that also stops nuclei from auto-fetching templates on a
+    fresh install — without templates every scan fails with 'no templates
+    provided'. So on first use we proactively run -update-templates.
+    """
+    global _NUCLEI_TEMPLATES_READY
+    if _NUCLEI_TEMPLATES_READY or not NUCLEI_PATH:
+        return
+    tdir = os.path.join(os.path.expanduser('~'), 'nuclei-templates')
+    if os.path.isdir(tdir) and os.listdir(tdir):
+        _NUCLEI_TEMPLATES_READY = True
+        return
+    try:
+        print('[nuclei] templates missing — running one-time -update-templates '
+              '(this can take a minute)…')
+        subprocess.run([NUCLEI_PATH, '-update-templates'],
+                       capture_output=True, text=True, timeout=600)
+        _NUCLEI_TEMPLATES_READY = True
+        print('[nuclei] templates installed.')
+    except Exception as e:
+        print(f'[nuclei] template install failed: {e}')
+
+
+def _run_nuclei(urls: list, severity: str | None = None,
+                tags: str | None = None) -> tuple:
+    """Run nuclei web vuln templates against the given URLs.
+
+    Returns (findings, meta):
+      findings = {host: [finding dicts]} keyed by the IP/host portion of a target.
+      meta     = run summary {status, target_count, finding_count, duration,
+                 severity, error} so callers can show *what nuclei did* even when
+                 it produced zero findings.
+    Never raises.
+
+    severity: comma-separated severities (e.g. 'medium,high,critical'); defaults
+              to NUCLEI_SEVERITY if omitted or invalid.
+    tags:     comma-separated nuclei template tags (e.g. 'cves,misconfigs').
+    """
+    import re as _re
+    _VALID_SEV = {'info', 'low', 'medium', 'high', 'critical'}
+    sev_parts  = [s.strip().lower() for s in (severity or '').split(',') if s.strip()]
+    sev        = ','.join(s for s in sev_parts if s in _VALID_SEV) or NUCLEI_SEVERITY
+    tag_parts  = [t.strip().lower() for t in (tags or '').split(',') if t.strip()]
+    clean_tags = ','.join(t for t in tag_parts if _re.fullmatch(r'[a-z0-9\-]+', t)) or None
+    meta = {
+        'status':        'skipped',
+        'target_count':  len(urls),
+        'finding_count': 0,
+        'duration':      0.0,
+        'severity':      sev,
+        'tags':          clean_tags or '',
+        'error':         '',
+    }
+    if not NUCLEI_PATH:
+        meta['error'] = 'nuclei not installed'
+        return {}, meta
+    if not urls:
+        meta['error'] = 'no web services to probe'
+        return {}, meta
+
+    _ensure_nuclei_templates()
+
+    tmp_path = None
+    t0 = time.time()
+    try:
+        with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False,
+                                         encoding='utf-8') as tf:
+            tf.write('\n'.join(urls))
+            tmp_path = tf.name
+
+        cmd = [NUCLEI_PATH, '-silent', '-jsonl', '-duc',
+               '-severity', sev, '-l', tmp_path]
+        if clean_tags:
+            cmd += ['-tags', clean_tags]
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=NUCLEI_TIMEOUT)
+    except Exception as e:
+        meta['duration'] = round(time.time() - t0, 1)
+        meta['status']   = 'error'
+        meta['error']    = str(e)
+        print(f'[nuclei] error after {meta["duration"]}s on {len(urls)} target(s): {e}')
+        return {}, meta
+    finally:
+        if tmp_path:
+            try: os.unlink(tmp_path)
+            except Exception: pass
+
+    meta['duration'] = round(time.time() - t0, 1)
+
+    # Surface fatal/error lines nuclei prints to stderr (e.g. missing templates)
+    fatal = [ln.strip() for ln in (proc.stderr or '').splitlines()
+             if '[FTL]' in ln or '[ERR]' in ln]
+    if fatal:
+        import re as _re
+        meta['error'] = _re.sub(r'\x1b\[[0-9;]*m', '', fatal[0])[:300]
+
+    findings: dict = {}
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith('{'):
+            continue
+        try:
+            rec  = json.loads(line)
+            info = rec.get('info', {}) or {}
+            # nuclei reports 'host' as the matched URL host; normalize to the
+            # bare IP/hostname so it matches the nmap host key.
+            raw_host = rec.get('host') or rec.get('matched-at') or ''
+            host = urllib.parse.urlparse(
+                raw_host if '://' in raw_host else f'//{raw_host}'
+            ).hostname or raw_host
+            ref = info.get('reference') or []
+            findings.setdefault(host, []).append({
+                'template_id': rec.get('template-id', ''),
+                'name':        info.get('name', ''),
+                'severity':    (info.get('severity') or 'info').lower(),
+                'matched_at':  rec.get('matched-at', '') or rec.get('host', ''),
+                'description': (info.get('description') or '').strip(),
+                'reference':   ref[0] if isinstance(ref, list) and ref else (ref if isinstance(ref, str) else ''),
+                'tags':        ','.join(info.get('tags', [])) if isinstance(info.get('tags'), list) else (info.get('tags') or ''),
+            })
+        except Exception:
+            pass
+
+    meta['finding_count'] = sum(len(v) for v in findings.values())
+    meta['status']        = 'error' if (meta['error'] and not findings) else 'ran'
+    print(f'[nuclei] {meta["status"]}: {len(urls)} target(s), '
+          f'{meta["finding_count"]} finding(s) at {NUCLEI_SEVERITY} '
+          f'in {meta["duration"]}s'
+          + (f' — {meta["error"]}' if meta['error'] else ''))
+    return findings, meta
+
+
+# ── TLS / certificate inspection stage ───────────────────────────────────────
+TLS_TIMEOUT = 120   # seconds — bound the ssl-cert/ssl-enum-ciphers scripts
+
+def _parse_ssl_cert(text: str) -> dict:
+    """Parse nmap ssl-cert script output into structured fields."""
+    import re
+    out = {}
+    m = re.search(r'Subject:.*?commonName=([^\n/]+)', text)
+    if m: out['subject'] = m.group(1).strip()
+    m = re.search(r'Issuer:\s*(.+)', text)
+    if m:
+        iss = m.group(1).strip()
+        cn  = re.search(r'commonName=([^\n/]+)', iss)
+        org = re.search(r'organizationName=([^\n/]+)', iss)
+        out['issuer'] = (cn.group(1).strip() if cn else
+                         org.group(1).strip() if org else iss[:80])
+    m = re.search(r'Not valid before:\s*([0-9T:\-]+)', text)
+    if m: out['not_before'] = m.group(1).strip()
+    m = re.search(r'Not valid after:\s*([0-9T:\-]+)', text)
+    if m: out['not_after'] = m.group(1).strip()
+    return out
+
+def _parse_ssl_ciphers(text: str) -> dict:
+    """Parse ssl-enum-ciphers output → weak protocols + least cipher grade."""
+    import re
+    weak = [p for p in ('SSLv2', 'SSLv3', 'TLSv1.0', 'TLSv1.1')
+            if re.search(rf'^\s*{re.escape(p)}:', text, re.M)]
+    grade = None
+    grades = re.findall(r'least strength:\s*([A-F])', text)
+    if grades:
+        grade = sorted(grades)[-1]      # worst (F > A) across protocols
+    return {'weak_protocols': weak, 'grade': grade}
+
+
+def _run_tls(host: str, tls_ports: list) -> list:
+    """Inspect TLS on the given ports via nmap ssl-cert + ssl-enum-ciphers.
+    Returns a list of per-port cert dicts with computed issues + risk. Never
+    raises (returns [] on failure or if there are no TLS ports)."""
+    if not tls_ports:
+        return []
+    try:
+        nm = nmap.PortScanner(nmap_search_path=NMAP_PATH)
+        nm.scan(hosts=host, ports=','.join(str(p) for p in tls_ports),
+                arguments='-Pn -sV --script ssl-cert,ssl-enum-ciphers '
+                          '--script-timeout 30s')
+    except Exception as e:
+        print(f'[tls] {host}: {e}')
+        return []
+
+    results = []
+    for h in nm.all_hosts():
+        tcp = nm[h].get('tcp', {})
+        for port, pinfo in tcp.items():
+            scripts = pinfo.get('script', {}) or {}
+            if 'ssl-cert' not in scripts and 'ssl-enum-ciphers' not in scripts:
+                continue
+            cert    = _parse_ssl_cert(scripts.get('ssl-cert', ''))
+            ciphers = _parse_ssl_ciphers(scripts.get('ssl-enum-ciphers', ''))
+
+            days_left = None
+            na = cert.get('not_after')
+            if na:
+                for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S'):
+                    try:
+                        exp = datetime.datetime.strptime(na, fmt)
+                        days_left = (exp - _utcnow()).days
+                        break
+                    except ValueError:
+                        continue
+
+            subj, iss = cert.get('subject', ''), cert.get('issuer', '')
+            self_signed = bool(subj and iss and subj == iss)
+            expired   = days_left is not None and days_left < 0
+            expiring  = days_left is not None and 0 <= days_left <= 30
+            weak_prot = ciphers.get('weak_protocols') or []
+            grade     = ciphers.get('grade')
+            weak_grade = grade in ('C', 'D', 'E', 'F')
+
+            issues = []
+            if expired:     issues.append(f'Certificate expired {abs(days_left)}d ago')
+            elif expiring:  issues.append(f'Certificate expires in {days_left}d')
+            if self_signed: issues.append('Self-signed certificate')
+            for p in weak_prot: issues.append(f'Weak protocol: {p}')
+            if weak_grade:  issues.append(f'Weak cipher grade: {grade}')
+
+            risk = ('high' if (expired or weak_prot or grade in ('D', 'E', 'F'))
+                    else 'medium' if (expiring or self_signed or grade == 'C')
+                    else 'low')
+
+            results.append({
+                'port':           port,
+                'subject':        subj,
+                'issuer':         iss,
+                'not_after':      na or '',
+                'days_left':      days_left,
+                'self_signed':    self_signed,
+                'expired':        expired,
+                'expiring':       expiring,
+                'weak_protocols': weak_prot,
+                'grade':          grade or '',
+                'issues':         issues,
+                'risk':           risk,
+            })
+    if results:
+        print(f'[tls] {host}: inspected {len(results)} port(s), '
+              f'{sum(len(r["issues"]) for r in results)} issue(s)')
+    return results
+
+
 # ── Scan worker ────────────────────────────────────────────────────────────
 # Targets are scanned concurrently with a bounded pool. nmap itself parallelizes
 # within a single target; this adds host-level concurrency for large lists. Each
 # worker builds its own PortScanner, so there's no shared nmap state across threads.
 MAX_SCAN_WORKERS = 8
 
-def _scan_target(target: str, ports: str, args: str, scan_type: str, job_id: str) -> list:
-    """Scan a single target string and return a list of host result dicts.
-    A target may be a CIDR/range, so it can yield multiple hosts."""
+def _set_stage(job: dict | None, lock, stage: str):
+    """Record the current pipeline stage on the job for UI display (thread-safe)."""
+    if job is None:
+        return
+    if lock is not None:
+        with lock:
+            job.setdefault('progress', {})['stage'] = stage
+    else:
+        job.setdefault('progress', {})['stage'] = stage
+
+
+def _scan_target(target: str, ports: str, args: str, scan_type: str, job_id: str,
+                 run_nuclei: bool = True, job: dict | None = None, lock=None,
+                 run_tls: bool = True, nuclei_severity: str | None = None,
+                 nuclei_tags: str | None = None) -> list:
+    """Scan a single target through the masscan → nmap → nuclei → TLS pipeline.
+
+    A target may be a CIDR/range, so it can yield multiple hosts. masscan only
+    runs for port-scanning types on ranges (and only if installed); otherwise we
+    go straight to nmap. nuclei runs against discovered web services and TLS
+    inspection runs against discovered TLS services."""
     out = []
     try:
         nm = nmap.PortScanner(nmap_search_path=NMAP_PATH)
-        if scan_type in ('ping', 'quick'):
+
+        # ── Stage 1: masscan discovery (ranges only) ─────────────────────────
+        # For port-scanning types on a CIDR/range, let masscan find open ports
+        # fast, then hand only those host:ports to nmap for service detection.
+        # masscan is TCP + explicit-port only, so it's skipped for UDP scans and
+        # top-ports mode (no explicit port list).
+        use_masscan = (scan_type not in ('ping', 'quick')
+                       and ports and '-sU' not in args
+                       and _is_range(target) and _masscan_installed())
+        discovered = None
+        if use_masscan:
+            _set_stage(job, lock, 'masscan')
+            discovered = _run_masscan(target, ports)
+
+        _set_stage(job, lock, 'nmap')
+        if discovered is not None:
+            # masscan ran cleanly; nothing open means no nmap work to do.
+            if not discovered:
+                return []
+            union_ports = sorted({p for plist in discovered.values() for p in plist})
+            nm.scan(hosts=' '.join(discovered.keys()),
+                    ports=','.join(str(p) for p in union_ports),
+                    arguments=args)
+        elif scan_type in ('ping', 'quick') or not ports:
+            # No explicit port list (ping/quick, or --top-ports in args)
             nm.scan(hosts=target, arguments=args)
         else:
             nm.scan(hosts=target, ports=ports, arguments=args)
@@ -532,6 +1198,9 @@ def _scan_target(target: str, ports: str, args: str, scan_type: str, job_id: str
                 'new_ports':      changes['new_ports'],
                 'closed_ports':   changes['closed_ports'],
                 'is_new_host':    changes['is_new_host'],
+                'findings':       [],
+                'finding_count':  0,
+                'tls':            [],
             })
 
     except nmap.PortScannerError:
@@ -543,6 +1212,7 @@ def _scan_target(target: str, ports: str, args: str, scan_type: str, job_id: str
             'ports': [], 'open_count': 0, 'critical_count': 0,
             'risk': 'info', 'scanned_at': _now(),
             'new_ports': [], 'closed_ports': [], 'is_new_host': False,
+            'findings': [], 'finding_count': 0, 'tls': [],
         })
     except Exception as exc:
         out.append({
@@ -552,7 +1222,80 @@ def _scan_target(target: str, ports: str, args: str, scan_type: str, job_id: str
             'ports': [], 'open_count': 0, 'critical_count': 0,
             'risk': 'info', 'scanned_at': _now(),
             'new_ports': [], 'closed_ports': [], 'is_new_host': False,
+            'findings': [], 'finding_count': 0, 'tls': [],
         })
+
+    # ── Stage 3: nuclei web vuln scan ────────────────────────────────────────
+    # Point nuclei at every open web service nmap found, fold finding severities
+    # back into each host's risk, and attach a per-host run summary (h['nuclei'])
+    # so the UI can show what nuclei did even when it found nothing.
+    host_urls = {
+        h['host']: [_url_for(h['host'], p['port'], p.get('service', ''))
+                    for p in h.get('ports', [])
+                    if p.get('state') == 'open' and _is_web(p['port'], p.get('service', ''))]
+        for h in out
+    }
+    total_urls = sum(len(v) for v in host_urls.values())
+
+    skip_reason = None
+    if scan_type == 'ping':
+        skip_reason = 'ping scan — no web probing'
+    elif not run_nuclei:
+        skip_reason = 'disabled for this scan'
+    elif not _nuclei_installed():
+        skip_reason = 'nuclei not installed'
+
+    def _nuclei_meta(status, probed, fcount, duration, error):
+        return {'status': status, 'probed': probed, 'finding_count': fcount,
+                'duration':  duration,
+                'severity':  nuclei_severity or NUCLEI_SEVERITY,
+                'tags':      nuclei_tags or '',
+                'error':     error}
+
+    if skip_reason is None and total_urls > 0:
+        _set_stage(job, lock, 'nuclei')
+        all_urls = [u for urls in host_urls.values() for u in urls]
+        findings_map, run_meta = _run_nuclei(all_urls,
+                                             severity=nuclei_severity,
+                                             tags=nuclei_tags)
+        for h in out:
+            hu = host_urls.get(h['host'], [])
+            f  = findings_map.get(h['host'], [])
+            h['findings']      = f
+            h['finding_count'] = len(f)
+            if hu:
+                h['nuclei'] = _nuclei_meta(run_meta['status'], len(hu), len(f),
+                                           run_meta['duration'], run_meta['error'])
+            if f:
+                sev_risk = max(RISK_ORDER.get(x['severity'], 0) for x in f)
+                cur      = RISK_ORDER.get(h['risk'], 0)
+                h['risk'] = RISK_LABELS[max(cur, sev_risk)]
+    else:
+        # nuclei didn't run — record why on every host that had web services.
+        for h in out:
+            hu = host_urls.get(h['host'], [])
+            if hu:
+                h['nuclei'] = _nuclei_meta('skipped', len(hu), 0, 0.0,
+                                           skip_reason or 'no web services')
+
+    # ── Stage 4: TLS / certificate inspection ────────────────────────────────
+    # Check discovered TLS services for expiring/expired/self-signed certs and
+    # weak protocols/ciphers, then fold the worst into the host's risk.
+    if run_tls and scan_type != 'ping':
+        for h in out:
+            tls_ports = sorted({p['port'] for p in h.get('ports', [])
+                                if p.get('state') == 'open'
+                                and _is_tls(p['port'], p.get('service', ''))})
+            if not tls_ports:
+                continue
+            _set_stage(job, lock, 'tls')
+            certs = _run_tls(h['host'], tls_ports)
+            h['tls'] = certs
+            if certs:
+                tls_risk = max(RISK_ORDER.get(c['risk'], 0) for c in certs)
+                cur      = RISK_ORDER.get(h['risk'], 0)
+                h['risk'] = RISK_LABELS[max(cur, tls_risk)]
+
     return out
 
 
@@ -561,22 +1304,28 @@ def run_scan(job_id: str):
     job['status']     = 'running'
     job['started_at'] = _now()
 
-    targets   = job['targets']
-    ports     = job['ports']
-    args      = job['arguments']
-    scan_type = job['scan_type']
-    total     = len(targets)
+    targets    = job['targets']
+    ports      = job['ports']
+    args       = job['arguments']
+    scan_type  = job['scan_type']
+    run_nuclei      = job.get('run_nuclei', True)
+    run_tls         = job.get('run_tls', True)
+    nuclei_severity = job.get('nuclei_severity') or None
+    nuclei_tags     = job.get('nuclei_tags') or None
+    total           = len(targets)
 
     results   = []
     lock      = threading.Lock()
     completed = 0
     workers   = max(1, min(MAX_SCAN_WORKERS, total))
 
-    job['progress'] = {'current': 0, 'total': total, 'host': '', 'pct': 0}
+    job['progress'] = {'current': 0, 'total': total, 'host': '', 'pct': 0, 'stage': ''}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as exe:
         future_map = {
-            exe.submit(_scan_target, t, ports, args, scan_type, job_id): t
+            exe.submit(_scan_target, t, ports, args, scan_type, job_id,
+                       run_nuclei, job, lock, run_tls,
+                       nuclei_severity, nuclei_tags): t
             for t in targets
         }
         for fut in concurrent.futures.as_completed(future_map):
@@ -597,6 +1346,7 @@ def run_scan(job_id: str):
                     'ports': [], 'open_count': 0, 'critical_count': 0,
                     'risk': 'info', 'scanned_at': _now(),
                     'new_ports': [], 'closed_ports': [], 'is_new_host': False,
+                    'findings': [], 'finding_count': 0,
                 }]
 
             with lock:
@@ -607,6 +1357,7 @@ def run_scan(job_id: str):
                     'current': completed, 'total': total,
                     'host': target,
                     'pct':  round(completed / total * 100) if total else 0,
+                    'stage': job.get('progress', {}).get('stage', ''),
                 }
 
     if job.get('cancelled'):
@@ -654,8 +1405,8 @@ if _APScheduler:
             force_pn    = bool(s['force_pn'])
 
             args = SCAN_PRESETS.get(scan_type) or custom_args
-            if scan_type == 'remote_access':
-                ports = '22,3389,5985,5986'
+            if scan_type in PRESET_PORTS:
+                ports = PRESET_PORTS[scan_type]
 
             args = _build_args(args, force_pn)
 
@@ -733,7 +1484,18 @@ def api_ping():
         })
     try:
         ver = nmap.PortScanner(nmap_search_path=NMAP_PATH).nmap_version()
-        return jsonify({'status': 'ok', 'nmap': '.'.join(str(v) for v in ver)})
+        return jsonify({
+            'status': 'ok',
+            'nmap':   '.'.join(str(v) for v in ver),
+            'tools':  {
+                'nmap':    {'installed': True,
+                            'version': '.'.join(str(v) for v in ver)},
+                'masscan': {'installed': _masscan_installed(),
+                            'version': _binary_version(MASSCAN_PATH)},
+                'nuclei':  {'installed': _nuclei_installed(),
+                            'version': _binary_version(NUCLEI_PATH)},
+            },
+        })
     except nmap.PortScannerError as e:
         return jsonify({
             'status':  'nmap_missing',
@@ -754,10 +1516,22 @@ def api_start_scan():
     raw       = data.get('targets', '').strip()
     scan_type = data.get('scan_type', 'service')
     ports     = data.get('ports', DEFAULT_PORTS).strip() or DEFAULT_PORTS
-    custom    = data.get('custom_args', '-sV -T4').strip()
-    force_pn  = data.get('force_pn', True)
-    label     = data.get('label', '').strip()
-
+    custom     = data.get('custom_args', '-sV -T4').strip()
+    force_pn   = data.get('force_pn', True)
+    label      = data.get('label', '').strip()
+    run_nuclei = bool(data.get('run_nuclei', True))
+    run_tls    = bool(data.get('run_tls', True))
+    udp        = bool(data.get('udp', False))
+    # Nuclei template selector — validate all values (allowlist) before storing.
+    import re as _re
+    _VALID_SEV      = {'info', 'low', 'medium', 'high', 'critical'}
+    raw_sev         = (data.get('nuclei_severity') or '').strip()
+    sev_parts       = [s.strip().lower() for s in raw_sev.split(',') if s.strip()]
+    nuclei_severity = ','.join(s for s in sev_parts if s in _VALID_SEV) or None
+    raw_tags        = (data.get('nuclei_tags') or '').strip()
+    tag_parts       = [t.strip().lower() for t in raw_tags.split(',') if t.strip()]
+    nuclei_tags     = ','.join(t for t in tag_parts
+                               if _re.fullmatch(r'[a-z0-9\-]+', t)) or None
     if not raw:
         return jsonify({'error': 'No targets provided'}), 400
 
@@ -766,25 +1540,33 @@ def api_start_scan():
         return jsonify({'error': 'No valid targets after parsing'}), 400
 
     args = SCAN_PRESETS.get(scan_type) or custom
-    if scan_type == 'remote_access':
-        ports = '22,3389,5985,5986'
+    if scan_type in PRESET_PORTS:
+        ports = PRESET_PORTS[scan_type]
+
+    # UDP adds a UDP scan plus a TCP SYN scan (both need root/Administrator).
+    if udp:
+        args += ' -sS -sU'
 
     args = _build_args(args, force_pn)
 
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {
-        'id':           job_id,
-        'targets':      targets,
-        'ports':        ports,
-        'scan_type':    scan_type,
-        'arguments':    args,
-        'label':        label,
-        'status':       'queued',
-        'progress':     {'current': 0, 'total': len(targets), 'host': '', 'pct': 0},
-        'results':      [],
-        'created_at':   _now(),
-        'started_at':   None,
-        'completed_at': None,
+        'id':              job_id,
+        'targets':         targets,
+        'ports':           ports,
+        'scan_type':       scan_type,
+        'arguments':       args,
+        'label':           label,
+        'run_nuclei':      run_nuclei,
+        'run_tls':         run_tls,
+        'nuclei_severity': nuclei_severity,
+        'nuclei_tags':     nuclei_tags,
+        'status':          'queued',
+        'progress':        {'current': 0, 'total': len(targets), 'host': '', 'pct': 0, 'stage': ''},
+        'results':         [],
+        'created_at':      _now(),
+        'started_at':      None,
+        'completed_at':    None,
     }
 
     threading.Thread(target=run_scan, args=(job_id,), daemon=True).start()
@@ -801,6 +1583,45 @@ def api_get_scan(job_id):
     if job:
         return jsonify(job)
     return jsonify({'error': 'Job not found'}), 404
+
+
+@app.route('/api/scan/<job_id>/stream')
+def api_scan_stream(job_id):
+    """Server-Sent Events endpoint — streams live scan progress to the UI.
+
+    Emits one JSON ``data:`` event per meaningful state change (progress
+    counter, pipeline stage, or job status). Automatically closes when the
+    job reaches a terminal state or after one hour.
+    """
+    def generate():
+        deadline = time.time() + 3600   # hard cap: 1-hour stream
+        last_key = None
+        while time.time() < deadline:
+            job = JOBS.get(job_id)
+            if not job:
+                # Job may have been pruned from memory but still exist in DB.
+                db_job = _job_from_db(job_id)
+                if db_job:
+                    yield f'data: {json.dumps(db_job)}\n\n'
+                return
+            prog     = job.get('progress', {})
+            curr_key = (prog.get('current'), prog.get('stage'), job.get('status'))
+            if curr_key != last_key:
+                last_key = curr_key
+                yield f'data: {json.dumps(job)}\n\n'
+            if job.get('status') in ('complete', 'cancelled', 'error'):
+                return
+            time.sleep(0.4)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control':     'no-cache',
+            'X-Accel-Buffering': 'no',   # disable nginx buffering if proxied
+            'Connection':        'keep-alive',
+        },
+    )
 
 
 @app.route('/api/scan/<job_id>/cancel', methods=['POST'])
@@ -846,6 +1667,85 @@ def api_list_jobs():
 
     all_jobs = active + historical
     return jsonify(sorted(all_jobs, key=lambda j: j.get('created_at', ''), reverse=True))
+
+
+# ── Triage / suppression CRUD ────────────────────────────────────────────────
+_SUPPRESS_KINDS  = {'port', 'finding'}
+_SUPPRESS_STATES = {'false_positive', 'accepted_risk', 'remediated'}
+
+@app.route('/api/suppressions', methods=['GET'])
+def api_list_suppressions():
+    """All suppressions, optionally filtered by ?host=. The UI loads these to
+    dim/triage matching ports and findings across every scan of a host."""
+    host = request.args.get('host')
+    try:
+        with get_db() as conn:
+            if host:
+                rows = conn.execute(
+                    'SELECT * FROM suppressions WHERE host=? ORDER BY created_at DESC', (host,)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    'SELECT * FROM suppressions ORDER BY created_at DESC'
+                ).fetchall()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/suppressions', methods=['POST'])
+def api_create_suppression():
+    """Create or update a suppression (upsert on host+kind+key)."""
+    data  = request.get_json(force=True)
+    host  = (data.get('host') or '').strip()
+    kind  = (data.get('kind') or '').strip()
+    key   = (data.get('key')  or '').strip()
+    state = (data.get('state') or 'accepted_risk').strip()
+    note  = (data.get('note') or '').strip()
+
+    if not host or not key:
+        return jsonify({'error': 'host and key are required'}), 400
+    if kind not in _SUPPRESS_KINDS:
+        return jsonify({'error': f'kind must be one of {sorted(_SUPPRESS_KINDS)}'}), 400
+    if state not in _SUPPRESS_STATES:
+        return jsonify({'error': f'state must be one of {sorted(_SUPPRESS_STATES)}'}), 400
+
+    try:
+        with get_db() as conn:
+            conn.execute('''
+                INSERT INTO suppressions (host, kind, key, state, note, created_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(host, kind, key)
+                DO UPDATE SET state=excluded.state, note=excluded.note,
+                              created_at=excluded.created_at
+            ''', (host, kind, key, state, note, _now()))
+            row = conn.execute(
+                'SELECT * FROM suppressions WHERE host=? AND kind=? AND key=?',
+                (host, kind, key)
+            ).fetchone()
+        return jsonify(dict(row))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/suppressions/delete', methods=['POST'])
+def api_delete_suppression():
+    """Remove a suppression (un-triage) by host+kind+key, or by id."""
+    data = request.get_json(force=True)
+    try:
+        with get_db() as conn:
+            if data.get('id'):
+                conn.execute('DELETE FROM suppressions WHERE id=?', (data['id'],))
+            else:
+                conn.execute(
+                    'DELETE FROM suppressions WHERE host=? AND kind=? AND key=?',
+                    ((data.get('host') or '').strip(),
+                     (data.get('kind') or '').strip(),
+                     (data.get('key')  or '').strip())
+                )
+        return jsonify({'status': 'deleted'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 # ── Schedule CRUD ──────────────────────────────────────────────────────────
@@ -949,6 +1849,22 @@ def api_cloudapps_subnet():
     if not api_token:  return jsonify({'error': 'api_token is required'}),  400
 
     portal_url = portal_url.replace('https://', '').replace('http://', '').strip('/')
+
+    # SSRF allowlist: only permit genuine Defender for Cloud Apps portal hostnames.
+    # This prevents the proxy from being used to reach internal services.
+    _MCAS_ALLOWED_SUFFIXES = (
+        '.portal.cloudappsecurity.com',
+        '.cloudapps.microsoft.com',
+    )
+    hostname = portal_url.split('/')[0].lower()
+    if not any(hostname.endswith(s) for s in _MCAS_ALLOWED_SUFFIXES):
+        return jsonify({
+            'error': (
+                'Invalid portal URL. Must be a Defender for Cloud Apps hostname '
+                '(e.g. contoso.us2.portal.cloudappsecurity.com)'
+            )
+        }), 400
+
     filters    = json.dumps({'category': {'eq': 1}})
     all_data   = []
     skip       = 0
@@ -1210,6 +2126,17 @@ def api_cve():
                 pass
 
     _cache_put_many('cve', fetched)
+
+    # Layer exploit-likelihood signals on top of the (cached) CVSS details.
+    # These have shorter TTLs than CVE details, so they're merged fresh each call.
+    epss_map = _fetch_epss(valid)
+    kev_set  = _kev_cve_set()
+    for cid, det in results.items():
+        e = epss_map.get(cid)
+        det['epss']            = e['epss']       if e else None
+        det['epss_percentile'] = e['percentile'] if e else None
+        det['kev']             = cid in kev_set
+
     return jsonify(results)
 
 
