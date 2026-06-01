@@ -108,6 +108,8 @@
   .xlist code, .xmuted code { background:var(--panel-2); padding:1px 5px; border-radius:3px; font-size:11.5px; color:#f97316; font-family:ui-monospace,Consolas,monospace; }
   .xmuted { font-size:12.5px; color:var(--muted); line-height:1.7; margin:0 0 8px; }
   .xwarn { font-size:12.5px; color:var(--warn); line-height:1.6; margin:0 0 6px; }
+  .xtenancy { font-size:12px; border-radius:5px; padding:8px 12px; margin:0 0 16px; line-height:1.6; }
+  .xtenancy strong { color:inherit; }
   .mitre-wrap { display:flex; flex-wrap:wrap; gap:6px; }
   .mitre { font-size:11px; background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.25); color:#fca5a5; padding:3px 8px; border-radius:5px; }
   .mitre strong { color:#ef4444; }
@@ -607,7 +609,7 @@
       var aSlice = results.slice(ai, ai+BATCH_MAX);
       var aRequests = aSlice.map(function(r){
         return { id: r.id, method:'GET',
-          url:'/applications?$filter='+encodeURIComponent("appId eq '"+r.appId+"'")+'&$select=id,appId,allowPublicClient,isFallbackPublicClient,signInAudience,web,spa,publicClient' };
+          url:'/applications?$filter='+encodeURIComponent("appId eq '"+r.appId+"'")+'&$select=id,appId,allowPublicClient,isFallbackPublicClient,signInAudience,verifiedPublisher,web,spa,publicClient' };
       });
       try {
         var aResponses = await graphBatch(aRequests, token);
@@ -633,9 +635,11 @@
         r.redirectUris = uris;
         r.signInAudience = reg.signInAudience || null;
         r.tenancy = (reg.signInAudience === 'AzureADMyOrg') ? 'single' : 'multi';
+        r.verifiedPublisherName = (reg.verifiedPublisher && reg.verifiedPublisher.displayName) ? reg.verifiedPublisher.displayName : null;
       } else {
         r.allowPublicClient = false; r.implicitGrant = false; r.redirectUris = [];
         r.signInAudience = null; r.tenancy = 'multi'; // inferred — external apps must be multi-tenant
+        r.verifiedPublisherName = null;
       }
     });
 
@@ -745,8 +749,16 @@
         ? '<div style="display:flex;flex-direction:column;gap:4px;align-items:flex-start">'+authParts.join('')+'</div>'
         : '<span style="color:var(--muted);font-size:12px">—</span>';
       var audInfo = AUDIENCE_INFO[r.signInAudience] || AUDIENCE_INFO['_inferred'];
+      var vpLine = (!r.isFirstPartyMicrosoft)
+        ? (r.verifiedPublisherName
+            ? '<span style="display:inline-block;font-size:10px;padding:0 5px;border-radius:3px;background:rgba(16,185,129,.12);color:var(--ok);border:1px solid rgba(16,185,129,.3)">✅ '+escHtml(r.verifiedPublisherName)+'</span>'
+            : '<span style="display:inline-block;font-size:10px;padding:0 5px;border-radius:3px;background:rgba(245,158,11,.1);color:var(--warn);border:1px solid rgba(245,158,11,.25)">⚠️ Unverified</span>')
+        : '';
       var tenancyCell = '<span class="has-tip">'
+        +'<div style="display:flex;flex-direction:column;gap:3px;align-items:flex-start">'
         +'<span style="display:inline-block;font-size:11px;padding:1px 6px;border-radius:4px;background:'+audInfo.bg+';color:'+audInfo.color+';font-weight:600;border:1px solid '+audInfo.border+'">'+escHtml(audInfo.label)+'</span>'
+        +vpLine
+        +'</div>'
         +'<span class="tip"><strong>'+escHtml(audInfo.label)+'</strong><br>'+escHtml(audInfo.tip)+'</span>'
         +'</span>';
       return '<tr>'
@@ -858,6 +870,9 @@
     var publicClient = r.allowPublicClient || false;
     var implicitGrant = r.implicitGrant || false;
     var redirectUris  = r.redirectUris  || [];
+    var audInfo      = AUDIENCE_INFO[r.signInAudience] || AUDIENCE_INFO['_inferred'];
+    var isMultiTenant = audInfo.tenancy === 'multi';
+    var verifiedPublisher = r.verifiedPublisherName || null;
 
     // Collect all granted scopes (delegated + app roles)
     var allScopes = [];
@@ -887,6 +902,15 @@
       mitreById['T1528'] = {id:'T1528', name:'Steal Application Access Token', tactic:'Credential Access'};
       if(!mitreById['T1078.004']) mitreById['T1078.004'] = {id:'T1078.004', name:'Valid Accounts: Cloud Accounts', tactic:'Initial Access'};
     }
+    if(isMultiTenant){
+      mitreById['T1199'] = {id:'T1199', name:'Trusted Relationship (vendor/supply-chain breach)', tactic:'Initial Access'};
+      if(!mitreById['T1078.004']) mitreById['T1078.004'] = {id:'T1078.004', name:'Valid Accounts: Cloud Accounts', tactic:'Initial Access'};
+      if(!r.isFirstPartyMicrosoft && !verifiedPublisher)
+        mitreById['T1195.002'] = {id:'T1195.002', name:'Supply Chain Compromise: Software Supply Chain (unverified publisher)', tactic:'Initial Access'};
+    }
+    if(r.signInAudience === 'AzureADandPersonalMicrosoftAccount' || r.signInAudience === 'PersonalMicrosoftAccount'){
+      mitreById['T1566'] = {id:'T1566', name:'Phishing (consumer MSA token vector)', tactic:'Initial Access'};
+    }
     var mitreTechs = Object.keys(mitreById).sort().map(function(k){ return mitreById[k]; });
 
     // Blast radius categories
@@ -914,6 +938,25 @@
       rems.push('Review whether this third-party app genuinely requires these permissions — apply least-privilege and revoke unused grants via Entra ID &rsaquo; Enterprise applications.');
     if(blastCats.indexOf('content') !== -1)
       rems.push('Apply Microsoft Purview sensitivity labels and DLP policies to reduce the data surface accessible via compromised OAuth tokens.');
+    if(isMultiTenant){
+      if(!r.isFirstPartyMicrosoft){
+        if(verifiedPublisher)
+          rems.push('Publisher is <strong>Microsoft-verified</strong> as <strong>'+escHtml(verifiedPublisher)+'</strong> — vendor identity confirmed as a Microsoft partner. Note: verification does not eliminate supply-chain risk if the vendor\'s Entra tenant is itself compromised.');
+        else
+          rems.push('<strong>⚠️ No Verified Publisher status</strong> — Microsoft has not confirmed this vendor\'s identity. Request verification before granting high-privilege consent, or apply stricter Conditional Access controls to compensate.');
+      }
+      rems.push('Apply a <strong>Conditional Access policy</strong> scoped to this application — enforce MFA, compliant device, and restrict sign-in location to limit exposure if the vendor tenant is compromised.');
+      if(r.signInAudience === 'AzureADandPersonalMicrosoftAccount' || r.signInAudience === 'PersonalMicrosoftAccount')
+        rems.push('This app accepts <strong>personal Microsoft account (MSA) tokens</strong> — if consumer-account access is unintentional, request the vendor restrict <code>signInAudience</code> to <code>AzureADMultipleOrgs</code> or <code>AzureADMyOrg</code>.');
+      if(r.signInAudience === null)
+        rems.push('Confirm multi-tenancy configuration with the vendor (this app is registered externally — <code>signInAudience</code> is not directly readable from your tenant).');
+    }
+    if(!r.isFirstPartyMicrosoft && !isMultiTenant){
+      if(verifiedPublisher)
+        rems.push('Publisher is <strong>Microsoft-verified</strong> as <strong>'+escHtml(verifiedPublisher)+'</strong>.');
+      else if(r.signInAudience !== null)
+        rems.push('<strong>⚠️ No Verified Publisher status</strong> — this single-tenant app registration has no verified publisher identity in Entra ID.');
+    }
     if(!rems.length)
       rems.push('No critical configuration issues detected — continue monitoring consent grants and rotate any app credentials on a regular schedule.');
 
@@ -954,11 +997,46 @@
     var pubBadge = publicClient
       ? ' <span style="font-size:11px;padding:2px 7px;border-radius:4px;background:rgba(239,68,68,0.15);color:var(--danger);border:1px solid rgba(239,68,68,0.3);vertical-align:middle">⚠️ Public client</span>'
       : '';
+    var tenancyBadge = ' <span style="font-size:11px;padding:2px 7px;border-radius:4px;background:'+audInfo.bg+';color:'+audInfo.color+';border:1px solid '+audInfo.border+';vertical-align:middle">'+(isMultiTenant?'🌍':'🏠')+' '+escHtml(audInfo.label)+'</span>';
+    var verifiedBadge = !r.isFirstPartyMicrosoft
+      ? (verifiedPublisher
+          ? ' <span style="font-size:11px;padding:2px 7px;border-radius:4px;background:rgba(16,185,129,.12);color:var(--ok);border:1px solid rgba(16,185,129,.3);vertical-align:middle">✅ '+escHtml(verifiedPublisher)+'</span>'
+          : ' <span style="font-size:11px;padding:2px 7px;border-radius:4px;background:rgba(245,158,11,.1);color:var(--warn);border:1px solid rgba(245,158,11,.25);vertical-align:middle">⚠️ Unverified publisher</span>')
+      : '';
+
+    // Tenancy risk section
+    var tenancySection = '';
+    if(isMultiTenant){
+      var tRisks = [];
+      if(!r.isFirstPartyMicrosoft){
+        if(verifiedPublisher)
+          tRisks.push('<li>✅ <strong>Verified Publisher: '+escHtml(verifiedPublisher)+'</strong> — Microsoft has confirmed the vendor\'s identity as a registered partner. Supply-chain risk is reduced but not eliminated if the vendor tenant is breached.</li>');
+        else
+          tRisks.push('<li>⚠️ <strong>Unverified publisher</strong> — Microsoft has not confirmed this vendor\'s identity. No external assurance exists that the app is operated by the claimed organization. Treat with elevated scrutiny.</li>');
+      }
+      tRisks.push(
+        '<li><strong>Supply-chain breach:</strong> A compromise of the vendor\'s Entra tenant (leaked credentials, insider threat, phishing of a vendor admin) would expose OAuth tokens issued by every organization that has consented to this app — your tenant included.</li>',
+        '<li><strong>Cross-tenant lateral movement:</strong> Once an attacker holds a valid token obtained via this app, they can access the consented Graph resources in your tenant without breaching your on-premises infrastructure or Entra directory directly.</li>',
+        '<li><strong>Opaque update surface:</strong> Permission scopes, redirect URIs, and authentication flows are controlled by the vendor\'s tenant — any change to the app registration takes immediate effect in every consenting organization.</li>'
+      );
+      if(r.signInAudience === 'AzureADandPersonalMicrosoftAccount' || r.signInAudience === 'PersonalMicrosoftAccount')
+        tRisks.push('<li><strong>Consumer account phishing:</strong> This app accepts personal Microsoft account (MSA) tokens — a successful phishing attack against a consumer account can yield Graph-scoped access tokens with the consented permissions.</li>');
+      if(r.signInAudience === null)
+        tRisks.push('<li><strong>Opaque registration:</strong> <code>signInAudience</code> is not readable from this tenant (app registered externally) — the actual token-acceptance surface cannot be verified without vendor cooperation.</li>');
+      tenancySection = '<div class="xtenancy" style="background:'+audInfo.bg+';border:1px solid '+audInfo.border+'">'
+        +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
+        +'<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:'+audInfo.bg+';color:'+audInfo.color+';font-weight:700;border:1px solid '+audInfo.border+'">'+escHtml(audInfo.label)+'</span>'
+        +(verifiedPublisher ? '<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:rgba(16,185,129,.12);color:var(--ok);border:1px solid rgba(16,185,129,.3)">✅ '+escHtml(verifiedPublisher)+'</span>' : (!r.isFirstPartyMicrosoft ? '<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:rgba(245,158,11,.1);color:var(--warn);border:1px solid rgba(245,158,11,.25)">⚠️ Unverified publisher</span>' : ''))
+        +'<span style="font-size:12px;font-weight:700;color:'+audInfo.color+'">Tenancy Attack Surface</span>'
+        +'</div>'
+        +'<ul class="xlist" style="color:var(--text)">'+tRisks.join('')+'</ul></div>';
+    }
 
     return '<div class="xpanel">'
-      +'<h4>🎯 Exploitation Path — '+escHtml(r.displayName)+pubBadge
+      +'<h4>🎯 Exploitation Path — '+escHtml(r.displayName)+pubBadge+tenancyBadge+verifiedBadge
       +'<span style="font-size:11px;font-weight:400;margin-left:12px;color:var(--muted)">'+escHtml(r.appId)+'</span></h4>'
       +authSection
+      +tenancySection
       +'<div class="xgrid">'
       +'<div class="xsec"><h5>💥 Blast Radius</h5>'+blastHtml+'</div>'
       +'<div class="xsec"><h5>⬆️ Escalation Pivots</h5>'+escHtml2+'</div>'
