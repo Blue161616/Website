@@ -196,6 +196,11 @@
     <option value="implicit">💧 Implicit grant</option>
     <option value="risky-uri">🔗 Risky redirect URI</option>
   </select>
+  <select id="f-tenancy">
+    <option value="">All tenancy types</option>
+    <option value="single">🏠 Single-tenant</option>
+    <option value="multi">🌍 Multi-tenant</option>
+  </select>
   <select id="f-msft">
     <option value="no">Exclude Microsoft first-party</option>
     <option value="">All publishers</option>
@@ -222,6 +227,7 @@
       <th data-sort="displayName">Application</th>
       <th data-sort="accessLevel">Access Level</th>
       <th>Auth Config</th>
+      <th data-sort="tenancy">Tenancy</th>
       <th>Recon Capabilities</th>
       <th>Permissions</th>
       <th data-sort="publisherName">Publisher</th>
@@ -336,6 +342,14 @@
   var CAT_ORDER  = ['privilege','identity','security','content','apps'];
   var SEV_LABELS = ['None','Low','Medium','High','Critical'];
   var SEV_CLASS  = ['lvl-0','lvl-1','lvl-2','lvl-3','lvl-4'];
+
+  var AUDIENCE_INFO = {
+    'AzureADMyOrg':                     { label:'Single-tenant',   color:'var(--ok)',     bg:'rgba(16,185,129,.12)',  border:'rgba(16,185,129,.3)',  tenancy:'single', tip:'Registered for this directory only — tokens are issued to this tenant exclusively. Lowest supply-chain blast radius.' },
+    'AzureADMultipleOrgs':              { label:'Multi-tenant',    color:'#f97316',       bg:'rgba(249,115,22,.12)', border:'rgba(249,115,22,.3)', tenancy:'multi',  tip:'Any Entra ID tenant can install this app. Supply-chain risk: a publisher compromise or malicious update affects every consenting tenant simultaneously.' },
+    'AzureADandPersonalMicrosoftAccount':{ label:'Multi + Consumer',color:'var(--danger)', bg:'rgba(239,68,68,.12)',   border:'rgba(239,68,68,.3)',   tenancy:'multi',  tip:'Accepts any Entra ID account AND personal Microsoft accounts — the broadest token-acceptance surface available.' },
+    'PersonalMicrosoftAccount':         { label:'Consumer only',   color:'var(--muted)',  bg:'rgba(124,127,160,.12)',border:'rgba(124,127,160,.3)',tenancy:'multi',  tip:'Accepts personal Microsoft accounts only.' },
+    '_inferred':                        { label:'Multi-tenant*',   color:'#f97316',       bg:'rgba(249,115,22,.12)', border:'rgba(249,115,22,.3)', tenancy:'multi',  tip:'Third-party app registered in another organization. Must be multi-tenant to appear in this directory — signInAudience not directly readable from this tenant.' },
+  };
 
   function computeReconCaps(scopes){
     var seen = {}, caps = [];
@@ -593,7 +607,7 @@
       var aSlice = results.slice(ai, ai+BATCH_MAX);
       var aRequests = aSlice.map(function(r){
         return { id: r.id, method:'GET',
-          url:'/applications?$filter='+encodeURIComponent("appId eq '"+r.appId+"'")+'&$select=id,appId,allowPublicClient,isFallbackPublicClient,web,spa,publicClient' };
+          url:'/applications?$filter='+encodeURIComponent("appId eq '"+r.appId+"'")+'&$select=id,appId,allowPublicClient,isFallbackPublicClient,signInAudience,web,spa,publicClient' };
       });
       try {
         var aResponses = await graphBatch(aRequests, token);
@@ -617,8 +631,11 @@
         if(reg.spa && reg.spa.redirectUris) uris = uris.concat(reg.spa.redirectUris);
         if(reg.publicClient && reg.publicClient.redirectUris) uris = uris.concat(reg.publicClient.redirectUris);
         r.redirectUris = uris;
+        r.signInAudience = reg.signInAudience || null;
+        r.tenancy = (reg.signInAudience === 'AzureADMyOrg') ? 'single' : 'multi';
       } else {
         r.allowPublicClient = false; r.implicitGrant = false; r.redirectUris = [];
+        r.signInAudience = null; r.tenancy = 'multi'; // inferred — external apps must be multi-tenant
       }
     });
 
@@ -666,6 +683,8 @@
     if(fAuth === 'implicit')  rows = rows.filter(function(r){ return r.implicitGrant; });
     if(fAuth === 'risky-uri') rows = rows.filter(function(r){ return (r.redirectUris||[]).some(function(u){ return redirectRisk(u); }); });
     if(fAuth === 'any')       rows = rows.filter(function(r){ return r.allowPublicClient || r.implicitGrant || (r.redirectUris||[]).some(function(u){ return redirectRisk(u); }); });
+    var fTenancy = el('f-tenancy').value;
+    if(fTenancy) rows = rows.filter(function(r){ return r.tenancy === fTenancy; });
     rows.sort(function(a,b){
       var av = a[sortState.key] != null ? a[sortState.key] : '';
       var bv = b[sortState.key] != null ? b[sortState.key] : '';
@@ -725,11 +744,17 @@
       var authCell = authParts.length
         ? '<div style="display:flex;flex-direction:column;gap:4px;align-items:flex-start">'+authParts.join('')+'</div>'
         : '<span style="color:var(--muted);font-size:12px">—</span>';
+      var audInfo = AUDIENCE_INFO[r.signInAudience] || AUDIENCE_INFO['_inferred'];
+      var tenancyCell = '<span class="has-tip">'
+        +'<span style="display:inline-block;font-size:11px;padding:1px 6px;border-radius:4px;background:'+audInfo.bg+';color:'+audInfo.color+';font-weight:600;border:1px solid '+audInfo.border+'">'+escHtml(audInfo.label)+'</span>'
+        +'<span class="tip"><strong>'+escHtml(audInfo.label)+'</strong><br>'+escHtml(audInfo.tip)+'</span>'
+        +'</span>';
       return '<tr>'
         + '<td><div class="app-name"><a href="' + escHtml(r.portalUrl) + '" target="_blank" rel="noopener">' + escHtml(r.displayName) + '</a></div><div class="appid">' + escHtml(r.appId) + '</div>'
         + '<button class="xpath" data-xpath="' + r.id + '">' + (r.allowPublicClient ? '⚠️ ' : '') + '▼ Attack Path</button></td>'
         + '<td>' + sevBadge + '</td>'
         + '<td>' + authCell + '</td>'
+        + '<td>' + tenancyCell + '</td>'
         + '<td>' + capHtml + '</td>'
         + '<td><div class="raw-perms">' + permsHtml + '</div></td>'
         + '<td>' + escHtml(r.publisherName||'—') + '</td>'
@@ -964,7 +989,7 @@
     detailTr.id = detailId;
     detailTr.className = 'detail-row';
     var td = document.createElement('td');
-    td.colSpan = 7;
+    td.colSpan = 8;
     td.innerHTML = buildAttackPath(r);
     detailTr.appendChild(td);
     tr.parentNode.insertBefore(detailTr, tr.nextSibling);
@@ -982,6 +1007,7 @@
   el('f-cat').addEventListener('change', render);
   el('f-msft').addEventListener('change', render);
   el('f-auth').addEventListener('change', render);
+  el('f-tenancy').addEventListener('change', render);
   document.querySelectorAll('th[data-sort]').forEach(function(th){
     th.addEventListener('click', function(){
       var key = th.getAttribute('data-sort');
