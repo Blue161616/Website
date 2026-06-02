@@ -272,34 +272,97 @@ _NUCLEI_COMMON_PATHS = [
     '/opt/homebrew/bin/nuclei',
 ]
 
-def _find_binary(names, common_paths: list) -> str | None:
+# httpx (ProjectDiscovery) — confirms which discovered ports are live web
+# services and yields the real scheme/title/tech, feeding clean URLs to nuclei.
+_HTTPX_NAMES = ['httpx']
+_HTTPX_COMMON_PATHS = [
+    os.path.expandvars(r'%USERPROFILE%\go\bin\httpx.exe'),
+    r'C:\httpx\httpx.exe',
+    os.path.expanduser('~/go/bin/httpx'),
+    '/usr/bin/httpx',
+    '/usr/local/bin/httpx',
+    '/opt/homebrew/bin/httpx',
+]
+
+# subfinder + dnsx (ProjectDiscovery) — pre-scan asset discovery: enumerate a
+# domain's subdomains (passive) and resolve them to IPs to feed the scanner.
+def _pd_common_paths(name: str) -> list:
+    return [
+        os.path.expandvars(rf'%USERPROFILE%\go\bin\{name}.exe'),
+        rf'C:\{name}\{name}.exe',
+        os.path.expanduser(f'~/go/bin/{name}'),
+        f'/usr/bin/{name}',
+        f'/usr/local/bin/{name}',
+        f'/opt/homebrew/bin/{name}',
+    ]
+_SUBFINDER_NAMES = ['subfinder']
+_DNSX_NAMES      = ['dnsx']
+
+def _find_binary(names, common_paths: list, verify=None) -> str | None:
     """Locate an external binary by trying, in order: each candidate name on
     PATH, then explicit common install paths, then the application's own
-    directory (so the binary can simply be dropped next to app.py)."""
+    directory (so the binary can simply be dropped next to app.py).
+
+    `verify` is an optional callable(path) -> bool; when given, a candidate is
+    accepted only if it passes (so a same-named but wrong binary on PATH is
+    skipped in favour of the real one elsewhere)."""
     if isinstance(names, str):
         names = [names]
+    def ok(c):
+        return verify is None or verify(c)
     for n in names:                       # 1) PATH (which appends .exe on Windows)
         found = shutil.which(n)
-        if found:
+        if found and ok(found):
             return found
     for p in common_paths:                # 2) known install locations
-        if os.path.isfile(p):
+        if os.path.isfile(p) and ok(p):
             return p
     for n in names:                       # 3) alongside app.py
         for ext in ('', '.exe'):
             cand = os.path.join(APP_DIR, n + ext)
-            if os.path.isfile(cand):
+            if os.path.isfile(cand) and ok(cand):
                 return cand
     return None
 
+
+def _verify_httpx(path: str) -> bool:
+    """Tell ProjectDiscovery httpx (the web prober we want) apart from the
+    unrelated Python 'httpx' HTTP-client CLI that frequently shadows it on PATH.
+
+    PD httpx answers `-version` with a semver string; the Python CLI is a Click
+    app that instead emits 'Usage: …' / 'No such option' / a traceback. Without
+    this guard we'd silently run the wrong binary on every scan."""
+    try:
+        proc = subprocess.run([path, '-version'], capture_output=True,
+                              text=True, timeout=8)
+    except Exception:
+        return False
+    out = (proc.stdout or '') + (proc.stderr or '')
+    if 'Usage:' in out or 'No such option' in out or 'Traceback' in out:
+        return False
+    import re
+    return bool(re.search(r'v?\d+\.\d+\.\d+', out))
+
 MASSCAN_PATH = _find_binary(_MASSCAN_NAMES, _MASSCAN_COMMON_PATHS)
 NUCLEI_PATH  = _find_binary(_NUCLEI_NAMES,  _NUCLEI_COMMON_PATHS)
+HTTPX_PATH   = _find_binary(_HTTPX_NAMES,   _HTTPX_COMMON_PATHS, verify=_verify_httpx)
+SUBFINDER_PATH = _find_binary(_SUBFINDER_NAMES, _pd_common_paths('subfinder'))
+DNSX_PATH      = _find_binary(_DNSX_NAMES,      _pd_common_paths('dnsx'))
 
 def _masscan_installed() -> bool:
     return MASSCAN_PATH is not None
 
 def _nuclei_installed() -> bool:
     return NUCLEI_PATH is not None
+
+def _httpx_installed() -> bool:
+    return HTTPX_PATH is not None
+
+def _subfinder_installed() -> bool:
+    return SUBFINDER_PATH is not None
+
+def _dnsx_installed() -> bool:
+    return DNSX_PATH is not None
 
 def _binary_version(path: str | None) -> str:
     """Best-effort `<bin> --version` → short version string ('' if unavailable)."""
@@ -308,17 +371,23 @@ def _binary_version(path: str | None) -> str:
     try:
         proc = subprocess.run([path, '--version'], capture_output=True,
                               text=True, timeout=8)
-        lines = (proc.stdout or proc.stderr or '').strip().splitlines()
-        if not lines:
-            return ''
-        import re
-        # Strip ANSI colour codes and a leading log tag like "[INF] " that tools
-        # such as nuclei emit on their --version line.
-        out = re.sub(r'\x1b\[[0-9;]*m', '', lines[0]).strip()
-        out = re.sub(r'^\[[A-Z]{2,4}\]\s*', '', out)
-        return out
     except Exception:
         return ''
+    import re
+    clean = []
+    for ln in ((proc.stdout or '') + '\n' + (proc.stderr or '')).splitlines():
+        ln = re.sub(r'\x1b\[[0-9;]*m', '', ln)         # strip ANSI colour codes
+        ln = re.sub(r'^\[[A-Z]{2,4}\]\s*', '', ln).strip()  # strip a [INF]-style tag
+        if ln:
+            clean.append(ln)
+    if not clean:
+        return ''
+    # Prefer the first line carrying an actual version number — skips the ASCII
+    # banners tools like httpx/subfinder print before their version line.
+    for ln in clean:
+        if re.search(r'\d+\.\d+', ln):
+            return ln
+    return clean[0]
 
 
 # ── Risk tables ────────────────────────────────────────────────────────────
@@ -390,6 +459,13 @@ MASSCAN_RATE    = 1000             # packets/sec for the masscan discovery stage
 MASSCAN_TIMEOUT = 600              # seconds — hard cap on a single masscan run
 NUCLEI_SEVERITY = 'medium,high,critical'
 NUCLEI_TIMEOUT  = 900              # seconds — hard cap on a single nuclei run
+HTTPX_TIMEOUT   = 300              # seconds — hard cap on a single httpx probe run
+SUBFINDER_TIMEOUT = 180            # seconds — hard cap on a subfinder enumeration
+SUBFINDER_MAX_MIN = 2              # minutes — subfinder's own -max-time (graceful partial exit)
+DNSX_TIMEOUT      = 120            # seconds — hard cap on a dnsx resolution run
+# Some domains (e.g. example.com) surface tens of thousands of CT-sourced
+# subdomains; cap how many we resolve/return so discovery stays bounded.
+MAX_DISCOVER_HOSTS = 2000
 
 # Ports we treat as web services for the nuclei stage (in addition to any port
 # whose nmap service name contains 'http').
@@ -403,6 +479,14 @@ def _url_for(host: str, port: int, service: str) -> str:
     svc = (service or '').lower()
     scheme = 'https' if port in _HTTPS_PORTS or 'https' in svc or 'ssl' in svc else 'http'
     return f'{scheme}://{host}:{port}'
+
+def _normalize_target(target: str) -> str:
+    """Drop a single-host CIDR suffix (/32 for IPv4, /128 for IPv6) so a lone IP
+    isn't treated as a range and pushed through masscan needlessly."""
+    t = target.strip()
+    if t.endswith('/32') or t.endswith('/128'):
+        return t.rsplit('/', 1)[0]
+    return t
 
 def _is_range(target: str) -> bool:
     """CIDR (10.0.0.0/24) or dash range (10.0.0.1-50) — worth a masscan sweep."""
@@ -852,6 +936,189 @@ def _run_masscan(target: str, ports: str) -> dict | None:
     return out
 
 
+# ── httpx stage ──────────────────────────────────────────────────────────────
+def _run_httpx(candidates: list) -> tuple:
+    """Probe candidate ``host:port`` web services with httpx.
+
+    Returns (per_host, live_urls, meta):
+      per_host  = {host: [ {url, scheme, port, status_code, title, webserver,
+                            tech:[...]} ]} keyed by the host we passed in (so it
+                  lines up with the nmap host key).
+      live_urls = flat list of confirmed-live URLs (for the nuclei stage).
+      meta      = {status, target_count, live_count, duration, error}.
+
+    httpx determines the real scheme (http vs https) and confirms the service is
+    actually a live web server — far more reliable than guessing from the port.
+    Never raises; on any failure the caller falls back to port-based URL guesses.
+    """
+    meta = {'status': 'skipped', 'target_count': len(candidates),
+            'live_count': 0, 'duration': 0.0, 'error': ''}
+    if not HTTPX_PATH:
+        meta['error'] = 'httpx not installed'
+        return {}, [], meta
+    if not candidates:
+        meta['error'] = 'no web candidates to probe'
+        return {}, [], meta
+
+    tmp_path = None
+    t0 = time.time()
+    try:
+        with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False,
+                                         encoding='utf-8') as tf:
+            tf.write('\n'.join(candidates))
+            tmp_path = tf.name
+        cmd = [HTTPX_PATH, '-l', tmp_path, '-json', '-silent', '-no-color',
+               '-disable-update-check', '-title', '-status-code',
+               '-tech-detect', '-web-server', '-timeout', '10']
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=HTTPX_TIMEOUT)
+    except Exception as e:
+        meta['duration'] = round(time.time() - t0, 1)
+        meta['status']   = 'error'
+        meta['error']    = str(e)
+        print(f'[httpx] error after {meta["duration"]}s on {len(candidates)} target(s): {e}')
+        return {}, [], meta
+    finally:
+        if tmp_path:
+            try: os.unlink(tmp_path)
+            except Exception: pass
+
+    meta['duration'] = round(time.time() - t0, 1)
+
+    per_host: dict = {}
+    live_urls = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith('{'):
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get('failed'):
+            continue
+        url = rec.get('url') or ''
+        if not url:
+            continue
+        # Key by the host portion of the exact input we supplied so it matches
+        # the nmap host key (httpx echoes `input` as e.g. "1.2.3.4:443").
+        raw_in = rec.get('input') or rec.get('host') or ''
+        host   = raw_in.rsplit(':', 1)[0] if ':' in raw_in and not raw_in.startswith('[') else (rec.get('host') or raw_in)
+        tech   = rec.get('tech') or rec.get('technologies') or []
+        if isinstance(tech, str):
+            tech = [tech]
+        per_host.setdefault(host, []).append({
+            'url':         url,
+            'scheme':      rec.get('scheme', ''),
+            'port':        rec.get('port', ''),
+            'status_code': rec.get('status_code') or rec.get('status-code') or 0,
+            'title':       (rec.get('title') or '').strip(),
+            'webserver':   rec.get('webserver') or rec.get('web_server') or '',
+            'tech':        tech,
+        })
+        live_urls.append(url)
+
+    meta['live_count'] = len(live_urls)
+    fatal = [ln.strip() for ln in (proc.stderr or '').splitlines()
+             if '[FTL]' in ln or '[ERR]' in ln]
+    if fatal and not live_urls:
+        import re as _re
+        meta['error'] = _re.sub(r'\x1b\[[0-9;]*m', '', fatal[0])[:300]
+        meta['status'] = 'error'
+    else:
+        meta['status'] = 'ran'
+    print(f'[httpx] {meta["status"]}: {len(candidates)} candidate(s) → '
+          f'{len(live_urls)} live in {meta["duration"]}s'
+          + (f' — {meta["error"]}' if meta['error'] else ''))
+    return per_host, live_urls, meta
+
+
+# ── subfinder + dnsx (pre-scan asset discovery) ──────────────────────────────
+import re as _re_disc
+_DOMAIN_RE = _re_disc.compile(r'^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}'
+                              r'(?:\.[A-Za-z0-9-]{1,63})*\.[A-Za-z]{2,}$')
+
+def _is_domain(name: str) -> bool:
+    """A bare registrable hostname (no scheme/port/path), not an IP/CIDR/range.
+    Also guards against argument injection (leading '-')."""
+    name = (name or '').strip()
+    if not name or name.startswith('-') or '/' in name or ' ' in name:
+        return False
+    # Reject anything that's purely an IPv4 address.
+    if _re_disc.fullmatch(r'\d{1,3}(?:\.\d{1,3}){3}', name):
+        return False
+    return bool(_DOMAIN_RE.match(name))
+
+
+def _run_subfinder(domain: str) -> tuple:
+    """Passive subdomain enumeration for a single domain.
+    Returns (subdomains, error). Never raises."""
+    if not SUBFINDER_PATH:
+        return [], 'subfinder not installed'
+    if not _is_domain(domain):
+        return [], 'invalid domain'
+    cmd = [SUBFINDER_PATH, '-silent', '-duc', '-d', domain,
+           '-max-time', str(SUBFINDER_MAX_MIN)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=SUBFINDER_TIMEOUT)
+    except Exception as e:
+        print(f'[subfinder] {domain}: {e}')
+        return [], str(e)
+    subs = []
+    for line in (proc.stdout or '').splitlines():
+        s = line.strip().lower()
+        if s and _is_domain(s):
+            subs.append(s)
+    subs = sorted(set(subs))
+    print(f'[subfinder] {domain}: {len(subs)} subdomain(s)')
+    return subs, ''
+
+
+def _run_dnsx(hosts: list) -> tuple:
+    """Resolve hostnames to A records with dnsx.
+    Returns (resolved, error) where resolved = {host: [ips]}. Never raises."""
+    hosts = [h for h in hosts if _is_domain(h)]
+    if not DNSX_PATH:
+        return {}, 'dnsx not installed'
+    if not hosts:
+        return {}, 'no resolvable hosts'
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False,
+                                         encoding='utf-8') as tf:
+            tf.write('\n'.join(hosts))
+            tmp_path = tf.name
+        cmd = [DNSX_PATH, '-silent', '-duc', '-json', '-a', '-resp', '-l', tmp_path]
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=DNSX_TIMEOUT)
+    except Exception as e:
+        print(f'[dnsx] {e}')
+        return {}, str(e)
+    finally:
+        if tmp_path:
+            try: os.unlink(tmp_path)
+            except Exception: pass
+    resolved: dict = {}
+    for line in (proc.stdout or '').splitlines():
+        line = line.strip()
+        if not line.startswith('{'):
+            continue
+        try:
+            rec  = json.loads(line)
+        except Exception:
+            continue
+        host = (rec.get('host') or '').lower()
+        ips  = rec.get('a') or []
+        if host and ips:
+            resolved.setdefault(host, [])
+            for ip in ips:
+                if ip not in resolved[host]:
+                    resolved[host].append(ip)
+    print(f'[dnsx] resolved {len(resolved)}/{len(hosts)} host(s)')
+    return resolved, ''
+
+
 # ── nuclei stage ─────────────────────────────────────────────────────────────
 _NUCLEI_TEMPLATES_READY = False
 
@@ -1200,6 +1467,7 @@ def _scan_target(target: str, ports: str, args: str, scan_type: str, job_id: str
                 'is_new_host':    changes['is_new_host'],
                 'findings':       [],
                 'finding_count':  0,
+                'http':           [],
                 'tls':            [],
             })
 
@@ -1212,7 +1480,7 @@ def _scan_target(target: str, ports: str, args: str, scan_type: str, job_id: str
             'ports': [], 'open_count': 0, 'critical_count': 0,
             'risk': 'info', 'scanned_at': _now(),
             'new_ports': [], 'closed_ports': [], 'is_new_host': False,
-            'findings': [], 'finding_count': 0, 'tls': [],
+            'findings': [], 'finding_count': 0, 'http': [], 'tls': [],
         })
     except Exception as exc:
         out.append({
@@ -1222,19 +1490,44 @@ def _scan_target(target: str, ports: str, args: str, scan_type: str, job_id: str
             'ports': [], 'open_count': 0, 'critical_count': 0,
             'risk': 'info', 'scanned_at': _now(),
             'new_ports': [], 'closed_ports': [], 'is_new_host': False,
-            'findings': [], 'finding_count': 0, 'tls': [],
+            'findings': [], 'finding_count': 0, 'http': [], 'tls': [],
         })
 
-    # ── Stage 3: nuclei web vuln scan ────────────────────────────────────────
-    # Point nuclei at every open web service nmap found, fold finding severities
-    # back into each host's risk, and attach a per-host run summary (h['nuclei'])
-    # so the UI can show what nuclei did even when it found nothing.
-    host_urls = {
-        h['host']: [_url_for(h['host'], p['port'], p.get('service', ''))
-                    for p in h.get('ports', [])
+    # ── Stage 2.5: httpx web probing ─────────────────────────────────────────
+    # Confirm which of nmap's open web-candidate ports are actually live HTTP/
+    # HTTPS, with the real scheme/title/tech. When httpx is installed we hand the
+    # *confirmed* URLs to nuclei; otherwise we fall back to guessing the scheme
+    # from the port (_url_for), preserving the original behaviour.
+    web_candidates = {
+        h['host']: [p['port'] for p in h.get('ports', [])
                     if p.get('state') == 'open' and _is_web(p['port'], p.get('service', ''))]
         for h in out
     }
+    flat_candidates = [f'{host}:{port}'
+                       for host, plist in web_candidates.items() for port in plist]
+
+    host_urls = {}
+    if (_httpx_installed() and scan_type != 'ping' and flat_candidates):
+        _set_stage(job, lock, 'httpx')
+        per_host, _live, hx_meta = _run_httpx(flat_candidates)
+        for h in out:
+            probes = per_host.get(h['host'], [])
+            h['http'] = probes
+            if probes:
+                host_urls[h['host']] = [pr['url'] for pr in probes]
+    else:
+        # No httpx (or ping scan): guess URLs from the open web ports.
+        host_urls = {
+            h['host']: [_url_for(h['host'], p['port'], p.get('service', ''))
+                        for p in h.get('ports', [])
+                        if p.get('state') == 'open' and _is_web(p['port'], p.get('service', ''))]
+            for h in out
+        }
+
+    # ── Stage 3: nuclei web vuln scan ────────────────────────────────────────
+    # Point nuclei at every confirmed (or guessed) web service, fold finding
+    # severities back into each host's risk, and attach a per-host run summary
+    # (h['nuclei']) so the UI can show what nuclei did even when it found nothing.
     total_urls = sum(len(v) for v in host_urls.values())
 
     skip_reason = None
@@ -1394,7 +1687,7 @@ if _APScheduler:
                     (now, next_run, schedule_id)
                 )
 
-            targets = [t.strip() for t in
+            targets = [_normalize_target(t) for t in
                        (s['targets'] or '').replace(',', '\n').splitlines() if t.strip()]
             if not targets:
                 return
@@ -1492,8 +1785,14 @@ def api_ping():
                             'version': '.'.join(str(v) for v in ver)},
                 'masscan': {'installed': _masscan_installed(),
                             'version': _binary_version(MASSCAN_PATH)},
+                'httpx':   {'installed': _httpx_installed(),
+                            'version': _binary_version(HTTPX_PATH)},
                 'nuclei':  {'installed': _nuclei_installed(),
                             'version': _binary_version(NUCLEI_PATH)},
+                'subfinder': {'installed': _subfinder_installed(),
+                              'version': _binary_version(SUBFINDER_PATH)},
+                'dnsx':      {'installed': _dnsx_installed(),
+                              'version': _binary_version(DNSX_PATH)},
             },
         })
     except nmap.PortScannerError as e:
@@ -1505,6 +1804,53 @@ def api_ping():
         })
     except Exception as e:
         return jsonify({'status': 'error', 'error': str(e)}), 500
+
+
+@app.route('/api/discover', methods=['POST'])
+def api_discover():
+    """Pre-scan asset discovery for a single domain.
+
+    Enumerates subdomains with subfinder (passive) and resolves every name to
+    its A records with dnsx, returning the discovered hosts + unique IPs for the
+    UI to merge into the target list. Both tools are optional: with neither
+    installed this returns an error; with only dnsx we still resolve the apex.
+    """
+    data   = request.get_json(force=True)
+    domain = (data.get('domain') or '').strip().lower()
+    if not _is_domain(domain):
+        return jsonify({'error': 'Enter a valid domain, e.g. example.com'}), 400
+    if not (_subfinder_installed() or _dnsx_installed()):
+        return jsonify({'error': 'subfinder/dnsx not installed — see Quick Setup Guide'}), 503
+
+    errors = []
+    subs, sub_err = _run_subfinder(domain)
+    if sub_err and sub_err != 'subfinder not installed':
+        errors.append(f'subfinder: {sub_err}')
+
+    found_count = len(subs)
+    names = sorted(set([domain] + subs))
+    truncated = len(names) > MAX_DISCOVER_HOSTS
+    if truncated:
+        names = names[:MAX_DISCOVER_HOSTS]
+        errors.append(f'capped to {MAX_DISCOVER_HOSTS} of {found_count} subdomains')
+
+    resolved, dns_err = _run_dnsx(names)
+    if dns_err and dns_err != 'dnsx not installed':
+        errors.append(f'dnsx: {dns_err}')
+
+    # Without dnsx we can't resolve; return the names so they can still be scanned.
+    hosts = [{'host': h, 'ips': resolved.get(h, [])} for h in names]
+    ips   = sorted({ip for v in resolved.values() for ip in v})
+    return jsonify({
+        'domain':           domain,
+        'subdomains':       [n for n in names if n != domain],
+        'subdomain_count':  found_count,
+        'truncated':        truncated,
+        'hosts':            hosts,
+        'ips':              ips,
+        'tools': {'subfinder': _subfinder_installed(), 'dnsx': _dnsx_installed()},
+        'errors':           errors,
+    })
 
 
 @app.route('/api/scan', methods=['POST'])
@@ -1535,7 +1881,7 @@ def api_start_scan():
     if not raw:
         return jsonify({'error': 'No targets provided'}), 400
 
-    targets = [t.strip() for t in raw.replace(',', '\n').splitlines() if t.strip()]
+    targets = [_normalize_target(t) for t in raw.replace(',', '\n').splitlines() if t.strip()]
     if not targets:
         return jsonify({'error': 'No valid targets after parsing'}), 400
 
