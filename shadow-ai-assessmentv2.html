@@ -1563,6 +1563,43 @@ async function fetchAiAgentInventory() {
         fetchDefenderAiAgentsList().catch(() => {});
         return STATE.data.aiAgentInv;
       }
+      // Legacy compatibility: some tenants still expose only AIAgentsInfo.
+      const kqlLegacy = [
+        'AIAgentsInfo',
+        '| summarize arg_max(Timestamp, *) by AIAgentId',
+        '| where AgentStatus != "Deleted"',
+        '| extend _auth = tolower(tostring(column_ifexists("UserAuthenticationType", "")))',
+        '| extend _hint = tolower(strcat(tostring(column_ifexists("ModelNameHint", "")), " ", tostring(column_ifexists("Model", "")), " ", extract(@"(?i)modelNameHint[\"\\s:]+([A-Za-z0-9_\\-.]+)", 1, tostring(column_ifexists("RawAgentInfo", "")))))',
+        '| extend _tools = tolower(tostring(column_ifexists("AgentToolsDetails", "")))',
+        '| summarize Total=count(), NoAuth=countif(_auth == "none" or _auth contains "noauth"), MakerCreds=countif(_auth contains "maker"), AnthropicCount=countif(_hint contains "sonnet" or _hint contains "haiku" or _hint contains "opus" or _hint contains "claude"), McpCount=countif(_tools contains "mcp"), HardCodedCount=countif(_tools contains "hardcoded" or _tools contains "hard-coded"), GenOrchCount=countif(tobool(column_ifexists("IsGenerativeOrchestrationEnabled", false)))',
+      ].join(' ');
+      const rL = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ Query: kqlLegacy, Timespan: 'P30D' }),
+      });
+      if (rL.ok) {
+        const dataL = await rL.json();
+        const rowL = (dataL.results || [])[0] || {};
+        STATE.data.aiAgentInv = {
+          ok: true,
+          rows: dataL.results || [],
+          total: rowL.Total || 0,
+          noAuth: rowL.NoAuth || 0,
+          makerCreds: rowL.MakerCreds || 0,
+          anthropicCount: rowL.AnthropicCount || 0,
+          mcpCount: rowL.McpCount || 0,
+          hardCodedCount: rowL.HardCodedCount || 0,
+          genOrchCount: rowL.GenOrchCount || 0,
+          modelHints: [],
+          modelHintsCode: code,
+          modelHintsError: msg,
+          degraded: true,
+          legacyTable: 'AIAgentsInfo',
+        };
+        fetchDefenderAiAgentsList().catch(() => {});
+        return STATE.data.aiAgentInv;
+      }
     } catch { /* fall through to hard-fail state */ }
     STATE.data.aiAgentInv = { ok: false, rows: [], total: 0, error: msg, code };
   }
@@ -1678,6 +1715,47 @@ async function fetchDefenderAiAgentsList() {
           modelInfo: hintToModelInfo(row.ModelHint || ''),
         }));
         STATE.data.defenderAgentList = { ok: true, agents, total: agents.length, degraded: true };
+        return STATE.data.defenderAgentList;
+      }
+      // Legacy compatibility: some tenants still expose only AIAgentsInfo.
+      const kqlLegacy = [
+        'AIAgentsInfo',
+        '| summarize arg_max(Timestamp, *) by AIAgentId',
+        '| where AgentStatus != "Deleted"',
+        '| extend ModelHint = tostring(extract(@"(?i)modelNameHint[\"\\s:]+([A-Za-z0-9_\\-.]+)", 1, tostring(column_ifexists("RawAgentInfo", ""))))',
+        '| extend Platform  = tostring(column_ifexists("AgentType", ""))',
+        '| extend PubStatus = tostring(column_ifexists("PublishStatus", ""))',
+        '| extend AuthType  = tostring(column_ifexists("UserAuthenticationType", ""))',
+        '| extend EntraId   = tostring(column_ifexists("EntraAgentId", AIAgentId))',
+        '| extend _toolsStr = tostring(column_ifexists("AgentToolsDetails", ""))',
+        '| extend McpCount  = toint(coalesce(array_length(extract_all(@"(?i)\"toolType\"\\s*:\\s*\"mcp\"", _toolsStr)), 0))',
+        '| extend ToolCount = toint(coalesce(array_length(extract_all(@"\"toolType\"", _toolsStr)), 0))',
+        '| extend HasGenOrch = tobool(column_ifexists("IsGenerativeOrchestrationEnabled", false))',
+        '| project AgentId=AIAgentId, AgentName = tostring(column_ifexists("AgentName", AIAgentId)), Platform, PubStatus, AuthType, EntraId, ModelHint, McpCount, ToolCount, HasGenOrch',
+        '| order by AgentName asc',
+        '| take 500',
+      ].join(' ');
+      const rL = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ Query: kqlLegacy, Timespan: 'P30D' }),
+      });
+      if (rL.ok) {
+        const dataL = await rL.json();
+        const agents = (dataL.results || []).map(row => ({
+          id: row.AgentId || '',
+          name: row.AgentName || row.AgentId || '—',
+          platform: row.Platform || 'Other',
+          pubStatus: row.PubStatus || '',
+          authType: row.AuthType || 'Unknown',
+          entraId: row.EntraId || '',
+          modelHint: row.ModelHint || '',
+          mcpCount: row.McpCount || 0,
+          toolCount: row.ToolCount || 0,
+          hasGenOrch: row.HasGenOrch || false,
+          modelInfo: hintToModelInfo(row.ModelHint || ''),
+        }));
+        STATE.data.defenderAgentList = { ok: true, agents, total: agents.length, degraded: true, legacyTable: 'AIAgentsInfo' };
         return STATE.data.defenderAgentList;
       }
     } catch { /* keep hard failure */ }
