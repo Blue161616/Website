@@ -1422,10 +1422,10 @@ async function fetchAiAgentInventory() {
   if (STATE.data.aiAgentInv !== undefined) return STATE.data.aiAgentInv;
   const kql = [
     'AgentsInfo',
-    '| extend _AgentId = tostring(column_ifexists("AgentId", column_ifexists("AIAgentId", "")))',
+    '| extend _AgentId = iff(isnotempty(tostring(column_ifexists("AgentId", ""))), tostring(column_ifexists("AgentId", "")), tostring(column_ifexists("AIAgentId", "")))',
     '| where isnotempty(_AgentId)',
     '| summarize arg_max(Timestamp, *) by _AgentId',
-    '| extend _Lifecycle = tostring(column_ifexists("LifecycleStatus", column_ifexists("AgentStatus", "")))',
+    '| extend _Lifecycle = iff(isnotempty(tostring(column_ifexists("LifecycleStatus", ""))), tostring(column_ifexists("LifecycleStatus", "")), tostring(column_ifexists("AgentStatus", "")))',
     '| where _Lifecycle != "Deleted"',
     '| extend _toolsAuth = tostring(column_ifexists("ToolsAuthenticationType", ""))',
     '| extend _userAuth = tostring(column_ifexists("UserAuthenticationType", ""))',
@@ -1486,10 +1486,10 @@ async function fetchAiAgentInventory() {
     try {
       const kqlM = [
         'AgentsInfo',
-        '| extend _AgentId = tostring(column_ifexists("AgentId", column_ifexists("AIAgentId", "")))',
+        '| extend _AgentId = iff(isnotempty(tostring(column_ifexists("AgentId", ""))), tostring(column_ifexists("AgentId", "")), tostring(column_ifexists("AIAgentId", "")))',
         '| where isnotempty(_AgentId)',
         '| summarize arg_max(Timestamp, *) by _AgentId',
-        '| extend _Lifecycle = tostring(column_ifexists("LifecycleStatus", column_ifexists("AgentStatus", "")))',
+        '| extend _Lifecycle = iff(isnotempty(tostring(column_ifexists("LifecycleStatus", ""))), tostring(column_ifexists("LifecycleStatus", "")), tostring(column_ifexists("AgentStatus", "")))',
         '| where _Lifecycle != "Deleted"',
         '| extend _raw = tostring(column_ifexists("RawAgentInfo", dynamic({})))',
         '| extend _modelHintCol = tostring(column_ifexists("ModelNameHint", ""))',
@@ -1521,8 +1521,41 @@ async function fetchAiAgentInventory() {
     fetchDefenderAiAgentsList().catch(() => {});
   } catch (e) {
     const msg = e.message || '';
-    STATE.data.aiAgentInv = { ok: false, rows: [], total: 0, error: msg,
-      code: classifyAgentsInfoError(msg) };
+    const code = classifyAgentsInfoError(msg);
+    // Fallback availability probe: if any AgentsInfo query returns, treat inventory as live/available.
+    try {
+      const kqlFallback = [
+        'AgentsInfo',
+        '| extend _AgentId = tostring(column_ifexists("AgentId", ""))',
+        '| where isnotempty(_AgentId)',
+        '| summarize arg_max(Timestamp, *) by _AgentId',
+        '| extend _Lifecycle = tostring(column_ifexists("LifecycleStatus", ""))',
+        '| where isempty(_Lifecycle) or _Lifecycle != "Deleted"',
+        '| summarize Total=count()',
+      ].join(' ');
+      const rF = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ Query: kqlFallback, Timespan: 'P30D' }),
+      });
+      if (rF.ok) {
+        const dataF = await rF.json();
+        const rowF = (dataF.results || [])[0] || {};
+        STATE.data.aiAgentInv = {
+          ok: true,
+          rows: dataF.results || [],
+          total: rowF.Total || 0,
+          noAuth: 0, makerCreds: 0, anthropicCount: 0, mcpCount: 0, hardCodedCount: 0, genOrchCount: 0,
+          modelHints: [],
+          modelHintsCode: code,
+          modelHintsError: msg,
+          degraded: true,
+        };
+        fetchDefenderAiAgentsList().catch(() => {});
+        return STATE.data.aiAgentInv;
+      }
+    } catch { /* fall through to hard-fail state */ }
+    STATE.data.aiAgentInv = { ok: false, rows: [], total: 0, error: msg, code };
   }
   return STATE.data.aiAgentInv;
 }
@@ -1541,17 +1574,17 @@ async function fetchDefenderAiAgentsList() {
   // per-agent shape used by the Defender AI Assets table.
   const kql = [
     'AgentsInfo',
-    '| extend AgentId = tostring(column_ifexists("AgentId", column_ifexists("AIAgentId", "")))',
+    '| extend AgentId = iff(isnotempty(tostring(column_ifexists("AgentId", ""))), tostring(column_ifexists("AgentId", "")), tostring(column_ifexists("AIAgentId", "")))',
     '| where isnotempty(AgentId)',
     '| summarize arg_max(Timestamp, *) by AgentId',
-    '| extend LifecycleStatus = tostring(column_ifexists("LifecycleStatus", column_ifexists("AgentStatus", "")))',
+    '| extend LifecycleStatus = iff(isnotempty(tostring(column_ifexists("LifecycleStatus", ""))), tostring(column_ifexists("LifecycleStatus", "")), tostring(column_ifexists("AgentStatus", "")))',
     '| where LifecycleStatus != "Deleted"',
     '| extend _raw = tostring(column_ifexists("RawAgentInfo", dynamic({})))',
     '| extend _modelHintCol = tostring(column_ifexists("ModelNameHint", ""))',
     '| extend _model = tostring(column_ifexists("Model", ""))',
     '| extend ModelHint = tostring(iff(isnotempty(_modelHintCol), _modelHintCol, iff(isnotempty(_model), _model, extract(@"(?i)modelNameHint[\"\\s:]+([A-Za-z0-9_\\-.]+)", 1, _raw))))',
-    '| extend Platform  = tostring(column_ifexists("Platform", column_ifexists("AgentType", "")))',
-    '| extend PubStatus = tostring(column_ifexists("PublishedStatus", column_ifexists("PublishStatus", "")))',
+    '| extend Platform  = iff(isnotempty(tostring(column_ifexists("Platform", ""))), tostring(column_ifexists("Platform", "")), tostring(column_ifexists("AgentType", "")))',
+    '| extend PubStatus = iff(isnotempty(tostring(column_ifexists("PublishedStatus", ""))), tostring(column_ifexists("PublishedStatus", "")), tostring(column_ifexists("PublishStatus", "")))',
     '| extend _toolsAuth = tostring(column_ifexists("ToolsAuthenticationType", ""))',
     '| extend _userAuth = tostring(column_ifexists("UserAuthenticationType", ""))',
     '| extend _toolsAuthSummary = tolower(_toolsAuth)',
@@ -1601,10 +1634,45 @@ async function fetchDefenderAiAgentsList() {
     STATE.data.defenderAgentList = { ok: true, agents, total: agents.length };
   } catch (e) {
     const msg = e.message || '';
-    STATE.data.defenderAgentList = {
-      ok: false, agents: [], total: 0, error: msg,
-      code: classifyAgentsInfoError(msg),
-    };
+    const code = classifyAgentsInfoError(msg);
+    try {
+      const kqlFallback = [
+        'AgentsInfo',
+        '| extend AgentId = tostring(column_ifexists("AgentId", ""))',
+        '| where isnotempty(AgentId)',
+        '| summarize arg_max(Timestamp, *) by AgentId',
+        '| extend LifecycleStatus = tostring(column_ifexists("LifecycleStatus", ""))',
+        '| where isempty(LifecycleStatus) or LifecycleStatus != "Deleted"',
+        '| extend ModelHint = tostring(iff(isnotempty(tostring(column_ifexists("ModelNameHint", ""))), tostring(column_ifexists("ModelNameHint", "")), tostring(column_ifexists("Model", ""))))',
+        '| project AgentId, AgentName = iff(isnotempty(tostring(column_ifexists("AgentName", ""))), tostring(column_ifexists("AgentName", "")), AgentId), Platform = tostring(column_ifexists("Platform", "")), PubStatus = tostring(column_ifexists("PublishedStatus", "")), ModelHint',
+        '| order by AgentName asc',
+        '| take 500',
+      ].join(' ');
+      const rF = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ Query: kqlFallback, Timespan: 'P30D' }),
+      });
+      if (rF.ok) {
+        const dataF = await rF.json();
+        const agents = (dataF.results || []).map(row => ({
+          id: row.AgentId || '',
+          name: row.AgentName || row.AgentId || '—',
+          platform: row.Platform || 'Other',
+          pubStatus: row.PubStatus || '',
+          authType: 'Unknown',
+          entraId: '',
+          modelHint: row.ModelHint || '',
+          mcpCount: 0,
+          toolCount: 0,
+          hasGenOrch: false,
+          modelInfo: hintToModelInfo(row.ModelHint || ''),
+        }));
+        STATE.data.defenderAgentList = { ok: true, agents, total: agents.length, degraded: true };
+        return STATE.data.defenderAgentList;
+      }
+    } catch { /* keep hard failure */ }
+    STATE.data.defenderAgentList = { ok: false, agents: [], total: 0, error: msg, code };
   }
   return STATE.data.defenderAgentList;
 }
@@ -7357,8 +7425,8 @@ async function loadProtection() {
                   : 'ℹ️ Live agent inventory unavailable via Advanced Hunting — verify the configuration below in the Defender portal.'}
             </div>`;
 
-        // Only observed agents prove the toggle is effectively ON in this time window.
-        const postureRows = hasRecentAgents
+        // If the AgentsInfo query is reachable, keep the experience in live mode.
+        const postureRows = huntingReachable
           ? [
               { label: 'Copilot Studio — AI security posture',    note: 'Connects Copilot Studio agents for exposure & posture visibility' },
               { label: 'Microsoft Foundry — AI security posture', note: 'Connects Azure AI Foundry workloads for security recommendations' },
@@ -7369,13 +7437,13 @@ async function loadProtection() {
               { label: 'Microsoft Foundry — AI security posture', note: 'Connects Azure AI Foundry workloads for security recommendations' },
             ];
 
-        const toggleBanner = hasRecentAgents ? `
+        const toggleBanner = huntingReachable ? `
           <div style="margin-bottom:12px;padding:8px 14px;border-radius:8px;background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.3);font-size:13px">
-            ✅ <strong>Security for AI agents toggle — ON</strong><span style="font-size:11px;color:var(--text-muted);margin-left:10px">Confirmed via Advanced Hunting · prerequisite for AI Agent Inventory &amp; Real-time Protection</span>
+            ✅ <strong>Security for AI agents — Live via Advanced Hunting</strong><span style="font-size:11px;color:var(--text-muted);margin-left:10px">${hasRecentAgents ? 'Confirmed from active agents in the last 30 days' : 'Connected, but no active agents observed in the last 30 days'}</span>
           </div>` : '';
 
         return toggleBanner + liveBlock
-        + (hasRecentAgents ? '' : card('🗂️', 'AI Agent Inventory &amp; Posture — Configuration',
+        + (huntingReachable ? '' : card('🗂️', 'AI Agent Inventory &amp; Posture — Configuration',
             'These connectors feed the inventory above. The <strong>Security for AI agents</strong> toggle and connector status are configuration that isn&#39;t exposed via Graph — verify in the Defender portal.',
             postureRows))
         + card('⏱️', 'Real-time Protection (Agent Runtime)',
