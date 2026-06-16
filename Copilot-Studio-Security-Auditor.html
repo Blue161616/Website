@@ -118,6 +118,8 @@
 //  Auth (MSAL delegated, multi-tenant public client)
 // ─────────────────────────────────────────────────────────────────────────────
 const REDIRECT = location.origin + location.pathname;
+// Your published app's client ID. Public (not a secret) — baked in so users just sign in.
+const DEFAULT_CLIENT_ID = '96e9b5f4-e974-4355-ae9f-4487099ef210';
 let msalApp = null;
 
 function initMsal(clientId){
@@ -170,6 +172,7 @@ const MAKER_RX = /connectionProperties[\s\S]{0,300}?mode["'\s]*[:=]["'\s]*maker/
 const HTTP_RX  = /HttpRequestAction/i;
 const MCP_RX   = /InvokeExternalAgentTaskAction/i;
 const MAIL_RX  = /office365(outlook)?[\s\S]{0,500}?sendemail/i;
+const URL_RX   = /url["'\s]*[:=]["'\s]*(https?:\/\/[^\s"'\\}]+)/ig;
 
 function status(msg){ document.getElementById('status').textContent = msg; }
 
@@ -183,12 +186,20 @@ async function scanEnvironment(orgUrl, opts){
   const add = (Severity,Finding,Agent,Detail)=>findings.push({Severity,Finding,Environment:envName,Agent,Detail});
 
   // 1) Agents (bot table) — No Auth, Authentication, Orphaned
-  const bots = await dvGetAll(api + "/bots?$select=name,botid,authenticationmode,authenticationtrigger,authorizedsecuritygroupids,statecode,_ownerid_value", H);
+  const bots = await dvGetAll(api + "/bots?$select=name,botid,authenticationmode,authenticationtrigger,authorizedsecuritygroupids,statecode,configuration,_ownerid_value", H);
   for (const b of bots){
     const m = b.authenticationmode;
     if (m === 0 || m === 1) add(m===1?'High':'Medium','No Authentication',b.name,'authenticationmode='+AUTHLBL[m]);
     const grp = (b.authorizedsecuritygroupids && String(b.authorizedsecuritygroupids).trim()) ? 'group-restricted' : 'no group restriction';
     add('Info','Authentication',b.name,'mode='+AUTHLBL[m]+'; trigger='+({0:'As Needed',1:'Always'}[b.authenticationtrigger]||'?')+'; '+grp);
+    // bot.configuration (JSON) — orchestration, multi-tenant sharing, file input
+    const cfg = b.configuration;
+    if (cfg){
+      const t = k => new RegExp('"'+k+'"\\s*:\\s*true','i').test(cfg);
+      if (t('GenerativeActionsEnabled')) add('Low','Generative Orchestration',b.name,'dynamic tool/knowledge/action selection enabled');
+      if (/"isMultiTenant"\s*:\s*true|any \(multitenant\)/i.test(cfg)) add('High','Multi-tenant Shared',b.name,'configuration indicates multi-tenant / org-wide access (heuristic)');
+      if (t('isFileAnalysisEnabled')) add('Info','File Input',b.name,'file upload / analysis enabled');
+    }
   }
   // Orphaned: owner disabled in Dataverse (batched)
   const owners = [...new Set(bots.map(b=>b._ownerid_value).filter(Boolean))];
@@ -204,24 +215,39 @@ async function scanEnvironment(orgUrl, opts){
     if (o && o.disabled) add('High','Orphaned Agent',b.name,"owner '"+o.name+"' is disabled in Dataverse");
   }
 
-  // 2) Components — Maker / HTTP / MCP / Send Mail
+  // 2) Components — Maker / HTTP / MCP / Send Mail (+ URL & recipient classification)
   if (opts.components){
-    const flags = {};  // botid -> {name,maker,http,mcp,mail}
+    const flags = {};
     const comps = await dvGetAll(api + "/botcomponents?$select=componenttype,data,_parentbotid_value", H);
     for (const c of comps){
       const d = c.data; if (!d) continue;
       const bid = c._parentbotid_value; if (!bid) continue;
-      const f = flags[bid] || (flags[bid] = { name: c['_parentbotid_value@OData.Community.Display.V1.FormattedValue'] || '(unknown)', maker:false,http:false,mcp:false,mail:false });
+      const f = flags[bid] || (flags[bid] = { name: c['_parentbotid_value@OData.Community.Display.V1.FormattedValue'] || '(unknown)', maker:false,http:false,mcp:false,mail:false, urls:new Set(), mailTo:[] });
       if (!f.maker && MAKER_RX.test(d)) f.maker = true;
-      if (!f.http  && HTTP_RX.test(d))  f.http  = true;
       if (!f.mcp   && MCP_RX.test(d))   f.mcp   = true;
-      if (!f.mail  && MAIL_RX.test(d))  f.mail  = true;
+      if (HTTP_RX.test(d)){ f.http = true; let m; const rx=new RegExp(URL_RX); while((m=rx.exec(d))) f.urls.add(m[1]); }
+      if (MAIL_RX.test(d)){ f.mail = true; let i=d.search(/sendemail/i); if(i>=0){ const w=d.slice(i,i+800); const m=/to["'\s\/]*[:=]["'\s]*([^\n,}{\]]+)/i.exec(w); if(m) f.mailTo.push(m[1].trim().replace(/["']/g,'')); } }
     }
     Object.values(flags).forEach(f=>{
       if (f.maker) add('High','Maker Credentials',f.name,'connector runs in maker auth context (connectionProperties.mode=maker)');
       if (f.http)  add('Medium','HTTP Requests',f.name,'HttpRequestAction present in agent topics');
       if (f.mcp)   add('Medium','MCP Server',f.name,'InvokeExternalAgentTaskAction (MCP) present');
       if (f.mail)  add('Medium','Send Mail',f.name,'office365/outlook SendEmail referenced (heuristic)');
+      // HTTP URL classification
+      const urls=[...f.urls];
+      const insecure=urls.filter(u=>/^http:\/\//i.test(u));
+      if (insecure.length) add('High','HTTP Non-HTTPS',f.name,'cleartext HTTP request to: '+insecure.slice(0,3).join(', '));
+      const nonstd=urls.filter(u=>{ try{ const p=new URL(u).port; return p && p!=='80' && p!=='443'; }catch{ return false; } });
+      if (nonstd.length) add('Medium','HTTP Non-standard Port',f.name,'request to non-standard port: '+nonstd.slice(0,3).join(', '));
+      // Email recipient classification
+      const seen=new Set();
+      f.mailTo.forEach(to=>{
+        if(seen.has(to)) return; seen.add(to);
+        const dynamic = /^=|\{|@\{|Topic\.|Global\.|System\.|bot\.|Activity\./i.test(to) || !/@/.test(to);
+        if (dynamic){ add('High','Email Dynamic Recipient',f.name,'send-mail recipient is a variable / AI-controlled value: '+to.slice(0,60)); }
+        else { const dom=(to.split('@')[1]||'').toLowerCase().replace(/[>;,\s].*$/,'');
+          if (dom && opts.tenantDomain && dom!==opts.tenantDomain) add('High','Email External',f.name,'send-mail to external domain: '+dom); }
+      });
     });
   }
 
@@ -257,14 +283,20 @@ function correlate(findings){
     const has=t=>types.has(t);
     const noAuth=has('No Authentication'), maker=has('Maker Credentials'), mail=has('Send Mail'),
           http=has('HTTP Requests'), mcp=has('MCP Server'), hard=has('Hard-coded Credential'),
-          auto=has('Autonomous Agent'), orphan=has('Orphaned Agent'),
+          auto=has('Autonomous Agent'), orphan=has('Orphaned Agent'), dormant=has('Dormant Agent'),
+          multitenant=has('Multi-tenant Shared'),
+          emailExfil=has('Email External')||has('Email Dynamic Recipient'),
+          insecureHttp=has('HTTP Non-HTTPS'),
           reshare=g.some(f=>f.Finding==='Sharing'&&/RE-SHARE/.test(f.Detail));
+    const egress = maker||http||mail||hard||emailExfil||insecureHttp;
     const reasons=[]; let sev='Info';
     const bump=s=>{ if(SEVRANK[s]>SEVRANK[sev]) sev=s; };
-    if (noAuth && (maker||http||mail||hard)){ reasons.push('anonymous agent with a privileged action / data-egress path'); bump('Critical'); }
+    if ((noAuth||multitenant) && egress){ reasons.push('anonymous/multi-tenant agent with a privileged action / data-egress path'); bump('Critical'); }
     if (auto && maker){ reasons.push('autonomous agent runs on maker (standing) credentials'); bump('Critical'); }
     if (noAuth && mcp){ reasons.push('anonymous agent exposes an MCP tool surface'); bump('Critical'); }
-    if (maker && mail){ reasons.push('maker-credential agent can send mail (exfiltration path)'); bump('High'); }
+    if (mcp && maker){ reasons.push('MCP tool runs on maker (standing) credentials'); bump('Critical'); }
+    if (maker && (mail||emailExfil)){ reasons.push('maker-credential agent can send mail (exfiltration path)'); bump('High'); }
+    if (maker && dormant){ reasons.push('dormant agent retains a maker (standing) credential connection'); bump('High'); }
     if (orphan && (maker||noAuth)){ reasons.push('orphaned agent is still anonymous and/or privileged'); bump('High'); }
     if (reshare && (noAuth||maker)){ reasons.push('shared with re-share rights while anonymous/privileged'); bump('High'); }
     if (reasons.length){
@@ -299,7 +331,8 @@ async function runScan(){
   const btn = document.getElementById('scanBtn'); btn.disabled = true;
   try {
     if (!msalApp) initMsal(clientId);
-    status('Signing in…'); await ensureSignedIn();
+    status('Signing in…'); const acct = await ensureSignedIn();
+    opts.tenantDomain = ((acct && acct.username || '').split('@')[1] || '').toLowerCase();
     let all = [];
     for (const e of envs){
       status('Scanning '+e+' …');
@@ -377,8 +410,10 @@ const SEV=['Critical','High','Medium','Low','Info'];
 const COLORS={Critical:'#f85149',High:'#ff7b72',Medium:'#d29922',Low:'#3fb950',Info:'#58a6ff'};
 // Per-finding-type colours for the Risk Correlation signal chips.
 const FINDCOLOR={'No Authentication':'#f85149','Orphaned Agent':'#f85149','Hard-coded Credential':'#f85149',
+  'HTTP Non-HTTPS':'#f85149','Email External':'#f85149','Email Dynamic Recipient':'#f85149','Multi-tenant Shared':'#f85149',
   'Maker Credentials':'#ff7b72','Sharing':'#bc8cff','Autonomous Agent':'#bc8cff',
-  'Send Mail':'#d29922','HTTP Requests':'#d29922','MCP Server':'#58a6ff'};
+  'Send Mail':'#d29922','HTTP Requests':'#d29922','HTTP Non-standard Port':'#d29922',
+  'MCP Server':'#58a6ff','Generative Orchestration':'#58a6ff','File Input':'#8b949e'};
 const findColor=f=>FINDCOLOR[f]||'#8b949e';
 // Recover reasons/signals from a correlation Detail string (e.g. imported rows).
 function splitCorrelation(detail){
@@ -445,7 +480,7 @@ function render(){
 }
 
 // restore last config
-document.getElementById('clientId').value = localStorage.getItem('cs_clientId')||'';
+document.getElementById('clientId').value = localStorage.getItem('cs_clientId')||DEFAULT_CLIENT_ID;
 document.getElementById('envs').value     = localStorage.getItem('cs_envs')||'';
 </script>
 </body>
