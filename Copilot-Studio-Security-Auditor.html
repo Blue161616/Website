@@ -201,7 +201,7 @@ async function scanEnvironment(orgUrl, opts){
   const H = dvHeaders(token);
   const findings = [];
   const envName = org.replace(/^https?:\/\//,'').split('.')[0];
-  const add = (Severity,Finding,Agent,Detail)=>findings.push({Severity,Finding,Environment:envName,Agent,Detail});
+  const add = (Severity,Finding,Agent,Detail,extra)=>findings.push(Object.assign({Severity,Finding,Environment:envName,Agent,Detail},extra||{}));
 
   // 1) Agents (bot table) — No Auth, Authentication, Orphaned
   const bots = await dvGetAll(api + "/bots?$select=name,botid,authenticationmode,authenticationtrigger,authorizedsecuritygroupids,statecode,configuration,_ownerid_value", H);
@@ -275,9 +275,16 @@ async function scanEnvironment(orgUrl, opts){
         if (!sh.length) continue;
         const types = [...new Set(sh.map(x=>(x.Principal&&x.Principal['@odata.type']||'principal').replace('#Microsoft.Dynamics.CRM.','')))];
         const masks = [...new Set(sh.flatMap(x=>String(x.AccessMask||'').split(',').map(s=>s.trim()).filter(Boolean)))];
-        const reshare = masks.includes('ShareAccess'), team = types.includes('team');
-        add((reshare||team)?'High':'Medium','Sharing',b.name,
-            'shared with '+sh.length+' principal(s) ['+types.join(', ')+']; rights: '+masks.join(', ')+(reshare?' — recipients can RE-SHARE':''));
+        const team = types.includes('team'), reshare = masks.includes('ShareAccess');
+        const caps = [];
+        if (team)                       caps.push('Team-wide');
+        if (reshare)                    caps.push('Re-share');
+        if (masks.includes('WriteAccess'))  caps.push('Write');
+        if (masks.includes('AssignAccess')) caps.push('Reassign');
+        if (masks.includes('DeleteAccess')) caps.push('Delete');
+        const recip = team ? 'team' : 'user';
+        const detail = 'Shared with '+sh.length+' '+recip+(sh.length!==1?'s':'') + (caps.length?' · '+caps.join(' · '):' · read-only');
+        add((reshare||team)?'High':'Medium','Sharing',b.name,detail,{ShareCaps:caps, ShareRecipient:recip, ShareCount:sh.length});
       } catch(e){ /* skip agents we can't read sharing for */ }
     }
   }
@@ -301,7 +308,7 @@ function correlate(findings){
           multitenant=has('Multi-tenant Shared'),
           emailExfil=has('Email External')||has('Email Dynamic Recipient'),
           insecureHttp=has('HTTP Non-HTTPS'),
-          reshare=g.some(f=>f.Finding==='Sharing'&&/RE-SHARE/.test(f.Detail));
+          reshare=g.some(f=>f.Finding==='Sharing'&&((f.ShareCaps&&f.ShareCaps.includes('Re-share'))||/re-?share/i.test(f.Detail)));
     const egress = maker||http||mail||hard||emailExfil||insecureHttp;
     const reasons=[]; let sev='Info';
     const bump=s=>{ if(SEVRANK[s]>SEVRANK[sev]) sev=s; };
@@ -429,6 +436,17 @@ const FINDCOLOR={'No Authentication':'#f85149','Orphaned Agent':'#f85149','Hard-
   'Send Mail':'#d29922','HTTP Requests':'#d29922','HTTP Non-standard Port':'#d29922',
   'MCP Server':'#58a6ff','Generative Orchestration':'#58a6ff'};
 const findColor=f=>FINDCOLOR[f]||'#8b949e';
+// Sharing capability chips — red = takeover/fan-out, orange = modify.
+const CAPCOLOR={'Team-wide':'#f85149','Re-share':'#f85149','Delete':'#f85149','Write':'#ff7b72','Reassign':'#ff7b72'};
+function parseShareCaps(detail){
+  const caps=[];
+  if(/team-wide|\[team\]|\bteam\b/i.test(detail)) caps.push('Team-wide');
+  if(/re-?share|ShareAccess/i.test(detail))       caps.push('Re-share');
+  if(/WriteAccess|\bWrite\b/i.test(detail))        caps.push('Write');
+  if(/AssignAccess|Reassign/i.test(detail))        caps.push('Reassign');
+  if(/DeleteAccess|\bDelete\b/i.test(detail))      caps.push('Delete');
+  return [...new Set(caps)];
+}
 // Recover reasons/signals from a correlation Detail string (e.g. imported rows).
 function splitCorrelation(detail){
   const m=/\[signals:\s*([^\]]*)\]\s*$/.exec(detail||'');
@@ -488,6 +506,16 @@ function render(){
           const col=findColor(s); chip.style.color=col; chip.style.borderColor=col+'66'; chip.style.background=col+'1a'; w.appendChild(chip); });
         c4.appendChild(w);
       }
+    } else if(d.Finding==='Sharing'){
+      const caps=d.ShareCaps||parseShareCaps(d.Detail);
+      const recip=d.ShareRecipient||(/team/i.test(d.Detail)?'team':'user');
+      const count=d.ShareCount!=null?d.ShareCount:((/(\d+)/.exec(d.Detail)||[])[1]||'');
+      const line=document.createElement('div'); line.textContent='Shared with '+count+' '+recip+(String(count)!=='1'?'s':''); c4.appendChild(line);
+      const w=document.createElement('div'); w.className='sigwrap';
+      if(caps.length){ caps.forEach(cap=>{ const chip=document.createElement('span'); chip.className='sig'; chip.textContent=cap;
+          const col=CAPCOLOR[cap]||'#8b949e'; chip.style.color=col; chip.style.borderColor=col+'66'; chip.style.background=col+'1a'; w.appendChild(chip); }); }
+      else { const e=document.createElement('span'); e.className='sig'; e.textContent='read-only'; e.style.color='#8b949e'; e.style.borderColor='#8b949e66'; w.appendChild(e); }
+      c4.appendChild(w);
     } else { c4.textContent=d.Detail; }
     tr.append(c0,c1,c2,c3,c4); tb.appendChild(tr);
   }
