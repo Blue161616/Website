@@ -149,7 +149,6 @@
       <input id="q" placeholder="Search agent, finding, detail…" oninput="state.q=this.value;render()">
       <select id="finding" class="ctl-select" onchange="state.finding=this.value;render()"></select>
       <select id="env" class="ctl-select" onchange="state.env=this.value;render()"></select>
-      <button class="ghost" onclick="exportJson()">Export JSON</button>
       <span class="count"><b id="shown">0</b> shown</span>
     </div>
     <table>
@@ -225,6 +224,15 @@ const HTTP_RX  = /HttpRequestAction/i;
 const MCP_RX   = /InvokeExternalAgentTaskAction/i;
 const MAIL_RX  = /office365(outlook)?[\s\S]{0,500}?sendemail/i;
 const URL_RX   = /url["'\s]*[:=]["'\s]*(https?:\/\/[^\s"'\\}]+)/ig;
+// AI model — Copilot Studio stores it as "modelNameHint" in the agent JSON
+// (same field your KQL extracts from RawAgentInfo).
+const MODEL_RX = /modelNameHint["':\s=]+([A-Za-z0-9_.\-]+)/i;
+function extractModel(s){ const m=MODEL_RX.exec(s||''); return m?m[1]:null; }
+function modelVendor(m){ const s=(m||'').toLowerCase();
+  if(/^(claude|sonnet|haiku|opus)/.test(s)) return {vendor:'Anthropic Claude', eu:false};
+  if(/^(gpt|o[1-9])/.test(s))               return {vendor:'OpenAI (Microsoft-hosted)', eu:true};
+  return {vendor:'other model', eu:null};
+}
 
 function status(msg){ document.getElementById('status').textContent = msg; }
 
@@ -236,6 +244,7 @@ async function scanEnvironment(orgUrl, opts){
   const findings = [];
   const envName = org.replace(/^https?:\/\//,'').split('.')[0];
   const add = (Severity,Finding,Agent,Detail,extra)=>findings.push(Object.assign({Severity,Finding,Environment:envName,Agent,Detail},extra||{}));
+  const models = {};   // botid -> {name, model}
 
   // 1) Agents (bot table) — No Auth, Authentication, Orphaned
   const bots = await dvGetAll(api + "/bots?$select=name,botid,authenticationmode,authenticationtrigger,authorizedsecuritygroupids,statecode,configuration,_ownerid_value", H);
@@ -248,6 +257,7 @@ async function scanEnvironment(orgUrl, opts){
       if (/"GenerativeActionsEnabled"\s*:\s*true/i.test(cfg)) add('Low','Generative Orchestration',b.name,'dynamic tool/knowledge/action selection enabled');
       if (/"isMultiTenant"\s*:\s*true|any \(multitenant\)/i.test(cfg)) add('High','Multi-tenant Shared',b.name,'configuration indicates multi-tenant / org-wide access (heuristic)');
     }
+    const mh = extractModel(cfg); if (mh) models[b.botid] = {name:b.name, model:mh};
   }
   // Orphaned: owner disabled in Dataverse (batched)
   const owners = [...new Set(bots.map(b=>b._ownerid_value).filter(Boolean))];
@@ -275,6 +285,7 @@ async function scanEnvironment(orgUrl, opts){
       if (!f.mcp   && MCP_RX.test(d))   f.mcp   = true;
       if (HTTP_RX.test(d)){ f.http = true; let m; const rx=new RegExp(URL_RX); while((m=rx.exec(d))) f.urls.add(m[1]); }
       if (MAIL_RX.test(d)){ f.mail = true; let i=d.search(/sendemail/i); if(i>=0){ const w=d.slice(i,i+800); const m=/to["'\s\/]*[:=]["'\s]*([^\n,}{\]]+)/i.exec(w); if(m) f.mailTo.push(m[1].trim().replace(/["']/g,'')); } }
+      if (!models[bid]){ const mh=extractModel(d); if(mh) models[bid]={name:f.name, model:mh}; }
     }
     Object.values(flags).forEach(f=>{
       if (f.maker) add('High','Maker Credentials',f.name,'connector runs in maker auth context (connectionProperties.mode=maker)');
@@ -298,6 +309,12 @@ async function scanEnvironment(orgUrl, opts){
       });
     });
   }
+
+  // 3) AI model per agent (modelNameHint) + EU-boundary note for non-MS-hosted models
+  Object.values(models).forEach(x=>{ const mi=modelVendor(x.model);
+    if (mi.eu===false) add('Low','AI Model',x.name, x.model+' · '+mi.vendor+' — processes OUTSIDE the EU Data Boundary');
+    else               add('Info','AI Model',x.name, x.model+' · '+mi.vendor);
+  });
 
   // 3) Sharing — RetrieveSharedPrincipalsAndAccess per agent
   if (opts.sharing){
@@ -536,10 +553,6 @@ function renderRegionMap(regions){
 function collapseCfg(){ const b=document.getElementById('cfgBody'); if(b){ b.style.display='none'; document.getElementById('cfgChevron').textContent='▸'; } }
 function toggleCfg(){ const b=document.getElementById('cfgBody'); if(!b) return; const hidden=b.style.display==='none'; b.style.display=hidden?'':'none'; document.getElementById('cfgChevron').textContent=hidden?'▾':'▸'; }
 
-function exportJson(){
-  const blob=new Blob([JSON.stringify(DATA,null,2)],{type:'application/json'});
-  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='cs-audit-findings.json'; a.click();
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Dashboard render (ported from Report.ps1)
@@ -551,7 +564,7 @@ const FINDCOLOR={'No Authentication':'#f85149','Orphaned Agent':'#f85149','Hard-
   'HTTP Non-HTTPS':'#f85149','Email External':'#f85149','Email Dynamic Recipient':'#f85149','Multi-tenant Shared':'#f85149',
   'Maker Credentials':'#ff7b72','Sharing':'#bc8cff','Autonomous Agent':'#bc8cff',
   'Send Mail':'#d29922','HTTP Requests':'#d29922','HTTP Non-standard Port':'#d29922',
-  'MCP Server':'#58a6ff','Generative Orchestration':'#58a6ff'};
+  'MCP Server':'#58a6ff','Generative Orchestration':'#58a6ff','AI Model':'#bc8cff'};
 const findColor=f=>FINDCOLOR[f]||'#8b949e';
 // Sharing capability chips — red = takeover/fan-out, orange = modify.
 const CAPCOLOR={'Team-wide':'#f85149','Re-share':'#f85149','Delete':'#f85149','Write':'#ff7b72','Reassign':'#ff7b72'};
