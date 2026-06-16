@@ -115,21 +115,26 @@
     </div>
   </div>
   <div class="panel" id="cfg">
-    <h2>Run a live scan (your sign-in, your access)</h2>
-    <input type="hidden" id="clientId">
-    <div class="row">
-      <div>
-        <label>Environment URL(s) — one per line (or use “Discover my environments”)</label>
-        <textarea id="envs" placeholder="https://org.crm.dynamics.com&#10;https://org2.crm4.dynamics.com"></textarea>
+    <h2 id="cfgHead" onclick="toggleCfg()" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;margin:0">
+      <span>Run a live scan (your sign-in, your access)</span>
+      <span id="cfgChevron" style="font-size:14px;color:var(--m)">▾</span>
+    </h2>
+    <div id="cfgBody" style="margin-top:12px">
+      <input type="hidden" id="clientId">
+      <div class="row">
+        <div>
+          <label>Environment URL(s) — one per line (or use “Discover my environments”)</label>
+          <textarea id="envs" placeholder="https://org.crm.dynamics.com&#10;https://org2.crm4.dynamics.com"></textarea>
+        </div>
       </div>
-    </div>
-    <div class="toggles">
-      <label><input type="checkbox" id="optComponents" checked> Scan agent components (Maker / HTTP / MCP / Send Mail)</label>
-      <label><input type="checkbox" id="optSharing"> Resolve sharing (slower — 1 call per agent)</label>
-    </div>
-    <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
-      <button id="scanBtn" onclick="runScan()">Sign in &amp; scan</button>
-      <button class="ghost" id="discoverBtn" onclick="discoverEnvs()">Discover my environments</button>
+      <div class="toggles">
+        <label><input type="checkbox" id="optComponents" checked> Scan agent components (Maker / HTTP / MCP / Send Mail)</label>
+        <label><input type="checkbox" id="optSharing"> Resolve sharing (slower — 1 call per agent)</label>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
+        <button id="scanBtn" onclick="runScan()">Sign in &amp; scan</button>
+        <button class="ghost" id="discoverBtn" onclick="discoverEnvs()">Discover my environments</button>
+      </div>
     </div>
     <div id="status"></div>
   </div>
@@ -392,6 +397,7 @@ async function runScan(){
     DATA = all;
     status('Done — '+DATA.length+' findings.');
     showDashboard();
+    collapseCfg();   // minimize the scan panel; map + findings take focus
   } catch(err){ status('Error: '+err.message); console.error(err); }
   finally { btn.disabled = false; }
 }
@@ -462,17 +468,29 @@ function ensureMap(){
   return _map;
 }
 // Detect & show the public IP of the machine running the app (client-side geo).
+// Browsers can't read their own public IP without an external service, so we try
+// several CORS-enabled providers (with timeouts) and fall back to IP-only.
 async function detectPublicIp(){
   ensureMap();
-  let g=null;
-  try{ const j=await (await fetch('https://ipwho.is/')).json();
-       if(j&&j.success!==false&&j.latitude!=null) g={ip:j.ip,city:j.city,country:j.country,lat:j.latitude,lon:j.longitude}; }catch(e){}
-  if(!g){ try{ const j=await (await fetch('https://ipapi.co/json/')).json();
-       if(j&&j.latitude!=null) g={ip:j.ip,city:j.city,country:j.country_name,lat:j.latitude,lon:j.longitude}; }catch(e){} }
   const ipEl=document.getElementById('myip'), locEl=document.getElementById('myloc');
-  if(!g){ if(ipEl)ipEl.textContent='unavailable'; if(locEl)locEl.textContent='Location unavailable'; return; }
-  if(ipEl)ipEl.textContent=g.ip; if(locEl)locEl.textContent=[g.city,g.country].filter(Boolean).join(', ');
-  if(!_map) return;
+  const fj=async u=>{ const c=new AbortController(); const t=setTimeout(()=>c.abort(),6000);
+    try{ const r=await fetch(u,{cache:'no-store',signal:c.signal}); if(!r.ok) throw new Error(r.status); return await r.json(); }
+    finally{ clearTimeout(t); } };
+  const ok=v=>Number.isFinite(v);
+  const providers=[
+    async()=>{ const j=await fj('https://ipwho.is/'); if(j.success===false) throw new Error(j.message||'fail'); return {ip:j.ip,lat:+j.latitude,lon:+j.longitude,city:j.city,country:j.country}; },
+    async()=>{ const j=await fj('https://get.geojs.io/v1/ip/geo.json'); return {ip:j.ip,lat:+j.latitude,lon:+j.longitude,city:j.city,country:j.country}; },
+    async()=>{ const j=await fj('https://ipapi.co/json/'); return {ip:j.ip,lat:+j.latitude,lon:+j.longitude,city:j.city,country:j.country_name}; }
+  ];
+  let g=null;
+  for(const p of providers){ try{ const x=await p(); if(ok(x.lat)&&ok(x.lon)){ g=x; break; } if(x.ip&&!g) g=x; }catch(e){ console.warn('geo provider failed:', e.message||e); } }
+  if(!g || !ok(g.lat)){   // last resort: IP only (most widely reachable)
+    try{ const j=await fj('https://api.ipify.org?format=json'); if(j.ip) g=Object.assign({ip:j.ip}, g||{}); }catch(e){ console.warn('ipify failed:', e.message||e); }
+  }
+  if(!g || !g.ip){ if(ipEl)ipEl.textContent='unavailable'; if(locEl)locEl.textContent='Blocked by network or geo service'; return; }
+  if(ipEl)ipEl.textContent=g.ip;
+  if(locEl)locEl.textContent=[g.city,g.country].filter(Boolean).join(', ') || 'Location unavailable';
+  if(!_map || !ok(g.lat) || !ok(g.lon)) return;
   _youLatLng=[g.lat,g.lon];
   if(_youMarker) _map.removeLayer(_youMarker);
   const icon=L.divIcon({className:'',iconSize:[16,16],iconAnchor:[8,8],html:
@@ -511,6 +529,9 @@ function renderRegionMap(regions){
            `<span style="color:var(--m);font-size:12px">${gi.names.length} environment${gi.names.length!==1?'s':''} — ${lbl} <span style="opacity:.55">(${gi.raw})</span></span></div>`; }).join('');
   if(shapes.length){ try{ _map.fitBounds(L.featureGroup(shapes).getBounds(),{padding:[20,20],maxZoom:6}); }catch(e){} }
 }
+
+function collapseCfg(){ const b=document.getElementById('cfgBody'); if(b){ b.style.display='none'; document.getElementById('cfgChevron').textContent='▸'; } }
+function toggleCfg(){ const b=document.getElementById('cfgBody'); if(!b) return; const hidden=b.style.display==='none'; b.style.display=hidden?'':'none'; document.getElementById('cfgChevron').textContent=hidden?'▾':'▸'; }
 
 function exportJson(){
   const blob=new Blob([JSON.stringify(DATA,null,2)],{type:'application/json'});
