@@ -6,6 +6,11 @@
 <title>Copilot Studio Security Auditor (Preview)</title>
 <!-- MSAL.js (delegated, public client). For production pin a version + SRI. -->
 <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2/lib/msal-browser.min.js"></script>
+<!-- Leaflet (map) -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H" crossorigin="anonymous"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH" crossorigin="anonymous"></script>
 <style>
   :root{--bg:#0d1117;--p:#161b22;--b:#30363d;--t:#e6edf3;--m:#8b949e;--blue:#58a6ff}
   *{box-sizing:border-box}
@@ -54,6 +59,11 @@
   .hidden{display:none}
   footer{padding:16px 28px;color:var(--m);font-size:11px;border-top:1px solid var(--b)}
   a{color:var(--blue)}
+  @keyframes hero-ping{0%{box-shadow:0 0 0 0 rgba(56,139,253,.7)}70%{box-shadow:0 0 0 18px rgba(56,139,253,0)}100%{box-shadow:0 0 0 0 rgba(56,139,253,0)}}
+  @keyframes hero-ring{0%{transform:scale(1);opacity:.7}100%{transform:scale(3.2);opacity:0}}
+  .leaflet-container{background:#0d1117!important;font-family:inherit}
+  .leaflet-dark-tooltip{background:#161b22!important;border:1px solid #30363d!important;color:#e6edf3!important;font-size:11px;box-shadow:0 2px 8px rgba(0,0,0,.5)!important}
+  .leaflet-dark-tooltip:before{display:none}
 </style>
 </head>
 <body>
@@ -88,7 +98,14 @@
 <div class="wrap">
   <div class="panel hidden" id="mapPanel">
     <h2>Tenant data residency</h2>
-    <div id="worldmap"></div>
+    <div style="position:relative">
+      <div id="leafletmap" style="height:320px;border-radius:8px;overflow:hidden;border:1px solid var(--b)"></div>
+      <div style="position:absolute;top:12px;right:16px;text-align:right;z-index:1000;pointer-events:none">
+        <div style="font-size:10px;color:var(--blue);text-transform:uppercase;letter-spacing:.08em">Your Public IP</div>
+        <div id="myip" style="font-size:20px;font-weight:800;font-family:ui-monospace,Consolas,monospace;color:var(--blue);text-shadow:0 1px 4px #000">Detecting…</div>
+        <div id="myloc" style="font-size:11px;color:var(--m);text-shadow:0 1px 4px #000"></div>
+      </div>
+    </div>
     <div id="regionList" style="margin-top:10px"></div>
     <div style="margin-top:10px;font-size:11px;color:var(--m);border-top:1px solid var(--b);padding-top:8px">
       🟢 EU / EEA data boundary · 🔴 outside EU · ⚪ unverified. <b>Note:</b> region shows where the agent
@@ -409,15 +426,6 @@ async function discoverEnvs(){
 // ─────────────────────────────────────────────────────────────────────────────
 //  Tenant data residency / world map
 // ─────────────────────────────────────────────────────────────────────────────
-// Stylized equirectangular continents (lng,lat) — markers land in the right place.
-const CONTINENTS={
-  na:[[-168,66],[-150,71],[-95,70],[-60,60],[-55,47],[-80,25],[-100,18],[-122,33],[-130,50],[-160,58]],
-  sa:[[-80,9],[-60,8],[-35,-5],[-40,-23],[-56,-35],[-72,-52],[-74,-30],[-82,-4]],
-  eu:[[-10,36],[2,44],[28,40],[42,46],[30,60],[10,62],[-5,58],[-11,47]],
-  af:[[-16,15],[10,8],[42,12],[51,11],[40,-18],[20,-35],[10,-22],[-12,5]],
-  as:[[40,47],[62,40],[92,30],[122,44],[142,40],[146,62],[100,73],[60,68],[36,55]],
-  oc:[[112,-12],[140,-12],[154,-26],[146,-39],[120,-35],[114,-22]]
-};
 function regionInfo(raw){
   const r=(raw||'').toLowerCase();
   const M=[
@@ -443,22 +451,56 @@ async function detectAndRenderRegions(orgUrls){
   const regions=orgUrls.map(e=>{ const i=byHost[e.replace(/\/$/,'').toLowerCase()]||{}; return Object.assign({name:i.FriendlyName||e, raw:i.Region||'?'}, regionInfo(i.Region)); });
   renderRegionMap(regions);
 }
+// Leaflet map (CartoDB dark) — public-IP marker + per-environment region markers.
+let _map=null, _regionLayer=null, _youMarker=null, _youLatLng=null;
+function ensureMap(){
+  if(_map || typeof L==='undefined') return _map;
+  document.getElementById('mapPanel').classList.remove('hidden');
+  _map=L.map('leafletmap',{attributionControl:false,scrollWheelZoom:false}).setView([30,15],2);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{subdomains:'abcd',maxZoom:19}).addTo(_map);
+  _regionLayer=L.layerGroup().addTo(_map);
+  return _map;
+}
+// Detect & show the public IP of the machine running the app (client-side geo).
+async function detectPublicIp(){
+  ensureMap();
+  let g=null;
+  try{ const j=await (await fetch('https://ipwho.is/')).json();
+       if(j&&j.success!==false&&j.latitude!=null) g={ip:j.ip,city:j.city,country:j.country,lat:j.latitude,lon:j.longitude}; }catch(e){}
+  if(!g){ try{ const j=await (await fetch('https://ipapi.co/json/')).json();
+       if(j&&j.latitude!=null) g={ip:j.ip,city:j.city,country:j.country_name,lat:j.latitude,lon:j.longitude}; }catch(e){} }
+  const ipEl=document.getElementById('myip'), locEl=document.getElementById('myloc');
+  if(!g){ if(ipEl)ipEl.textContent='unavailable'; if(locEl)locEl.textContent='Location unavailable'; return; }
+  if(ipEl)ipEl.textContent=g.ip; if(locEl)locEl.textContent=[g.city,g.country].filter(Boolean).join(', ');
+  if(!_map) return;
+  _youLatLng=[g.lat,g.lon];
+  if(_youMarker) _map.removeLayer(_youMarker);
+  const icon=L.divIcon({className:'',iconSize:[16,16],iconAnchor:[8,8],html:
+    `<div style="width:16px;height:16px;border-radius:50%;background:rgba(56,139,253,.95);border:2px solid #fff;animation:hero-ping 1.8s ease-out infinite;position:relative">`+
+    `<div style="position:absolute;inset:-10px;border-radius:50%;border:1.5px solid rgba(56,139,253,.5);animation:hero-ring 1.8s ease-out infinite"></div></div>`});
+  _youMarker=L.marker(_youLatLng,{icon}).bindTooltip(`<strong>${g.ip}</strong><br>${[g.city,g.country].filter(Boolean).join(', ')}`,
+    {direction:'top',offset:[0,-10],className:'leaflet-dark-tooltip'}).addTo(_map);
+  _map.flyTo(_youLatLng,5,{duration:1.6});
+}
 function renderRegionMap(regions){
-  const W=1000,Hh=500, proj=([lng,lat])=>[+((lng+180)*W/360).toFixed(1), +((90-lat)*Hh/180).toFixed(1)];
-  const conts=Object.values(CONTINENTS).map(pts=>`<path d="M${pts.map(p=>proj(p).join(',')).join(' L')}Z" fill="#1b2330" stroke="#30363d" stroke-width="1"/>`).join('');
-  let grid='';
-  for(let lng=-150;lng<=150;lng+=30){ const x=proj([lng,0])[0]; grid+=`<line x1="${x}" y1="0" x2="${x}" y2="${Hh}" stroke="#30363d" stroke-opacity=".25" stroke-width=".5"/>`; }
-  for(let lat=-60;lat<=60;lat+=30){ const y=proj([0,lat])[1]; grid+=`<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="#30363d" stroke-opacity=".25" stroke-width=".5"/>`; }
-  const seen={};
-  const markers=regions.map(r=>{ const [x,y]=proj([r.lng,r.lat]); const col=r.eu===true?'#3fb950':(r.eu===false?'#f85149':'#8b949e');
-    const dup=seen[r.geo]?18:0; seen[r.geo]=1;
-    return `<g><circle cx="${x}" cy="${y+dup}" r="10" fill="${col}" fill-opacity=".22"/><circle cx="${x}" cy="${y+dup}" r="4.5" fill="${col}" stroke="#0d1117" stroke-width="1.5"/>`+
-           `<text x="${x}" y="${y+dup-13}" text-anchor="middle" font-size="16" fill="${col}" font-weight="700">${r.geo}</text></g>`; }).join('');
-  document.getElementById('worldmap').innerHTML=`<svg viewBox="0 0 ${W} ${Hh}" width="100%" style="max-height:300px;display:block">${grid}${conts}${markers}</svg>`;
+  ensureMap(); if(!_map) return;
+  _regionLayer.clearLayers();
+  const pts=[];
+  regions.forEach(r=>{
+    if(r.lat==null||r.lng==null) return;
+    const col=r.eu===true?'#3fb950':(r.eu===false?'#f85149':'#8b949e');
+    const icon=L.divIcon({className:'',iconSize:[16,16],iconAnchor:[8,8],
+      html:`<div style="width:14px;height:14px;border-radius:50%;background:${col};border:2px solid #0d1117;box-shadow:0 0 0 4px ${col}44"></div>`});
+    const lbl=r.eu===true?'EU / EEA data boundary':(r.eu===false?'outside EU':'region unverified');
+    L.marker([r.lat,r.lng],{icon}).bindTooltip(`<strong>${r.geo}</strong><br>${r.name}<br>${lbl}`,
+      {direction:'top',offset:[0,-8],className:'leaflet-dark-tooltip'}).addTo(_regionLayer);
+    pts.push([r.lat,r.lng]);
+  });
   document.getElementById('regionList').innerHTML=regions.map(r=>{ const lbl=r.eu===true?'EU / EEA data boundary':(r.eu===false?'outside EU':'region unverified'); const col=r.eu===true?'#3fb950':(r.eu===false?'#f85149':'#8b949e');
     return `<div style="display:flex;gap:8px;align-items:center;margin:3px 0"><span class="sig" style="color:${col};border-color:${col}66;background:${col}1a">${r.geo}</span>`+
            `<span style="color:var(--m);font-size:12px">${r.name} — ${lbl} <span style="opacity:.55">(${r.raw})</span></span></div>`; }).join('');
-  document.getElementById('mapPanel').classList.remove('hidden');
+  if(_youLatLng) pts.push(_youLatLng);
+  if(pts.length){ try{ _map.fitBounds(pts,{padding:[40,40],maxZoom:6}); }catch(e){} }
 }
 
 function exportJson(){
@@ -565,6 +607,8 @@ function render(){
 
 // restore last config
 document.getElementById('clientId').value = localStorage.getItem('cs_clientId')||DEFAULT_CLIENT_ID;
+// Show the public IP + location on a detailed map as soon as the app starts.
+window.addEventListener('load', () => { try { detectPublicIp(); } catch(e){ console.warn('public IP detect failed', e); } });
 document.getElementById('envs').value     = localStorage.getItem('cs_envs')||'';
 </script>
 </body>
