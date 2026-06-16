@@ -86,6 +86,17 @@
 </header>
 
 <div class="wrap">
+  <div class="panel hidden" id="mapPanel">
+    <h2>Tenant data residency</h2>
+    <div id="worldmap"></div>
+    <div id="regionList" style="margin-top:10px"></div>
+    <div style="margin-top:10px;font-size:11px;color:var(--m);border-top:1px solid var(--b);padding-top:8px">
+      🟢 EU / EEA data boundary · 🔴 outside EU · ⚪ unverified. <b>Note:</b> region shows where the agent
+      <i>environment</i> is hosted — the AI <b>models</b> agents invoke (e.g. Anthropic Claude, OpenAI) may
+      process prompts <b>outside the EU Data Boundary</b> regardless of tenant region. Verify model residency
+      separately for EU compliance.
+    </div>
+  </div>
   <div class="panel" id="cfg">
     <h2>Run a live scan (your sign-in, your access)</h2>
     <input type="hidden" id="clientId">
@@ -102,8 +113,6 @@
     <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
       <button id="scanBtn" onclick="runScan()">Sign in &amp; scan</button>
       <button class="ghost" id="discoverBtn" onclick="discoverEnvs()">Discover my environments</button>
-      <button class="ghost" onclick="document.getElementById('importFile').click()">Import PS output (CSV/JSON)</button>
-      <input type="file" id="importFile" class="hidden" accept=".csv,.json" onchange="importFile(this.files[0])">
     </div>
     <div id="status"></div>
   </div>
@@ -354,6 +363,7 @@ async function runScan(){
     if (!msalApp) initMsal(clientId);
     status('Signing in…'); const acct = await ensureSignedIn();
     opts.tenantDomain = ((acct && acct.username || '').split('@')[1] || '').toLowerCase();
+    status('Detecting tenant region…'); try { await detectAndRenderRegions(envs); } catch(e){ console.warn('region detect failed', e); }
     let all = [];
     for (const e of envs){
       status('Scanning '+e+' …');
@@ -390,35 +400,67 @@ async function discoverEnvs(){
     if (!urls.length){ status('No environments returned for your account (GDS omits disabled accounts and security-group-filtered access).'); return; }
     document.getElementById('envs').value = urls.join('\n');
     localStorage.setItem('cs_envs', urls.join('\n'));
+    try { await detectAndRenderRegions(urls); } catch(e){ console.warn('region detect failed', e); }
     status('Found ' + urls.length + ' environment(s): ' + inst.map(i=>i.FriendlyName).filter(Boolean).join(', ') + '\nReview the list, then Sign in & scan.');
   } catch(err){ status('Discovery failed: ' + err.message + ' — you can still enter URLs manually.'); console.error(err); }
   finally { btn.disabled = false; }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Import mode
+//  Tenant data residency / world map
 // ─────────────────────────────────────────────────────────────────────────────
-function parseCsv(text){
-  const rows=[]; let i=0,field='',row=[],inQ=false;
-  while(i<text.length){ const c=text[i];
-    if(inQ){ if(c==='"'){ if(text[i+1]==='"'){field+='"';i++;} else inQ=false; } else field+=c; }
-    else { if(c==='"') inQ=true; else if(c===','){row.push(field);field='';}
-      else if(c==='\r'){} else if(c==='\n'){row.push(field);rows.push(row);row=[];field='';} else field+=c; }
-    i++; }
-  if(field.length||row.length){ row.push(field); rows.push(row); }
-  const header=rows.shift()||[];
-  return rows.filter(r=>r.length>1).map(r=>{ const o={}; header.forEach((h,idx)=>o[h.replace(/^"|"$/g,'').trim()]=r[idx]); return o; });
+// Stylized equirectangular continents (lng,lat) — markers land in the right place.
+const CONTINENTS={
+  na:[[-168,66],[-150,71],[-95,70],[-60,60],[-55,47],[-80,25],[-100,18],[-122,33],[-130,50],[-160,58]],
+  sa:[[-80,9],[-60,8],[-35,-5],[-40,-23],[-56,-35],[-72,-52],[-74,-30],[-82,-4]],
+  eu:[[-10,36],[2,44],[28,40],[42,46],[30,60],[10,62],[-5,58],[-11,47]],
+  af:[[-16,15],[10,8],[42,12],[51,11],[40,-18],[20,-35],[10,-22],[-12,5]],
+  as:[[40,47],[62,40],[92,30],[122,44],[142,40],[146,62],[100,73],[60,68],[36,55]],
+  oc:[[112,-12],[140,-12],[154,-26],[146,-39],[120,-35],[114,-22]]
+};
+function regionInfo(raw){
+  const r=(raw||'').toLowerCase();
+  const M=[
+    [/\bfra\b|france/,'France',[2,47],true],[/\bger\b|deu|germany/,'Germany',[10,51],true],
+    [/\bche\b|swiss|switz/,'Switzerland',[8,47],true],[/\bnor\b|norway/,'Norway',[9,61],true],
+    [/\bswe\b|sweden/,'Sweden',[15,62],true],[/eur|emea|europe/,'Europe',[10,50],true],
+    [/\bgbr\b|\buk\b|united ?kingdom|britain/,'United Kingdom',[-2,54],false],
+    [/\bcan\b|canada/,'Canada',[-106,56],false],[/\bnam?\b|north ?america|unitedstates|\busa?\b/,'North America',[-100,40],false],
+    [/\bsam\b|south ?america|bra|brazil/,'South America',[-60,-15],false],
+    [/\bjpn\b|japan/,'Japan',[138,36],false],[/\bind\b|india/,'India',[78,22],false],
+    [/\bkor\b|korea/,'Korea',[128,36],false],[/\buae\b|emirates/,'UAE',[54,24],false],
+    [/zaf|south ?africa/,'South Africa',[25,-30],false],[/apac|apj|asia/,'Asia Pacific',[100,30],false],
+    [/oce|\baus\b|australia/,'Australia',[135,-25],false]
+  ];
+  for(const [rx,geo,ll,eu] of M) if(rx.test(r)) return {geo,lng:ll[0],lat:ll[1],eu};
+  return {geo:raw||'Unknown',lng:0,lat:20,eu:null};
 }
-async function importFile(file){
-  if(!file) return;
-  const text = await file.text();
-  try {
-    DATA = file.name.toLowerCase().endsWith('.json') ? JSON.parse(text) : parseCsv(text);
-    if(!Array.isArray(DATA)) DATA=[DATA];
-    status('Imported '+DATA.length+' findings from '+file.name);
-    showDashboard();
-  } catch(e){ status('Import failed: '+e.message); }
+async function detectAndRenderRegions(orgUrls){
+  const token=await getToken(GDS);
+  const inst=((await (await fetch(GDS+'/api/discovery/v2.0/Instances?$select=ApiUrl,FriendlyName,Region',
+                  {headers:{Authorization:'Bearer '+token,Accept:'application/json'}})).json()).value)||[];
+  const byHost={}; inst.forEach(i=>{ byHost[(i.ApiUrl||'').replace(/\/$/,'').toLowerCase()]=i; });
+  const regions=orgUrls.map(e=>{ const i=byHost[e.replace(/\/$/,'').toLowerCase()]||{}; return Object.assign({name:i.FriendlyName||e, raw:i.Region||'?'}, regionInfo(i.Region)); });
+  renderRegionMap(regions);
 }
+function renderRegionMap(regions){
+  const W=1000,Hh=500, proj=([lng,lat])=>[+((lng+180)*W/360).toFixed(1), +((90-lat)*Hh/180).toFixed(1)];
+  const conts=Object.values(CONTINENTS).map(pts=>`<path d="M${pts.map(p=>proj(p).join(',')).join(' L')}Z" fill="#1b2330" stroke="#30363d" stroke-width="1"/>`).join('');
+  let grid='';
+  for(let lng=-150;lng<=150;lng+=30){ const x=proj([lng,0])[0]; grid+=`<line x1="${x}" y1="0" x2="${x}" y2="${Hh}" stroke="#30363d" stroke-opacity=".25" stroke-width=".5"/>`; }
+  for(let lat=-60;lat<=60;lat+=30){ const y=proj([0,lat])[1]; grid+=`<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="#30363d" stroke-opacity=".25" stroke-width=".5"/>`; }
+  const seen={};
+  const markers=regions.map(r=>{ const [x,y]=proj([r.lng,r.lat]); const col=r.eu===true?'#3fb950':(r.eu===false?'#f85149':'#8b949e');
+    const dup=seen[r.geo]?18:0; seen[r.geo]=1;
+    return `<g><circle cx="${x}" cy="${y+dup}" r="10" fill="${col}" fill-opacity=".22"/><circle cx="${x}" cy="${y+dup}" r="4.5" fill="${col}" stroke="#0d1117" stroke-width="1.5"/>`+
+           `<text x="${x}" y="${y+dup-13}" text-anchor="middle" font-size="16" fill="${col}" font-weight="700">${r.geo}</text></g>`; }).join('');
+  document.getElementById('worldmap').innerHTML=`<svg viewBox="0 0 ${W} ${Hh}" width="100%" style="max-height:300px;display:block">${grid}${conts}${markers}</svg>`;
+  document.getElementById('regionList').innerHTML=regions.map(r=>{ const lbl=r.eu===true?'EU / EEA data boundary':(r.eu===false?'outside EU':'region unverified'); const col=r.eu===true?'#3fb950':(r.eu===false?'#f85149':'#8b949e');
+    return `<div style="display:flex;gap:8px;align-items:center;margin:3px 0"><span class="sig" style="color:${col};border-color:${col}66;background:${col}1a">${r.geo}</span>`+
+           `<span style="color:var(--m);font-size:12px">${r.name} — ${lbl} <span style="opacity:.55">(${r.raw})</span></span></div>`; }).join('');
+  document.getElementById('mapPanel').classList.remove('hidden');
+}
+
 function exportJson(){
   const blob=new Blob([JSON.stringify(DATA,null,2)],{type:'application/json'});
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='cs-audit-findings.json'; a.click();
