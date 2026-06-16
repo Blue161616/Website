@@ -565,7 +565,7 @@ const GRAPH_SCOPES = [
 // admin-consent-required and would break silent token acquisition for everyone).
 // Requested per-feature on demand, and included in the admin-consent URL so they can be granted.
 const OPTIONAL_SCOPES = [
-  'https://graph.microsoft.com/ThreatHunting.Read.All',       // Defender Advanced Hunting (AIAgentsInfo)
+  'https://graph.microsoft.com/ThreatHunting.Read.All',       // Defender Advanced Hunting (KQL-based insights)
   'https://graph.microsoft.com/CopilotPolicySettings.Read',   // Copilot policy settings (web grounding etc.)
   'https://graph.microsoft.com/ProtectionScopes.Compute.User', // Purview DLP/collection scope for the signed-in user
 ];
@@ -828,44 +828,6 @@ function isAiApp(sp) {
 function detectModel(name) {
   const entry = APP_MODEL_MAP.find(e => e.pattern.test(name));
   return entry || { model: 'Unknown', provider: name, residency: 'Unknown', training: 'Unknown', gdprOk: false, risk: 'medium' };
-}
-
-// Map AIAgentsInfo modelNameHint values to model metadata for the risk table.
-// Checks are ordered most-specific first so GPT-4.1 / Sonnet 4.x are not swallowed
-// by the generic gpt4 / sonnet catch-alls below them.
-function hintToModelInfo(hint) {
-  if (!hint) return null;
-  const h = hint.toLowerCase().replace(/\s+/g, '');
-  const flat = h.replace(/[-_.]/g, '');
-  // ── OpenAI GPT-5 (GPT5Chat, gpt-5, gpt5) ─────────────────────────────────
-  if (h.startsWith('gpt5') || h.startsWith('gpt-5'))
-    return { model:'GPT-5',    provider:'Microsoft (Azure OpenAI)', residency:'EU possible', training:'No', gdprOk:true, risk:'low' };
-  // ── OpenAI GPT-4.1 (GPT41, gpt-4.1) ─────────────────────────────────────
-  if (h === 'gpt41' || h === 'gpt-4.1' || h.startsWith('gpt4.1') || h.startsWith('gpt-4.1'))
-    return { model:'GPT-4.1',  provider:'Microsoft (Azure OpenAI)', residency:'EU possible', training:'No', gdprOk:true, risk:'low' };
-  // ── Anthropic Claude 4.x ─────────────────────────────────────────────────
-  if (flat.includes('claudesonnet46') || flat.includes('sonnet46'))
-    return { model:'Claude Sonnet 4.6', provider:'Anthropic', residency:'USA', training:'No', gdprOk:false, risk:'medium' };
-  if (flat.includes('claudesonnet45') || flat.includes('sonnet45'))
-    return { model:'Claude Sonnet 4.5', provider:'Anthropic', residency:'USA', training:'No', gdprOk:false, risk:'medium' };
-  if (flat.startsWith('claudesonnet4') || flat.startsWith('sonnet4'))
-    return { model:'Claude Sonnet 4',   provider:'Anthropic', residency:'USA', training:'No', gdprOk:false, risk:'medium' };
-  // ── Anthropic Claude 3.x (existing) ──────────────────────────────────────
-  if (flat.startsWith('claudesonnet') || flat.startsWith('sonnet')) return { model:'Claude 3.x Sonnet', provider:'Anthropic',  residency:'USA',          training:'No',      gdprOk:false, risk:'medium' };
-  if (flat.startsWith('claudehaiku')  || flat.startsWith('haiku'))  return { model:'Claude Haiku',       provider:'Anthropic',  residency:'USA',          training:'No',      gdprOk:false, risk:'medium' };
-  if (flat.startsWith('claudeopus')   || flat.startsWith('opus'))   return { model:'Claude Opus',        provider:'Anthropic',  residency:'USA',          training:'No',      gdprOk:false, risk:'medium' };
-  // ── OpenAI GPT-4 catch-all ────────────────────────────────────────────────
-  if (h.startsWith('gpt-4') || h.startsWith('gpt4')) return { model:'GPT-4o',  provider:'Microsoft (Azure OpenAI)', residency:'EU possible', training:'No', gdprOk:true,  risk:'low' };
-  if (h.startsWith('gpt-3') || h.startsWith('gpt3')) return { model:'GPT-3.5', provider:'Microsoft (Azure OpenAI)', residency:'EU possible', training:'No', gdprOk:true,  risk:'low' };
-  if (h.startsWith('o1') || h.startsWith('o3'))      return { model:'OpenAI o-series', provider:'Microsoft (Azure OpenAI)', residency:'EU possible', training:'No', gdprOk:true, risk:'low' };
-  if (h.startsWith('gemini'))   return { model:'Gemini',             provider:'Google',     residency:'Global',       training:'Opt-out', gdprOk:false, risk:'medium' };
-  if (h.startsWith('mistral'))  return { model:'Mistral Large',      provider:'Mistral AI', residency:'EU',           training:'No',      gdprOk:true,  risk:'medium' };
-  if (h.startsWith('llama'))    return { model:'Llama',              provider:'Meta',       residency:'USA',          training:'No',      gdprOk:false, risk:'medium' };
-  if (h.startsWith('deepseek')) return { model:'DeepSeek R1',        provider:'DeepSeek',   residency:'China',        training:'Yes',     gdprOk:false, risk:'critical' };
-  if (h.startsWith('command'))  return { model:'Command R+',         provider:'Cohere',     residency:'USA/EU',       training:'Opt-out', gdprOk:false, risk:'medium' };
-  // Fallback: try APP_MODEL_MAP pattern matching
-  const entry = APP_MODEL_MAP.find(e => e.pattern.test(hint));
-  return entry ? { ...entry } : null;
 }
 
 function canonicalModelProvider(provider) {
@@ -1397,178 +1359,37 @@ async function fetchIdProtectionAgentStats() {
   return STATE.data.idProtectionAgentStats;
 }
 
-function classifyAIAgentsInfoError(msg = '') {
-  if (/403|forbidden|authorization/i.test(msg)) return 'forbidden';
-  if (/failed to resolve table expression|failed to resolve table or column expression named ['"]?AIAgentsInfo|does not refer to any known table|unknown table/i.test(msg)) return 'unsupported';
-  if (/failed to resolve scalar expression|failed to resolve column|could not find a property|semantic|parsing query|invalid query|recognize/i.test(msg)) return 'schema';
-  return 'error';
-}
-
-function renderAIAgentsInfoModelHintWarning(aiInv) {
-  if (!aiInv?.ok || !aiInv.modelHintsCode) return '';
-  const detail = aiInv.modelHintsCode === 'schema'
-    ? 'AIAgentsInfo inventory loaded, but model attribution could not be derived from the current Advanced Hunting schema.'
-    : aiInv.modelHintsCode === 'unsupported'
-      ? 'AIAgentsInfo model attribution isn\'t available in this tenant yet.'
-      : 'AIAgentsInfo model attribution is currently unavailable.';
-  const err = aiInv.modelHintsError ? `<div style="margin-top:6px;font-size:11px;color:var(--text-dim)">${esc(aiInv.modelHintsError)}</div>` : '';
-  return `<div class="perm-warn">⚠️ ${detail}${err}</div>`;
-}
-
-// Defender XDR "Security for AI agents" — read the live agent inventory/posture via the
-// Advanced Hunting AIAgentsInfo table (Graph security/runHuntingQuery, ThreatHunting.Read.All).
-// Connector/toggle state isn't a settings API, but agents returning here ⇒ it's connected.
+// Defender XDR inventory table used previously in this app is being deprecated.
+// Keep a stable shape so callers can keep rendering a manual-check experience.
 async function fetchAiAgentInventory() {
   if (STATE.data.aiAgentInv !== undefined) return STATE.data.aiAgentInv;
-  const kql = [
-    'AIAgentsInfo',
-    '| where Timestamp > ago(30d)',
-    '| extend _AgentKey = iff(isnotempty(tostring(column_ifexists("AIAgentId", ""))), tostring(column_ifexists("AIAgentId", "")), iff(isnotempty(tostring(column_ifexists("AgentId", ""))), tostring(column_ifexists("AgentId", "")), iff(isnotempty(tostring(column_ifexists("AIAgentName", ""))), tostring(column_ifexists("AIAgentName", "")), tostring(column_ifexists("AgentName", "")))))',
-    '| where isnotempty(_AgentKey)',
-    '| summarize arg_max(Timestamp, *) by _AgentKey',
-    '| extend _Lifecycle = tolower(iff(isnotempty(tostring(column_ifexists("LifecycleStatus", ""))), tostring(column_ifexists("LifecycleStatus", "")), tostring(column_ifexists("AgentStatus", ""))))',
-    '| where isempty(_Lifecycle) or _Lifecycle != "deleted"',
-    '| extend _raw = tolower(tostring(column_ifexists("RawAgentInfo", "")))',
-    '| extend _authInventory = tolower(strcat(tostring(column_ifexists("UserAuthenticationType", "")), " ", tostring(column_ifexists("ToolsAuthenticationType", "")), " ", tostring(column_ifexists("AgentToolsDetails", "")), " ", _raw))',
-    '| extend _IsMaker = _authInventory contains "maker"',
-    '| extend _hint = tolower(strcat(tostring(column_ifexists("ModelNameHint", "")), " ", tostring(column_ifexists("Model", "")), " ", extract(@"(?i)modelNameHint[\"\\s:]+([A-Za-z0-9_\\-.]+)", 1, tostring(column_ifexists("RawAgentInfo", "")))))',
-    '| extend _IsAnthropic = _hint contains "sonnet" or _hint contains "haiku" or _hint contains "opus" or _hint contains "claude"',
-    '| extend _tools = tolower(strcat(tostring(column_ifexists("DeclaredTools", dynamic([]))), " ", tostring(column_ifexists("McpServers", dynamic([]))), " ", tostring(column_ifexists("AgentToolsDetails", "")), " ", _raw))',
-    '| extend _IsMcp = _tools contains "mcp"',
-    '| extend _IsHardCoded = _tools contains "hardcoded" or _tools contains "hard-coded"',
-    '| extend _IsGenOrch = tobool(column_ifexists("IsGenerativeOrchestrationEnabled", false)) or _raw contains "isgenerativeorchestrationenabled\":true" or _raw contains "generative orchestration"',
-    '| summarize Total=count(), NoAuth=countif(_authInventory contains "none" or _authInventory contains "noauth" or _authInventory contains "no authentication"), MakerCreds=countif(_IsMaker), AnthropicCount=countif(_IsAnthropic), McpCount=countif(_IsMcp), HardCodedCount=countif(_IsHardCoded), GenOrchCount=countif(_IsGenOrch)',
-  ].join(' ');
-  // Incremental consent: silent-only token for the hunting scope (no popup).
-  const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
-  if (!token) {
-    STATE.data.aiAgentInv = { ok: false, rows: [], total: 0, code: 'forbidden', error: 'ThreatHunting.Read.All not consented' };
-    return STATE.data.aiAgentInv;
-  }
-  try {
-    const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
-      method: 'POST',
-      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ Query: kql, Timespan: 'P30D' }),
-    });
-    if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + t.slice(0, 200)); }
-    const data = await r.json();
-    const rows = data.results || [];
-    const row = rows[0] || {};
-    const total = row.Total || 0;
-    STATE.data.aiAgentInv = {
-      ok: true, rows, total,
-      noAuth:        row.NoAuth        || 0,
-      makerCreds:    row.MakerCreds    || 0,
-      anthropicCount: row.AnthropicCount || 0,
-      mcpCount:      row.McpCount      || 0,
-      hardCodedCount: row.HardCodedCount || 0,
-      genOrchCount:   row.GenOrchCount   || 0,
-      modelHints: [],
-      modelHintsCode: null,
-      modelHintsError: '',
-    };
-    // Second query: per-model breakdown, used to enrich the AI Models risk table.
-    try {
-      const kqlM = [
-        'AIAgentsInfo',
-        '| where Timestamp > ago(30d)',
-        '| extend _AgentKey = iff(isnotempty(tostring(column_ifexists("AIAgentId", ""))), tostring(column_ifexists("AIAgentId", "")), iff(isnotempty(tostring(column_ifexists("AgentId", ""))), tostring(column_ifexists("AgentId", "")), iff(isnotempty(tostring(column_ifexists("AIAgentName", ""))), tostring(column_ifexists("AIAgentName", "")), tostring(column_ifexists("AgentName", "")))))',
-        '| where isnotempty(_AgentKey)',
-        '| summarize arg_max(Timestamp, *) by _AgentKey',
-        '| extend _Lifecycle = tolower(iff(isnotempty(tostring(column_ifexists("LifecycleStatus", ""))), tostring(column_ifexists("LifecycleStatus", "")), tostring(column_ifexists("AgentStatus", ""))))',
-        '| where isempty(_Lifecycle) or _Lifecycle != "deleted"',
-        '| extend _hint = tolower(strcat(tostring(column_ifexists("ModelNameHint", "")), " ", tostring(column_ifexists("Model", "")), " ", extract(@"(?i)modelNameHint[\"\\s:]+([A-Za-z0-9_\\-.]+)", 1, tostring(column_ifexists("RawAgentInfo", "")))))',
-        '| where isnotempty(_hint)',
-        '| summarize AgentCount=count() by ModelHint=_hint',
-      ].join(' ');
-      const r2 = await fetch(`${GRAPH}/security/runHuntingQuery`, {
-        method: 'POST',
-        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ Query: kqlM, Timespan: 'P30D' }),
-      });
-      if (r2.ok) STATE.data.aiAgentInv.modelHints = (await r2.json()).results || [];
-    } catch { /* best-effort */ }
-    // Third query: kick off per-agent list used by the Defender AI Assets table.
-    // Run asynchronously — result stored in STATE.data.defenderAgentList independently.
-    fetchDefenderAiAgentsList().catch(() => {});
-  } catch (e) {
-    const msg = e.message || '';
-    STATE.data.aiAgentInv = { ok: false, rows: [], total: 0, error: msg,
-      code: /403|forbidden|authorization/i.test(msg) ? 'forbidden' : /400|bad request|failed to resolve|semantic|recognize/i.test(msg) ? 'unsupported' : 'error' };
-  }
+  STATE.data.aiAgentInv = {
+    ok: false,
+    rows: [],
+    total: 0,
+    code: 'unsupported',
+    error: 'Legacy Defender AI inventory table is deprecated and no longer queried by this app.',
+    noAuth: 0,
+    makerCreds: 0,
+    anthropicCount: 0,
+    mcpCount: 0,
+    hardCodedCount: 0,
+    genOrchCount: 0,
+    modelHints: [],
+  };
   return STATE.data.aiAgentInv;
 }
 
-// Fetch individual agent records from the Defender AI Assets page (AIAgentsInfo table).
-// Returns per-agent rows: name, platform/type, model hint, publish status, MCP count, auth type.
-// Same ThreatHunting.Read.All scope as fetchAiAgentInventory — reuses the same token.
+// Legacy Defender AI assets list was backed by a deprecated table; keep this stable stub.
 async function fetchDefenderAiAgentsList() {
   if (STATE.data.defenderAgentList !== undefined) return STATE.data.defenderAgentList;
-  const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
-  if (!token) {
-    STATE.data.defenderAgentList = { ok: false, agents: [], code: 'forbidden' };
-    return STATE.data.defenderAgentList;
-  }
-  // Extract model hint from RawAgentInfo JSON, MCP server count from AgentToolsDetails,
-  // and Entra agent ID from column_ifexists for resilience across schema versions.
-  const kql = [
-    'AIAgentsInfo',
-    '| where Timestamp > ago(30d)',
-    '| extend AgentId = iff(isnotempty(tostring(column_ifexists("AIAgentId", ""))), tostring(column_ifexists("AIAgentId", "")), iff(isnotempty(tostring(column_ifexists("AgentId", ""))), tostring(column_ifexists("AgentId", "")), iff(isnotempty(tostring(column_ifexists("AIAgentName", ""))), tostring(column_ifexists("AIAgentName", "")), tostring(column_ifexists("AgentName", "")))))',
-    '| where isnotempty(AgentId)',
-    '| summarize arg_max(Timestamp, *) by AgentId',
-    '| extend _Lifecycle = tolower(iff(isnotempty(tostring(column_ifexists("LifecycleStatus", ""))), tostring(column_ifexists("LifecycleStatus", "")), tostring(column_ifexists("AgentStatus", ""))))',
-    '| where isempty(_Lifecycle) or _Lifecycle != "deleted"',
-    '| extend _raw = tostring(column_ifexists("RawAgentInfo", ""))',
-    '| extend ModelHint = tostring(iff(isnotempty(tostring(column_ifexists("ModelNameHint", ""))), tostring(column_ifexists("ModelNameHint", "")), iff(isnotempty(tostring(column_ifexists("Model", ""))), tostring(column_ifexists("Model", "")), extract(@"(?i)modelNameHint[\"\\s:]+([A-Za-z0-9_\\-.]+)", 1, _raw))))',
-    '| extend Platform  = tostring(iff(isnotempty(tostring(column_ifexists("AgentType", ""))), tostring(column_ifexists("AgentType", "")), tostring(column_ifexists("Platform", ""))))',
-    '| extend PubStatus = tostring(iff(isnotempty(tostring(column_ifexists("PublishStatus", ""))), tostring(column_ifexists("PublishStatus", "")), tostring(column_ifexists("PublishedStatus", ""))))',
-    '| extend AuthType  = tostring(iff(isnotempty(tostring(column_ifexists("UserAuthenticationType", ""))), tostring(column_ifexists("UserAuthenticationType", "")), tostring(column_ifexists("ToolsAuthenticationType", ""))))',
-    '| extend EntraId   = tostring(column_ifexists("EntraAgentId", AgentId))',
-    '| extend _toolsStr = tostring(column_ifexists("AgentToolsDetails", ""))',
-    '| extend _declaredToolCount = toint(coalesce(array_length(column_ifexists("DeclaredTools", dynamic([]))), 0))',
-    '| extend _mcpArrayCount = toint(coalesce(array_length(column_ifexists("McpServers", dynamic([]))), 0))',
-    '| extend _legacyMcpCount = toint(coalesce(array_length(extract_all(@"(?i)\"toolType\"\\s*:\\s*\"mcp\"", _toolsStr)), 0))',
-    '| extend _legacyToolCount = toint(coalesce(array_length(extract_all(@"\"toolType\"", _toolsStr)), 0))',
-    '| extend McpCount  = _mcpArrayCount + _legacyMcpCount',
-    '| extend ToolCount = _declaredToolCount + _mcpArrayCount + _legacyToolCount',
-    '| extend HasGenOrch = tobool(column_ifexists("IsGenerativeOrchestrationEnabled", false))',
-    '| project AgentId, AgentName = tostring(iff(isnotempty(tostring(column_ifexists("AIAgentName", ""))), tostring(column_ifexists("AIAgentName", "")), iff(isnotempty(tostring(column_ifexists("AgentName", ""))), tostring(column_ifexists("AgentName", "")), AgentId))), Platform, PubStatus, AuthType, EntraId, ModelHint, McpCount, ToolCount, HasGenOrch',
-    '| order by AgentName asc',
-    '| take 500',
-  ].join(' ');
-  try {
-    const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
-      method: 'POST',
-      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ Query: kql, Timespan: 'P30D' }),
-    });
-    if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + t.slice(0, 200)); }
-    const data = await r.json();
-    const agents = (data.results || []).map(row => ({
-      id:         row.AgentId     || '',
-      name:       row.AgentName   || row.AgentId || '—',
-      platform:   row.Platform    || 'Other',
-      pubStatus:  row.PubStatus   || '',
-      authType:   row.AuthType    || '',
-      entraId:    row.EntraId     || '',
-      modelHint:  row.ModelHint   || '',
-      mcpCount:   row.McpCount    || 0,
-      toolCount:  row.ToolCount   || 0,
-      hasGenOrch: row.HasGenOrch  || false,
-      modelInfo:  hintToModelInfo(row.ModelHint || ''),
-    }));
-    STATE.data.defenderAgentList = { ok: true, agents, total: agents.length };
-  } catch (e) {
-    const msg = e.message || '';
-    STATE.data.defenderAgentList = {
-      ok: false, agents: [], total: 0, error: msg,
-      code: /403|forbidden|authorization/i.test(msg) ? 'forbidden'
-          : /400|bad request|failed to resolve|semantic|recognize/i.test(msg) ? 'unsupported'
-          : 'error',
-    };
-  }
+  STATE.data.defenderAgentList = {
+    ok: false,
+    agents: [],
+    total: 0,
+    code: 'unsupported',
+    error: 'Legacy Defender AI inventory table is deprecated and disabled in this app.',
+  };
   return STATE.data.defenderAgentList;
 }
 
@@ -3160,11 +2981,10 @@ async function loadModels() {
           return STATE.data.mcasApps;
         }).catch(() => []);
 
-    const [sps, signIns, mcasApps, aiAgentInv] = await Promise.all([
-      fetchServicePrincipals(), fetchSignIns(), mcasPromise, fetchAiAgentInventory(),
+    const [sps, signIns, mcasApps] = await Promise.all([
+      fetchServicePrincipals(), fetchSignIns(), mcasPromise,
     ]);
     const aiApps = sps.filter(isAiApp);
-    const hasAgentsInfoModelHints = !!(aiAgentInv?.ok && aiAgentInv.modelHints?.length);
 
     // Filter MCAS to AI-related apps only
     const mcasAiApps = (mcasApps || []).filter(a => {
@@ -3227,34 +3047,18 @@ async function loadModels() {
       return null;
     };
 
-    if (!hasAgentsInfoModelHints) {
-      agentSpsAll.forEach(sp => {
-        const agType = getAgentType(sp);
-        if (agType.type === 'blueprint' || agType.type === 'classic') return;
-        const mi = inferAgentModel(sp);
-        if (!mi) return;
-        // Add to shared modelMap so it appears in the risk assessment table
-        const key = modelMapKey(mi);
-        if (!modelMap[key]) modelMap[key] = { ...mi, apps: [], calls: 0, sources: new Set(), mcasUsers: 0, mcasTraffic: 0, agentCount: 0 };
-        modelMap[key].sources.add('agent');
-        modelMap[key].agentCount = (modelMap[key].agentCount || 0) + 1;
-        agentModelRows.push({ sp, blueprint: agentParentMap[sp.id], mi });
-      });
-    }
-
-    // ── AIAgentsInfo model hints ───────────────────────────────────────────────
-    // Merge models detected via KQL (AIAgentsInfo.modelNameHint) into the risk table.
-    if (_aiInv?.ok && _aiInv.modelHints?.length) {
-      _aiInv.modelHints.forEach(({ ModelHint, AgentCount }) => {
-        const mi = hintToModelInfo(ModelHint);
-        if (!mi) return;
-        const key = modelMapKey(mi);
-        if (!modelMap[key]) modelMap[key] = { ...mi, apps: [], calls: 0, sources: new Set(), mcasUsers: 0, mcasTraffic: 0, agentCount: 0 };
-        modelMap[key].sources.add('agent');
-        modelMap[key].agentCount = (modelMap[key].agentCount || 0) + (AgentCount || 1);
-      });
-    }
-    const agentsInfoModelWarn = renderAIAgentsInfoModelHintWarning(_aiInv);
+    agentSpsAll.forEach(sp => {
+      const agType = getAgentType(sp);
+      if (agType.type === 'blueprint' || agType.type === 'classic') return;
+      const mi = inferAgentModel(sp);
+      if (!mi) return;
+      // Add to shared modelMap so it appears in the risk assessment table
+      const key = modelMapKey(mi);
+      if (!modelMap[key]) modelMap[key] = { ...mi, apps: [], calls: 0, sources: new Set(), mcasUsers: 0, mcasTraffic: 0, agentCount: 0 };
+      modelMap[key].sources.add('agent');
+      modelMap[key].agentCount = (modelMap[key].agentCount || 0) + 1;
+      agentModelRows.push({ sp, blueprint: agentParentMap[sp.id], mi });
+    });
 
     const models = Object.values(modelMap).sort((a,b)=>b.calls - a.calls || (b.agentCount||0) - (a.agentCount||0) || b.mcasUsers - a.mcasUsers);
     STATE.data.modelList = models;
@@ -3298,7 +3102,6 @@ async function loadModels() {
 
     el.innerHTML = `
       ${STATE.data.signInsError ? permWarn('AuditLog.Read.All', STATE.data.signInsError) : ''}
-      ${agentsInfoModelWarn}
       <div class="section-header">
         <div class="section-title">AI Models in Use — Shadow &amp; Sanctioned</div>
         <span class="data-source source-live">● Sign-in logs · Service principals${mcasAiApps.length ? ' · Defender for Cloud Apps' : ''}</span>
@@ -4238,7 +4041,7 @@ function showAgentSection(name) {
 }
 
 // ── DEFENDER AI ASSETS ────────────────────────────────────────────────────
-// Renders the per-agent table from the Defender AI Assets page (AIAgentsInfo).
+// Renders the per-agent table from the Defender AI Assets page.
 
 let _defAssetsExpanded = true;
 function toggleDefenderAssetsTable() {
@@ -4258,9 +4061,9 @@ async function renderDefenderAssetsSection() {
     const msg = list.code === 'forbidden'
       ? '🔒 <strong>ThreatHunting.Read.All</strong> not consented — sign out &amp; back in (or re-run admin consent) to read the Defender AI Assets table.'
       : list.code === 'unsupported'
-      ? 'ℹ️ The <code>AIAgentsInfo</code> table isn\'t available in this tenant yet (Security for AI agents preview not enabled).'
+      ? 'ℹ️ The legacy Defender AI inventory source used by this app has been deprecated. Verify AI asset posture directly in Defender.'
       : list.code === 'schema'
-      ? '⚠️ The live <code>AIAgentsInfo</code> query no longer matches the current Advanced Hunting schema. Review the query or Defender error details.'
+      ? '⚠️ The legacy Defender AI inventory query no longer matches the current Advanced Hunting schema. Review the query or Defender error details.'
       : 'ℹ️ Defender AI Assets unavailable — ' + esc(list.error || 'unknown error');
     if (badgeEl) badgeEl.textContent = 'unavailable';
     bodyEl.innerHTML = `<div style="padding:12px 16px;font-size:12px;color:var(--text-muted)">${msg}</div>`;
@@ -4276,7 +4079,7 @@ async function renderDefenderAssetsSection() {
   }
 
   if (!agents.length) {
-    bodyEl.innerHTML = '<div class="empty-state text-muted" style="padding:24px">No active agents found in the AIAgentsInfo table (last 30 days).</div>';
+    bodyEl.innerHTML = '<div class="empty-state text-muted" style="padding:24px">No active agents found from the configured Defender AI Assets source (last 30 days).</div>';
     return;
   }
 
@@ -4335,7 +4138,7 @@ async function renderDefenderAssetsSection() {
       </table>
     </div>
     <div style="padding:8px 16px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
-      Live from <code>AIAgentsInfo</code> Advanced Hunting table · last 30 days · max 500 agents.
+      Live from Defender AI Assets source · last 30 days · max 500 agents.
       <a href="https://security.microsoft.com/v2/aiassets" target="_blank" rel="noopener" style="color:var(--accent-blue);margin-left:8px">Open in Defender ↗</a>
     </div>
   `;
@@ -4830,14 +4633,14 @@ async function loadAgents() {
         </div>
       </div>
 
-      <!-- Defender AI Assets (live from AIAgentsInfo) -->
+      <!-- Defender AI Assets -->
       <div id="section-defender-assets" style="margin-bottom:20px">
         <div class="card">
           <div class="card-header" style="cursor:pointer" onclick="toggleDefenderAssetsTable()">
             <div class="card-title">🛡️ Defender AI Assets
               <span id="def-assets-badge" style="margin-left:8px;font-size:11px;padding:2px 7px;border-radius:10px;background:rgba(56,139,253,.12);color:var(--accent-blue);border:1px solid rgba(56,139,253,.3)">loading…</span>
             </div>
-            <span class="data-source source-live" style="font-size:10px">● AIAgentsInfo · Advanced Hunting (P30D)</span>
+            <span class="data-source source-live" style="font-size:10px">● Defender AI Assets · Advanced Hunting (P30D)</span>
           </div>
           <div id="def-assets-body">
             <div class="section-loading" style="padding:20px"><span class="spinner"></span>Loading Defender AI Assets…</div>
@@ -5660,10 +5463,10 @@ async function loadDataRisk() {
 async function loadCompliance() {
   const el = document.getElementById('compliance-content');
   try {
-    const [caP, org, grantPolicies, sps, signIns, tenantRegion, webGrounding, aiAgentInv, dlpScope] = await Promise.all([
+    const [caP, org, grantPolicies, sps, signIns, tenantRegion, webGrounding, dlpScope] = await Promise.all([
       fetchCAPolicies(), fetchOrg(), fetchGrantPolicies(),
       fetchServicePrincipals(), fetchSignIns(), fetchTenantRegion(),
-      fetchWebGroundingSetting(), fetchAiAgentInventory(), fetchDlpProtectionScope(),
+      fetchWebGroundingSetting(), fetchDlpProtectionScope(),
     ]);
     const authPolicy = STATE.data.authPolicy || {};
     const secDefaults = STATE.data.secDefaults || {};
@@ -5690,18 +5493,6 @@ async function loadCompliance() {
       gdprModelMap[key].calls += modelSigninCounts[name] || 0;
       gdprModelMap[key].apps.push(name);
     });
-    // Merge AIAgentsInfo model hints (same source used on the AI Models page)
-    const _aiInvC = aiAgentInv;
-    if (_aiInvC?.ok && _aiInvC.modelHints?.length) {
-      _aiInvC.modelHints.forEach(({ ModelHint, AgentCount }) => {
-        const mi = hintToModelInfo(ModelHint);
-        if (!mi || mi.model === 'Unknown') return;
-        const key = modelMapKey(mi);
-        if (!gdprModelMap[key]) gdprModelMap[key] = { ...mi, calls: 0, apps: [], agentCount: 0 };
-        gdprModelMap[key].agentCount = (gdprModelMap[key].agentCount || 0) + (AgentCount || 1);
-      });
-    }
-    const agentsInfoModelWarn = renderAIAgentsInfoModelHintWarning(_aiInvC);
     const gdprModels = Object.values(gdprModelMap);
     // Score: weighted by sign-in usage; if no sign-ins, weighted equally by model count
     const totalCalls = gdprModels.reduce((s, m) => s + m.calls, 0);
@@ -5754,7 +5545,6 @@ async function loadCompliance() {
 
     el.innerHTML = `
       ${STATE.data.caError ? permWarn('Policy.Read.All', STATE.data.caError) : ''}
-      ${agentsInfoModelWarn}
       <div class="section-header">
         <div class="section-title">Compliance &amp; Governance Posture</div>
         <span class="data-source source-live">● Live from Graph</span>
@@ -7231,7 +7021,7 @@ async function loadProtection() {
               <div style="display:flex;flex-direction:column;gap:8px">${rows.map(defRow).join('')}</div>
             </div>
           </div>`;
-        // Live AI agent inventory via Advanced Hunting (AIAgentsInfo).
+        // Live AI agent inventory via Advanced Hunting (legacy source).
         // Distinguish a reachable table from recently observed agents.
         const inv = aiAgentInv || { ok:false, rows:[], total:0 };
         const huntingReachable = !!aiAgentInv?.ok;
@@ -7249,13 +7039,13 @@ async function loadProtection() {
           ? `<div class="card" style="margin-bottom:16px">
               <div class="card-header">
                 <div class="card-title">🗂️ AI Agent Inventory (live)</div>
-                <span class="data-source source-live" style="font-size:10px">● security/runHuntingQuery · AIAgentsInfo</span>
+                <span class="data-source source-live" style="font-size:10px">● security/runHuntingQuery · legacy AI inventory source</span>
               </div>
               <div class="card-body">
                 <div style="margin-bottom:14px">
                   ${hasRecentAgents
-                    ? `<span style="display:inline-flex;align-items:center;gap:8px;padding:6px 16px;border-radius:8px;background:rgba(63,185,80,.12);border:1px solid rgba(63,185,80,.3);font-size:13px;font-weight:700;color:var(--risk-low)">✅ Security for AI agents — Connected</span>
-                       <span style="font-size:11px;color:var(--text-muted);margin-left:10px">inferred from ${inv.total} active agent${inv.total !== 1 ? 's' : ''} in AIAgentsInfo</span>`
+                      ? `<span style="display:inline-flex;align-items:center;gap:8px;padding:6px 16px;border-radius:8px;background:rgba(63,185,80,.12);border:1px solid rgba(63,185,80,.3);font-size:13px;font-weight:700;color:var(--risk-low)">✅ Security for AI agents — Connected</span>
+                        <span style="font-size:11px;color:var(--text-muted);margin-left:10px">inferred from ${inv.total} active agent${inv.total !== 1 ? 's' : ''} in the legacy inventory source</span>`
                     : `<span style="display:inline-flex;align-items:center;gap:8px;padding:6px 16px;border-radius:8px;background:rgba(56,139,253,.12);border:1px solid rgba(56,139,253,.28);font-size:13px;font-weight:700;color:var(--accent-blue)">ℹ️ Advanced Hunting reachable</span>
                        <span style="font-size:11px;color:var(--text-muted);margin-left:10px">No active agents observed in the last 30 days — verify the toggle below.</span>`}
                 </div>
@@ -7309,20 +7099,20 @@ async function loadProtection() {
                   )}
                 </div>
 
-<div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Live from the <code>AIAgentsInfo</code> Advanced Hunting table (P30D). No-auth agents are publicly accessible — review with owners. Maker-credential agents embed the creator's account in actions.</div>
+<div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Live from the legacy Defender AI inventory source (P30D). No-auth agents are publicly accessible — review with owners. Maker-credential agents embed the creator's account in actions.</div>
               </div>
             </div>`
           : `<div style="margin-bottom:16px;padding:10px 14px;border-radius:8px;background:rgba(56,139,253,.06);border:1px solid rgba(56,139,253,.2);font-size:12px;color:var(--text-muted)">
               ${inv.code === 'forbidden'
-                ? '🔒 <strong>Live agent inventory needs <code>ThreatHunting.Read.All</code>.</strong> Sign out &amp; back in (or re-run admin consent) to read Defender&#39;s <code>AIAgentsInfo</code> table via Advanced Hunting — it will then replace the manual checks below with the live inventory.'
+                ? '🔒 <strong>Live agent inventory needs <code>ThreatHunting.Read.All</code>.</strong> Sign out &amp; back in (or re-run admin consent) to read Defender&#39;s legacy AI inventory source via Advanced Hunting — it will then replace the manual checks below with the live inventory.'
                 : inv.code === 'unsupported'
-                  ? 'ℹ️ The <code>AIAgentsInfo</code> Advanced Hunting table isn&#39;t available in this tenant yet (Security for AI agents not onboarded / preview not enabled). Verify the configuration below in the Defender portal.'
+                  ? 'ℹ️ The legacy Advanced Hunting inventory source is unavailable or deprecated in this tenant. Verify the configuration below in the Defender portal.'
                   : inv.code === 'schema'
-                    ? '⚠️ The live <code>AIAgentsInfo</code> query no longer matches the current Advanced Hunting schema. Review the query or Defender error details, then verify the configuration below in the Defender portal.'
+                    ? '⚠️ The live legacy inventory query no longer matches the current Advanced Hunting schema. Review the query or Defender error details, then verify the configuration below in the Defender portal.'
                   : 'ℹ️ Live agent inventory unavailable via Advanced Hunting — verify the configuration below in the Defender portal.'}
             </div>`;
 
-        // If the AIAgentsInfo query is reachable, keep the experience in live mode.
+        // If the legacy query is reachable, keep the experience in live mode.
         const postureRows = huntingReachable
           ? [
               { label: 'Copilot Studio — AI security posture',    note: 'Connects Copilot Studio agents for exposure & posture visibility' },
