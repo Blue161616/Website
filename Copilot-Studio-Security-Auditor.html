@@ -239,6 +239,23 @@ const AUTHLBL = {0:'Unspecified',1:'None (No authentication)',2:'Integrated',3:'
 const MAKER_RX = /connectionProperties[\s\S]{0,300}?mode["'\s]*[:=]["'\s]*maker/i;
 const HTTP_RX  = /HttpRequestAction/i;
 const MCP_RX   = /InvokeExternalAgentTaskAction/i;
+// Best-effort: name the MCP server(s) an agent calls. MCP tools are wired through
+// custom connectors, so the topic data carries a server name / URL / connector
+// reference near the invoke action. High-signal patterns only; [] when nothing
+// identifiable (caller falls back to the generic "present" message).
+const MCP_ID_RX = [
+  /server\s*url["'\s:=]+(https?:\/\/[^\s"'\\}]+)/ig,
+  /server\s*name["'\s:=]+([^\n,"'}\]]{2,80})/ig,
+  /(shared_[A-Za-z0-9][\w.\-]{2,80})/ig,
+];
+function extractMcpServers(d){
+  const out=new Set(); const occ=/InvokeExternalAgentTaskAction/ig; let m;
+  while((m=occ.exec(d))){ const w=d.slice(Math.max(0,m.index-500), m.index+800);
+    for(const rx of MCP_ID_RX){ rx.lastIndex=0; let x;
+      while((x=rx.exec(w))){ const v=(x[1]||'').trim().replace(/^[="'\s]+|["'\s]+$/g,'');
+        if(v && v.toLowerCase()!=='mcp') out.add(v); if(out.size>=4) break; } } }
+  return [...out].slice(0,4);
+}
 const MAIL_RX  = /office365(outlook)?[\s\S]{0,500}?sendemail/i;
 const URL_RX   = /url["'\s]*[:=]["'\s]*(https?:\/\/[^\s"'\\}]+)/ig;
 // AI model — Copilot Studio stores it as "modelNameHint" in the agent JSON
@@ -298,9 +315,9 @@ async function scanEnvironment(orgUrl, opts){
     for (const c of comps){
       const d = c.data; if (!d) continue;
       const bid = c._parentbotid_value; if (!bid) continue;
-      const f = flags[bid] || (flags[bid] = { name: c['_parentbotid_value@OData.Community.Display.V1.FormattedValue'] || '(unknown)', maker:false,http:false,mcp:false,mail:false, urls:new Set(), mailTo:[] });
+      const f = flags[bid] || (flags[bid] = { name: c['_parentbotid_value@OData.Community.Display.V1.FormattedValue'] || '(unknown)', maker:false,http:false,mcp:false,mail:false, urls:new Set(), mailTo:[], mcpServers:new Set() });
       if (!f.maker && MAKER_RX.test(d)) f.maker = true;
-      if (!f.mcp   && MCP_RX.test(d))   f.mcp   = true;
+      if (MCP_RX.test(d)){ f.mcp = true; extractMcpServers(d).forEach(s=>f.mcpServers.add(s)); }
       if (HTTP_RX.test(d)){ f.http = true; let m; const rx=new RegExp(URL_RX); while((m=rx.exec(d))) f.urls.add(m[1]); }
       if (MAIL_RX.test(d)){ f.mail = true; let i=d.search(/sendemail/i); if(i>=0){ const w=d.slice(i,i+800); const m=/to["'\s\/]*[:=]["'\s]*([^\n,}{\]]+)/i.exec(w); if(m) f.mailTo.push(m[1].trim().replace(/["']/g,'')); } }
       if (!models[bid]){ const mh=extractModel(d); if(mh) models[bid]={name:f.name, model:mh}; }
@@ -308,7 +325,8 @@ async function scanEnvironment(orgUrl, opts){
     Object.values(flags).forEach(f=>{
       if (f.maker) add('High','Maker Credentials',f.name,'connector runs in maker auth context (connectionProperties.mode=maker)');
       if (f.http)  add('Medium','HTTP Requests',f.name,'HttpRequestAction present in agent topics');
-      if (f.mcp)   add('Medium','MCP Server',f.name,'InvokeExternalAgentTaskAction (MCP) present');
+      if (f.mcp){ const s=[...f.mcpServers];
+        add('Medium','MCP Server',f.name, s.length ? 'MCP server: '+s.slice(0,3).join(', ')+(s.length>3?', …':'') : 'InvokeExternalAgentTaskAction (MCP) present'); }
       if (f.mail)  add('Medium','Send Mail',f.name,'office365/outlook SendEmail referenced (heuristic)');
       // HTTP URL classification
       const urls=[...f.urls];
@@ -342,7 +360,12 @@ async function scanEnvironment(orgUrl, opts){
         const j = await dvGet(api+"/RetrieveSharedPrincipalsAndAccess(Target=@p1)?@p1="+p1, H);
         const sh = j.PrincipalAccesses || [];
         if (!sh.length) continue;
-        const types = [...new Set(sh.map(x=>(x.Principal&&x.Principal['@odata.type']||'principal').replace('#Microsoft.Dynamics.CRM.','')))];
+        const ptypes = sh.map(x=>(x.Principal&&x.Principal['@odata.type']||'principal').replace('#Microsoft.Dynamics.CRM.',''));
+        const teamCount = ptypes.filter(t=>t==='team').length, userCount = sh.length - teamCount;
+        // A lone team principal with no users is the platform-default owner/business-unit
+        // team that Dataverse auto-attaches to every agent — not a configured share. Skip it.
+        if (sh.length===1 && teamCount===1 && userCount===0) continue;
+        const types = [...new Set(ptypes)];
         const masks = [...new Set(sh.flatMap(x=>String(x.AccessMask||'').split(',').map(s=>s.trim()).filter(Boolean)))];
         const team = types.includes('team'), reshare = masks.includes('ShareAccess');
         const caps = [];
