@@ -2193,6 +2193,9 @@ function saveDashSnapshot(metrics, extra) {
 async function loadDashboard() {
   const el = document.getElementById('dash-content');
   try {
+    // Defender AI Assets (silent token) — fetched in parallel so the AI Models
+    // tile can use the SAME inventory builder as the Models page (counts agree).
+    const defenderListP = fetchDefenderAiAgentsList().catch(() => ({ ok: false, agents: [] }));
     const [sps, grants, signIns, users, riskyUsers, caP, skus, spSettings, labels] = await Promise.all([
       fetchServicePrincipals(), fetchOAuth2Grants(), fetchSignIns(),
       fetchUsers(), fetchRiskyUsers(), fetchCAPolicies(),
@@ -2229,6 +2232,19 @@ async function loadDashboard() {
       aiAppIds.has(s.appId)
     );
     const aiUsers = [...new Set(aiSignIns.map(s => s.userPrincipalName).filter(Boolean))];
+
+    // ── Model inventory — SAME builder as the AI Models page so the tile agrees ──
+    const defenderList = await defenderListP;
+    const dashModelCounts = {};
+    signIns.forEach(s => { const n = s.appDisplayName || ''; if (AI_KEYWORDS.some(k => n.toLowerCase().includes(k))) dashModelCounts[n] = (dashModelCounts[n] || 0) + 1; });
+    const dashMcasAiApps = (STATE.data.mcasApps || []).filter(a => {
+      const cat = (a.category || '').toLowerCase(), name = (a.name || '').toLowerCase();
+      return /ai|generative|copilot|gpt|claude|gemini|llm|chatbot/.test(cat) || AI_KEYWORDS.some(k => name.includes(k));
+    });
+    const dashModels = buildModelInventory({
+      aiApps, modelCounts: dashModelCounts, mcasAiApps: dashMcasAiApps, defenderList,
+      agentSps: STATE.data.agentSps || [], agentParentMap: STATE.data.agentParentBlueprint || {},
+    }).models;
 
     // High-risk grants: check ALL grants for high-risk scopes (not just AI-detected SPs)
     const highRiskGrants = grants.filter(g => grantHasAnyScope(g, HIGH_RISK_SCOPES));
@@ -3410,75 +3426,6 @@ function renderMcasApps(el, apps, mcasUrl) {
   saveMcasSnapshot(apps.map(a => String(a.appId ?? a.name)));
 }
 
-function renderCredentialHygieneHtml() {
-  const sps   = STATE.data.servicePrincipals || [];
-  const aiSps = sps.filter(isAiApp);
-  const now   = Date.now();
-  const d30   = now + 30  * 86400000;
-  const d90   = now + 90  * 86400000;
-
-  const rows = [];
-  for (const sp of aiSps) {
-    for (const c of (sp.passwordCredentials || [])) {
-      const exp = c.endDateTime ? new Date(c.endDateTime) : null;
-      if (!exp) continue;
-      const t = exp.getTime();
-      const status = t < now ? 'expired' : t < d30 ? 'critical' : t < d90 ? 'warning' : 'ok';
-      if (status === 'ok') continue;
-      rows.push({ sp, kind: 'Secret', name: c.displayName || c.hint || '—', exp, status });
-    }
-    for (const c of (sp.keyCredentials || [])) {
-      const exp = c.endDateTime ? new Date(c.endDateTime) : null;
-      if (!exp) continue;
-      const t = exp.getTime();
-      const status = t < now ? 'expired' : t < d30 ? 'critical' : t < d90 ? 'warning' : 'ok';
-      if (status === 'ok') continue;
-      rows.push({ sp, kind: 'Certificate', name: c.displayName || '—', exp, status });
-    }
-  }
-
-  rows.sort((a, b) => {
-    const o = { expired: 0, critical: 1, warning: 2 };
-    return (o[a.status] - o[b.status]) || (a.exp - b.exp);
-  });
-
-  const credBadge = s => {
-    if (s === 'expired')  return '<span class="badge badge-critical" style="font-size:10px">❌ Expired</span>';
-    if (s === 'critical') return '<span class="badge badge-critical" style="font-size:10px">🔴 &lt;30 days</span>';
-    return '<span class="badge badge-medium" style="font-size:10px">⚠️ &lt;90 days</span>';
-  };
-
-  const expired = rows.filter(r => r.status === 'expired').length;
-  const critical = rows.filter(r => r.status === 'critical').length;
-
-  return '<div class="card">'
-    + '<div class="card-header">'
-    + '<div class="card-title">🔑 Credential Hygiene — Secrets &amp; Certificates</div>'
-    + (rows.length
-        ? '<span style="font-size:11px;color:var(--risk-critical)">' + expired + ' expired · ' + critical + ' expiring &lt;30d</span>'
-        : '<span style="font-size:11px;color:var(--risk-low)">✅ All credentials healthy</span>')
-    + '<span class="data-source source-live">● passwordCredentials · keyCredentials</span>'
-    + '</div>'
-    + (rows.length
-      ? '<div class="table-wrap"><table>'
-        + '<thead><tr><th>Application</th><th>Type</th><th>Name</th><th>Expires</th><th>Status</th></tr></thead>'
-        + '<tbody>'
-        + rows.map(r =>
-            '<tr>'
-            + '<td><strong style="font-size:13px">' + esc(r.sp.displayName) + '</strong>'
-            + (r.sp.publisherName ? '<span style="font-size:11px;color:var(--text-muted);margin-left:6px">' + esc(r.sp.publisherName) + '</span>' : '')
-            + '</td>'
-            + '<td><span style="font-size:11px;color:var(--text-muted)">' + r.kind + '</span></td>'
-            + '<td class="mono" style="font-size:11px">' + esc(r.name) + '</td>'
-            + '<td class="mono" style="font-size:11px;white-space:nowrap">' + r.exp.toLocaleDateString('en-GB') + '</td>'
-            + '<td>' + credBadge(r.status) + '</td>'
-            + '</tr>'
-          ).join('')
-        + '</tbody></table></div>'
-      : '<div class="card-body"><div class="empty-state text-muted">No expiring or expired credentials found among detected AI apps.</div></div>')
-    + '</div>';
-}
-
 // ── AI MODELS ─────────────────────────────────────────────────────────────
 
 // Shadow-AI-aware risk level for a detected model. Starts from the static per-model
@@ -3729,6 +3676,84 @@ function renderModelResidencyMap(models, tenantRegion) {
   try { map.fitBounds(L.latLngBounds(bounds), { padding: [30, 40], maxZoom: 5 }); } catch { }
 }
 
+// ── Shared model inventory ─────────────────────────────────────────────────
+// Single source of truth for "distinct AI models in use", so the dashboard tile
+// and the AI Models page always agree. Merges every detection feed the caller
+// passes: service principals, sign-ins, Defender for Cloud Apps, Defender AI
+// Assets (typed Model), and — when agentSps are supplied — agent model inference.
+// Returns { models, agentModelRows }.
+function buildModelInventory({ aiApps = [], modelCounts = {}, mcasAiApps = [], defenderList = null, agentSps = null, agentParentMap = {} }) {
+  const modelMap = {};
+  const addToMap = (name, source, mcasData) => {
+    const info = detectModel(name);
+    const key = modelMapKey(info);
+    if (!modelMap[key]) modelMap[key] = { ...info, apps: [], calls: 0, sources: new Set(), mcasUsers: 0, mcasTraffic: 0 };
+    modelMap[key].apps.push(name);
+    modelMap[key].calls += modelCounts[name] || 0;
+    modelMap[key].sources.add(source);
+    if (mcasData) {
+      modelMap[key].mcasUsers  = Math.max(modelMap[key].mcasUsers, mcasData.usersCount || 0);
+      modelMap[key].mcasTraffic += mcasData.trafficTotalBytes || 0;
+    }
+  };
+  aiApps.forEach(a => addToMap(a.displayName, 'sp'));
+  Object.keys(modelCounts).forEach(name => addToMap(name, 'signin'));
+  mcasAiApps.forEach(a => addToMap(a.name, 'mcas', a));
+
+  // Defender AgentsInfo — typed Model/Version columns (only rows with an explicit model)
+  if (defenderList?.ok) {
+    defenderList.agents.forEach(a => {
+      if (!a.modelHint) return;
+      const det = a.modelInfo && a.modelInfo.model !== 'Unknown' ? a.modelInfo : null;
+      const msHosted = /copilot studio|foundry|azure/i.test(a.platform || '');
+      const info = det || {
+        model: a.modelHint + (a.modelVersion ? ' ' + a.modelVersion : ''),
+        provider: msHosted ? 'Microsoft (' + a.platform + ')' : (a.platform || 'Defender AI Assets'),
+        residency: msHosted ? 'EU possible' : 'Unknown',
+        training: msHosted ? 'No' : 'Unknown',
+        gdprOk: msHosted, risk: msHosted ? 'low' : 'medium',
+      };
+      const key = modelMapKey(info);
+      if (!modelMap[key]) modelMap[key] = { ...info, apps: [], calls: 0, sources: new Set(), mcasUsers: 0, mcasTraffic: 0 };
+      modelMap[key].apps.push(a.name);
+      modelMap[key].sources.add('defender');
+      modelMap[key].agentCount = (modelMap[key].agentCount || 0) + 1;
+    });
+  }
+
+  // Agent model inference — Copilot Studio / AI Foundry / ServiceIdentity agents
+  const agentModelRows = [];
+  if (agentSps) {
+    const inferAgentModel = sp => {
+      const text = ((sp.notes||'') + ' ' + (sp.description||'')).toLowerCase();
+      const explicit = APP_MODEL_MAP.find(e => e.pattern.test(text));
+      if (explicit) return { ...explicit, confidence: 'explicit' };
+      const t = getAgentType(sp).type;
+      if (/Microsoft Copilot Studio/i.test(sp.displayName) || sp.publisherName === 'Microsoft Copilot Studio' || t === 'copilot-studio')
+        return { model: 'GPT-4o', provider: 'Microsoft (Azure OpenAI)', residency: 'EU possible', training: 'No', gdprOk: true, risk: 'low', confidence: 'inferred' };
+      if (t === 'ai-foundry')
+        return { model: 'Azure OpenAI (configurable)', provider: 'Microsoft Azure', residency: 'EU possible', training: 'No', gdprOk: true, risk: 'low', confidence: 'inferred' };
+      if (sp.servicePrincipalType === 'ServiceIdentity' || STATE.data.agentIdentityIds?.has(sp.id))
+        return { model: 'GPT-4o', provider: 'Microsoft (Azure OpenAI)', residency: 'EU possible', training: 'No', gdprOk: true, risk: 'low', confidence: 'inferred' };
+      return null;
+    };
+    agentSps.forEach(sp => {
+      const agType = getAgentType(sp);
+      if (agType.type === 'blueprint' || agType.type === 'classic') return;
+      const mi = inferAgentModel(sp);
+      if (!mi) return;
+      const key = modelMapKey(mi);
+      if (!modelMap[key]) modelMap[key] = { ...mi, apps: [], calls: 0, sources: new Set(), mcasUsers: 0, mcasTraffic: 0, agentCount: 0 };
+      modelMap[key].sources.add('agent');
+      modelMap[key].agentCount = (modelMap[key].agentCount || 0) + 1;
+      agentModelRows.push({ sp, blueprint: agentParentMap[sp.id], mi });
+    });
+  }
+
+  const models = Object.values(modelMap).sort((a,b) => b.calls - a.calls || (b.agentCount||0) - (a.agentCount||0) || b.mcasUsers - a.mcasUsers);
+  return { models, agentModelRows };
+}
+
 async function loadModels() {
   const el = document.getElementById('models-content');
   try {
@@ -3774,95 +3799,13 @@ async function loadModels() {
     });
     const modelCounts = Object.fromEntries(Object.entries(appUsage).map(([n, u]) => [n, u.count]));
 
-    // Build unique model list — track sources: 'sp', 'signin', 'mcas'
-    const modelMap = {};
-    const addToMap = (name, source, mcasData) => {
-      const info = detectModel(name);
-      const key = modelMapKey(info);
-      if (!modelMap[key]) modelMap[key] = { ...info, apps: [], calls: 0, sources: new Set(), mcasUsers: 0, mcasTraffic: 0 };
-      modelMap[key].apps.push(name);
-      modelMap[key].calls += modelCounts[name] || 0;
-      modelMap[key].sources.add(source);
-      if (mcasData) {
-        modelMap[key].mcasUsers  = Math.max(modelMap[key].mcasUsers, mcasData.usersCount || 0);
-        modelMap[key].mcasTraffic += mcasData.trafficTotalBytes || 0;
-      }
-    };
-    aiApps.forEach(a => addToMap(a.displayName, 'sp'));
-    Object.keys(modelCounts).forEach(name => addToMap(name, 'signin'));
-    mcasAiApps.forEach(a => addToMap(a.name, 'mcas', a));
-
-    // ── Defender AgentsInfo — typed Model/Version columns ─────────────────
-    // Authoritative model data for Copilot Studio / Foundry / M365 Copilot /
-    // Agent 365 SDK agents. Only rows with an explicit Model column are merged
-    // (the raw-row regex fallback in fetchDefenderAiAgentsList is too speculative).
-    if (defenderList?.ok) {
-      defenderList.agents.forEach(a => {
-        if (!a.modelHint) return;
-        const det = a.modelInfo && a.modelInfo.model !== 'Unknown' ? a.modelInfo : null;
-        // Unmatched model names on Microsoft-hosted platforms (gpt-4o, phi-4 … in
-        // Copilot Studio / Foundry) are Azure-hosted — same defaults as inferAgentModel.
-        const msHosted = /copilot studio|foundry|azure/i.test(a.platform || '');
-        const info = det || {
-          model: a.modelHint + (a.modelVersion ? ' ' + a.modelVersion : ''),
-          provider: msHosted ? 'Microsoft (' + a.platform + ')' : (a.platform || 'Defender AI Assets'),
-          residency: msHosted ? 'EU possible' : 'Unknown',
-          training: msHosted ? 'No' : 'Unknown',
-          gdprOk: msHosted, risk: msHosted ? 'low' : 'medium',
-        };
-        const key = modelMapKey(info);
-        if (!modelMap[key]) modelMap[key] = { ...info, apps: [], calls: 0, sources: new Set(), mcasUsers: 0, mcasTraffic: 0 };
-        modelMap[key].apps.push(a.name);
-        modelMap[key].sources.add('defender');
-        modelMap[key].agentCount = (modelMap[key].agentCount || 0) + 1;
-      });
-    }
-
-    // (Local endpoint agents are intentionally NOT merged here — agent-level
-    // endpoint discovery belongs to the Shadow AI Apps cross-badges, and the
-    // AgentsInfo fallback can misclassify cloud agents as local, which would
-    // pollute this model inventory with per-agent pseudo-models.)
-
-    // ── Agent model inference ──────────────────────────────────────────────
-    // Copilot Studio and AI Foundry agents use Azure OpenAI models.
-    // We scan description/notes for explicit mentions; otherwise infer from agent type.
-    const agentSpsAll = STATE.data.agentSps || [];
-    const agentParentMap = STATE.data.agentParentBlueprint || {};
-    const agentModelRows = [];
-
-    const inferAgentModel = sp => {
-      // Explicit: scan description + notes for model name patterns
-      const text = ((sp.notes||'') + ' ' + (sp.description||'')).toLowerCase();
-      const explicit = APP_MODEL_MAP.find(e => e.pattern.test(text));
-      if (explicit) return { ...explicit, confidence: 'explicit' };
-      // Infer from agent type
-      const t = getAgentType(sp).type;
-      if (/Microsoft Copilot Studio/i.test(sp.displayName) || sp.publisherName === 'Microsoft Copilot Studio' || t === 'copilot-studio') {
-        return { model: 'GPT-4o', provider: 'Microsoft (Azure OpenAI)', residency: 'EU possible', training: 'No', gdprOk: true, risk: 'low', confidence: 'inferred' };
-      }
-      if (t === 'ai-foundry') {
-        return { model: 'Azure OpenAI (configurable)', provider: 'Microsoft Azure', residency: 'EU possible', training: 'No', gdprOk: true, risk: 'low', confidence: 'inferred' };
-      }
-      if (sp.servicePrincipalType === 'ServiceIdentity' || STATE.data.agentIdentityIds?.has(sp.id)) {
-        return { model: 'GPT-4o', provider: 'Microsoft (Azure OpenAI)', residency: 'EU possible', training: 'No', gdprOk: true, risk: 'low', confidence: 'inferred' };
-      }
-      return null;
-    };
-
-    agentSpsAll.forEach(sp => {
-      const agType = getAgentType(sp);
-      if (agType.type === 'blueprint' || agType.type === 'classic') return;
-      const mi = inferAgentModel(sp);
-      if (!mi) return;
-      // Add to shared modelMap so it appears in the risk assessment table
-      const key = modelMapKey(mi);
-      if (!modelMap[key]) modelMap[key] = { ...mi, apps: [], calls: 0, sources: new Set(), mcasUsers: 0, mcasTraffic: 0, agentCount: 0 };
-      modelMap[key].sources.add('agent');
-      modelMap[key].agentCount = (modelMap[key].agentCount || 0) + 1;
-      agentModelRows.push({ sp, blueprint: agentParentMap[sp.id], mi });
+    // Build the unique model list via the shared inventory builder (same one the
+    // dashboard tile uses, so the counts always agree). Local endpoint agents are
+    // intentionally NOT merged — that lives on Shadow AI Apps as a cross-badge.
+    const { models, agentModelRows } = buildModelInventory({
+      aiApps, modelCounts, mcasAiApps, defenderList,
+      agentSps: STATE.data.agentSps || [], agentParentMap: STATE.data.agentParentBlueprint || {},
     });
-
-    const models = Object.values(modelMap).sort((a,b)=>b.calls - a.calls || (b.agentCount||0) - (a.agentCount||0) || b.mcasUsers - a.mcasUsers);
     STATE.data.modelList = models;
 
     const fmtBytes = b => b >= 1e9 ? (b/1e9).toFixed(1)+' GB' : b >= 1e6 ? (b/1e6).toFixed(1)+' MB' : b >= 1e3 ? (b/1e3).toFixed(0)+' KB' : b+' B';
@@ -4737,7 +4680,7 @@ function sortClassicTable(key) {
 
 function showAgentSection(name, scroll = false) {
   STATE.agentSection = name;
-  const sections = ['blueprints', 'identities', 'classic', 'risky', 'stale', 'localagents', 'mcp'];
+  const sections = ['defender', 'blueprints', 'identities', 'classic', 'risky', 'stale', 'localagents', 'mcp'];
   sections.forEach(s => {
     const sec = document.getElementById('section-' + s);
     const kpi = document.getElementById('kpi-agent-' + s);
@@ -4770,16 +4713,11 @@ function showAgentSection(name, scroll = false) {
 // ── DEFENDER AI ASSETS ────────────────────────────────────────────────────
 // Renders the per-agent table from the Defender AI Assets page.
 
-let _defAssetsExpanded = true;
-function toggleDefenderAssetsTable() {
-  _defAssetsExpanded = !_defAssetsExpanded;
-  const body = document.getElementById('def-assets-body');
-  if (body) body.style.display = _defAssetsExpanded ? '' : 'none';
-}
-
 async function renderDefenderAssetsSection() {
   const bodyEl   = document.getElementById('def-assets-body');
   const badgeEl  = document.getElementById('def-assets-badge');
+  const kpiVal   = document.getElementById('kpi-defender-val');
+  const kpiSub   = document.getElementById('kpi-defender-sub');
   if (!bodyEl) return;
 
   const list = await fetchDefenderAiAgentsList();
@@ -4793,6 +4731,8 @@ async function renderDefenderAssetsSection() {
       ? '⚠️ The legacy Defender AI inventory query no longer matches the current Advanced Hunting schema. Review the query or Defender error details.'
       : 'ℹ️ Defender AI Assets unavailable — ' + esc(list.error || 'unknown error');
     if (badgeEl) badgeEl.textContent = 'unavailable';
+    if (kpiVal) kpiVal.textContent = '—';
+    if (kpiSub) kpiSub.textContent = list.code === 'forbidden' ? 'needs ThreatHunting.Read.All' : 'unavailable';
     bodyEl.innerHTML = `<div style="padding:12px 16px;font-size:12px;color:var(--text-muted)">${msg}</div>`;
     return;
   }
@@ -4803,6 +4743,11 @@ async function renderDefenderAssetsSection() {
     badgeEl.style.background = 'rgba(63,185,80,.12)';
     badgeEl.style.color = 'var(--risk-low)';
     badgeEl.style.borderColor = 'rgba(63,185,80,.3)';
+  }
+  if (kpiVal) kpiVal.textContent = agents.length;
+  if (kpiSub) {
+    const noAuth = agents.filter(a => !a.authType || /^none$/i.test(a.authType)).length;
+    kpiSub.textContent = noAuth > 0 ? `${noAuth} with no auth` : 'live · Advanced Hunting';
   }
 
   if (!agents.length) {
@@ -5317,7 +5262,13 @@ async function loadAgents() {
           </div>
           <span class="data-source source-derived">⚡ Derived from service principals</span>
         </div>
-        <div class="kpi-row" style="grid-template-columns:repeat(7,1fr);margin-bottom:0">
+        <div class="kpi-row" style="grid-template-columns:repeat(8,1fr);margin-bottom:0">
+          <div class="kpi-card info" id="kpi-agent-defender" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('defender', true)">
+            <div class="kpi-label">Defender AI Assets</div>
+            <div class="kpi-value text-blue" id="kpi-defender-val">…</div>
+            <div class="kpi-delta" id="kpi-defender-sub">Copilot Studio · Foundry · local</div>
+            <div class="kpi-icon">🛡️</div>
+          </div>
           <div class="kpi-card medium" id="kpi-agent-blueprints" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('blueprints', true)">
             <div class="kpi-label">Agent Blueprints</div>
             <div class="kpi-value text-medium">${bpSps.length}</div>
@@ -5362,10 +5313,10 @@ async function loadAgents() {
         </div>
       </div>
 
-      <!-- Defender AI Assets -->
-      <div id="section-defender-assets" style="margin-bottom:20px">
-        <div class="card">
-          <div class="card-header" style="cursor:pointer" onclick="toggleDefenderAssetsTable()">
+      <!-- Defender AI Assets (first section) -->
+      <div id="section-defender">
+        <div class="card" style="margin-bottom:16px">
+          <div class="card-header">
             <div class="card-title">🛡️ Defender AI Assets
               <span id="def-assets-badge" style="margin-left:8px;font-size:11px;padding:2px 7px;border-radius:10px;background:rgba(56,139,253,.12);color:var(--accent-blue);border:1px solid rgba(56,139,253,.3)">loading…</span>
             </div>
@@ -5522,17 +5473,11 @@ async function loadAgents() {
         <div id="mcp-content"><div class="section-loading"><span class="spinner"></span>Loading MCP servers…</div></div>
       </div>
 
-      <!-- Credential Hygiene -->
-      <div id="section-cred-hygiene" style="margin-top:16px">
-        <div id="cred-hygiene-content"></div>
-      </div>
-
     `;
     renderAllAgentTables();
-    // Guard against a stale persisted selection (e.g. the removed 'audit' section)
-    const validSections = ['blueprints', 'identities', 'classic', 'risky', 'stale', 'localagents', 'mcp'];
-    showAgentSection(validSections.includes(STATE.agentSection) ? STATE.agentSection : 'blueprints');
-    document.getElementById('cred-hygiene-content').innerHTML = renderCredentialHygieneHtml();
+    // Guard against a stale persisted selection (e.g. removed 'audit'/'cred-hygiene')
+    const validSections = ['defender', 'blueprints', 'identities', 'classic', 'risky', 'stale', 'localagents', 'mcp'];
+    showAgentSection(validSections.includes(STATE.agentSection) ? STATE.agentSection : 'defender');
     renderStaleAgentsSection(agentSps, grants);
     // Owners/sponsors load in background — re-render tables when done
     fetchAgentOwnersSponsors(agentSps).then(() => { renderAllAgentTables(); renderStaleAgentsSection(agentSps, grants); });
@@ -7441,14 +7386,24 @@ const SKU_FRIENDLY = {
   'THREAT_INTELLIGENCE':'Microsoft Defender Threat Intelligence',
 };
 
-const AI_LICENSE_FLAGS = [
-  { test: s => /COPILOT/i.test(s),              label:'Copilot',       color:'#388bfd', icon:'🤖' },
-  { test: s => /AGENT.?365|365.?AGENT/i.test(s),label:'Agent 365',    color:'#a371f7', icon:'⚡' },
-  { test: s => /E7/i.test(s),                   label:'M365 E7',       color:'#a371f7', icon:'⭐' },
-  { test: s => /AAD_PREMIUM_P2|ENTRA.*P2/i.test(s), label:'Entra P2', color:'#f0883e', icon:'🔑' },
-  { test: s => /EMSPREMIUM|EMS_E5/i.test(s),    label:'EMS E5',        color:'#3fb950', icon:'🛡️' },
-  { test: s => /SPE_E5|ENTERPRISEPREMIUM/i.test(s), label:'M365 E5',   color:'#3fb950', icon:'⭐' },
-];
+// Friendly names for the AI/agent service plans that appear on the Licenses page,
+// so the raw plan codes translate to what a reader recognises.
+const AI_PLAN_FRIENDLY = {
+  M365_COPILOT_BUSINESS_CHAT:'Copilot Business Chat', M365_COPILOT_TEAMS:'Copilot in Teams',
+  M365_COPILOT_SHAREPOINT:'Copilot in SharePoint', M365_COPILOT_APPS:'Copilot in M365 apps',
+  M365_COPILOT_CONNECTORS:'Copilot connectors', GRAPH_CONNECTORS_COPILOT:'Graph connectors for Copilot',
+  M365_COPILOT_INTELLIGENT_SEARCH:'Copilot intelligent search', COPILOT_STUDIO_IN_COPILOT_FOR_M365:'Copilot Studio (in Copilot)',
+  POWER_VIRTUAL_AGENTS_O365_P3:'Power Virtual Agents (Copilot Studio)',
+  AGENT_365:'Agent 365 core', AGENT_365_TOOLS:'Agent 365 tools',
+  DATA_LOSS_PREVENTION_FOR_AGENTS:'DLP for agents', INFORMATION_PROTECTION_FOR_AGENTS:'Information Protection for agents',
+  INSIDER_RISK_MANAGEMENT_FOR_AGENTS:'Insider Risk for agents', EDISCOVERY_FOR_AGENTS:'eDiscovery for agents',
+  DATA_LIFECYCLE_MANAGEMENT_FOR_AGENTS:'Data Lifecycle for agents', COMPLIANCE_MANAGER_FOR_AGENTS:'Compliance Manager for agents',
+  COMMUNICATION_COMPLIANCE_FOR_AGENTS:'Comms Compliance for agents', AUDIT_FOR_AGENTS:'Audit for agents',
+  ENTRA_ID_GOV_FOR_ASSISTIVE_AGENTS:'Entra ID Governance for agents', ENTRA_NETWORK_CONTROLS_FOR_ASSISTIVE_AGENTS:'Entra Network Controls for agents',
+};
+const aiPlanFriendly = n => AI_PLAN_FRIENDLY[n] || (n || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+// A service plan is AI/agent-relevant if it drives a Copilot, agent, or PVA capability.
+const isAiRelevantPlan = n => /copilot|_for_agents|for_assistive_agents|agent_365|virtual_agent/i.test(n || '');
 
 // Find an Enabled SKU matching a pattern on its part number OR a bundled service plan.
 function skuLicensed(skus, re) {
@@ -7477,14 +7432,26 @@ function agentProtectionPlanStatus(sku) {
   return { total: plans.length, active, disabled: plans.length - active };
 }
 
+// Priority classifier — Power Virtual Agents / Copilot Studio plans no longer
+// get mislabelled as "Copilot", and the platform SKUs that gate AI detection
+// (E7 / P2 / E5) are distinguished from genuine Copilot / Agent 365 entitlements.
 function getAiLicenseFlag(sku) {
   const part = sku.skuPartNumber || '';
-  const hasAiPlan = (sku.servicePlans || []).some(p =>
-    /copilot|agent/i.test(p.servicePlanName || ''));
-  for (const f of AI_LICENSE_FLAGS) {
-    if (f.test(part) || (hasAiPlan && /copilot|agent/i.test(f.label))) return f;
-  }
-  if (hasAiPlan) return { label:'AI Plan', color:'#388bfd', icon:'🤖' };
+  const plans = (sku.servicePlans || []).map(p => p.servicePlanName || '');
+  const hasPlan = re => plans.some(p => re.test(p));
+  // Genuine AI entitlements first
+  if (/COPILOT/i.test(part) || hasPlan(/M365_COPILOT|COPILOT_FOR_M365|COPILOT_BUSINESS_CHAT/i))
+    return { label:'M365 Copilot', color:'#388bfd', icon:'🤖' };
+  if (/AGENT_?365|AGENT_FRONTIER/i.test(part) || hasPlan(/AGENT_365|_FOR_AGENTS|FOR_ASSISTIVE_AGENTS/i))
+    return { label:'Agent 365', color:'#a371f7', icon:'⚡' };
+  // Known platform SKUs (their identity wins over an incidentally-bundled PVA plan)
+  if (/E7/i.test(part) && /MICROSOFT_?365|M365|SPE|ENTERPRISE/i.test(part)) return { label:'M365 E7', color:'#a371f7', icon:'⭐' };
+  if (/SPE_E5|ENTERPRISEPREMIUM/i.test(part)) return { label:'M365 E5', color:'#3fb950', icon:'⭐' };
+  if (/EMSPREMIUM|EMS_E5/i.test(part)) return { label:'EMS E5', color:'#3fb950', icon:'🛡️' };
+  if (/AAD_PREMIUM_P2/i.test(part) || hasPlan(/AAD_PREMIUM_P2/i)) return { label:'Entra P2', color:'#f0883e', icon:'🔑' };
+  // Power Virtual Agents / Copilot Studio — fallback for SKUs not otherwise a known platform
+  if (hasPlan(/POWER_VIRTUAL_AGENT|VIRTUAL_AGENT/i))
+    return { label:'Copilot Studio (PVA)', color:'#8957e5', icon:'💬' };
   return null;
 }
 
@@ -7505,16 +7472,17 @@ async function loadLicenses() {
       s.skuPartNumber === 'AAD_PREMIUM_P2' ||
       hasActivePlan(s, 'AAD_PREMIUM_P2')
     ));
-    // Agent 365: only match dedicated Agent 365 SKUs with actual assigned units (not FRONTIER bundles)
-    const agent365 = skus.find(s => s.capabilityStatus === 'Enabled' &&
-      s.consumedUnits > 0 &&
-      /MICROSOFT_AGENT_365_TIER|^AGENT_365$/i.test(s.skuPartNumber)
-    );
-    // Copilot: own SKU or service plan inside another bundle
+    // Agent 365 — SAME detection as the dashboard & Protection page (agent365Sku),
+    // so the pages agree. This matches E7 / Agent 365 / Agent Frontier bundles.
+    const agent365 = agent365Sku(skus);
+    const agent365ViaFrontier = agent365 && /FRONTIER/i.test(agent365.skuPartNumber || '');
+    const agentPlans = agent365 ? agentProtectionPlanStatus(agent365) : { total: 0, active: 0, disabled: 0 };
+    // Copilot: true M365 Copilot SKU or plan (not Power Virtual Agents)
     const copilot = skus.find(s => s.capabilityStatus === 'Enabled' && (
       /COPILOT/i.test(s.skuPartNumber) ||
-      (s.servicePlans||[]).some(p => /copilot/i.test(p.servicePlanName) && p.provisioningStatus === 'Success')
+      (s.servicePlans||[]).some(p => /M365_COPILOT|COPILOT_FOR_M365|COPILOT_BUSINESS_CHAT/i.test(p.servicePlanName) && p.provisioningStatus === 'Success')
     ));
+    const copilotSeats = copilot ? { total: copilot.prepaidUnits?.enabled ?? 0, used: copilot.consumedUnits ?? 0 } : null;
 
     const skuRow = sku => {
       const flag  = getAiLicenseFlag(sku);
@@ -7523,21 +7491,45 @@ async function loadLicenses() {
       const used  = sku.consumedUnits ?? 0;
       const avail = typeof total === 'number' ? total - used : '—';
       const pct   = typeof total === 'number' && total > 0 ? Math.round(used / total * 100) : null;
-      const statusCls = sku.capabilityStatus === 'Enabled' ? 'text-low' : sku.capabilityStatus === 'Warning' ? 'text-medium' : 'text-critical';
-      const aiPlans = (sku.servicePlans || []).filter(p => /copilot|agent/i.test(p.servicePlanName || '') && p.provisioningStatus === 'Success');
-      return `<tr style="${flag ? 'background:rgba(56,139,253,.04)' : ''}">
+      const enabled   = sku.capabilityStatus === 'Enabled';
+      const statusCls = enabled ? 'text-low' : sku.capabilityStatus === 'Warning' ? 'text-medium' : 'text-critical';
+
+      // AI-relevant plan chips — friendly names, coloured by provisioning status
+      const aiPlans = (sku.servicePlans || []).filter(p => isAiRelevantPlan(p.servicePlanName));
+      const planChips = aiPlans.slice(0, 14).map(p => {
+        const ok = (p.provisioningStatus || '').toLowerCase() === 'success';
+        const col = ok ? 'var(--risk-low)' : 'var(--text-dim)';
+        return `<span title="${esc(p.servicePlanName)} · ${esc(p.provisioningStatus||'')}" style="display:inline-block;margin:1px 3px 1px 0;font-size:10px;color:var(--text-muted)"><span style="color:${col}">${ok?'●':'○'}</span> ${esc(aiPlanFriendly(p.servicePlanName))}</span>`;
+      }).join('');
+
+      // Agent-protection provisioning (licensed vs actually active)
+      const ap = agentProtectionPlanStatus(sku);
+      const apLine = ap.total > 0
+        ? `<br><span style="font-size:10px;color:${ap.disabled>0?'var(--risk-medium)':'var(--risk-low)'}" title="Agent-protection service plans licensed by this SKU vs actually provisioned">${ap.disabled>0?'◐':'✅'} ${ap.active}/${ap.total} agent-protection plans active${ap.disabled>0?` · ${ap.disabled} disabled`:''}</span>`
+        : '';
+
+      // Utilisation / cost flags relevant to AI spend
+      const util = [];
+      if (!enabled) util.push({ t: sku.capabilityStatus, c:'var(--risk-high)' });
+      if (enabled && pct !== null && pct >= 100) util.push({ t:'no seat headroom', c:'var(--risk-medium)' });
+      if (enabled && ap.total > 0 && typeof total === 'number' && total >= 5 && pct !== null && pct < 20) util.push({ t:`${avail} agent seats unused`, c:'var(--risk-medium)' });
+      const utilChips = util.map(u => `<span style="display:inline-block;margin-left:6px;font-size:9.5px;font-weight:700;padding:2px 7px;border-radius:20px;color:${u.c};background:${u.c}1a;border:1px solid ${u.c}44">⚠ ${esc(u.t)}</span>`).join('');
+
+      return `<tr style="${!enabled && flag ? 'background:rgba(248,81,73,.04)' : flag ? 'background:rgba(56,139,253,.04)' : ''}">
         <td>
           <strong>${esc(name)}</strong>
-          ${flag ? `<span class="badge" style="margin-left:8px;font-size:10px;background:rgba(56,139,253,.12);color:${flag.color};border:1px solid ${flag.color}40">${flag.icon} ${esc(flag.label)}</span>` : ''}
+          ${flag ? `<span class="badge" style="margin-left:8px;font-size:10px;background:${flag.color}1a;color:${flag.color};border:1px solid ${flag.color}40">${flag.icon} ${esc(flag.label)}</span>` : ''}
+          ${utilChips}
           <br><span class="mono text-muted" style="font-size:10px">${esc(sku.skuPartNumber)}</span>
-          ${aiPlans.length ? `<br><span style="font-size:10px;color:var(--accent-blue)">● ${aiPlans.map(p=>esc(p.servicePlanName)).join(' · ')}</span>` : ''}
+          ${planChips ? `<br><span style="line-height:1.7">${planChips}</span>` : ''}
+          ${apLine}
         </td>
         <td><span class="${statusCls}" style="font-size:12px">${esc(sku.capabilityStatus)}</span></td>
         <td style="font-weight:600">${used}</td>
         <td class="text-muted">${total}</td>
         <td class="text-muted">${avail}</td>
         <td>
-          ${pct !== null ? `<div style="background:var(--border);border-radius:4px;height:6px;width:80px;overflow:hidden"><div style="background:${pct>90?'var(--risk-high)':pct>70?'var(--risk-medium)':'var(--accent-blue)'};width:${pct}%;height:100%"></div></div><span style="font-size:10px;color:var(--text-muted);margin-left:6px">${pct}%</span>` : '—'}
+          ${pct !== null ? `<div style="background:var(--border);border-radius:4px;height:6px;width:80px;overflow:hidden"><div style="background:${pct>=100?'var(--risk-high)':pct>90?'var(--risk-high)':pct>70?'var(--risk-medium)':'var(--accent-blue)'};width:${Math.min(pct,100)}%;height:100%"></div></div><span style="font-size:10px;color:var(--text-muted);margin-left:6px">${pct}%</span>` : '—'}
         </td>
       </tr>`;
     };
@@ -7573,13 +7565,17 @@ async function loadLicenses() {
         <div class="kpi-card ${p2 ? 'low' : 'critical'}">
           <div class="kpi-label">Entra ID P2</div>
           <div class="kpi-value ${p2 ? 'text-low' : 'text-critical'}">${p2 ? '✅' : '❌'}</div>
-          <div class="kpi-delta">${p2 ? 'Identity Protection available' : 'Required for Risky Agents'}</div>
+          <div class="kpi-delta">${p2 ? 'enables Risky Agents & Users' : 'Required for Risky Agents'}</div>
           <div class="kpi-icon">🔑</div>
         </div>
-        <div class="kpi-card ${agent365 ? 'low' : 'info'}">
+        <div class="kpi-card ${agent365 ? (agentPlans.disabled > 0 ? 'medium' : 'low') : 'info'}">
           <div class="kpi-label">Agent 365</div>
-          <div class="kpi-value ${agent365 ? 'text-low' : 'text-muted'}">${agent365 ? '✅' : '—'}</div>
-          <div class="kpi-delta">${agent365 ? 'AI Agent identity protection active' : 'Not detected in tenant'}</div>
+          <div class="kpi-value ${agent365 ? (agentPlans.disabled > 0 ? 'text-medium' : 'text-low') : 'text-muted'}">${agent365 ? (agentPlans.disabled > 0 ? '◐' : '✅') : '—'}</div>
+          <div class="kpi-delta">${agent365
+            ? (agentPlans.total > 0
+                ? `${agentPlans.active}/${agentPlans.total} agent-protection plans active${agent365ViaFrontier ? ' · via Frontier' : ''}`
+                : 'detected' + (agent365ViaFrontier ? ' · via Frontier' : ''))
+            : 'Not detected in tenant'}</div>
           <div class="kpi-icon">⚡</div>
         </div>
       </div>
@@ -7603,10 +7599,28 @@ async function loadLicenses() {
           </table>
         </div>
         <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:12px">
-          <span>ℹ️ <strong>Agent 365</strong> enables Identity Protection for agents · <strong>Entra P2</strong> required for Risky Agents detection · <strong>Microsoft 365 Copilot</strong> enables Copilot Studio &amp; M365 Copilot.</span>
+          <span>ℹ️ <strong>Agent 365</strong> → Identity Protection for agents · <strong>Entra P2</strong> → <a onclick="navigate('agents', document.querySelector('[onclick*=agents]'))" style="color:var(--accent-blue);cursor:pointer">Risky Agents</a> · <strong>Copilot</strong> → Copilot Studio &amp; M365 Copilot. A SKU can be assigned while its plans are still <strong>Disabled</strong> (● active / ○ disabled above) — see <a onclick="navigate('protection', document.querySelector('[onclick*=protection]'))" style="color:var(--accent-blue);cursor:pointer">Agent 365 Protections</a>.</span>
           ${(total > tableSkus.length || licShowAll) ? `<button class="btn btn-ghost" style="font-size:11px;white-space:nowrap" onclick="STATE.licShowAll=${!licShowAll};loadLicenses()">${licShowAll ? '↑ AI-relevant only' : `Show all ${total} licenses`}</button>` : ''}
         </div>
       </div>
+
+      ${copilotSeats && copilotSeats.total > 0 ? `
+      <div class="card" style="margin-top:16px">
+        <div class="card-header">
+          <div class="card-title">🤖 Microsoft 365 Copilot — Seat Utilisation</div>
+          <span class="text-muted" style="font-size:11px">licensing spend vs actual usage</span>
+        </div>
+        <div class="card-body" style="display:flex;align-items:center;gap:20px;flex-wrap:wrap">
+          <div><div style="font-size:26px;font-weight:800;color:var(--accent-blue)">${copilotSeats.used}<span style="font-size:13px;color:var(--text-dim)">/${copilotSeats.total}</span></div><div style="font-size:11px;color:var(--text-muted)">seats assigned</div></div>
+          <div style="flex:1;min-width:200px;font-size:12px;color:var(--text-muted)">
+            ${copilotSeats.used >= copilotSeats.total
+              ? '⚠️ <strong style="color:var(--risk-medium)">All Copilot seats assigned</strong> — no headroom to onboard another user without buying seats.'
+              : `${copilotSeats.total - copilotSeats.used} unassigned seat${copilotSeats.total - copilotSeats.used !== 1 ? 's' : ''} available.`}
+            Assignment ≠ usage — a seat can be assigned but unused for 30+ days (reclaim candidate).
+            <a onclick="navigate('copilot', document.querySelector('[onclick*=copilot]'))" style="color:var(--accent-blue);cursor:pointer">See active vs inactive on Copilot Usage →</a>
+          </div>
+        </div>
+      </div>` : ''}
     `;
   } catch (e) {
     el.innerHTML = permWarn('Organization.Read.All', e.message);
