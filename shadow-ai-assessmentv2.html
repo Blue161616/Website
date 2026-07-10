@@ -1631,53 +1631,122 @@ async function fetchDefenderAiAgentsList() {
 // token as the AgentsInfo inventory. Requires MDE P2 / M365 E5 / Agent 365 / E7.
 async function fetchLocalAiAgents() {
   if (STATE.data.localAiAgents !== undefined) return STATE.data.localAiAgents;
-  const base = { ok: false, agents: [], total: 0, code: 'error', error: null };
+  const base = { ok: false, agents: [], total: 0, code: 'error', error: null, note: null };
   const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
   if (!token) {
     STATE.data.localAiAgents = { ...base, code: 'forbidden', error: 'ThreatHunting.Read.All not consented.' };
     return STATE.data.localAiAgents;
   }
-  const kql = [
-    'ExposureGraphEdges',
-    '| where SourceNodeLabel == "endpointAiAgent"',
-    '| where EdgeLabel =~ "runs on"',
-    '| summarize Devices = make_set(TargetNodeName), DeviceCount = dcount(TargetNodeName) by AIAgent = SourceNodeName',
-    '| sort by DeviceCount desc',
-  ].join(' ');
+
   const isUnsupportedErr = msg => /failed to resolve table|could not be resolved|unknown table|does not refer to any known table|semantic error/i.test(msg || '');
-  try {
-    const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
-      method: 'POST',
-      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ Query: kql, Timespan: 'P30D' }),
-    });
-    if (!r.ok) {
-      const text = await r.text();
-      STATE.data.localAiAgents = {
-        ...base,
-        code: r.status === 403 ? 'forbidden' : isUnsupportedErr(text) ? 'unsupported' : 'error',
-        error: text.slice(0, 300),
-      };
-      return STATE.data.localAiAgents;
-    }
-    const data = await r.json();
-    const rows = Array.isArray(data.results) ? data.results : (Array.isArray(data.Results) ? data.Results : []);
-    const agents = rows.map(row => {
-      // make_set() may come back as a JSON array or a serialized string
-      let devices = row.Devices;
-      if (typeof devices === 'string') { try { devices = JSON.parse(devices); } catch { devices = [devices]; } }
-      devices = Array.isArray(devices) ? devices.map(String) : [];
-      return {
+  // The exposure graph is a point-in-time snapshot — no Timespan on these queries.
+  let lastErr = null, anySuccess = false;
+  const tryRun = async kql => {
+    try {
+      const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ Query: kql }),
+      });
+      if (!r.ok) { const e = new Error((await r.text()).slice(0, 300)); e.status = r.status; throw e; }
+      anySuccess = true;
+      const data = await r.json();
+      return Array.isArray(data.results) ? data.results : (Array.isArray(data.Results) ? data.Results : []);
+    } catch (e) { lastErr = e; return null; }
+  };
+  const parseDevices = v => {
+    let d = v;
+    if (typeof d === 'string') { try { d = JSON.parse(d); } catch { d = [d]; } }
+    return Array.isArray(d) ? d.map(String).filter(Boolean) : [];
+  };
+  const done = agents => {
+    STATE.data.localAiAgents = { ok: true, agents, total: agents.length, code: null, error: null, note: null };
+    return STATE.data.localAiAgents;
+  };
+
+  // ── 1. Exposure graph edges — agents + the devices they run on.
+  //    Case-insensitive label match (=~), both edge directions, and no strict
+  //    "runs on" EdgeLabel filter: the preview schema varies across tenants.
+  for (const [src, tgt] of [['Source', 'Target'], ['Target', 'Source']]) {
+    const rows = await tryRun([
+      'ExposureGraphEdges',
+      `| where ${src}NodeLabel =~ "endpointAiAgent"`,
+      `| summarize Devices = make_set(${tgt}NodeName), DeviceCount = dcount(${tgt}NodeName) by AIAgent = ${src}NodeName`,
+      '| sort by DeviceCount desc',
+    ].join(' '));
+    if (rows?.length) {
+      return done(rows.map(row => ({
         name: String(row.AIAgent || '').trim(),
-        devices,
-        deviceCount: Number(row.DeviceCount) || devices.length,
-      };
-    }).filter(a => a.name);
-    STATE.data.localAiAgents = { ok: true, agents, total: agents.length, code: null, error: null };
-  } catch (e) {
-    const msg = e.message || String(e);
-    STATE.data.localAiAgents = { ...base, code: isUnsupportedErr(msg) ? 'unsupported' : 'error', error: msg };
+        devices: parseDevices(row.Devices),
+        deviceCount: Number(row.DeviceCount) || 0,
+        vendor: null,
+      })).filter(a => a.name));
+    }
   }
+
+  // ── 2. Exposure graph nodes — agents without device linkage, with a
+  //    self-healing label discovery pass in case the preview label differs.
+  const vendorFrom = props => String(props || '').match(/"vendor(?:Name)?"\s*:\s*"([^"]{1,60})"/i)?.[1] || null;
+  let nodeRows = await tryRun('ExposureGraphNodes | where NodeLabel =~ "endpointAiAgent" | project AIAgent = NodeName, Props = tostring(NodeProperties) | take 200');
+  let discoveredLabel = null;
+  if (!nodeRows?.length) {
+    const labels = await tryRun('ExposureGraphNodes | where tolower(NodeLabel) contains "agent" | summarize Nodes = count() by NodeLabel | take 20');
+    const cand = (labels || []).map(l => String(l.NodeLabel || '')).find(l => /ai/i.test(l) && /agent/i.test(l));
+    if (cand) {
+      discoveredLabel = cand;
+      nodeRows = await tryRun(`ExposureGraphNodes | where NodeLabel == "${cand.replace(/"/g, '')}" | project AIAgent = NodeName, Props = tostring(NodeProperties) | take 200`);
+    }
+  }
+  if (nodeRows?.length) {
+    const agents = nodeRows.map(row => ({
+      name: String(row.AIAgent || '').trim(),
+      devices: [], deviceCount: 0,
+      vendor: vendorFrom(row.Props),
+    })).filter(a => a.name);
+    STATE.data.localAiAgents = { ok: true, agents, total: agents.length, code: null, error: null,
+      note: 'Device linkage unavailable — agents read from ExposureGraphNodes' + (discoveredLabel ? ` (label: ${discoveredLabel})` : '') + '.' };
+    return STATE.data.localAiAgents;
+  }
+
+  // ── 3. AgentsInfo unified inventory — since June 2026 it also carries
+  //    endpoint-discovered agents; scan rows for a local/endpoint source marker.
+  try {
+    const inv = await fetchAiAgentInventory();
+    if (inv.ok && inv.rows.length) {
+      const pickName = r => String(r.AgentName || r.agentName || r.DisplayName || r.displayName || r.Name || r.name || '').trim();
+      const localRows = inv.rows.filter(r => /endpoint|local|device/i.test(JSON.stringify([
+        r.Platform, r.platform, r.SourcePlatform, r.sourcePlatform, r.Source, r.source,
+        r.DiscoverySource, r.discoverySource, r.AgentType, r.agentType, r.HostingEnvironment, r.hostingEnvironment,
+      ])));
+      if (localRows.length) {
+        const byName = {};
+        localRows.forEach(r => {
+          const name = pickName(r); if (!name) return;
+          const dev = String(r.DeviceName || r.deviceName || r.DeviceId || r.deviceId || '').trim();
+          const e = byName[name] = byName[name] || { name, devices: new Set(), vendor: String(r.Vendor || r.vendor || r.Publisher || r.publisher || '').trim() || null };
+          if (dev) e.devices.add(dev);
+        });
+        const agents = Object.values(byName).map(e => ({ name: e.name, devices: [...e.devices], deviceCount: e.devices.size, vendor: e.vendor }));
+        STATE.data.localAiAgents = { ok: true, agents, total: agents.length, code: null, error: null,
+          note: 'Read from the AgentsInfo unified inventory (endpoint-sourced rows).' };
+        return STATE.data.localAiAgents;
+      }
+    }
+  } catch { /* AgentsInfo unavailable — fall through */ }
+
+  // Nothing found. If at least one query returned 200, the graph is reachable —
+  // report an informative empty state instead of an error.
+  if (anySuccess) {
+    STATE.data.localAiAgents = { ok: true, agents: [], total: 0, code: null, error: null,
+      note: 'Advanced Hunting is reachable but returned no endpoint AI-agent entries — the local-agent discovery preview may not be active for this tenant’s hunting tables yet, even when the AI Assets → Local agents tab shows agents. Check Defender AV active mode + current platform updates.' };
+    return STATE.data.localAiAgents;
+  }
+  const msg = lastErr?.message || 'unknown error';
+  STATE.data.localAiAgents = {
+    ...base,
+    code: lastErr?.status === 403 ? 'forbidden' : isUnsupportedErr(msg) ? 'unsupported' : 'error',
+    error: msg,
+  };
   return STATE.data.localAiAgents;
 }
 
@@ -2688,7 +2757,11 @@ function updateDashShadowKpi() {
   if (deltaEl) deltaEl.textContent = unsanctioned > 0 ? unsanctioned + ' unsanctioned' : '0 unsanctioned';
 }
 
-async function fetchMcasAppsFromGraph() {
+async function fetchMcasAppsFromGraph(period) {
+  // Default P90D: the portal's discovered-apps list uses a long window, and a
+  // 30-day traffic filter silently drops low-traffic apps (e.g. unreviewed
+  // local LLMs) from the inventory. The Shadow AI page has a period selector.
+  const p = period || STATE.mcasPeriod || 'P90D';
   const streamsResp = await gget(`${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams`);
   const streams = streamsResp.value || [];
   if (!streams.length) throw new Error('No cloud discovery streams found. Ensure Defender for Cloud Apps is connected and receiving data.');
@@ -2701,16 +2774,15 @@ async function fetchMcasAppsFromGraph() {
       // Prefer header surfaces evolvable-enum categories (aiModelProvider, mcpServer,
       // clientAiApp) instead of collapsing them to unknownFutureValue.
       const aiEnumHdr = { Prefer: 'include-unknown-enum-members' };
-      const period = STATE.mcasPeriod || 'P90D';
       let resp;
       try {
         resp = await gget(
-          `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${stream.id}/microsoft.graph.security.aggregatedAppsDetails(period=duration'${period}')?$top=500&$expand=userActivity`,
+          `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${stream.id}/microsoft.graph.security.aggregatedAppsDetails(period=duration'${p}')?$top=500&$expand=userActivity`,
           false, aiEnumHdr
         );
       } catch {
         resp = await gget(
-          `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${stream.id}/microsoft.graph.security.aggregatedAppsDetails(period=duration'${period}')?$top=500`,
+          `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${stream.id}/microsoft.graph.security.aggregatedAppsDetails(period=duration'${p}')?$top=500`,
           false, aiEnumHdr
         );
       }
@@ -3149,7 +3221,13 @@ function renderMcasApps(el, apps, mcasUrl) {
               })()}</td>
               <td><a href="https://security.microsoft.com/cloudapps/discovery" target="_blank" rel="noopener" title="Open Microsoft Defender → Cloud Apps → Cloud Discovery → Discovered apps, then select &quot;${esc(name)}&quot;" style="font-size:11px;color:var(--accent-blue);text-decoration:none;white-space:nowrap">Review ↗</a></td>
             </tr>`;
-          }).join('') || '<tr><td colspan="9" class="empty-state text-muted">No Generative AI apps discovered</td></tr>'}
+          }).join('') || `<tr><td colspan="9" class="empty-state text-muted">${activeFilter === 'new'
+            ? '✅ No new apps since the last assessment — <a href="#" onclick="mcasFilterBy(\'all\');return false" style="color:var(--accent-blue)">show all</a>'
+            : activeFilter === 'review'
+              ? '✅ Nothing needs review — every discovered app is sanctioned or protected — <a href="#" onclick="mcasFilterBy(\'all\');return false" style="color:var(--accent-blue)">show all</a>'
+              : activeFilter !== 'all'
+                ? 'No apps in this category — <a href="#" onclick="mcasFilterBy(\'all\');return false" style="color:var(--accent-blue)">show all</a>'
+                : 'No Generative AI apps discovered'}</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -3782,7 +3860,7 @@ async function loadModels() {
         <div class="card-header">
           <div class="card-title">💻 Local AI on Endpoints${localAi?.ok ? ` (${localAi.agents.length})` : ''}</div>
           <span class="data-source ${localAi?.ok ? 'source-live' : 'source-derived'}" style="font-size:10px">
-            ${localAi?.ok ? '● Defender for Endpoint · ExposureGraph (P30D)' : '⚡ Defender for Endpoint local AI discovery'}</span>
+            ${localAi?.ok ? '● Defender for Endpoint · Advanced Hunting' : '⚡ Defender for Endpoint local AI discovery'}</span>
         </div>
         ${localAi?.ok
           ? (localAi.agents.length ? `
@@ -3801,19 +3879,19 @@ async function loadModels() {
               return `<tr>
                 <td><strong style="font-size:13px">${esc(a.name)}</strong></td>
                 <td>${known ? esc(det.model) : '<span class="text-muted">—</span>'}</td>
-                <td class="text-muted">${known ? esc(det.provider) : 'Local endpoint'}</td>
+                <td class="text-muted">${known ? esc(det.provider) : esc(a.vendor || 'Local endpoint')}</td>
                 <td class="mono" style="font-size:11px">${esc(residency)} ${isLocalRes ? '<span class="text-low">✅ on-device</span>' : '<span class="text-critical">❌ cloud egress</span>'}</td>
-                <td style="font-size:12px"><strong>${a.deviceCount}</strong>${devNames ? `<br><span class="text-muted" style="font-size:10px" title="${esc((a.devices || []).join(', '))}">${devNames}${a.devices.length > 3 ? ` +${a.devices.length - 3} more` : ''}</span>` : ''}</td>
+                <td style="font-size:12px"><strong>${a.deviceCount || '—'}</strong>${devNames ? `<br><span class="text-muted" style="font-size:10px" title="${esc((a.devices || []).join(', '))}">${devNames}${a.devices.length > 3 ? ` +${a.devices.length - 3} more` : ''}</span>` : ''}</td>
               </tr>`;
             }).join('')}
             </tbody>
           </table>
         </div>
         <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
-          ℹ️ Source: <code>ExposureGraphEdges</code> (endpointAiAgent → runs on) · discovery-only preview — no posture assessment or alerts for endpoint agents.
+          ℹ️ ${localAi.note ? esc(localAi.note) + ' · ' : ''}Source: Defender for Endpoint local-agent discovery (exposure graph / AgentsInfo) · discovery-only preview — no posture assessment or alerts for endpoint agents.
           <a href="https://security.microsoft.com/v2/aiassets" target="_blank" rel="noopener" style="color:var(--accent-blue);margin-left:6px">Open AI Assets ↗</a>
         </div>`
-            : `<div class="card-body"><div class="empty-state text-muted">✅ No local AI agents discovered on onboarded endpoints (last 30 days).</div></div>`)
+            : `<div class="card-body"><div class="empty-state text-muted">${localAi.note ? 'ℹ️ ' + esc(localAi.note) : '✅ No local AI agents discovered on onboarded endpoints.'}<br><a href="https://security.microsoft.com/v2/aiassets" target="_blank" rel="noopener" style="color:var(--accent-blue);font-size:11px">Compare with AI Assets → Local agents ↗</a></div></div>`)
           : `<div class="card-body" style="font-size:12px;color:var(--text-muted)">
               ${localAi?.code === 'forbidden'
                 ? '🔒 Needs <code>ThreatHunting.Read.All</code> — re-run admin consent, then sign out &amp; back in, to read local AI agents discovered by Defender for Endpoint.'
