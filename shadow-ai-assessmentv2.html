@@ -1586,6 +1586,7 @@ async function fetchDefenderAiAgentsList() {
     const raw = JSON.stringify(row || '');
     const name = String(pick(row, ['AgentName', 'agentName', 'DisplayName', 'displayName', 'Name', 'name']) || ('Agent ' + (idx + 1)));
     const modelHint = String(pick(row, ['Model', 'model', 'ModelName', 'modelName', 'ProviderModel', 'providerModel']) || '').trim();
+    const modelVersion = String(pick(row, ['ModelVersion', 'modelVersion']) || '').trim();
     const providerHint = String(pick(row, ['Provider', 'provider', 'ModelProvider', 'modelProvider']) || '').trim();
     const modelInfo = modelHint || providerHint
       ? detectModel((modelHint + ' ' + providerHint).trim())
@@ -1604,6 +1605,7 @@ async function fetchDefenderAiAgentsList() {
       name,
       platform: inferPlatform(row, raw),
       modelHint: modelHint || null,
+      modelVersion: modelVersion || null,
       modelInfo,
       authType: authType || null,
       pubStatus: pubStatus || null,
@@ -1621,6 +1623,62 @@ async function fetchDefenderAiAgentsList() {
     error: null,
   };
   return STATE.data.defenderAgentList;
+}
+
+// Local AI agents & runtimes (Ollama, LM Studio, desktop assistants, IDE agents)
+// automatically discovered on onboarded devices by Defender for Endpoint (preview).
+// Read from the exposure graph via Advanced Hunting — same ThreatHunting.Read.All
+// token as the AgentsInfo inventory. Requires MDE P2 / M365 E5 / Agent 365 / E7.
+async function fetchLocalAiAgents() {
+  if (STATE.data.localAiAgents !== undefined) return STATE.data.localAiAgents;
+  const base = { ok: false, agents: [], total: 0, code: 'error', error: null };
+  const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
+  if (!token) {
+    STATE.data.localAiAgents = { ...base, code: 'forbidden', error: 'ThreatHunting.Read.All not consented.' };
+    return STATE.data.localAiAgents;
+  }
+  const kql = [
+    'ExposureGraphEdges',
+    '| where SourceNodeLabel == "endpointAiAgent"',
+    '| where EdgeLabel =~ "runs on"',
+    '| summarize Devices = make_set(TargetNodeName), DeviceCount = dcount(TargetNodeName) by AIAgent = SourceNodeName',
+    '| sort by DeviceCount desc',
+  ].join(' ');
+  const isUnsupportedErr = msg => /failed to resolve table|could not be resolved|unknown table|does not refer to any known table|semantic error/i.test(msg || '');
+  try {
+    const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ Query: kql, Timespan: 'P30D' }),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      STATE.data.localAiAgents = {
+        ...base,
+        code: r.status === 403 ? 'forbidden' : isUnsupportedErr(text) ? 'unsupported' : 'error',
+        error: text.slice(0, 300),
+      };
+      return STATE.data.localAiAgents;
+    }
+    const data = await r.json();
+    const rows = Array.isArray(data.results) ? data.results : (Array.isArray(data.Results) ? data.Results : []);
+    const agents = rows.map(row => {
+      // make_set() may come back as a JSON array or a serialized string
+      let devices = row.Devices;
+      if (typeof devices === 'string') { try { devices = JSON.parse(devices); } catch { devices = [devices]; } }
+      devices = Array.isArray(devices) ? devices.map(String) : [];
+      return {
+        name: String(row.AIAgent || '').trim(),
+        devices,
+        deviceCount: Number(row.DeviceCount) || devices.length,
+      };
+    }).filter(a => a.name);
+    STATE.data.localAiAgents = { ok: true, agents, total: agents.length, code: null, error: null };
+  } catch (e) {
+    const msg = e.message || String(e);
+    STATE.data.localAiAgents = { ...base, code: isUnsupportedErr(msg) ? 'unsupported' : 'error', error: msg };
+  }
+  return STATE.data.localAiAgents;
 }
 
 // Web Grounding (Copilot web search) IS readable via the Copilot policy settings API —
@@ -3170,6 +3228,8 @@ function renderModelTable() {
     if (sources?.has('signin')) badges.push('<span class="badge" style="font-size:9px;background:rgba(163,113,247,.15);color:var(--accent-purple)">Sign-in</span>');
     if (sources?.has('mcas'))   badges.push('<span class="badge" style="font-size:9px;background:rgba(63,185,80,.15);color:var(--risk-low)">MCAS</span>');
     if (sources?.has('agent'))  badges.push('<span class="badge" style="font-size:9px;background:rgba(227,179,65,.15);color:var(--gold)">Agent</span>');
+    if (sources?.has('defender')) badges.push('<span class="badge" style="font-size:9px;background:rgba(248,81,73,.15);color:var(--risk-high)" title="Typed Model column from Defender AgentsInfo (Advanced Hunting)">Defender</span>');
+    if (sources?.has('local'))  badges.push('<span class="badge" style="font-size:9px;background:rgba(139,148,158,.18);color:var(--text-muted)" title="Discovered on endpoints by Defender for Endpoint">Local</span>');
     return badges.join(' ');
   };
 
@@ -3185,7 +3245,10 @@ function renderModelTable() {
       + '<td>' + (m.training==='Yes' ? '<span class="text-critical">⚠️ Yes</span>' : m.training==='No' ? '<span class="text-low">✅ No</span>' : '<span class="text-medium">⚡ ' + esc(m.training) + '</span>') + '</td>'
       + '<td>' + (m.gdprOk ? '<span class="text-low">✅</span>' : '<span class="text-critical">❌</span>') + '</td>'
       + '<td>' + riskCell + '</td>'
-      + '<td>' + srcBadgeInline(m.sources) + (m.mcasUsers ? '<span class="text-muted" style="font-size:10px;margin-left:4px">' + m.mcasUsers + ' users</span>' : '') + '</td>'
+      + '<td>' + srcBadgeInline(m.sources)
+        + (m.mcasUsers ? '<span class="text-muted" style="font-size:10px;margin-left:4px">' + m.mcasUsers + ' users</span>' : '')
+        + (m.localDevices ? '<span class="text-muted" style="font-size:10px;margin-left:4px">' + m.localDevices + ' device' + (m.localDevices !== 1 ? 's' : '') + '</span>' : '')
+        + '</td>'
       + '</tr>';
   }).join('') || '<tr><td colspan="7" class="empty-state text-muted">No model data available</td></tr>';
 
@@ -3249,14 +3312,14 @@ function renderModelResidencyMap(models, tenantRegion) {
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { subdomains: 'abcd', maxZoom: 19 }).addTo(map);
   STATE.residencyMap = map;
 
-  // Tenant region — shaded circle, green when inside the EU data boundary
+  // Tenant region — small dot + label (no shaded area circle), green when inside the EU boundary
   const tCol = tEu === true ? '#3fb950' : tEu === false ? '#f0883e' : '#8b949e';
   const bounds = [[tLat, tLng]];
-  L.circle([tLat, tLng], { radius: 900000, color: tCol, weight: 1.5, opacity: .85, fillColor: tCol, fillOpacity: .18 })
+  L.circleMarker([tLat, tLng], { radius: 6, color: '#0d1117', weight: 2, fillColor: tCol, fillOpacity: 1 })
     .bindTooltip(`<strong>Tenant · ${esc(tName)}</strong><br>${tEu === true ? 'EU / EEA data boundary' : tEu === false ? 'outside EU' : 'region unverified'}`,
       { direction: 'top', className: 'leaflet-dark-tooltip', sticky: true }).addTo(map);
   L.marker([tLat, tLng], { interactive: false, icon: L.divIcon({ className: '', iconSize: [0, 0],
-    html: `<div style="transform:translate(-50%,-50%);color:${tCol};font-weight:800;font-size:14px;white-space:nowrap;text-shadow:0 1px 5px #000">${esc(tName)}</div>` }) }).addTo(map);
+    html: `<div style="transform:translate(-50%,-170%);color:${tCol};font-weight:800;font-size:14px;white-space:nowrap;text-shadow:0 1px 5px #000">${esc(tName)}</div>` }) }).addTo(map);
 
   // Group detected models by where their prompts are processed
   const byGeo = {};
@@ -3302,8 +3365,12 @@ async function loadModels() {
           return STATE.data.mcasApps;
         }).catch(() => []);
 
-    const [sps, signIns, mcasApps, tenantRegion] = await Promise.all([
+    const [sps, signIns, mcasApps, tenantRegion, defenderList, localAi] = await Promise.all([
       fetchServicePrincipals(), fetchSignIns(), mcasPromise, fetchTenantRegion().catch(() => null),
+      // Both use the silently-acquired ThreatHunting.Read.All token and degrade
+      // gracefully (code: forbidden/unsupported) when it isn't available.
+      fetchDefenderAiAgentsList().catch(() => ({ ok: false, agents: [], code: 'error' })),
+      fetchLocalAiAgents().catch(() => ({ ok: false, agents: [], code: 'error' })),
     ]);
     const aiApps = sps.filter(isAiApp);
 
@@ -3341,6 +3408,50 @@ async function loadModels() {
     aiApps.forEach(a => addToMap(a.displayName, 'sp'));
     Object.keys(modelCounts).forEach(name => addToMap(name, 'signin'));
     mcasAiApps.forEach(a => addToMap(a.name, 'mcas', a));
+
+    // ── Defender AgentsInfo — typed Model/Version columns ─────────────────
+    // Authoritative model data for Copilot Studio / Foundry / M365 Copilot /
+    // Agent 365 SDK agents. Only rows with an explicit Model column are merged
+    // (the raw-row regex fallback in fetchDefenderAiAgentsList is too speculative).
+    if (defenderList?.ok) {
+      defenderList.agents.forEach(a => {
+        if (!a.modelHint) return;
+        const det = a.modelInfo && a.modelInfo.model !== 'Unknown' ? a.modelInfo : null;
+        // Unmatched model names on Microsoft-hosted platforms (gpt-4o, phi-4 … in
+        // Copilot Studio / Foundry) are Azure-hosted — same defaults as inferAgentModel.
+        const msHosted = /copilot studio|foundry|azure/i.test(a.platform || '');
+        const info = det || {
+          model: a.modelHint + (a.modelVersion ? ' ' + a.modelVersion : ''),
+          provider: msHosted ? 'Microsoft (' + a.platform + ')' : (a.platform || 'Defender AI Assets'),
+          residency: msHosted ? 'EU possible' : 'Unknown',
+          training: msHosted ? 'No' : 'Unknown',
+          gdprOk: msHosted, risk: msHosted ? 'low' : 'medium',
+        };
+        const key = modelMapKey(info);
+        if (!modelMap[key]) modelMap[key] = { ...info, apps: [], calls: 0, sources: new Set(), mcasUsers: 0, mcasTraffic: 0 };
+        modelMap[key].apps.push(a.name);
+        modelMap[key].sources.add('defender');
+        modelMap[key].agentCount = (modelMap[key].agentCount || 0) + 1;
+      });
+    }
+
+    // ── Local endpoint AI (Defender for Endpoint discovery, preview) ──────
+    // Known cloud clients (e.g. Claude Desktop) map to their cloud model — the
+    // prompts still leave the device; unknown runtimes stay local/self-hosted.
+    if (localAi?.ok) {
+      localAi.agents.forEach(a => {
+        const det = detectModel(a.name || '');
+        const info = det.model !== 'Unknown' ? det : {
+          model: a.name, provider: 'Local endpoint', residency: 'Local / self-hosted',
+          training: 'Unknown', gdprOk: true, risk: 'medium',
+        };
+        const key = modelMapKey(info);
+        if (!modelMap[key]) modelMap[key] = { ...info, apps: [], calls: 0, sources: new Set(), mcasUsers: 0, mcasTraffic: 0 };
+        modelMap[key].apps.push(a.name);
+        modelMap[key].sources.add('local');
+        modelMap[key].localDevices = (modelMap[key].localDevices || 0) + (a.deviceCount || 0);
+      });
+    }
 
     // ── Agent model inference ──────────────────────────────────────────────
     // Copilot Studio and AI Foundry agents use Azure OpenAI models.
@@ -3418,6 +3529,7 @@ async function loadModels() {
       return 'Outside EU';
     };
     const RES_ORDER = ['EU','Local','Outside EU','Unknown'];
+    const RES_COLORS = { EU:'#3fb950', Local:'#388bfd', 'Outside EU':'#f85149', Unknown:'#8b949e' };
     const resCounts = { EU:0, Local:0, 'Outside EU':0, Unknown:0 };
     models.forEach(m => { resCounts[residencyBucket(m)]++; });
 
@@ -3425,7 +3537,7 @@ async function loadModels() {
       ${STATE.data.signInsError ? permWarn('AuditLog.Read.All', STATE.data.signInsError) : ''}
       <div class="section-header">
         <div class="section-title">AI Models in Use — Shadow &amp; Sanctioned</div>
-        <span class="data-source source-live">● Sign-in logs · Service principals${mcasAiApps.length ? ' · Defender for Cloud Apps' : ''}</span>
+        <span class="data-source source-live">● Sign-in logs · Service principals${mcasAiApps.length ? ' · Defender for Cloud Apps' : ''}${defenderList?.ok ? ' · Defender AI Assets' : ''}${localAi?.ok ? ' · Endpoints' : ''}</span>
       </div>
 
       <div class="kpi-row" style="grid-template-columns:repeat(5,1fr);margin-bottom:16px">
@@ -3465,8 +3577,12 @@ async function loadModels() {
         <div class="card">
           <div class="card-header"><div class="card-title">Data Residency of Models in Use</div><span class="text-muted" style="font-size:11px">all detection sources</span></div>
           <div class="card-body">
-            <div id="models-map" style="height:230px;border-radius:8px;overflow:hidden;border:1px solid var(--border);margin-bottom:12px"></div>
-            <div class="chart-container" style="height:170px"><canvas id="models-bar"></canvas></div>
+            <div id="models-map" style="height:280px;border-radius:8px;overflow:hidden;border:1px solid var(--border);margin-bottom:10px"></div>
+            <div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:2px 0 4px">
+              ${RES_ORDER.filter(k => resCounts[k] > 0).map(k =>
+                `<span style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted)"><span style="width:10px;height:10px;border-radius:50%;background:${RES_COLORS[k]};flex-shrink:0"></span>${k} <strong style="color:var(--text-primary)">(${resCounts[k]})</strong></span>`
+              ).join('') || '<span style="font-size:12px;color:var(--text-dim)">No models detected</span>'}
+            </div>
           </div>
         </div>
         <div class="card">
@@ -3481,6 +3597,52 @@ async function loadModels() {
             </table>
           </div>
         </div>
+      </div>
+
+      <!-- Local AI on endpoints (Defender for Endpoint discovery · preview) -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">💻 Local AI on Endpoints${localAi?.ok ? ` (${localAi.agents.length})` : ''}</div>
+          <span class="data-source ${localAi?.ok ? 'source-live' : 'source-derived'}" style="font-size:10px">
+            ${localAi?.ok ? '● Defender for Endpoint · ExposureGraph (P30D)' : '⚡ Defender for Endpoint local AI discovery'}</span>
+        </div>
+        ${localAi?.ok
+          ? (localAi.agents.length ? `
+        <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">
+          Local AI agents, runtimes and MCP servers automatically discovered on onboarded devices. Known cloud clients (e.g. Claude Desktop) still send prompts to their provider — check the mapped residency.
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Agent / Runtime</th><th>Mapped Model</th><th>Provider</th><th>Data Residency</th><th>Devices</th></tr></thead>
+            <tbody>${localAi.agents.map(a => {
+              const det = detectModel(a.name || '');
+              const known = det.model !== 'Unknown';
+              const residency = known ? det.residency : 'Local / self-hosted';
+              const isLocalRes = /local|self-?hosted/i.test(residency);
+              const devNames = (a.devices || []).slice(0, 3).map(esc).join(', ');
+              return `<tr>
+                <td><strong style="font-size:13px">${esc(a.name)}</strong></td>
+                <td>${known ? esc(det.model) : '<span class="text-muted">—</span>'}</td>
+                <td class="text-muted">${known ? esc(det.provider) : 'Local endpoint'}</td>
+                <td class="mono" style="font-size:11px">${esc(residency)} ${isLocalRes ? '<span class="text-low">✅ on-device</span>' : '<span class="text-critical">❌ cloud egress</span>'}</td>
+                <td style="font-size:12px"><strong>${a.deviceCount}</strong>${devNames ? `<br><span class="text-muted" style="font-size:10px" title="${esc((a.devices || []).join(', '))}">${devNames}${a.devices.length > 3 ? ` +${a.devices.length - 3} more` : ''}</span>` : ''}</td>
+              </tr>`;
+            }).join('')}
+            </tbody>
+          </table>
+        </div>
+        <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
+          ℹ️ Source: <code>ExposureGraphEdges</code> (endpointAiAgent → runs on) · discovery-only preview — no posture assessment or alerts for endpoint agents.
+          <a href="https://security.microsoft.com/v2/aiassets" target="_blank" rel="noopener" style="color:var(--accent-blue);margin-left:6px">Open AI Assets ↗</a>
+        </div>`
+            : `<div class="card-body"><div class="empty-state text-muted">✅ No local AI agents discovered on onboarded endpoints (last 30 days).</div></div>`)
+          : `<div class="card-body" style="font-size:12px;color:var(--text-muted)">
+              ${localAi?.code === 'forbidden'
+                ? '🔒 Needs <code>ThreatHunting.Read.All</code> — re-run admin consent, then sign out &amp; back in, to read local AI agents discovered by Defender for Endpoint.'
+                : localAi?.code === 'unsupported'
+                  ? 'ℹ️ Local AI agent discovery (preview) isn&#39;t available in this tenant — it requires Defender for Endpoint P2 / M365 E5 / Agent 365 / E7 with onboarded devices running Defender AV in active mode.'
+                  : 'ℹ️ Local AI agent data unavailable — ' + esc(String(localAi?.error || 'unknown error').slice(0, 160))}
+            </div>`}
       </div>
 
       <div class="card">
@@ -3638,30 +3800,8 @@ async function loadModels() {
 
     renderModelTable();
 
-    // Chart — data-residency distribution across ALL detected models (sign-ins,
-    // service principals AND Cloud Discovery), so shadow models aren't hidden the way
-    // a sign-in-only chart hides everything that doesn't authenticate through Entra.
-    destroyChart('models-bar');
-    {
-      const RES_COLORS = { EU:'#3fb950', Local:'#388bfd', 'Outside EU':'#f85149', Unknown:'#8b949e' };
-      const resLabels = RES_ORDER.filter(k => resCounts[k] > 0);
-      const canvas = document.getElementById('models-bar');
-      if (resLabels.length && canvas) {
-        STATE.charts['models-bar'] = new Chart(canvas, {
-          type: 'doughnut',
-          data: {
-            labels: resLabels.map(k => `${k} (${resCounts[k]})`),
-            datasets: [{ data: resLabels.map(k => resCounts[k]), backgroundColor: resLabels.map(k => RES_COLORS[k]), borderWidth: 0 }],
-          },
-          options: { responsive:true, maintainAspectRatio:false, cutout:'58%',
-            plugins:{ legend:{ position:'right', labels:{ boxWidth:10, padding:10, font:{size:11} } } } },
-        });
-      } else if (canvas) {
-        canvas.parentElement.innerHTML = '<div class="empty-state text-muted" style="padding:40px">No models detected</div>';
-      }
-    }
-
-    // World map above the donut — tenant region + model-residency egress arcs
+    // World map — tenant region + model-residency egress arcs; the residency
+    // counts render as a static legend baked into the card body above.
     renderModelResidencyMap(models, tenantRegion);
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
