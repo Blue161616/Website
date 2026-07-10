@@ -432,7 +432,7 @@
       <button class="nav-item" onclick="navigate('models',this)"><span class="nav-icon">🤖</span>AI Models</button>
       <button class="nav-item" onclick="navigate('agents',this)"><span class="nav-icon">⚡</span>AI Agents</button>
       <button class="nav-item" onclick="navigate('copilot',this)"><span class="nav-icon">💬</span>Copilot Usage</button>
-      <div class="nav-section-label">Data Protection</div>
+      <div class="nav-section-label">Data Security</div>
       <button class="nav-item" onclick="navigate('sharing',this)"><span class="nav-icon">🌐</span>External Sharing</button>
       <button class="nav-item" onclick="navigate('labels',this)"><span class="nav-icon">🏷️</span>Sensitivity Labels</button>
       <button class="nav-item" onclick="navigate('data-risk',this)"><span class="nav-icon">🔐</span>Data Risk</button>
@@ -5688,7 +5688,59 @@ const DATA_REACH_CATS = [
   { key:'directory',  label:'Directory / HR',      icon:'👥', scopes:['User.Read.All','User.ReadWrite.All','Directory.Read.All','Directory.ReadWrite.All','People.Read.All','OrgContact.Read.All'] },
 ];
 
-function renderDataReachabilityHtml(agentSps, grants, appPerms) {
+// Which reachability categories CloudAppEvents can actually evidence. Files, mail
+// and Teams surface in Office 365 activity; calendar & directory reads don't, so
+// those columns stay permission-only (clearly marked).
+const REACH_EVIDENCE_CAT = { sharepoint: 'files', mail: 'mail', teams: 'teams' };
+
+// Broad activity evidence per app across files / mail / Teams (30d). Same silent
+// ThreatHunting.Read.All token as the other Advanced Hunting cards.
+async function fetchAiActivityEvidence(appIds) {
+  if (STATE.data.aiActivityEvidence !== undefined) return STATE.data.aiActivityEvidence;
+  const base = { ok: false, byAppId: {}, code: 'error', error: null };
+  const ids = [...new Set((appIds || []).filter(Boolean).map(s => String(s).toLowerCase()))].slice(0, 40);
+  if (!ids.length) { STATE.data.aiActivityEvidence = { ok: true, byAppId: {}, code: null, error: null }; return STATE.data.aiActivityEvidence; }
+  const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
+  if (!token) { STATE.data.aiActivityEvidence = { ...base, code: 'forbidden', error: 'ThreatHunting.Read.All not consented.' }; return STATE.data.aiActivityEvidence; }
+  const kql = [
+    'CloudAppEvents',
+    '| where Timestamp > ago(30d)',
+    '| extend OAuthAppId = tolower(tostring(RawEventData.ApplicationId))',
+    `| where OAuthAppId in (${ids.map(i => `"${i}"`).join(',')})`,
+    '| extend Cat = case(',
+    '    ActionType has_any("File","Sync","Sharing"), "files",',
+    '    ActionType has "Mail" or ActionType == "Send", "mail",',
+    '    ActionType has_any("Message","Chat","Channel","Team"), "teams",',
+    '    "other")',
+    '| where Cat != "other"',
+    '| summarize Events = count(), Last = max(Timestamp) by OAuthAppId, Cat',
+  ].join(' ');
+  const isUnsupportedErr = msg => /failed to resolve table|could not be resolved|unknown table|does not refer to any known table|semantic error|failed to resolve scalar/i.test(msg || '');
+  try {
+    const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ Query: kql, Timespan: 'P30D' }),
+    });
+    if (!r.ok) { const t = await r.text(); STATE.data.aiActivityEvidence = { ...base, code: r.status === 403 ? 'forbidden' : isUnsupportedErr(t) ? 'unsupported' : 'error', error: t.slice(0, 300) }; return STATE.data.aiActivityEvidence; }
+    const data = await r.json();
+    const rows = Array.isArray(data.results) ? data.results : (Array.isArray(data.Results) ? data.Results : []);
+    const byAppId = {};
+    rows.forEach(row => {
+      const id = String(row.OAuthAppId || '').toLowerCase();
+      const cat = String(row.Cat || '');
+      if (!id || !cat) return;
+      (byAppId[id] = byAppId[id] || {})[cat] = { events: Number(row.Events) || 0, last: row.Last || null };
+    });
+    STATE.data.aiActivityEvidence = { ok: true, byAppId, code: null, error: null };
+  } catch (e) {
+    const msg = e.message || String(e);
+    STATE.data.aiActivityEvidence = { ...base, code: isUnsupportedErr(msg) ? 'unsupported' : 'error', error: msg };
+  }
+  return STATE.data.aiActivityEvidence;
+}
+
+// evidence: result of fetchAiActivityEvidence, or null for permission-only mode.
+function renderDataReachabilityHtml(agentSps, grants, appPerms, evidence) {
   const rows = agentSps.map(sp => {
     const delegated = getScopesForSp(sp.id, grants);
     const appRoles  = (appPerms?.[sp.id] || []).map(p => p.role);
@@ -5700,22 +5752,65 @@ function renderDataReachabilityHtml(agentSps, grants, appPerms) {
 
   const totalExposed = rows.length;
   const highRisk = rows.filter(r => r.cats.length >= 3).length;
+  const evOk  = evidence?.ok;
+  const evFor = id => evOk ? (evidence.byAppId[(id || '').toLowerCase()] || null) : null;
+  // Confirmed = has scope AND observed activity in an evidence-capable category
+  const confirmedAgents = evOk ? rows.filter(r => {
+    const e = evFor(r.sp.appId); if (!e) return false;
+    return r.cats.some(c => { const ek = REACH_EVIDENCE_CAT[c.key]; return ek && e[ek]?.events > 0; });
+  }).length : 0;
+
+  const headline = evOk
+    ? (confirmedAgents > 0
+        ? `<span style="font-size:11px;color:var(--risk-critical)">🔴 ${confirmedAgents} agent${confirmedAgents !== 1 ? 's' : ''} observed actually accessing data · ${totalExposed} with permissions</span>`
+        : `<span style="font-size:11px;color:var(--risk-low)">✅ No observed data access · ${totalExposed} agent${totalExposed !== 1 ? 's' : ''} hold reach permissions</span>`)
+    : (totalExposed > 0
+        ? `<span style="font-size:11px;color:var(--risk-high)">${totalExposed} agent${totalExposed !== 1 ? 's' : ''} can reach sensitive data · ${highRisk} with 3+ categories</span>`
+        : '<span style="font-size:11px;color:var(--risk-low)">✅ No agents with sensitive data access detected</span>');
+
+  const cell = (r, c) => {
+    const match = r.cats.find(rc => rc.key === c.key);
+    if (!match) return '<td style="text-align:center;color:var(--text-dim);font-size:12px">—</td>';
+    const matchedScopes = match.scopes.filter(s => r.allPerms.has(s));
+    const ek = REACH_EVIDENCE_CAT[c.key];
+    const e  = evFor(r.sp.appId);
+    if (evOk && ek) {
+      const hit = e?.[ek];
+      if (hit?.events > 0) {
+        const rel = mcasRelTime(hit.last);
+        return `<td style="text-align:center" title="${esc(matchedScopes.join(', '))} · ${hit.events} event${hit.events !== 1 ? 's' : ''}${rel ? ' · ' + rel : ''}"><span style="color:var(--risk-critical);font-size:15px">✦</span><br><span style="font-size:9px;color:var(--risk-critical)">${hit.events} obs</span></td>`;
+      }
+      // scope but no observed activity → potential only
+      return `<td style="text-align:center" title="${esc(matchedScopes.join(', '))} · no activity observed in 30d"><span style="color:var(--text-dim);font-size:14px">◇</span></td>`;
+    }
+    // evidence not available for this category (calendar/directory) or not loaded
+    return `<td style="text-align:center" title="${esc(matchedScopes.join(', '))}${evOk ? ' · no activity evidence for this category' : ''}"><span style="color:${evOk ? 'var(--risk-medium)' : 'var(--risk-high)'};font-size:14px">✦</span></td>`;
+  };
+
+  const legend = evOk
+    ? '<span style="color:var(--risk-critical)">✦ observed</span> · <span style="color:var(--text-dim)">◇ permission, no activity (files/mail/Teams)</span> · <span style="color:var(--risk-medium)">✦ permission only (calendar/directory)</span>'
+    : (evidence
+        ? `⚠️ Activity evidence unavailable (${evidence.code === 'forbidden' ? 'needs ThreatHunting.Read.All' : evidence.code === 'unsupported' ? 'connect the Office 365 connector in Defender for Cloud Apps' : 'query error'}) — showing potential access from permissions only.`
+        : 'Loading activity evidence…');
 
   return '<div class="card">'
     + '<div class="card-header">'
-    + '<div class="card-title">📂 Sensitive Data Reachability</div>'
+    + '<div class="card-title">📂 Data Reachability — Observed vs Potential</div>'
     + '<div style="display:flex;align-items:center;gap:10px">'
-    + (totalExposed > 0
-        ? '<span style="font-size:11px;color:var(--risk-high)">' + totalExposed + ' agent' + (totalExposed > 1 ? 's' : '') + ' can reach sensitive data · ' + highRisk + ' with 3+ categories</span>'
-        : '<span style="font-size:11px;color:var(--risk-low)">✅ No agents with sensitive data access detected</span>')
-    + '<span class="data-source source-live">● appRoleAssignments · oauth2PermissionGrants</span>'
+    + headline
+    + `<span class="data-source ${evOk ? 'source-live' : 'source-derived'}">${evOk ? '● CloudAppEvents × grants' : '⚡ appRoleAssignments · oauth2PermissionGrants'}</span>`
     + '</div>'
     + '</div>'
     + (rows.length ? (
-        '<div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Based on delegated grants and application permissions. Shows which data categories each agent can access.</div>'
+        `<div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">${legend}</div>`
       + '<div class="table-wrap"><table>'
       + '<thead><tr><th>Agent</th>'
-      + DATA_REACH_CATS.map(c => '<th style="text-align:center;white-space:nowrap">' + c.icon + ' ' + c.label + '</th>').join('')
+      + DATA_REACH_CATS.map(c => {
+          const link = c.key === 'sharepoint'
+            ? ` <a onclick="navigate('sharing', document.querySelector('[onclick*=sharing]'))" style="color:var(--accent-blue);cursor:pointer;font-size:9px;font-weight:400" title="File-access deep-dive with evidence & sharing settings">(details ↗)</a>`
+            : '';
+          return '<th style="text-align:center;white-space:nowrap">' + c.icon + ' ' + c.label + link + '</th>';
+        }).join('')
       + '</tr></thead><tbody>'
       + rows.map(r => {
           const typeInfo = getAgentType(r.sp);
@@ -5725,17 +5820,11 @@ function renderDataReachabilityHtml(agentSps, grants, appPerms) {
             + '<span style="font-size:10px;color:var(--text-muted);margin-left:6px">' + esc(typeInfo.label || typeInfo.type) + '</span>'
             + (r.cats.length >= 3 ? '<span class="badge badge-high" style="font-size:10px;margin-left:6px">⚠️ Broad access</span>' : '')
             + '</td>'
-            + DATA_REACH_CATS.map(c => {
-                const match = r.cats.find(rc => rc.key === c.key);
-                if (!match) return '<td style="text-align:center;color:var(--text-dim);font-size:12px">—</td>';
-                const matchedScopes = match.scopes.filter(s => r.allPerms.has(s));
-                return '<td style="text-align:center" title="' + esc(matchedScopes.join(', ')) + '">'
-                  + '<span style="color:var(--risk-high);font-size:14px" title="' + esc(matchedScopes.join(', ')) + '">✦</span>'
-                  + '</td>';
-              }).join('')
+            + DATA_REACH_CATS.map(c => cell(r, c)).join('')
             + '</tr>';
         }).join('')
       + '</tbody></table></div>'
+      + `<div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">ℹ️ <strong>Observed</strong> = the agent's OAuth id actually appears in <code>CloudAppEvents</code> for that category in 30 days. Calendar &amp; Directory have no Office-365 activity signal, so they stay permission-only. Files drill down on <a onclick="navigate('sharing', document.querySelector('[onclick*=sharing]'))" style="color:var(--accent-blue);cursor:pointer">External Sharing</a>.</div>`
     ) : '<div class="card-body"><div class="empty-state text-muted">No agents with access to sensitive data categories detected.</div></div>')
     + '</div>';
 }
@@ -5925,6 +6014,13 @@ async function loadDataRisk() {
       ${STATE.data.riskyUsersError ? permWarn('IdentityRiskyUser.Read.All', STATE.data.riskyUsersError) : ''}
       ${STATE.data.riskyAgentsError ? permWarn('IdentityRiskyAgent.Read.All', STATE.data.riskyAgentsError) : ''}
 
+      <div class="section-header" style="margin-bottom:12px">
+        <div>
+          <div class="section-title">AI Permissions &amp; Identity Risk</div>
+          <div class="section-sub">The control plane across <strong>all</strong> data categories — who &amp; what can touch data, which agents hold platform-blocked permissions, and which identities are compromised. Files-specific evidence &amp; sharing settings live on <a onclick="navigate('sharing', document.querySelector('[onclick*=sharing]'))" style="color:var(--accent-blue);cursor:pointer">External Sharing</a>.</div>
+        </div>
+      </div>
+
       <div class="kpi-row" style="grid-template-columns:repeat(5,1fr)">
         <div class="kpi-card critical">
           <div class="kpi-label">Risky Sign-ins to AI Apps</div>
@@ -5958,7 +6054,7 @@ async function loadDataRisk() {
         </div>
       </div>
 
-      <div style="margin-bottom:16px">${renderDataReachabilityHtml(agentSps, grants, agentAppPerms)}</div>
+      <div id="data-reach-card" style="margin-bottom:16px">${renderDataReachabilityHtml(agentSps, grants, agentAppPerms, null)}</div>
 
       <div class="grid-2">
         <div class="card">
@@ -6090,6 +6186,13 @@ async function loadDataRisk() {
       </div>
     `;
     showDataRiskTab('reach');
+
+    // Evidence-back the reachability matrix async — turns "potential" into
+    // "observed" for files/mail/Teams from CloudAppEvents.
+    fetchAiActivityEvidence(agentSps.map(sp => sp.appId)).then(ev => {
+      const card = document.getElementById('data-reach-card');
+      if (card) card.innerHTML = renderDataReachabilityHtml(agentSps, grants, agentAppPerms, ev);
+    }).catch(() => {});
   } catch (e) {
     el.innerHTML = permWarn('Multiple permissions', e.message);
   }
