@@ -7333,16 +7333,96 @@ async function fetchNamedLocations() {
   return STATE.data.namedLocations;
 }
 
+// Shared Advanced Hunting runner (silent ThreatHunting.Read.All token, v1→beta,
+// graceful degrade). Returns { ok, rows, code, error }.
+async function runAgentHuntingQuery(kql) {
+  const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
+  if (!token) return { ok: false, code: 'forbidden', rows: [] };
+  const isUnsupportedErr = msg => /failed to resolve table|could not be resolved|unknown table|does not refer to any known table|semantic error|failed to resolve scalar|column.+(not found|does not exist)/i.test(msg || '');
+  let lastErr = null;
+  for (const endpoint of [`${GRAPH}/security/runHuntingQuery`, `${GRAPH_BETA}/security/runHuntingQuery`]) {
+    try {
+      const r = await fetch(endpoint, { method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ Query: kql, Timespan: 'P30D' }) });
+      if (!r.ok) { const t = await r.text(); if (r.status === 403) return { ok: false, code: 'forbidden', rows: [], error: t.slice(0, 200) }; if (isUnsupportedErr(t)) { lastErr = t; continue; } return { ok: false, code: 'error', rows: [], error: t.slice(0, 200) }; }
+      const data = await r.json();
+      return { ok: true, code: null, rows: Array.isArray(data.results) ? data.results : (Array.isArray(data.Results) ? data.Results : []) };
+    } catch (e) { lastErr = e.message; if (isUnsupportedErr(e.message)) continue; return { ok: false, code: 'error', rows: [], error: e.message }; }
+  }
+  return { ok: false, code: 'unsupported', rows: [], error: lastErr };
+}
+
+// Real-time protection audit/block events — recorded as behaviors in BehaviorInfo
+// (docs: security-for-ai/ai-agent-real-time-protection). Live proof the runtime
+// guardrails are firing, replacing the old "manual check" card.
+async function fetchAgentRuntimeBehaviors() {
+  if (STATE.data.agentBehaviors !== undefined) return STATE.data.agentBehaviors;
+  const kql = [
+    'BehaviorInfo',
+    '| where Timestamp > ago(30d)',
+    '| where Categories has_any("Agent","AI") or ActionType has_any("Agent","Prompt","Tool","Jailbreak","Injection") or ServiceSource has_any("Agent","AI")',
+    '| summarize Count=count(), Last=max(Timestamp) by ActionType, Categories',
+    '| order by Count desc | take 100',
+  ].join(' ');
+  const res = await runAgentHuntingQuery(kql);
+  if (!res.ok) { STATE.data.agentBehaviors = { ok: false, code: res.code, error: res.error }; return STATE.data.agentBehaviors; }
+  let total = 0, block = 0, audit = 0, last = null;
+  const byType = {};
+  res.rows.forEach(r => {
+    const c = Number(r.Count) || 0; total += c;
+    const sig = (String(r.ActionType || '') + ' ' + String(r.Categories || '')).toLowerCase();
+    if (/block|prevent|restrict|deny/.test(sig)) block += c; else audit += c;
+    const k = r.ActionType || 'behavior'; byType[k] = (byType[k] || 0) + c;
+    if (r.Last && (!last || r.Last > last)) last = r.Last;
+  });
+  const topTypes = Object.entries(byType).sort((a, b) => b[1] - a[1]).slice(0, 6);
+  STATE.data.agentBehaviors = { ok: true, total, block, audit, last, topTypes, code: null };
+  return STATE.data.agentBehaviors;
+}
+
+// Near-real-time agent threat detections — surfaced as alerts in AlertInfo.
+async function fetchAgentThreatAlerts() {
+  if (STATE.data.agentThreatAlerts !== undefined) return STATE.data.agentThreatAlerts;
+  const kql = [
+    'AlertInfo',
+    '| where Timestamp > ago(30d)',
+    '| where Title has_any("agent","prompt inject","jailbreak","XPIA","exfiltrat","credential","secret","poison") or Category has_any("AI","Agent")',
+    '| project Timestamp, Title, Severity, Category, ServiceSource',
+    '| order by Timestamp desc | take 50',
+  ].join(' ');
+  const res = await runAgentHuntingQuery(kql);
+  if (!res.ok) { STATE.data.agentThreatAlerts = { ok: false, code: res.code, error: res.error }; return STATE.data.agentThreatAlerts; }
+  const sev = { high: 0, medium: 0, low: 0, informational: 0 };
+  res.rows.forEach(r => { const s = String(r.Severity || '').toLowerCase(); if (s in sev) sev[s]++; else sev.informational++; });
+  STATE.data.agentThreatAlerts = { ok: true, total: res.rows.length, alerts: res.rows.slice(0, 12), sev, code: null };
+  return STATE.data.agentThreatAlerts;
+}
+
+// Purview-for-agents capabilities bundled in Agent 365 / Agent Frontier. Each maps
+// to a service-plan name pattern so we can show licensed-vs-provisioned per capability.
+const PURVIEW_AGENT_CAPS = [
+  { label: 'DSPM for AI',            re: /INFORMATION_PROTECTION_FOR_AGENTS/i, note: 'AI observability — risk overview across agents', link: 'https://purview.microsoft.com/datasecurityposturemanagement' },
+  { label: 'Data Loss Prevention',  re: /DATA_LOSS_PREVENTION_FOR_AGENTS/i,   note: 'Block agents accessing/sharing sensitive content', link: 'https://purview.microsoft.com/datalossprevention/policies', live: 'dlp' },
+  { label: 'Insider Risk (Risky AI)', re: /INSIDER_RISK_MANAGEMENT_FOR_AGENTS/i, note: 'Risky AI usage policy — applied by default', link: 'https://purview.microsoft.com/insiderriskmgmt' },
+  { label: 'Communication Compliance', re: /COMMUNICATION_COMPLIANCE_FOR_AGENTS/i, note: 'Monitor agent↔human interactions for violations', link: 'https://purview.microsoft.com/communicationcompliance' },
+  { label: 'eDiscovery',            re: /EDISCOVERY_FOR_AGENTS/i,             note: 'Search / preserve / export agent interactions', link: 'https://purview.microsoft.com/ediscovery' },
+  { label: 'Data Lifecycle',        re: /DATA_LIFECYCLE_MANAGEMENT_FOR_AGENTS/i, note: 'Retention & deletion for agent-generated content', link: 'https://purview.microsoft.com/datalifecyclemanagement' },
+  { label: 'Compliance Manager',    re: /COMPLIANCE_MANAGER_FOR_AGENTS/i,     note: 'AI-regulation assessments for agent instances', link: 'https://purview.microsoft.com/compliancemanager' },
+  { label: 'Audit',                 re: /AUDIT_FOR_AGENTS/i,                  note: 'Log all agent interactions (auto-enabled)', link: 'https://purview.microsoft.com/audit/auditsearch' },
+];
+
 async function loadProtection() {
   const el = document.getElementById('protection-content');
   el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Loading protection data…</div>';
   try {
-    const [caP, idpStats, skus, aiAgentInv, defenderAgentList] = await Promise.all([
+    const [caP, idpStats, skus, aiAgentInv, defenderAgentList, agentBehaviors, agentThreatAlerts, dlpScope] = await Promise.all([
       fetchCAPolicies(),
       fetchIdProtectionAgentStats(),
       fetchSubscribedSkus(),
       fetchAiAgentInventory(),
       fetchDefenderAiAgentsList(),
+      fetchAgentRuntimeBehaviors().catch(() => ({ ok: false, code: 'error' })),   // BehaviorInfo (runtime audit/block)
+      fetchAgentThreatAlerts().catch(() => ({ ok: false, code: 'error' })),        // AlertInfo (agent threat alerts)
+      fetchDlpProtectionScope().catch(() => null),                                 // Purview DLP-for-AI live coverage
     ]);
 
     // Agent 365 protections require a Microsoft 365 E7 (any variant), Agent 365, or Agent Frontier license.
@@ -7405,9 +7485,9 @@ async function loadProtection() {
       <div class="section-header" style="margin-bottom:14px">
         <div>
           <div class="section-title">🛡️ Agent 365 Protections</div>
-          <div class="section-sub">Microsoft protections for AI agents across two product families — Microsoft Entra ID (identity &amp; access) and Microsoft Defender XDR (inventory &amp; runtime).</div>
+          <div class="section-sub">Microsoft protections for AI agents across three product families — Microsoft Entra ID (identity &amp; access), Microsoft Defender XDR (inventory &amp; runtime), and Microsoft Purview (data security &amp; compliance).</div>
         </div>
-        <span class="data-source source-live">● Entra · Defender XDR</span>
+        <span class="data-source source-live">● Entra · Defender XDR · Purview</span>
       </div>
 
       ${!agentLicensed
@@ -7670,21 +7750,87 @@ async function loadProtection() {
             ✅ <strong>Security for AI agents — Live via Advanced Hunting</strong><span style="font-size:11px;color:var(--text-muted);margin-left:10px">${hasRecentAgents ? 'Confirmed from active agents in the last 30 days' : 'Connected, but no active agents observed in the last 30 days'}</span>
           </div>` : '';
 
+        // ── Real-time protection — LIVE from BehaviorInfo (audit/block) + AlertInfo ──
+        const rt = agentBehaviors, al = agentThreatAlerts;
+        const rtLive = rt?.ok || al?.ok;
+        const rtStat = (label, value, color, sub) => `<div><div style="font-size:11px;color:var(--text-muted);margin-bottom:2px">${label}</div><div style="font-size:22px;font-weight:700;color:${color};line-height:1">${value}</div><div style="font-size:10px;color:var(--text-dim);margin-top:2px">${sub}</div></div>`;
+        const realtimeHtml = !rtLive
+          ? card('⏱️', 'Real-time Protection (Agent Runtime)',
+              'Monitors agent action requests at runtime and raises alerts for data leakage, prompt injection, poisoning &amp; jailbreak. ' + ((rt?.code === 'forbidden' || al?.code === 'forbidden') ? 'Grant <code>ThreatHunting.Read.All</code> (re-run admin consent, then sign out &amp; back in) to read live audit/block behaviours &amp; alerts.' : 'Not available via Advanced Hunting in this tenant — verify in the Defender portal.'),
+              [
+                { label: 'Copilot Studio — Real-time protection',   note: 'Monitors agent action requests at runtime · blocks risky actions' },
+                { label: 'Microsoft Foundry — Real-time protection', note: 'Surfaces security alerts for data leakage, poisoning & jailbreak' },
+              ])
+          : `<div class="card" style="margin-bottom:16px">
+              <div class="card-header">
+                <div class="card-title">⏱️ Real-time Protection (Agent Runtime) — live</div>
+                <span class="data-source source-live" style="font-size:10px">● BehaviorInfo · AlertInfo · Advanced Hunting (P30D)</span>
+              </div>
+              <div class="card-body">
+                <div style="display:flex;align-items:flex-start;gap:24px;flex-wrap:wrap;margin-bottom:12px">
+                  ${rt?.ok ? rtStat('Audit events', rt.audit, rt.audit > 0 ? 'var(--accent-blue)' : 'var(--text-muted)', 'Runtime activity recorded (not blocked)') : ''}
+                  ${rt?.ok ? '<div style="width:1px;background:var(--border);height:44px"></div>' : ''}
+                  ${rt?.ok ? rtStat(rt.block > 0 ? '⚠️ Block events' : 'Block events', rt.block, rt.block > 0 ? 'var(--risk-high)' : 'var(--risk-low)', 'Risky actions prevented before execution') : ''}
+                  ${rt?.ok && al?.ok ? '<div style="width:1px;background:var(--border);height:44px"></div>' : ''}
+                  ${al?.ok ? rtStat(al.total > 0 ? '⚠️ Agent alerts' : 'Agent alerts', al.total, al.total > 0 ? 'var(--risk-high)' : 'var(--risk-low)', `${al.sev.high} high · ${al.sev.medium} medium (30d)`) : ''}
+                </div>
+                ${al?.ok && al.alerts.length ? `<div style="margin-bottom:10px"><div style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Recent agent threat detections</div>${al.alerts.map(a => { const s = String(a.Severity || 'medium').toLowerCase(); return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid rgba(48,54,61,.4);font-size:12px">${riskBadge(s === 'informational' ? 'info' : s)}<span style="flex:1">${esc(a.Title || '—')}</span><span class="mono text-muted" style="font-size:10px;white-space:nowrap">${a.Timestamp ? new Date(a.Timestamp).toLocaleDateString() : ''}</span></div>`; }).join('')}</div>` : ''}
+                ${(rt?.ok && rt.total === 0) && (!al?.ok || al.total === 0) ? '<div style="font-size:12px;color:var(--text-muted)">✅ Advanced Hunting reachable — no runtime audit/block behaviours or agent alerts in the last 30 days.</div>' : ''}
+                <div style="margin-top:10px;padding:8px 12px;border-radius:6px;background:rgba(240,136,62,.08);border:1px solid rgba(240,136,62,.25);font-size:11px;color:var(--risk-medium)">⚠️ Legacy Agent 365 <strong>Block</strong> rules stop blocking on <strong>1 July 2026</strong> — recreate them under Defender → Settings → Security for AI → Policies &amp; rules → Real-time protection to keep enforcement.</div>
+              </div>
+            </div>`;
+
         return toggleBanner + liveBlock
         + (huntingReachable ? '' : card('🗂️', 'AI Agent Inventory &amp; Posture — Configuration',
             'These connectors feed the inventory above. The <strong>Security for AI agents</strong> toggle and connector status are configuration that isn&#39;t exposed via Graph — verify in the Defender portal.',
             postureRows))
-        + card('⏱️', 'Real-time Protection (Agent Runtime)',
-          'Monitors agent action requests at runtime and raises alerts for data leakage, prompt injection, poisoning &amp; jailbreak. Not exposed via Graph — verify in the Defender portal.',
-          [
-            { label: 'Copilot Studio — Real-time protection',   note: 'Monitors agent action requests at runtime · blocks risky actions' },
-            { label: 'Microsoft Foundry — Real-time protection', note: 'Surfaces security alerts for data leakage, poisoning & jailbreak' },
-          ]);
+        + realtimeHtml;
       })()}
 
       <div style="margin-bottom:16px;padding:10px 12px;border-radius:6px;background:rgba(56,139,253,.06);border:1px solid rgba(56,139,253,.2);font-size:12px;color:var(--text-muted)">
         🔗 <strong>Where to check:</strong>
         <a href="https://security.microsoft.com/settings/security-for-ai" target="_blank" rel="noopener" style="color:var(--accent-blue);margin-left:6px">Microsoft Defender XDR → Settings → Security for AI agents →</a>
+      </div>
+
+      <div style="display:flex;align-items:center;gap:10px;margin:22px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--border)">
+        <span style="font-size:13px;font-weight:700;color:var(--risk-low)">🟢 Microsoft Purview</span>
+        <span style="font-size:11px;color:var(--text-muted)">Data security &amp; compliance for agents · agent instances are treated like users</span>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">🟢 Purview for Agents — Capability Coverage</div>
+          <span class="data-source source-live" style="font-size:10px">● subscribedSkus provisioning · protectionScopes/compute</span>
+        </div>
+        <div class="card-body">
+          <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px">
+            Agent 365 extends the full Purview stack to agents. A capability can be <strong>licensed but not provisioned</strong> (plan Disabled), so it isn't actually protecting agents yet. Policy <em>definitions</em> are portal/PowerShell-only — below is per-capability licensing + provisioning, plus <strong>live</strong> DLP-for-AI coverage.
+          </p>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+            ${PURVIEW_AGENT_CAPS.map(cap => {
+              const plan = (a365sku?.servicePlans || []).find(p => cap.re.test(p.servicePlanName || ''));
+              const prov = (plan?.provisioningStatus || '').toLowerCase();
+              const state = !plan ? 'none' : prov === 'success' ? 'ok' : 'disabled';
+              const cfg = { ok:['var(--risk-low)','✅ Active'], disabled:['var(--risk-medium)','◐ Licensed · not provisioned'], none:['var(--text-dim)','❌ Not licensed'] }[state];
+              let liveBadge = '';
+              if (cap.live === 'dlp' && dlpScope?.ok) {
+                liveBadge = dlpScope.configured
+                  ? `<span style="font-size:10px;color:var(--risk-low)"> · live: ${dlpScope.total} scope${dlpScope.total !== 1 ? 's' : ''}${dlpScope.blocking ? ' · blocking' : ''}</span>`
+                  : `<span style="font-size:10px;color:var(--risk-medium)"> · live: no scope for this user</span>`;
+              }
+              return `<div style="display:flex;align-items:center;justify-content:space-between;padding:9px 12px;border-radius:6px;background:var(--bg-secondary);border:1px solid var(--border)">
+                <div style="min-width:0"><span style="font-size:12px;font-weight:600">${esc(cap.label)}</span>${liveBadge}<br><span style="font-size:10px;color:var(--text-muted)">${esc(cap.note)}</span></div>
+                <a href="${cap.link}" target="_blank" rel="noopener" title="Open in Purview" style="text-align:right;white-space:nowrap;margin-left:10px;font-size:10px;color:${cfg[0]};text-decoration:none">${cfg[1]} ↗</a>
+              </div>`;
+            }).join('')}
+          </div>
+          ${!agentLicensed ? '<div style="margin-top:10px;font-size:11px;color:var(--risk-medium)">⚠️ No Agent 365 / Agent Frontier license detected — Purview-for-agents plans aren\'t available.</div>' : (agentPlans.disabled > 0 ? `<div style="margin-top:10px;font-size:11px;color:var(--risk-medium)">◐ ${agentPlans.disabled} of ${agentPlans.total} agent-protection plans are licensed but still <strong>Disabled</strong> — enable them so the capability actually protects agents.</div>` : '')}
+          <div style="margin-top:12px;font-size:11px;color:var(--text-dim)">
+            📍 Purview portal → <strong>DSPM → AI observability</strong> for the agent risk overview (oversharing · exfiltration · unethical behaviour). Include agent instances in IRM / DLP / Comm-Compliance / eDiscovery policies the same way you would a user.
+            &nbsp;·&nbsp;
+            <a href="https://learn.microsoft.com/purview/ai-agent-365" target="_blank" rel="noopener" style="color:var(--accent-blue)">Documentation →</a>
+          </div>
+        </div>
       </div>
     `;
   } catch (e) {
