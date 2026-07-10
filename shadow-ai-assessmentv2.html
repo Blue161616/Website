@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -282,8 +282,8 @@
     .source-live{color:var(--risk-low);}
     .source-derived{color:var(--gold);}
 
-    /* ── Model Risk Assessment: scrolls inside the card, header stays pinned ── */
-    #model-risk-table th{position:sticky;top:0;z-index:2;}
+    /* ── Height-capped tables: scroll inside the card, header stays pinned ── */
+    #model-risk-table th,#def-assets-table th{position:sticky;top:0;z-index:2;}
 
     /* ── Leaflet residency map ── */
     .leaflet-container{background:#0d1117!important;font-family:inherit;}
@@ -3390,10 +3390,9 @@ const MODEL_FILTER_FNS = {
   all:        () => true,
   violations: isPolicyViolationModel,
   external:   m => !isManagedModel(m),
-  local:      m => m.sources?.has('local'),
   mcas:       m => m.sources?.has('mcas'),
 };
-const MODEL_FILTER_LABELS = { violations: 'policy violations', external: 'external models', local: 'local endpoints', mcas: 'Cloud Discovery' };
+const MODEL_FILTER_LABELS = { violations: 'policy violations', external: 'external models', mcas: 'Cloud Discovery' };
 
 function filterModelTable(key) {
   STATE.modelFilter = (key === 'all' || STATE.modelFilter === key) ? 'all' : key;
@@ -3460,7 +3459,6 @@ function renderModelTable() {
     if (sources?.has('mcas'))   badges.push('<span class="badge" style="font-size:9px;background:rgba(63,185,80,.15);color:var(--risk-low)">MCAS</span>');
     if (sources?.has('agent'))  badges.push('<span class="badge" style="font-size:9px;background:rgba(227,179,65,.15);color:var(--gold)">Agent</span>');
     if (sources?.has('defender')) badges.push('<span class="badge" style="font-size:9px;background:rgba(248,81,73,.15);color:var(--risk-high)" title="Typed Model column from Defender AgentsInfo (Advanced Hunting)">Defender</span>');
-    if (sources?.has('local'))  badges.push('<span class="badge" style="font-size:9px;background:rgba(139,148,158,.18);color:var(--text-muted)" title="Discovered on endpoints by Defender for Endpoint">Local</span>');
     return badges.join(' ');
   };
 
@@ -3478,7 +3476,6 @@ function renderModelTable() {
       + '<td>' + riskCell + '</td>'
       + '<td>' + srcBadgeInline(m.sources)
         + (m.mcasUsers ? '<span class="text-muted" style="font-size:10px;margin-left:4px">' + m.mcasUsers + ' users</span>' : '')
-        + (m.localDevices ? '<span class="text-muted" style="font-size:10px;margin-left:4px">' + m.localDevices + ' device' + (m.localDevices !== 1 ? 's' : '') + '</span>' : '')
         + '</td>'
       + '</tr>';
   }).join('') || `<tr><td colspan="7" class="empty-state text-muted">${filter !== 'all'
@@ -3496,12 +3493,12 @@ function renderModelTable() {
   // Filter feedback: header sub-label + active-KPI highlight
   const subEl = document.getElementById('model-table-sub');
   if (subEl) subEl.textContent = `${filtered.length} of ${models.length}${filter !== 'all' ? ' · ' + (MODEL_FILTER_LABELS[filter] || filter) : ''} · click headers to sort`;
-  ['kpi-model-all','kpi-model-violations','kpi-model-external','kpi-model-local','kpi-model-mcas'].forEach(id => {
+  ['kpi-model-all','kpi-model-violations','kpi-model-external','kpi-model-mcas'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.style.outline = '';
   });
   if (filter !== 'all') {
-    const activeEl = document.getElementById({ violations:'kpi-model-violations', external:'kpi-model-external', local:'kpi-model-local', mcas:'kpi-model-mcas' }[filter]);
+    const activeEl = document.getElementById({ violations:'kpi-model-violations', external:'kpi-model-external', mcas:'kpi-model-mcas' }[filter]);
     if (activeEl) activeEl.style.outline = '2px solid var(--accent-blue)';
   }
 }
@@ -3610,12 +3607,11 @@ async function loadModels() {
           return STATE.data.mcasApps;
         }).catch(() => []);
 
-    const [sps, signIns, mcasApps, tenantRegion, defenderList, localAi] = await Promise.all([
+    const [sps, signIns, mcasApps, tenantRegion, defenderList] = await Promise.all([
       fetchServicePrincipals(), fetchSignIns(), mcasPromise, fetchTenantRegion().catch(() => null),
-      // Both use the silently-acquired ThreatHunting.Read.All token and degrade
+      // Uses the silently-acquired ThreatHunting.Read.All token and degrades
       // gracefully (code: forbidden/unsupported) when it isn't available.
       fetchDefenderAiAgentsList().catch(() => ({ ok: false, agents: [], code: 'error' })),
-      fetchLocalAiAgents().catch(() => ({ ok: false, agents: [], code: 'error' })),
     ]);
     // Live web-grounding state (CopilotPolicySettings.Read, silent token; also cached
     // for the Compliance page). null → fall back to the manual-check rendering.
@@ -3642,26 +3638,6 @@ async function loadModels() {
       if (s.createdDateTime && (!u.last || s.createdDateTime > u.last)) u.last = s.createdDateTime;
     });
     const modelCounts = Object.fromEntries(Object.entries(appUsage).map(([n, u]) => [n, u.count]));
-
-    // Risk-first usage rows for the "Risky AI Usage" table: external apps
-    // expanded and sorted worst-first; sanctioned Microsoft apps collapsed.
-    const usageRows  = Object.entries(appUsage).map(([name, u]) => ({ name, ...u, info: detectModel(name) }));
-    const RISK_ORD_U = { critical: 4, high: 3, medium: 2, low: 1 };
-    const riskyUsage = usageRows.filter(r => !isManagedModel(r.info))
-      .sort((a, b) => (RISK_ORD_U[b.info.risk] || 0) - (RISK_ORD_U[a.info.risk] || 0) || b.count - a.count);
-    const msUsage    = usageRows.filter(r => isManagedModel(r.info)).sort((a, b) => b.count - a.count);
-    const msTotalCount = msUsage.reduce((n, r) => n + r.count, 0);
-    const msTotalUsers = new Set(msUsage.flatMap(r => [...r.users])).size;
-    const usageRow = (r, cls) => `<tr${cls
-        ? ` class="${cls}" style="display:none"`
-        : (r.info.risk === 'critical' ? ' style="background:rgba(248,81,73,.04)"' : r.info.risk === 'high' ? ' style="background:rgba(240,136,62,.03)"' : '')}>
-      <td><strong>${esc(r.name)}</strong></td>
-      <td>${riskBadge(r.info.risk)}</td>
-      <td style="font-weight:600" title="${esc([...r.users].slice(0, 8).join(', '))}">${r.users.size} 👤</td>
-      <td>${r.count}</td>
-      <td style="font-size:12px;color:var(--text-muted)">${mcasRelTime(r.last) || '—'}</td>
-      <td><span style="font-size:12px">${esc(r.info.model)}</span><br><span class="text-muted" style="font-size:10px">${esc(r.info.provider)} · ${esc(r.info.residency)}</span></td>
-    </tr>`;
 
     // Build unique model list — track sources: 'sp', 'signin', 'mcas'
     const modelMap = {};
@@ -3707,23 +3683,10 @@ async function loadModels() {
       });
     }
 
-    // ── Local endpoint AI (Defender for Endpoint discovery, preview) ──────
-    // Known cloud clients (e.g. Claude Desktop) map to their cloud model — the
-    // prompts still leave the device; unknown runtimes stay local/self-hosted.
-    if (localAi?.ok) {
-      localAi.agents.forEach(a => {
-        const det = detectModel(a.name || '');
-        const info = det.model !== 'Unknown' ? det : {
-          model: a.name, provider: 'Local endpoint', residency: 'Local / self-hosted',
-          training: 'Unknown', gdprOk: true, risk: 'medium',
-        };
-        const key = modelMapKey(info);
-        if (!modelMap[key]) modelMap[key] = { ...info, apps: [], calls: 0, sources: new Set(), mcasUsers: 0, mcasTraffic: 0 };
-        modelMap[key].apps.push(a.name);
-        modelMap[key].sources.add('local');
-        modelMap[key].localDevices = (modelMap[key].localDevices || 0) + (a.deviceCount || 0);
-      });
-    }
+    // (Local endpoint agents are intentionally NOT merged here — agent-level
+    // endpoint discovery belongs to the Shadow AI Apps cross-badges, and the
+    // AgentsInfo fallback can misclassify cloud agents as local, which would
+    // pollute this model inventory with per-agent pseudo-models.)
 
     // ── Agent model inference ──────────────────────────────────────────────
     // Copilot Studio and AI Foundry agents use Azure OpenAI models.
@@ -3802,8 +3765,6 @@ async function loadModels() {
     const usersExposed = extUserSet.size;
     const mcasExtUsers = mcasAiApps.reduce((n, a) => n + (a.usersCount || 0), 0);
     const totalUpload  = mcasAiApps.reduce((s, a) => s + (a.trafficUploadedBytes ?? 0), 0);
-    const localAgentCount  = localAi?.ok ? localAi.agents.length : null;
-    const localDeviceCount = localAi?.ok ? localAi.agents.reduce((n, a) => n + (a.deviceCount || 0), 0) : 0;
     // Previous assessment for the ▲/▼ trend lines (persisted at most every 6h)
     STATE.data._modelsSnap = loadModelsSnapshot();
 
@@ -3824,10 +3785,10 @@ async function loadModels() {
       ${STATE.data.signInsError ? permWarn('AuditLog.Read.All', STATE.data.signInsError) : ''}
       <div class="section-header">
         <div class="section-title">AI Models in Use — Shadow &amp; Sanctioned</div>
-        <span class="data-source source-live">● Sign-in logs · Service principals${mcasAiApps.length ? ' · Defender for Cloud Apps' : ''}${defenderList?.ok ? ' · Defender AI Assets' : ''}${localAi?.ok ? ' · Endpoints' : ''}</span>
+        <span class="data-source source-live">● Sign-in logs · Service principals${mcasAiApps.length ? ' · Defender for Cloud Apps' : ''}${defenderList?.ok ? ' · Defender AI Assets' : ''}</span>
       </div>
 
-      <div class="kpi-row" style="grid-template-columns:repeat(5,1fr);margin-bottom:16px">
+      <div class="kpi-row" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px">
         <div id="kpi-model-all" class="kpi-card info" style="cursor:pointer;transition:outline .15s" onclick="filterModelTable('all')" title="Show all models">
           <div class="kpi-label">Models in Use</div>
           <div class="kpi-value text-blue">${kpiTotal}</div>
@@ -3848,14 +3809,6 @@ async function loadModels() {
           <div class="kpi-delta">sign-ins to external AI${mcasExtUsers ? ` · ${mcasExtUsers} via Cloud Discovery` : ''}</div>
           ${modelTrendHtml('users', usersExposed)}
           <div class="kpi-icon">👥</div>
-        </div>
-        <div id="kpi-model-local" class="kpi-card ${localAgentCount ? 'medium' : 'info'}" style="cursor:pointer;transition:outline .15s" onclick="filterModelTable('local')" title="Filter: models discovered on endpoints">
-          <div class="kpi-label">Local on Endpoints</div>
-          <div class="kpi-value ${localAgentCount ? 'text-medium' : 'text-muted'}">${localAgentCount ?? '—'}</div>
-          <div class="kpi-delta">${localAi?.ok
-            ? `${localDeviceCount} device${localDeviceCount !== 1 ? 's' : ''} · Defender for Endpoint`
-            : localAi?.code === 'forbidden' ? 'needs ThreatHunting.Read.All' : 'discovery unavailable'}</div>
-          <div class="kpi-icon">💻</div>
         </div>
         <div id="kpi-model-mcas" class="kpi-card ${totalUpload > 0 ? 'high' : 'info'}" style="cursor:pointer;transition:outline .15s" onclick="filterModelTable('mcas')" title="Filter: models seen in Defender for Cloud Apps traffic">
           <div class="kpi-label">Data to AI (${mcasPeriodLabel()})</div>
@@ -3889,77 +3842,6 @@ async function loadModels() {
               <tbody id="model-risk-tbody"></tbody>
             </table>
           </div>
-        </div>
-      </div>
-
-      <!-- Local AI on endpoints (Defender for Endpoint discovery · preview) -->
-      <div class="card" style="margin-bottom:16px">
-        <div class="card-header">
-          <div class="card-title">💻 Local AI on Endpoints${localAi?.ok ? ` (${localAi.agents.length})` : ''}</div>
-          <span class="data-source ${localAi?.ok ? 'source-live' : 'source-derived'}" style="font-size:10px">
-            ${localAi?.ok ? '● Defender for Endpoint · Advanced Hunting' : '⚡ Defender for Endpoint local AI discovery'}</span>
-        </div>
-        ${localAi?.ok
-          ? (localAi.agents.length ? `
-        <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">
-          Local AI agents, runtimes and MCP servers automatically discovered on onboarded devices. Known cloud clients (e.g. Claude Desktop) still send prompts to their provider — check the mapped residency.
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Agent / Runtime</th><th>Mapped Model</th><th>Provider</th><th>Data Residency</th><th>Devices</th></tr></thead>
-            <tbody>${localAi.agents.map(a => {
-              const det = detectModel(a.name || '');
-              const known = det.model !== 'Unknown';
-              const residency = known ? det.residency : 'Local / self-hosted';
-              const isLocalRes = /local|self-?hosted/i.test(residency);
-              const devNames = (a.devices || []).slice(0, 3).map(esc).join(', ');
-              return `<tr>
-                <td><strong style="font-size:13px">${esc(a.name)}</strong></td>
-                <td>${known ? esc(det.model) : '<span class="text-muted">—</span>'}</td>
-                <td class="text-muted">${known ? esc(det.provider) : esc(a.vendor || 'Local endpoint')}</td>
-                <td class="mono" style="font-size:11px">${esc(residency)} ${isLocalRes ? '<span class="text-low">✅ on-device</span>' : '<span class="text-critical">❌ cloud egress</span>'}</td>
-                <td style="font-size:12px"><strong>${a.deviceCount || '—'}</strong>${devNames ? `<br><span class="text-muted" style="font-size:10px" title="${esc((a.devices || []).join(', '))}">${devNames}${a.devices.length > 3 ? ` +${a.devices.length - 3} more` : ''}</span>` : ''}</td>
-              </tr>`;
-            }).join('')}
-            </tbody>
-          </table>
-        </div>
-        <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
-          ℹ️ ${localAi.note ? esc(localAi.note) + ' · ' : ''}Source: Defender for Endpoint local-agent discovery (exposure graph / AgentsInfo) · discovery-only preview — no posture assessment or alerts for endpoint agents.
-          <a href="https://security.microsoft.com/v2/aiassets" target="_blank" rel="noopener" style="color:var(--accent-blue);margin-left:6px">Open AI Assets ↗</a>
-        </div>`
-            : `<div class="card-body"><div class="empty-state text-muted">${localAi.note ? 'ℹ️ ' + esc(localAi.note) : '✅ No local AI agents discovered on onboarded endpoints.'}<br><a href="https://security.microsoft.com/v2/aiassets" target="_blank" rel="noopener" style="color:var(--accent-blue);font-size:11px">Compare with AI Assets → Local agents ↗</a></div></div>`)
-          : `<div class="card-body" style="font-size:12px;color:var(--text-muted)">
-              ${localAi?.code === 'forbidden'
-                ? '🔒 Needs <code>ThreatHunting.Read.All</code> — re-run admin consent, then sign out &amp; back in, to read local AI agents discovered by Defender for Endpoint.'
-                : localAi?.code === 'unsupported'
-                  ? 'ℹ️ Local AI agent discovery (preview) isn&#39;t available in this tenant — it requires Defender for Endpoint P2 / M365 E5 / Agent 365 / E7 with onboarded devices running Defender AV in active mode.'
-                  : 'ℹ️ Local AI agent data unavailable — ' + esc(String(localAi?.error || 'unknown error').slice(0, 160))}
-            </div>`}
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div class="card-title">Risky AI Usage (30d)</div>
-          <span class="text-muted" style="font-size:11px">Entra sign-ins · sorted by risk · sanctioned Microsoft apps collapsed · shadow apps appear under Shadow AI Apps</span>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>App / Service</th><th>Risk</th><th>Users</th><th>Sign-ins</th><th>Last Activity</th><th>Underlying Model</th></tr></thead>
-            <tbody>
-              ${riskyUsage.map(r => usageRow(r)).join('')}
-              ${!riskyUsage.length ? `<tr><td colspan="6" class="empty-state text-muted">${usageRows.length
-                ? '✅ No sign-ins to external AI apps in the last 30 days'
-                : 'No AI sign-in events — grant AuditLog.Read.All'}</td></tr>` : ''}
-              ${msUsage.length ? `
-              <tr style="cursor:pointer;background:rgba(63,185,80,.04)" onclick="document.querySelectorAll('.ms-usage-row').forEach(r => r.style.display = r.style.display === 'none' ? '' : 'none'); const c = document.getElementById('ms-usage-chevron'); if (c) c.textContent = c.textContent === '▸' ? '▾' : '▸'">
-                <td colspan="6" style="font-size:12px;color:var(--text-muted)">
-                  <span id="ms-usage-chevron">▸</span> <span class="text-low">✓</span> ${msUsage.length} sanctioned Microsoft app${msUsage.length !== 1 ? 's' : ''} · ${msTotalCount} sign-ins · ${msTotalUsers} user${msTotalUsers !== 1 ? 's' : ''} — click to expand
-                </td>
-              </tr>
-              ${msUsage.map(r => usageRow(r, 'ms-usage-row')).join('')}` : ''}
-            </tbody>
-          </table>
         </div>
       </div>
 
@@ -4805,7 +4687,7 @@ function sortClassicTable(key) {
   renderClassicTable();
 }
 
-function showAgentSection(name) {
+function showAgentSection(name, scroll = false) {
   STATE.agentSection = name;
   const sections = ['blueprints', 'identities', 'classic', 'risky', 'stale', 'audit', 'mcp'];
   sections.forEach(s => {
@@ -4817,6 +4699,19 @@ function showAgentSection(name) {
       kpi.style.opacity = s === name ? '1' : '0.55';
     }
   });
+  // On user clicks, bring the selected section into view — the Defender AI Assets
+  // card above the sections can push it below the fold, which otherwise makes the
+  // KPI cards look like they do nothing. Offset = topbar (52) + sticky KPI header.
+  if (scroll) {
+    const sec = document.getElementById('section-' + name);
+    const sticky = document.querySelector('#agents-content > div');
+    if (sec) {
+      // Instant scroll — smooth (rAF-driven) scrolling silently stalls in
+      // backgrounded/throttled tabs, which would make the cards look broken again.
+      const offset = 52 + (sticky?.offsetHeight || 0) + 8;
+      window.scrollTo(0, Math.max(0, sec.getBoundingClientRect().top + window.scrollY - offset));
+    }
+  }
   // MCP servers (agent tools) render lazily on first view into #mcp-content.
   if (name === 'mcp' && !STATE._mcpFoldedLoaded) {
     STATE._mcpFoldedLoaded = true;
@@ -4905,7 +4800,9 @@ async function renderDefenderAssetsSection() {
       </label>
       <span style="margin-left:auto;font-size:11px;color:var(--text-dim)" id="def-assets-count">${agents.length} agents</span>
     </div>
-    <div class="table-wrap">
+    <!-- Height-capped: with many agents this card otherwise pushes the section
+         content selected via the KPI cards far below the fold -->
+    <div class="table-wrap" style="max-height:420px;overflow-y:auto">
       <table id="def-assets-table">
         <thead><tr>
           <th>Agent Name</th>
@@ -5373,42 +5270,42 @@ async function loadAgents() {
           <span class="data-source source-derived">⚡ Derived from service principals</span>
         </div>
         <div class="kpi-row" style="grid-template-columns:repeat(7,1fr);margin-bottom:0">
-          <div class="kpi-card medium" id="kpi-agent-blueprints" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('blueprints')">
+          <div class="kpi-card medium" id="kpi-agent-blueprints" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('blueprints', true)">
             <div class="kpi-label">Agent Blueprints</div>
             <div class="kpi-value text-medium">${bpSps.length}</div>
             <div class="kpi-delta" id="kpi-bp-no-owner-sub">…</div>
             <div class="kpi-icon">📋</div>
           </div>
-          <div class="kpi-card info" id="kpi-agent-identities" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('identities')">
+          <div class="kpi-card info" id="kpi-agent-identities" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('identities', true)">
             <div class="kpi-label">Agent Identities</div>
             <div class="kpi-value text-blue">${agentIdentities.length}</div>
             <div class="kpi-delta" id="kpi-id-no-sponsor-sub">…</div>
             <div class="kpi-icon">🤖</div>
           </div>
-          <div class="kpi-card low" id="kpi-agent-classic" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('classic')">
+          <div class="kpi-card low" id="kpi-agent-classic" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('classic', true)">
             <div class="kpi-label">Classic Agents</div>
             <div class="kpi-value text-low">${clSps.length}</div>
             <div class="kpi-icon">⚙️</div>
           </div>
-          <div class="kpi-card ${riskyAgentCount > 0 ? 'critical' : 'low'}" id="kpi-agent-risky" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('risky')">
+          <div class="kpi-card ${riskyAgentCount > 0 ? 'critical' : 'low'}" id="kpi-agent-risky" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('risky', true)">
             <div class="kpi-label">Risky Agents</div>
             <div class="kpi-value ${riskyAgentCount > 0 ? 'text-critical' : 'text-low'}">${riskyAgentCount}${STATE.data.riskyAgentsError ? '*' : ''}</div>
             <div class="kpi-delta">${riskyHighCount} high · ${riskyMedCount} medium${STATE.data.riskyAgentsError ? ' · *no P2' : ''}</div>
             <div class="kpi-icon">⚡</div>
           </div>
-          <div class="kpi-card medium" id="kpi-agent-stale" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('stale')">
+          <div class="kpi-card medium" id="kpi-agent-stale" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('stale', true)">
             <div class="kpi-label">Stale / Orphaned</div>
             <div class="kpi-value text-medium" id="kpi-stale-val">…</div>
             <div class="kpi-delta" id="kpi-stale-sub">Dormant · orphaned · expiring</div>
             <div class="kpi-icon">💤</div>
           </div>
-          <div class="kpi-card info" id="kpi-agent-audit" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('audit')">
+          <div class="kpi-card info" id="kpi-agent-audit" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('audit', true)">
             <div class="kpi-label">Audit Log</div>
             <div class="kpi-value text-blue" id="kpi-audit-val">…</div>
             <div class="kpi-delta">Agent identity events</div>
             <div class="kpi-icon">🕐</div>
           </div>
-          <div class="kpi-card info" id="kpi-agent-mcp" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('mcp')">
+          <div class="kpi-card info" id="kpi-agent-mcp" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('mcp', true)">
             <div class="kpi-label">MCP Servers</div>
             <div class="kpi-value text-blue">${mcpCount}</div>
             <div class="kpi-delta">Agent tools &amp; connectors</div>
