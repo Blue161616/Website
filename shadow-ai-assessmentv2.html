@@ -2641,6 +2641,36 @@ function fmtBytes(b) {
 
 // ── SHADOW APPS ────────────────────────────────────────────────────────────
 
+// Cloud Discovery aggregation window — selectable on the Shadow AI Apps page.
+// Defaults to 90d so the inventory matches the portal's discovered-apps list:
+// a 30d window silently drops apps with no recent traffic (e.g. a local LLM
+// runtime last seen weeks ago).
+const MCAS_PERIODS = { P7D: '7d', P30D: '30d', P90D: '90d' };
+function mcasPeriodLabel() { return MCAS_PERIODS[STATE.mcasPeriod || 'P90D'] || '90d'; }
+function setMcasPeriod(p) {
+  if (!MCAS_PERIODS[p] || STATE.mcasPeriod === p) return;
+  STATE.mcasPeriod = p;
+  STATE.data.mcasApps = undefined;
+  STATE.data.mcasTotal = undefined;
+  STATE.data.mcasFilteredToGenAi = undefined;
+  STATE.loaded.delete('shadow-apps');
+  loadShadowApps();
+}
+
+// Shadow-apps snapshot (per tenant, localStorage) — powers the "NEW since last
+// assessment" badges/KPI. Overwritten at most every 6h, like the models snapshot.
+function mcasSnapKey() { return 'shadowai_apps_snap_' + (STATE.account?.tenantId || STATE.data.org?.id || 'default'); }
+function loadMcasSnapshot() {
+  try { const raw = localStorage.getItem(mcasSnapKey()); return raw ? JSON.parse(raw) : null; } catch { return null; }
+}
+function saveMcasSnapshot(appKeys) {
+  try {
+    const prev = loadMcasSnapshot();
+    if (prev?.ts && Date.now() - new Date(prev.ts).getTime() < 6 * 3600e3) return;
+    localStorage.setItem(mcasSnapKey(), JSON.stringify({ ts: new Date().toISOString(), apps: appKeys }));
+  } catch { /* storage unavailable */ }
+}
+
 function updateDashAgentKpi() {
   const count = STATE.data.agentIdentityCount;
   if (count === undefined) return;
@@ -2671,15 +2701,16 @@ async function fetchMcasAppsFromGraph() {
       // Prefer header surfaces evolvable-enum categories (aiModelProvider, mcpServer,
       // clientAiApp) instead of collapsing them to unknownFutureValue.
       const aiEnumHdr = { Prefer: 'include-unknown-enum-members' };
+      const period = STATE.mcasPeriod || 'P90D';
       let resp;
       try {
         resp = await gget(
-          `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${stream.id}/microsoft.graph.security.aggregatedAppsDetails(period=duration'P30D')?$top=500&$expand=userActivity`,
+          `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${stream.id}/microsoft.graph.security.aggregatedAppsDetails(period=duration'${period}')?$top=500&$expand=userActivity`,
           false, aiEnumHdr
         );
       } catch {
         resp = await gget(
-          `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${stream.id}/microsoft.graph.security.aggregatedAppsDetails(period=duration'P30D')?$top=500`,
+          `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${stream.id}/microsoft.graph.security.aggregatedAppsDetails(period=duration'${period}')?$top=500`,
           false, aiEnumHdr
         );
       }
@@ -2746,6 +2777,15 @@ function mcasSortBy(key) {
 
 async function loadShadowApps() {
   const el = document.getElementById('shadow-content');
+
+  // Endpoint cross-badges: load local AI agents (silent token) in the background
+  // and re-render once available, so MDCA rows can show "also on N devices".
+  if (STATE.data.localAiAgents === undefined) {
+    fetchLocalAiAgents().then(inv => {
+      const el2 = document.getElementById('shadow-content');
+      if (inv?.ok && el2 && STATE.data.mcasApps) renderMcasApps(el2, STATE.data.mcasApps, STATE.data.mcasUrl);
+    }).catch(() => {});
+  }
 
   if (STATE.data.mcasApps !== undefined) {
     renderMcasApps(el, STATE.data.mcasApps, STATE.data.mcasUrl);
@@ -2891,26 +2931,42 @@ function renderMcasApps(el, apps, mcasUrl) {
            tags.some(t => t.includes('sanction') && !t.includes('un'));
   };
 
-  // Category filter (All / Generative AI / Model Provider / MCP Server / Other).
-  // Counts come from the full set; KPIs + table reflect the active filter.
+  // Snapshot diff — NEW = app not present in the previous assessment's list.
+  if (STATE.data._mcasSnap === undefined) STATE.data._mcasSnap = loadMcasSnapshot();
+  const snap = STATE.data._mcasSnap;
+  const prevKeys = new Set((snap?.apps || []).map(String));
+  const isNewApp = a => !!snap && !prevKeys.has(String(a.appId ?? a.name));
+
+  // Review states — mirrors mcasSanctionBadge: protected/sanctioned are decided;
+  // unreviewed plus unsanctioned form the triage queue.
+  const isProtected  = a => { const s = (a.status || '').toLowerCase(); return a.type === 2 || s.includes('protected') || mcasTagNames(a).includes('protected'); };
+  const isUnreviewed = a => !isUnsanctioned(a) && !isSanctioned(a) && !isProtected(a);
+
+  // Category / special filter (KPI cards + chips). KPI roll-ups come from the
+  // full tenant-wide set; only the table reflects the active filter.
   const activeFilter = STATE.mcasCatFilter ?? 'all';
   const catCount = { genai: 0, model: 0, mcp: 0, other: 0 };
   apps.forEach(a => { catCount[aiCatBucket(a.category)]++; });
-  const viewApps = activeFilter === 'all'
-    ? apps
+  const viewApps = activeFilter === 'all' ? apps
+    : activeFilter === 'new'    ? apps.filter(isNewApp)
+    : activeFilter === 'review' ? apps.filter(a => isUnreviewed(a) || isUnsanctioned(a))
     : apps.filter(a => aiCatBucket(a.category) === activeFilter);
 
-  const unsanctioned = viewApps.filter(isUnsanctioned);
-  const highRisk     = viewApps.filter(a => { const s = getScore(a); return s != null && s <= 4; });
+  const unsanctioned   = apps.filter(isUnsanctioned);
+  const unreviewedApps = apps.filter(isUnreviewed);
+  const needsReview    = apps.filter(a => isUnreviewed(a) || isUnsanctioned(a));
+  const newApps        = apps.filter(isNewApp);
   // Apps with activity in the last 7 days = live shadow-AI usage (accurate from lastSeen).
   const isActive7d = a => {
     const last = a.lastUsed ?? a.lastSeen;
     const t = last ? new Date(last).getTime() : NaN;
     return !isNaN(t) && (Date.now() - t) / 86400000 <= 7;
   };
-  const activeApps   = viewApps.filter(isActive7d).length;
-  const totalUpload  = viewApps.reduce((s,a) => s + (a.trafficUploadedBytes ?? 0), 0);
+  const activeApps   = apps.filter(isActive7d).length;
+  const totalUpload  = apps.reduce((s,a) => s + (a.trafficUploadedBytes ?? 0), 0);
   const unsUpload    = unsanctioned.reduce((s,a) => s + (a.trafficUploadedBytes ?? 0), 0);
+  // Local endpoint agents (Defender for Endpoint discovery) for row cross-badges
+  const localAgents  = STATE.data.localAiAgents?.ok ? STATE.data.localAiAgents.agents : [];
 
   // Composite shadow-AI risk: unsanctioned dominates, then low trust score, then how
   // much data is being uploaded to the app (the exfiltration signal).
@@ -2958,11 +3014,14 @@ function renderMcasApps(el, apps, mcasUrl) {
           Source: Defender for Cloud Apps · <span class="mono">${esc(mcasUrl)}</span>
           ${STATE.data.mcasFilteredToGenAi
             ? ` · Generative AI + Model Provider + MCP Server categories (${STATE.data.mcasTotal} total apps scanned)`
-            : ` · all categories (${STATE.data.mcasTotal} total apps — AI category filter returned nothing)`}
+            : ` · all categories (${STATE.data.mcasTotal} total apps — AI category filter returned nothing)`} · ${mcasPeriodLabel()} window
         </div>
       </div>
-      <div style="display:flex;gap:8px;align-items:center">
+      <div style="display:flex;gap:6px;align-items:center">
         <span class="data-source source-live">● Live from MDCA</span>
+        <span style="font-size:10px;color:var(--text-dim);margin-left:4px">Window</span>
+        ${Object.entries(MCAS_PERIODS).map(([p, l]) =>
+          `<button class="btn ${(STATE.mcasPeriod || 'P90D') === p ? 'btn-primary' : 'btn-ghost'}" style="font-size:10px;padding:3px 8px" onclick="setMcasPeriod('${p}')" title="Cloud Discovery aggregation period — 90d matches the portal's discovered-apps list">${l}</button>`).join('')}
         <button class="btn btn-ghost" style="font-size:11px"
           onclick="STATE.data.mcasApps=undefined;STATE.loaded.delete('shadow-apps');loadShadowApps()">
           🔄 Re-fetch
@@ -2971,33 +3030,33 @@ function renderMcasApps(el, apps, mcasUrl) {
     </div>
 
     <div class="kpi-row" style="grid-template-columns:repeat(5,1fr)">
-      <div class="kpi-card info">
-        <div class="kpi-label">${activeFilter === 'all' ? 'AI Apps' : (AI_CAT_FILTERS.find(f => f.key === activeFilter)?.label.replace(/^\S+\s/, '') || 'AI Apps')}</div>
-        <div class="kpi-value text-blue">${viewApps.length}</div>
-        <div class="kpi-delta">${activeFilter === 'all'
-          ? ([
-              catCount.genai ? `${catCount.genai} GenAI` : '',
-              catCount.model ? `${catCount.model} Model Provider` : '',
-              catCount.mcp   ? `${catCount.mcp} MCP Server` : '',
-              catCount.other ? `${catCount.other} Other` : '',
-            ].filter(Boolean).join(' · ') || `of ${STATE.data.mcasTotal||'?'} total discovered`)
-          : `of ${apps.length} AI apps`}</div>
+      <div class="kpi-card info" style="cursor:pointer;transition:outline .15s" onclick="mcasFilterBy('all')" title="Show all discovered AI apps">
+        <div class="kpi-label">AI Apps</div>
+        <div class="kpi-value text-blue">${apps.length}</div>
+        <div class="kpi-delta">${[
+            catCount.genai ? `${catCount.genai} GenAI` : '',
+            catCount.model ? `${catCount.model} Model Provider` : '',
+            catCount.mcp   ? `${catCount.mcp} MCP Server` : '',
+            catCount.other ? `${catCount.other} Other` : '',
+          ].filter(Boolean).join(' · ') || `of ${STATE.data.mcasTotal||'?'} total discovered`}</div>
         <div class="kpi-icon">🤖</div>
       </div>
-      <div class="kpi-card critical">
-        <div class="kpi-label">Unsanctioned</div>
-        <div class="kpi-value text-critical">${unsanctioned.length}</div>
-        <div class="kpi-delta">Not approved for use</div>
+      <div class="kpi-card ${newApps.length ? 'high' : 'low'}" style="cursor:pointer;transition:outline .15s;${activeFilter === 'new' ? 'outline:2px solid var(--accent-blue)' : ''}" onclick="mcasFilterBy('new')" title="Filter: apps not seen in the previous assessment">
+        <div class="kpi-label">New Apps</div>
+        <div class="kpi-value ${newApps.length ? 'text-high' : 'text-low'}">${snap ? newApps.length : '—'}</div>
+        <div class="kpi-delta">${snap
+          ? `since ${snap.ts ? new Date(snap.ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) : 'last scan'}`
+          : 'baseline saved — populates next assessment'}</div>
+        <div class="kpi-icon">✨</div>
+      </div>
+      <div class="kpi-card ${needsReview.length ? 'critical' : 'low'}" style="cursor:pointer;transition:outline .15s;${activeFilter === 'review' ? 'outline:2px solid var(--accent-blue)' : ''}" onclick="mcasFilterBy('review')" title="Filter: unreviewed + unsanctioned apps — the triage queue">
+        <div class="kpi-label">Needs Review</div>
+        <div class="kpi-value ${needsReview.length ? 'text-critical' : 'text-low'}">${needsReview.length}</div>
+        <div class="kpi-delta">${unreviewedApps.length} unreviewed · ${unsanctioned.length} unsanctioned</div>
         <div class="kpi-icon">🚫</div>
       </div>
-      <div class="kpi-card high">
-        <div class="kpi-label">Low Trust (score ≤ 4)</div>
-        <div class="kpi-value text-high">${highRisk.length}</div>
-        <div class="kpi-delta">MDCA app score · 10 = safest</div>
-        <div class="kpi-icon">⚠️</div>
-      </div>
       <div class="kpi-card ${unsUpload > 0 ? 'critical' : 'high'}">
-        <div class="kpi-label">Uploaded to AI (30d)</div>
+        <div class="kpi-label">Uploaded to AI (${mcasPeriodLabel()})</div>
         <div class="kpi-value ${unsUpload > 0 ? 'text-critical' : 'text-high'}">${fmtBytes(totalUpload)}</div>
         <div class="kpi-delta">Data sent to AI apps${unsUpload > 0 ? ` · ${fmtBytes(unsUpload)} to unsanctioned` : ''}</div>
         <div class="kpi-icon">📤</div>
@@ -3005,7 +3064,7 @@ function renderMcasApps(el, apps, mcasUrl) {
       <div class="kpi-card ${activeApps > 0 ? 'medium' : 'low'}">
         <div class="kpi-label">Active (last 7 days)</div>
         <div class="kpi-value text-medium">${activeApps}</div>
-        <div class="kpi-delta">${viewApps.length - activeApps} dormant · of ${viewApps.length} AI app${viewApps.length !== 1 ? 's' : ''}</div>
+        <div class="kpi-delta">${apps.length - activeApps} dormant · of ${apps.length} AI app${apps.length !== 1 ? 's' : ''}</div>
         <div class="kpi-icon">🟢</div>
       </div>
     </div>
@@ -3054,10 +3113,16 @@ function renderMcasApps(el, apps, mcasUrl) {
             const name    = a.name ?? a.appInfo?.name ?? '—';
             const rawCat  = a.category ?? a.appInfo?.category ?? '';
             const cat     = fmtCategory(rawCat);
+            // Sanctioned ≠ compliant: surface the underlying model's residency/GDPR verdict
+            const mi = detectModel(name);
+            const localMatch = localAgents.find(la => _appNameMatches(name, la.name) || _appNameMatches(la.name, name));
             return `<tr>
               <td>
                 <strong>${esc(name)}</strong>
+                ${isNewApp(a) ? '<span class="badge badge-high" style="font-size:9px;margin-left:6px" title="Not present in the previous assessment">✨ NEW</span>' : ''}
+                ${localMatch ? `<span class="badge" style="font-size:9px;margin-left:4px;background:rgba(139,148,158,.18);color:var(--text-muted)" title="Also discovered on endpoints by Defender for Endpoint: ${esc((localMatch.devices || []).join(', '))}">💻 on ${localMatch.deviceCount} device${localMatch.deviceCount !== 1 ? 's' : ''}</span>` : ''}
                 ${cat ? `<br><span class="badge badge-purple" style="font-size:10px">${esc(cat)}</span>` : ''}
+                ${mi.model !== 'Unknown' ? `<br><span style="font-size:10px;color:${mi.gdprOk ? 'var(--text-dim)' : 'var(--risk-high)'}" title="Underlying model: ${esc(mi.model)} — sanctioning is an access decision, not a data-residency one">${mi.gdprOk ? '' : '⚠️ '}${esc(mi.provider)} · ${esc(mi.residency)} · GDPR ${mi.gdprOk ? '✅' : '❌'}</span>` : ''}
               </td>
               <td>${mcasSanctionBadge(a)}</td>
               <td>
@@ -3070,7 +3135,9 @@ function renderMcasApps(el, apps, mcasUrl) {
               <td>${upload > 0
                 ? `<span style="font-weight:700;color:${upload >= 1e6 ? 'var(--risk-high)' : 'var(--risk-medium)'}">↑ ${fmtBytes(upload)}</span>`
                 : '<span class="text-muted">—</span>'}</td>
-              <td class="text-muted">${download > 0 ? '↓ ' + fmtBytes(download) : '—'}</td>
+              <td>${download > 0
+                ? `<span style="${download >= 1e8 ? 'font-weight:700;color:var(--risk-medium)' : 'color:var(--text-muted)'}" title="Content coming back from the AI app (generated code/documents entering the estate)">↓ ${fmtBytes(download)}</span>`
+                : '<span class="text-muted">—</span>'}</td>
               <td class="text-muted" style="font-size:12px">${(tx || devices)
                 ? `${tx ? tx.toLocaleString() + ' tx' : ''}${tx && devices ? ' · ' : ''}${devices ? devices + ' dev' : ''}`
                 : '—'}</td>
@@ -3089,6 +3156,9 @@ function renderMcasApps(el, apps, mcasUrl) {
     </div>
   `;
 
+  // Persist the full app list (unfiltered) so the next assessment can badge NEW
+  // apps — the 6h guard inside saveMcasSnapshot makes re-renders harmless.
+  saveMcasSnapshot(apps.map(a => String(a.appId ?? a.name)));
 }
 
 function renderCredentialHygieneHtml() {
@@ -3433,6 +3503,9 @@ async function loadModels() {
       fetchDefenderAiAgentsList().catch(() => ({ ok: false, agents: [], code: 'error' })),
       fetchLocalAiAgents().catch(() => ({ ok: false, agents: [], code: 'error' })),
     ]);
+    // Live web-grounding state (CopilotPolicySettings.Read, silent token; also cached
+    // for the Compliance page). null → fall back to the manual-check rendering.
+    const webGrounding = await fetchWebGroundingSetting().catch(() => null);
     const aiApps = sps.filter(isAiApp);
 
     // Filter MCAS to AI-related apps only
@@ -3671,7 +3744,7 @@ async function loadModels() {
           <div class="kpi-icon">💻</div>
         </div>
         <div id="kpi-model-mcas" class="kpi-card ${totalUpload > 0 ? 'high' : 'info'}" style="cursor:pointer;transition:outline .15s" onclick="filterModelTable('mcas')" title="Filter: models seen in Defender for Cloud Apps traffic">
-          <div class="kpi-label">Data to AI (30d)</div>
+          <div class="kpi-label">Data to AI (${mcasPeriodLabel()})</div>
           <div class="kpi-value ${totalUpload > 0 ? 'text-high' : 'text-muted'}" style="font-size:22px">${fmtBytes(totalUpload)}</div>
           <div class="kpi-delta">${mcasAiApps.length ? `uploaded via ${mcasAiApps.length} discovered app${mcasAiApps.length !== 1 ? 's' : ''}` : 'no Cloud Discovery data'}</div>
           <div class="kpi-icon">📤</div>
@@ -3823,6 +3896,11 @@ async function loadModels() {
           <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px">
             For EU/EFTA tenants, <strong>Flex Routing</strong> allows LLM inferencing to occur outside the EU Data Boundary (in USA, Canada, or Australia) during periods of peak demand. When enabled, prompts may be processed outside the EU — affecting GDPR compliance. This setting is <strong>on by default</strong> for tenants created after March 25, 2026, and is not exposed via any public API.
           </p>
+          ${tenantRegion?.regionScope === 'EU'
+            ? `<div style="margin-bottom:12px;padding:8px 12px;border-radius:6px;background:rgba(240,136,62,.08);border:1px solid rgba(240,136,62,.25);font-size:12px;color:var(--risk-medium)">📍 <strong>Applies to your tenant</strong> — region ${esc(tenantRegion.subScope || tenantRegion.regionLabel || 'EU')} is inside the EU Data Boundary. Verify the toggle in the admin center.</div>`
+            : tenantRegion?.regionScope
+              ? `<div style="margin-bottom:12px;padding:8px 12px;border-radius:6px;background:rgba(63,185,80,.07);border:1px solid rgba(63,185,80,.25);font-size:12px;color:var(--text-muted)">ℹ️ Your tenant region (${esc(tenantRegion.subScope || tenantRegion.regionLabel)}) is outside EU/EFTA — flex routing does not apply to this tenant.</div>`
+              : ''}
           <div style="display:flex;flex-direction:column;gap:8px">
             ${[
               { label: 'Allowed (default)', note: 'Inferencing may occur in USA · Canada · Australia during peak · GDPR: ⚠️ Risk', risk: true },
@@ -3848,16 +3926,29 @@ async function loadModels() {
       <div class="card" style="margin-bottom:16px">
         <div class="card-header">
           <div class="card-title">🌐 Web Grounding (Copilot for Microsoft 365)</div>
-          <span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.12);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">⚠️ Manual check required</span>
+          ${webGrounding?.ok
+            ? (webGrounding.enabled
+                ? `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(248,81,73,.12);color:var(--risk-critical);border:1px solid rgba(248,81,73,.3)">🔴 Web search ${webGrounding.configured ? 'enabled' : 'on (default)'}</span>`
+                : `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(63,185,80,.12);color:var(--risk-low);border:1px solid rgba(63,185,80,.3)">✅ Web search disabled</span>`)
+            : `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.12);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">${webGrounding?.code === 'forbidden' ? '🔒 Needs CopilotPolicySettings.Read' : '⚠️ Manual check required'}</span>`}
         </div>
         <div class="card-body">
           <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px">
-            When <strong>Web grounding</strong> is enabled, Copilot for Microsoft 365 sends user queries to <strong>Bing</strong> to supplement responses with web content. Bing is operated outside the EU Data Boundary — meaning prompts (including potentially sensitive organisational context) may be processed in the USA. This setting is <strong>on by default</strong> and is not exposed via any public API or Graph endpoint.
+            When <strong>Web grounding</strong> is enabled, Copilot for Microsoft 365 sends user queries to <strong>Bing</strong> to supplement responses with web content. Bing is operated outside the EU Data Boundary — meaning prompts (including potentially sensitive organisational context) may be processed in the USA. ${webGrounding?.ok
+              ? 'Read live from the Copilot policy <code>microsoft.copilot.allowwebsearch</code>.'
+              : 'This setting is <strong>on by default</strong>.'}
           </p>
-          <div style="display:flex;flex-direction:column;gap:8px">
+          ${webGrounding?.ok
+            ? `<div style="padding:9px 12px;border-radius:6px;background:${webGrounding.enabled ? 'rgba(248,81,73,.08)' : 'rgba(63,185,80,.08)'};border:1px solid ${webGrounding.enabled ? 'rgba(248,81,73,.25)' : 'rgba(63,185,80,.25)'};font-size:12px;color:var(--text-muted)">
+                ${webGrounding.enabled ? '🔴' : '✅'} <strong style="color:${webGrounding.enabled ? 'var(--risk-critical)' : 'var(--risk-low)'}">Web search ${webGrounding.configured ? (webGrounding.enabled ? 'Enabled' : 'Disabled') : 'not configured (default = enabled)'}.</strong>
+                ${webGrounding.enabled ? 'Prompts may be sent to Bing outside the EU Data Boundary — GDPR risk.' : 'Copilot answers from Microsoft 365 data only — stays within EU.'}
+                ${webGrounding.value != null ? `<span style="font-size:10px;color:var(--text-dim)"> · policy value: <code>${esc(webGrounding.value)}</code></span>` : ''}
+                <span class="data-source source-live" style="font-size:10px;margin-left:6px">● beta/copilot/admin/policySettings</span>
+              </div>`
+            : `<div style="display:flex;flex-direction:column;gap:8px">
             ${[
-              { label: 'Enabled (default)', note: 'Queries sent to Bing · Data may leave EU Data Boundary · GDPR: ❌ Risk', risk: true },
-              { label: 'Disabled',          note: 'Copilot answers from Microsoft 365 data only · Stays within EU · GDPR: ✅ Safe', risk: false },
+              { label: 'Enabled (default)', note: 'Queries sent to Bing · Data may leave EU Data Boundary · GDPR: ❌ Risk' },
+              { label: 'Disabled',          note: 'Copilot answers from Microsoft 365 data only · Stays within EU · GDPR: ✅ Safe' },
             ].map(p => `
               <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-radius:6px;background:var(--bg-secondary);border:1px solid var(--border)">
                 <div>
@@ -3865,9 +3956,9 @@ async function loadModels() {
                   <span style="font-size:11px;color:var(--text-muted);margin-left:10px">${esc(p.note)}</span>
                 </div>
                 <a href="https://admin.microsoft.com/#/copilot/settings" target="_blank"
-                  style="font-size:11px;padding:3px 10px;border-radius:10px;background:rgba(240,136,62,.1);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25);text-decoration:none">⚠️ Check in Admin Center</a>
+                  style="font-size:11px;padding:3px 10px;border-radius:10px;background:rgba(240,136,62,.1);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25);text-decoration:none">${webGrounding?.code === 'forbidden' ? '🔒 Grant CopilotPolicySettings.Read' : '⚠️ Check in Admin Center'}</a>
               </div>`).join('')}
-          </div>
+          </div>`}
           <div style="margin-top:14px;padding:10px 12px;border-radius:6px;background:rgba(56,139,253,.06);border:1px solid rgba(56,139,253,.2);font-size:12px;color:var(--text-muted)">
             🔗 <strong>Where to check:</strong>
             <a href="https://admin.microsoft.com/#/copilot/settings" target="_blank" style="color:var(--accent-blue);margin-left:4px">M365 Admin Center → Copilot → Settings → <em>Web search for Copilot</em></a>
@@ -9138,7 +9229,7 @@ async function fetchMcasAppUsers(app) {
   for (const streamId of streamIds) {
     // ── Strategy 1: proper navigation endpoint (user-recommended) ──────────
     try {
-      const url = `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${streamId}/aggregatedAppsDetails(period=duration'P30D')/${app.appId}/users`;
+      const url = `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${streamId}/aggregatedAppsDetails(period=duration'${STATE.mcasPeriod || 'P90D'}')/${app.appId}/users`;
       const resp = await gget(url);
       const users = resp.value || (Array.isArray(resp) ? resp : []);
       if (users.length) {
@@ -9149,7 +9240,7 @@ async function fetchMcasAppUsers(app) {
 
     // ── Strategy 2: $expand=userActivity, filter client-side ───────────────
     try {
-      const url = `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${streamId}/microsoft.graph.security.aggregatedAppsDetails(period=duration'P30D')?$top=500&$expand=userActivity`;
+      const url = `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${streamId}/microsoft.graph.security.aggregatedAppsDetails(period=duration'${STATE.mcasPeriod || 'P90D'}')?$top=500&$expand=userActivity`;
       const resp = await gget(url);
       const detail = (resp.value || []).find(a => String(a.id) === String(app.appId) || a.displayName === app.name);
       if (detail?.userActivity?.length) {
@@ -9231,7 +9322,7 @@ function _renderPopoverUsers(users, sourceName) {
   const body = document.getElementById('pop-body');
   if (!users || users.length === 0) {
     body.innerHTML = `<div style="font-size:11px;color:var(--text-dim);font-style:italic;padding:4px 0">
-      No user data found for this app in the last 30 days.<br>
+      No user data found for this app in the last ${mcasPeriodLabel()}.<br>
       Requires <code style="font-size:10px;background:var(--bg-hover);padding:1px 4px;border-radius:3px">AuditLog.Read.All</code> and active MDCA discovery.
     </div>`;
     return;
@@ -9252,7 +9343,7 @@ function _renderPopoverUsers(users, sourceName) {
       </div>
       <div class="pop-date">${lastStr}</div>
     </div>`;
-  }).join('') + `<div class="pop-hint">${users.length} user${users.length !== 1 ? 's' : ''} · ${sourceName} · last 30 days</div>`;
+  }).join('') + `<div class="pop-hint">${users.length} user${users.length !== 1 ? 's' : ''} · ${sourceName} · last ${mcasPeriodLabel()}</div>`;
 }
 
 function _positionPopover(anchorEl, estRows) {
