@@ -4,9 +4,16 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Shadow AI Security Assessment V2</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-  <script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
-  <script>if(typeof msal==='undefined'){document.write('<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"><\/script>');}</script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"
+    integrity="sha384-e6nUZLBkQ86NJ6TVVKAeSaK8jWa3NhkYWZFomE39AvDbQWeie9PlQqM3pmYW5d1g" crossorigin="anonymous"></script>
+  <!-- alcdn.msauth.net no longer serves 2.38.3 (404) — jsdelivr is the single pinned source, verified via SRI -->
+  <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"
+    integrity="sha384-OJTwghM0Gh3Zc+gmd6l0lz1pFw9KuHHq0mSEZgmQEKgMnuSWWDb3bU9KzuD7w2hU" crossorigin="anonymous"></script>
+  <!-- Leaflet (data-residency world map on the AI Models page) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H" crossorigin="anonymous"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH" crossorigin="anonymous"></script>
   <style>
     :root {
       --bg-primary:#0d1117; --bg-secondary:#161b22; --bg-card:#1c2128;
@@ -274,6 +281,14 @@
     .data-source{display:inline-flex;align-items:center;gap:4px;font-size:10px;color:var(--text-dim);margin-left:8px;}
     .source-live{color:var(--risk-low);}
     .source-derived{color:var(--gold);}
+
+    /* ── Leaflet residency map ── */
+    .leaflet-container{background:#0d1117!important;font-family:inherit;}
+    .leaflet-dark-tooltip{background:#161b22!important;border:1px solid #30363d!important;color:#e6edf3!important;font-size:11px;box-shadow:0 2px 8px rgba(0,0,0,.5)!important;}
+    .leaflet-dark-tooltip:before{display:none;}
+    @keyframes map-ping{0%{box-shadow:0 0 0 0 rgba(248,81,73,.6)}70%{box-shadow:0 0 0 14px rgba(248,81,73,0)}100%{box-shadow:0 0 0 0 rgba(248,81,73,0)}}
+    @keyframes egress-flow{to{stroke-dashoffset:-28}}
+    .egress-arc{animation:egress-flow 1.1s linear infinite;}
   </style>
 </head>
 <body>
@@ -843,7 +858,7 @@ function riskScore(sp, grants = []) {
   let score = { critical: 4, high: 3, medium: 2, low: 1 }[info.risk] || 2;
   // boost if high-risk scopes granted
   if (grants.some(g => g.clientId === sp.id &&
-    HIGH_RISK_SCOPES.some(s => (g.scope || '').includes(s)))) score = Math.max(score, 3);
+    grantHasAnyScope(g, HIGH_RISK_SCOPES))) score = Math.max(score, 3);
   if (!sp.accountEnabled) score = 1;
   return ['low', 'low', 'medium', 'high', 'critical'][Math.min(score, 4)];
 }
@@ -851,6 +866,13 @@ function riskScore(sp, grants = []) {
 function getScopesForSp(spId, grants) {
   const joined = grants.filter(g => g.clientId === spId).map(g => g.scope || '').join(' ').trim();
   return joined ? joined.split(/\s+/) : [];
+}
+
+// Exact-match check: does this grant carry any scope from the list?
+// (substring matching would make 'Mail.Read' also match 'Mail.ReadBasic')
+function grantHasAnyScope(g, scopeList) {
+  const scopes = (g.scope || '').split(/\s+/).filter(Boolean);
+  return scopeList.some(s => scopes.includes(s));
 }
 
 function highRiskScopesFor(spId, grants) {
@@ -1164,23 +1186,58 @@ async function fetchCopilotUsage() {
   if (STATE.data.copilotUsage !== undefined) return STATE.data.copilotUsage;
   const result = { summary: null, userDetail: [], source: null, error: null, errorCode: null };
 
-  // Try v1.0 summary endpoint first, fall back to beta
+  // Summary: getMicrosoft365CopilotUserCountSummary — aggregated active/enabled users per
+  // Copilot app. v1.0 lives under /copilot/reports; /beta/reports is the legacy path.
   // Capture the last HTTP error code so we can distinguish 403 (no permission) vs 404/204 (no data)
   let lastErr = null;
-  for (const base of [GRAPH, GRAPH_BETA]) {
+  for (const [base, src] of [[`${GRAPH}/copilot/reports`, 'v1.0'], [`${GRAPH_BETA}/reports`, 'beta']]) {
     try {
-      const d = await gget(`${base}/reports/getM365CopilotUsageSummary`);
-      result.summary = d;
-      result.source = base === GRAPH ? 'v1.0' : 'beta';
+      const d = await gget(`${base}/getMicrosoft365CopilotUserCountSummary(period='D30')?$format=application/json`);
+      const row0 = (d.value || [])[0];
+      const adoption = row0?.adoptionByProduct?.[0];
+      if (!adoption) continue;
+      // Normalise the documented shape (value[0].adoptionByProduct[0].{app}Active/EnabledUsers)
+      // into the per-app { activeUsers, inactiveUsers } objects the renderer expects.
+      const app = prefix => ({
+        activeUsers:   adoption[prefix + 'ActiveUsers'] ?? 0,
+        inactiveUsers: Math.max(0, (adoption[prefix + 'EnabledUsers'] ?? 0) - (adoption[prefix + 'ActiveUsers'] ?? 0)),
+      });
+      result.summary = {
+        reportRefreshDate: row0.reportRefreshDate || '',
+        reportPeriod:      adoption.reportPeriod || 30,
+        totalActiveUsers:  adoption.anyAppActiveUsers ?? 0,
+        userCopilot:       app('anyApp'),
+        teamsChat:         app('microsoftTeams'),
+        word:              app('word'),
+        excel:             app('excel'),
+        powerPoint:        app('powerPoint'),
+        outlook:           app('outlook'),
+        oneNote:           app('oneNote'),
+        loop:              app('loop'),
+        copilotChat:       app('copilotChat'),
+      };
+      result.source = src;
       break;
     } catch (e) { lastErr = e; }
   }
 
-  // User-level activity (D30)
-  try {
-    const d = await gget(`${GRAPH_BETA}/reports/getM365CopilotUserDetailWithPeriod(period='D30')`);
-    result.userDetail = Array.isArray(d) ? d : (d.value || []);
-  } catch (e) { if (!lastErr) lastErr = e; }
+  // User-level activity (D30): getMicrosoft365CopilotUsageUserDetail — rows carry per-app
+  // …CopilotLastActivityDate fields; derive the per-app usage flags the renderer reads.
+  for (const base of [`${GRAPH}/copilot/reports`, `${GRAPH_BETA}/copilot/reports`]) {
+    try {
+      const d = await gget(`${base}/getMicrosoft365CopilotUsageUserDetail(period='D30')?$format=application/json`);
+      const rows = Array.isArray(d) ? d : (d.value || []);
+      result.userDetail = rows.map(u => ({
+        ...u,
+        teamsChatCount:  u.microsoftTeamsCopilotLastActivityDate ? 1 : 0,
+        wordCount:       u.wordCopilotLastActivityDate ? 1 : 0,
+        excelCount:      u.excelCopilotLastActivityDate ? 1 : 0,
+        powerPointCount: u.powerPointCopilotLastActivityDate ? 1 : 0,
+        outlookCount:    u.outlookCopilotLastActivityDate ? 1 : 0,
+      }));
+      break;
+    } catch (e) { if (!lastErr) lastErr = e; }
+  }
 
   if (!result.summary && !result.userDetail.length) {
     const msg  = (lastErr?.message || '').toLowerCase();
@@ -1359,16 +1416,17 @@ async function fetchIdProtectionAgentStats() {
   return STATE.data.idProtectionAgentStats;
 }
 
-// Defender XDR inventory table used previously in this app is being deprecated.
-// Keep a stable shape so callers can keep rendering a manual-check experience.
+// Live AI agent inventory from Defender Advanced Hunting.
+// Uses AgentsInfo (legacy source retained by Defender in many tenants).
 async function fetchAiAgentInventory() {
   if (STATE.data.aiAgentInv !== undefined) return STATE.data.aiAgentInv;
-  STATE.data.aiAgentInv = {
+
+  const base = {
     ok: false,
     rows: [],
     total: 0,
-    code: 'unsupported',
-    error: 'Legacy Defender AI inventory table is deprecated and no longer queried by this app.',
+    code: 'error',
+    error: null,
     noAuth: 0,
     makerCreds: 0,
     anthropicCount: 0,
@@ -1377,18 +1435,190 @@ async function fetchAiAgentInventory() {
     genOrchCount: 0,
     modelHints: [],
   };
+
+  const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
+  if (!token) {
+    STATE.data.aiAgentInv = { ...base, code: 'forbidden', error: 'ThreatHunting.Read.All not consented.' };
+    return STATE.data.aiAgentInv;
+  }
+
+  const queryCandidates = [
+    'AgentsInfo | take 500',
+    'AgentInfo | take 500',
+    'AiAssetsInfo | take 500',
+    'AIAssetsInfo | take 500',
+    'AIAgentsInfo | take 500',
+  ];
+  const endpoints = [`${GRAPH}/security/runHuntingQuery`, `${GRAPH_BETA}/security/runHuntingQuery`];
+
+  const isUnsupportedErr = msg => /failed to resolve table|could not be resolved|unknown table|does not refer to any known table|semantic error/i.test(msg || '');
+  const isSchemaErr = msg => /failed to resolve scalar expression|column.+(not found|does not exist)|parse|syntax/i.test(msg || '');
+
+  let lastNonUnsupportedError = null;
+  for (const endpoint of endpoints) {
+    for (const q of queryCandidates) {
+      try {
+        const r = await fetch(endpoint, {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ Query: q, Timespan: 'P30D' }),
+        });
+
+        const text = !r.ok ? await r.text() : '';
+        if (!r.ok) {
+          if (r.status === 403) {
+            STATE.data.aiAgentInv = { ...base, code: 'forbidden', error: text || 'Forbidden' };
+            return STATE.data.aiAgentInv;
+          }
+          if (isUnsupportedErr(text)) continue;
+          lastNonUnsupportedError = text || ('Query failed with HTTP ' + r.status);
+          continue;
+        }
+
+        const data = await r.json();
+        const rows = Array.isArray(data.results) ? data.results : (Array.isArray(data.Results) ? data.Results : []);
+
+      let noAuth = 0;
+      let makerCreds = 0;
+      let anthropicCount = 0;
+      let mcpCount = 0;
+      let hardCodedCount = 0;
+      let genOrchCount = 0;
+      const modelHints = new Set();
+
+      rows.forEach(row => {
+        const rowText = JSON.stringify(row || {}).toLowerCase();
+        const authText = [
+          row.AuthenticationType, row.authenticationType,
+          row.AuthType, row.authType,
+          row.AgentAuthenticationType, row.agentAuthenticationType,
+          row.IdentityType, row.identityType,
+        ].filter(Boolean).join(' ').toLowerCase();
+
+        if (/(^|[\s_\-])(none|noauth|no_auth|anonymous|unauthenticated)([\s_\-]|$)/i.test(authText)) noAuth++;
+        if (/maker credential|author credential|creator credential|makercredentials|authorcredentials/i.test(rowText)) makerCreds++;
+        if (/anthropic|claude/i.test(rowText)) anthropicCount++;
+        if (/\bmcp\b|model context protocol/i.test(rowText)) mcpCount++;
+        if (/hard[\s\-]?coded|embedded credential|plaintext\s(secret|password)|connection string/i.test(rowText)) hardCodedCount++;
+        if (/generative orchestration|gen\s*orch|orchestration/i.test(rowText)) genOrchCount++;
+
+        Object.entries(row || {}).forEach(([k, v]) => {
+          if (!/(model|provider|llm|engine)/i.test(k)) return;
+          if (typeof v !== 'string') return;
+          const s = v.trim();
+          if (!s || s.length > 80) return;
+          modelHints.add(s);
+        });
+      });
+
+        STATE.data.aiAgentInv = {
+          ok: true,
+          rows,
+          total: rows.length,
+          code: null,
+          error: null,
+          noAuth,
+          makerCreds,
+          anthropicCount,
+          mcpCount,
+          hardCodedCount,
+          genOrchCount,
+          modelHints: [...modelHints].slice(0, 40),
+        };
+        return STATE.data.aiAgentInv;
+      } catch (e) {
+        const msg = e.message || String(e);
+        if (isUnsupportedErr(msg)) continue;
+        lastNonUnsupportedError = msg;
+      }
+    }
+  }
+
+  if (lastNonUnsupportedError) {
+    STATE.data.aiAgentInv = {
+      ...base,
+      code: isSchemaErr(lastNonUnsupportedError) ? 'schema' : 'error',
+      error: lastNonUnsupportedError,
+    };
+    return STATE.data.aiAgentInv;
+  }
+
+  STATE.data.aiAgentInv = {
+    ...base,
+    code: 'unsupported',
+    error: 'Advanced Hunting table AgentsInfo is unavailable in this tenant.',
+  };
   return STATE.data.aiAgentInv;
 }
 
-// Legacy Defender AI assets list was backed by a deprecated table; keep this stable stub.
+// Per-agent list from the same live AgentsInfo feed.
 async function fetchDefenderAiAgentsList() {
   if (STATE.data.defenderAgentList !== undefined) return STATE.data.defenderAgentList;
+
+  const inv = await fetchAiAgentInventory();
+  if (!inv.ok) {
+    STATE.data.defenderAgentList = {
+      ok: false,
+      agents: [],
+      total: 0,
+      code: inv.code,
+      error: inv.error,
+    };
+    return STATE.data.defenderAgentList;
+  }
+
+  const pick = (row, keys) => {
+    for (const k of keys) {
+      if (row[k] !== undefined && row[k] !== null && String(row[k]).trim() !== '') return row[k];
+    }
+    return null;
+  };
+
+  const inferPlatform = (row, raw) => {
+    const p = pick(row, ['Platform', 'platform', 'SourcePlatform', 'sourcePlatform', 'Provider']);
+    if (p) return String(p);
+    if (/copilot studio/i.test(raw)) return 'Copilot Studio';
+    if (/foundry|azure ai/i.test(raw)) return 'Azure AI Foundry';
+    return 'Other';
+  };
+
+  const agents = inv.rows.map((row, idx) => {
+    const raw = JSON.stringify(row || '');
+    const name = String(pick(row, ['AgentName', 'agentName', 'DisplayName', 'displayName', 'Name', 'name']) || ('Agent ' + (idx + 1)));
+    const modelHint = String(pick(row, ['Model', 'model', 'ModelName', 'modelName', 'ProviderModel', 'providerModel']) || '').trim();
+    const providerHint = String(pick(row, ['Provider', 'provider', 'ModelProvider', 'modelProvider']) || '').trim();
+    const modelInfo = modelHint || providerHint
+      ? detectModel((modelHint + ' ' + providerHint).trim())
+      : detectModel(raw);
+
+    const authType = String(pick(row, ['AuthenticationType', 'authenticationType', 'AuthType', 'authType', 'AgentAuthenticationType']) || '').trim();
+    const pubStatus = String(pick(row, ['PublishStatus', 'publishStatus', 'Status', 'status']) || '').trim();
+    const toolCountRaw = pick(row, ['ToolCount', 'toolCount', 'ToolsCount', 'toolsCount']);
+    const mcpCountRaw = pick(row, ['McpCount', 'mcpCount', 'MCPCount', 'McpServerCount', 'mcpServerCount']);
+    const toolCount = Number.isFinite(Number(toolCountRaw)) ? Number(toolCountRaw) : ((/tool/i.test(raw) && /\d+/.test(raw)) ? 1 : 0);
+    const mcpCount = Number.isFinite(Number(mcpCountRaw)) ? Number(mcpCountRaw) : (/\bmcp\b|model context protocol/i.test(raw) ? 1 : 0);
+    const hasGenOrch = /generative orchestration|gen\s*orch|orchestration/i.test(raw.toLowerCase());
+
+    return {
+      id: String(pick(row, ['AgentId', 'agentId', 'Id', 'id']) || ('row-' + idx)),
+      name,
+      platform: inferPlatform(row, raw),
+      modelHint: modelHint || null,
+      modelInfo,
+      authType: authType || null,
+      pubStatus: pubStatus || null,
+      mcpCount,
+      toolCount,
+      hasGenOrch,
+    };
+  });
+
   STATE.data.defenderAgentList = {
-    ok: false,
-    agents: [],
-    total: 0,
-    code: 'unsupported',
-    error: 'Legacy Defender AI inventory table is deprecated and disabled in this app.',
+    ok: true,
+    agents,
+    total: agents.length,
+    code: null,
+    error: null,
   };
   return STATE.data.defenderAgentList;
 }
@@ -1489,7 +1719,7 @@ async function fetchTenantRegion() {
 
 // ── Shared render helpers ──────────────────────────────────────────────────
 
-function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
 function riskBadge(r) {
   const cfg = {
@@ -1789,10 +2019,10 @@ async function loadDashboard() {
     const aiUsers = [...new Set(aiSignIns.map(s => s.userPrincipalName).filter(Boolean))];
 
     // High-risk grants: check ALL grants for high-risk scopes (not just AI-detected SPs)
-    const highRiskGrants = grants.filter(g => HIGH_RISK_SCOPES.some(s => (g.scope||'').includes(s)));
+    const highRiskGrants = grants.filter(g => grantHasAnyScope(g, HIGH_RISK_SCOPES));
     // Subset: high-risk grants where the client SP is a detected AI app
     const highRiskAi = grants.filter(g =>
-      aiApps.some(a => a.id === g.clientId) && HIGH_RISK_SCOPES.some(s => (g.scope||'').includes(s))
+      aiApps.some(a => a.id === g.clientId) && grantHasAnyScope(g, HIGH_RISK_SCOPES)
     );
     const riskyAiUsers = riskyUsers.filter(u => u.riskLevel !== 'none' && u.riskLevel !== null);
     const blockedCa = caP.filter(p => p.state === 'disabled').length;
@@ -2968,6 +3198,97 @@ function renderModelTable() {
   });
 }
 
+// ── Model residency world map (Leaflet · CartoDB dark tiles) ────────────────
+// Ported from Copilot-Studio-Security-Auditor.html: tenant-region circle plus
+// per-location model markers with animated dashed egress arcs for non-EU flows.
+
+// Anchor coordinates per tenant region scope (from fetchTenantRegion()).
+const TENANT_REGION_GEO = {
+  EU:[50,10,'Europe',true],           UK:[54,-2,'United Kingdom',false],
+  NA:[40,-100,'North America',false], CA:[56,-106,'Canada',false],
+  LA:[-15,-60,'Latin America',false], AP:[30,100,'Asia Pacific',false],
+  JP:[36,138,'Japan',false],          KR:[36,128,'South Korea',false],
+  IN:[22,78,'India',false],           OC:[-25,135,'Oceania',false],
+  AF:[-30,25,'Africa',false],         ME:[24,54,'Middle East',false],
+};
+
+// Where a model's prompts are processed, from its residency string. Mirrors the
+// residencyBucket() rules; returns null for local/self-hosted models (no egress).
+function modelResidencyGeo(m) {
+  const r = (m.residency || '').toLowerCase();
+  if (/local|self-?hosted|on-?device/.test(r)) return null;
+  if (/china/.test(r)) return { lat:35, lng:105, label:'China', eu:false };
+  // EU anchor sits slightly south-east of the tenant-circle centre so the model
+  // dot/label don't overlap the tenant's own "Europe" label at [50,10].
+  if (/\beu\b|europe/.test(r) && !/usa|global|\bau\b|au\+/.test(r)) return { lat:47.5, lng:16.5, label:'EU', eu:true };
+  if (/usa|\bus\b|united states/.test(r)) return { lat:39.5, lng:-98.35, label:'US', eu:false };
+  return { lat:39.5, lng:-98.35, label:'US / Global', eu:false };   // Global / Unknown / Varies
+}
+
+// Quadratic-bezier arc between two [lat,lng] points (bowed north).
+function mapCurveArc(a, b, steps = 28) {
+  const ctrl = [Math.max(a[0], b[0]) + Math.abs(b[1] - a[1]) * 0.16, (a[1] + b[1]) / 2], pts = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    pts.push([(1-t)*(1-t)*a[0] + 2*(1-t)*t*ctrl[0] + t*t*b[0], (1-t)*(1-t)*a[1] + 2*(1-t)*t*ctrl[1] + t*t*b[1]]);
+  }
+  return pts;
+}
+
+function renderModelResidencyMap(models, tenantRegion) {
+  const el = document.getElementById('models-map');
+  if (!el) return;
+  if (typeof L === 'undefined') { el.style.display = 'none'; return; }   // Leaflet blocked / offline
+  if (STATE.residencyMap) { try { STATE.residencyMap.remove(); } catch { } STATE.residencyMap = null; }
+
+  const scope = tenantRegion?.regionScope;
+  const [tLat, tLng, tName, tEu] = TENANT_REGION_GEO[scope] ||
+    [50, 10, tenantRegion?.regionLabel || 'Tenant region', scope ? false : null];
+
+  const map = L.map(el, { attributionControl: false, scrollWheelZoom: false }).setView([30, 10], 1);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { subdomains: 'abcd', maxZoom: 19 }).addTo(map);
+  STATE.residencyMap = map;
+
+  // Tenant region — shaded circle, green when inside the EU data boundary
+  const tCol = tEu === true ? '#3fb950' : tEu === false ? '#f0883e' : '#8b949e';
+  const bounds = [[tLat, tLng]];
+  L.circle([tLat, tLng], { radius: 900000, color: tCol, weight: 1.5, opacity: .85, fillColor: tCol, fillOpacity: .18 })
+    .bindTooltip(`<strong>Tenant · ${esc(tName)}</strong><br>${tEu === true ? 'EU / EEA data boundary' : tEu === false ? 'outside EU' : 'region unverified'}`,
+      { direction: 'top', className: 'leaflet-dark-tooltip', sticky: true }).addTo(map);
+  L.marker([tLat, tLng], { interactive: false, icon: L.divIcon({ className: '', iconSize: [0, 0],
+    html: `<div style="transform:translate(-50%,-50%);color:${tCol};font-weight:800;font-size:14px;white-space:nowrap;text-shadow:0 1px 5px #000">${esc(tName)}</div>` }) }).addTo(map);
+
+  // Group detected models by where their prompts are processed
+  const byGeo = {};
+  (models || []).forEach(m => {
+    const g = modelResidencyGeo(m);
+    if (!g) return;
+    const key = g.lat + ',' + g.lng;
+    (byGeo[key] = byGeo[key] || { ...g, providers: new Set() }).providers.add(canonicalModelProvider(m.provider) || m.model);
+  });
+
+  Object.values(byGeo).forEach(g => {
+    const col = g.eu ? '#3fb950' : '#f85149';
+    const provList = [...g.providers];
+    const provs = provList.slice(0, 3).join(' · ') + (provList.length > 3 ? ` +${provList.length - 3}` : '');
+    bounds.push([g.lat, g.lng]);
+    L.marker([g.lat, g.lng], { icon: L.divIcon({ className: '', iconSize: [14, 14], iconAnchor: [7, 7],
+      html: `<div style="width:13px;height:13px;border-radius:50%;background:${col};border:2px solid #0d1117;box-shadow:0 0 0 4px ${col}44${g.eu ? '' : ';animation:map-ping 1.8s ease-out infinite'}"></div>` }) })
+      .bindTooltip(`<strong>${esc(provs)}</strong><br>${g.eu ? 'inside EU data boundary' : 'outside EU Data Boundary'}`,
+        { direction: 'top', className: 'leaflet-dark-tooltip' }).addTo(map);
+    L.marker([g.lat, g.lng], { interactive: false, icon: L.divIcon({ className: '', iconSize: [0, 0],
+      html: `<div style="transform:translate(-50%,-170%);color:${col};font-weight:800;font-size:12px;white-space:nowrap;text-shadow:0 1px 5px #000">${esc(provs)} (${esc(g.label)})</div>` }) }).addTo(map);
+    // Non-EU processing → animated dashed egress arc from the tenant region
+    if (!g.eu) {
+      const pts = mapCurveArc([tLat, tLng], [g.lat, g.lng]);
+      bounds.push(...pts);
+      L.polyline(pts, { color: '#f85149', weight: 2, opacity: .9, dashArray: '6 8', className: 'egress-arc' }).addTo(map);
+    }
+  });
+
+  try { map.fitBounds(L.latLngBounds(bounds), { padding: [30, 40], maxZoom: 5 }); } catch { }
+}
+
 async function loadModels() {
   const el = document.getElementById('models-content');
   try {
@@ -2981,8 +3302,8 @@ async function loadModels() {
           return STATE.data.mcasApps;
         }).catch(() => []);
 
-    const [sps, signIns, mcasApps] = await Promise.all([
-      fetchServicePrincipals(), fetchSignIns(), mcasPromise,
+    const [sps, signIns, mcasApps, tenantRegion] = await Promise.all([
+      fetchServicePrincipals(), fetchSignIns(), mcasPromise, fetchTenantRegion().catch(() => null),
     ]);
     const aiApps = sps.filter(isAiApp);
 
@@ -3144,7 +3465,8 @@ async function loadModels() {
         <div class="card">
           <div class="card-header"><div class="card-title">Data Residency of Models in Use</div><span class="text-muted" style="font-size:11px">all detection sources</span></div>
           <div class="card-body">
-            <div class="chart-container" style="height:220px"><canvas id="models-bar"></canvas></div>
+            <div id="models-map" style="height:230px;border-radius:8px;overflow:hidden;border:1px solid var(--border);margin-bottom:12px"></div>
+            <div class="chart-container" style="height:170px"><canvas id="models-bar"></canvas></div>
           </div>
         </div>
         <div class="card">
@@ -3338,6 +3660,9 @@ async function loadModels() {
         canvas.parentElement.innerHTML = '<div class="empty-state text-muted" style="padding:40px">No models detected</div>';
       }
     }
+
+    // World map above the donut — tenant region + model-residency egress arcs
+    renderModelResidencyMap(models, tenantRegion);
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
   }
@@ -4443,7 +4768,7 @@ async function loadAgents() {
       const isAgent = AGENT_KEYWORDS.some(k => name.includes(k));
       const isAi = isAiApp(sp);
       const hasWriteScopes = grants.some(g => g.clientId === sp.id &&
-        AGENT_WRITE_SCOPES.some(s => (g.scope||'').includes(s)));
+        grantHasAnyScope(g, AGENT_WRITE_SCOPES));
       const isAgentBlueprint    = tags.some(t => t === 'agentidentityblueprint' || t === 'agentblueprintprincipal' || t === 'agentidentityblueprintprincipal');
       const isServiceIdentity   = sp.servicePrincipalType === 'ServiceIdentity';
       const isExplicitBlueprint = STATE.data.blueprintSpIds?.has(sp.id) || STATE.data.blueprintSpIds?.has(sp.appId);
@@ -4567,7 +4892,7 @@ async function loadAgents() {
     STATE.data.agentIdentityCount = agentIdentities.length;
     updateDashAgentKpi();
     const clSps = agentSps.filter(sp => isEntraClassicKpi(sp));
-    const writeCount = agentSps.filter(sp => grants.some(g => g.clientId===sp.id && AGENT_WRITE_SCOPES.some(s=>(g.scope||'').includes(s)))).length;
+    const writeCount = agentSps.filter(sp => grants.some(g => g.clientId===sp.id && grantHasAnyScope(g, AGENT_WRITE_SCOPES))).length;
     const tenantWide = grants.filter(g => g.consentType==='AllPrincipals' && agentSps.some(a=>a.id===g.clientId)).length;
     // MCP servers (agent tools) — folded into this page as a tab; count for the KPI.
     const mcpCount = sps.filter(sp =>
@@ -4901,7 +5226,7 @@ function renderStaleAgentsSection(agentSps, grants) {
   const DORMANT_DAYS = 90;
   const EXPIRY_WARN_DAYS = 30;
   const ownersMap  = STATE.data.agentOwnersSponsors || {};
-  const loading    = !STATE.data.agentOwnersLoaded;
+  const loading    = !STATE.data.agentOwnersSponsors;
 
   const rows = agentSps.map(sp => {
     const issues = [];
@@ -6270,7 +6595,7 @@ async function loadAlerts() {
           <span style="font-size:11px;color:var(--text-dim);margin-right:2px">Status:</span>
           ${statBtn('all',        'All',          allAlerts.length,              '🔘')}
           ${statCounts.derived > 0  ? statBtn('derived',    'Derived',     statCounts.derived,     '⚡') : ''}
-          ${statCounts.newAlert > 0 ? statBtn('newAlert',   'New',         statCounts.newAlert,    '🆕') : ''}
+          ${(statCounts.new||0) > 0 ? statBtn('new',        'New',         statCounts.new,         '🆕') : ''}
           ${(statCounts.inProgress||0) > 0 ? statBtn('inProgress','In Progress',statCounts.inProgress||0,'🔵') : ''}
           ${(statCounts.resolved||0) > 0   ? statBtn('resolved',  'Resolved',   statCounts.resolved||0, '✅') : ''}
           ${(statCounts.dismissed||0) > 0  ? statBtn('dismissed', 'Dismissed',  statCounts.dismissed||0,'🚫') : ''}
@@ -7106,7 +7431,7 @@ async function loadProtection() {
               ${inv.code === 'forbidden'
                 ? '🔒 <strong>Live agent inventory needs <code>ThreatHunting.Read.All</code>.</strong> Sign out &amp; back in (or re-run admin consent) to read Defender&#39;s legacy AI inventory source via Advanced Hunting — it will then replace the manual checks below with the live inventory.'
                 : inv.code === 'unsupported'
-                  ? 'ℹ️ The legacy Advanced Hunting inventory source is unavailable or deprecated in this tenant. Verify the configuration below in the Defender portal.'
+                  ? 'ℹ️ The legacy Advanced Hunting inventory source is unavailable or deprecated in this tenant. Verify the configuration below in the Defender portal.' + (inv.error ? `<div style="margin-top:6px;font-size:11px;color:var(--text-dim)">Details: ${esc(String(inv.error).slice(0, 220))}</div>` : '')
                   : inv.code === 'schema'
                     ? '⚠️ The live legacy inventory query no longer matches the current Advanced Hunting schema. Review the query or Defender error details, then verify the configuration below in the Defender portal.'
                   : 'ℹ️ Live agent inventory unavailable via Advanced Hunting — verify the configuration below in the Defender portal.'}
@@ -7185,7 +7510,7 @@ async function loadExternalSharing() {
       getScopesForSp(sp.id, grants).some(s => FILE_WRITE_SCOPES.includes(s))
     );
     const adminConsentFileApps = fileAiApps.filter(sp =>
-      grants.some(g => g.clientId === sp.id && g.consentType === 'AllPrincipals' && FILE_ACCESS_SCOPES.some(s => (g.scope||'').includes(s)))
+      grants.some(g => g.clientId === sp.id && g.consentType === 'AllPrincipals' && grantHasAnyScope(g, FILE_ACCESS_SCOPES))
     );
 
     const sharingCap   = spSettings?.sharingCapability;
@@ -8916,7 +9241,7 @@ async function loadCopilotUsage() {
       { key: 'outlook',      label: 'Outlook',       icon: '📧' },
       { key: 'oneNote',      label: 'OneNote',       icon: '📓' },
       { key: 'loop',         label: 'Loop',          icon: '🔁' },
-      { key: 'copilotStudio',label: 'Copilot Studio',icon: '🤖' },
+      { key: 'copilotChat',  label: 'Copilot Chat',  icon: '🤖' },
     ].map(a => ({ ...a, activeUsers: active(a.key), inactiveUsers: inactive(a.key) }))
      .filter(a => a.activeUsers > 0 || s[a.key] !== undefined);
 
@@ -8937,7 +9262,7 @@ async function loadCopilotUsage() {
           <div class="section-sub">Microsoft 365 Copilot activity · last ${period} days</div>
         </div>
         <span class="data-source ${usage.source ? 'source-live' : 'source-derived'}">
-          ${usage.source ? `● reports/getM365CopilotUsageSummary (${usage.source})` : '⚡ No data'}
+          ${usage.source ? `● copilot/reports/getMicrosoft365CopilotUserCountSummary (${usage.source})` : '⚡ No data'}
           ${refreshDate ? ` · refreshed ${refreshDate}` : ''}
         </span>
       </div>
