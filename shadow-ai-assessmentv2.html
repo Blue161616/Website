@@ -283,7 +283,7 @@
     .source-derived{color:var(--gold);}
 
     /* ── Height-capped tables: scroll inside the card, header stays pinned ── */
-    #model-risk-table th,#def-assets-table th{position:sticky;top:0;z-index:2;}
+    #model-risk-table th,#def-assets-table th,#localagents-table th{position:sticky;top:0;z-index:2;}
 
     /* ── Leaflet residency map ── */
     .leaflet-container{background:#0d1117!important;font-family:inherit;}
@@ -4233,93 +4233,6 @@ async function enrichClassicAgents(classicSps) {
   renderClassicTable();
 }
 
-async function fetchAgentAuditLog() {
-  if (STATE.data.agentAuditLog) return STATE.data.agentAuditLog;
-  // Normalize events from either signIns or directoryAudits into a common shape
-  const normalizeSignIn = e => ({
-    id: e.id,
-    activityDateTime: e.createdDateTime,
-    activityDisplayName: 'Sign-in',
-    category: 'SignIn',
-    result: e.status?.errorCode === 0 ? 'success' : 'failure',
-    resultReason: e.status?.failureReason || null,
-    risk: e.riskLevelDuringSignIn || e.riskState || null,
-    initiatedBy: { app: { displayName: e.appDisplayName || null } },
-    targetResources: [{ displayName: e.resourceDisplayName || e.appDisplayName || null, id: e.appId || null }],
-    _source: 'signIn', _raw: e,
-  });
-  const normalizeAudit = e => ({ ...e, _source: 'audit', _raw: e });
-
-  // Classify a Graph error so the UI can explain *why* there's no data.
-  const classify = msg => /403|forbidden|authorization/i.test(msg) ? 'forbidden'
-    : /400|bad request|not supported|invalid filter|could not find a property|parsing query/i.test(msg) ? 'unsupported'
-    : 'error';
-  let lastErr = null, lastCode = null;
-  const note = e => { lastErr = e.message; lastCode = classify(e.message || ''); };
-
-  const agentSps    = STATE.data.agentSps || [];
-  const agentAppIds = [...new Set(agentSps.map(s => s.appId).filter(Boolean))];
-  const agentSpIds  = new Set(agentSps.map(s => s.id).filter(Boolean));
-
-  // ── Strategy 1: preview signIns filter (richest where the schema is live) ──
-  try {
-    const siSel = 'id,createdDateTime,appDisplayName,appId,resourceDisplayName,status,riskLevelDuringSignIn,riskState,agent,signInEventTypes';
-    const r = await gget(
-      `${GRAPH_BETA}/auditLogs/signIns?$filter=signInEventTypes/any(t: t eq 'servicePrincipal') and agent/agentType eq 'AgentIdentity'&$top=200&$select=${siSel}`,
-      true
-    );
-    if (r?.value?.length) {
-      STATE.data.agentAuditLog = r.value.map(normalizeSignIn);
-      STATE.data.agentAuditLogSource = 'signIns · agent identity';
-      return STATE.data.agentAuditLog;
-    }
-  } catch (e) { note(e); }
-
-  // ── Strategy 2: stable schema — SP sign-ins for the known agent appIds ──
-  if (agentAppIds.length) {
-    const sel = 'id,createdDateTime,appDisplayName,appId,resourceDisplayName,status,riskLevelDuringSignIn,riskState';
-    const collected = [];
-    for (let i = 0; i < agentAppIds.length; i += 15) {
-      const idFilter = agentAppIds.slice(i, i + 15).map(id => `appId eq '${id}'`).join(' or ');
-      try {
-        const r = await gget(
-          `${GRAPH_BETA}/auditLogs/signIns?$filter=signInEventTypes/any(t: t eq 'servicePrincipal') and (${idFilter})&$top=100&$select=${sel}`,
-          true
-        );
-        if (r?.value) collected.push(...r.value);
-      } catch (e) { note(e); }
-    }
-    if (collected.length) {
-      const seen = new Set();
-      STATE.data.agentAuditLog = collected
-        .filter(e => { if (seen.has(e.id)) return false; seen.add(e.id); return true; })
-        .map(normalizeSignIn)
-        .sort((a, b) => new Date(b.activityDateTime) - new Date(a.activityDateTime));
-      STATE.data.agentAuditLogSource = 'signIns · agent service principals';
-      return STATE.data.agentAuditLog;
-    }
-  }
-
-  // ── Strategy 3: directory lifecycle audits, client-filtered to agent targets ──
-  try {
-    const auSel = 'id,activityDateTime,activityDisplayName,category,result,resultReason,initiatedBy,targetResources';
-    const r = await gget(`${GRAPH}/auditLogs/directoryAudits?$orderby=activityDateTime desc&$top=200&$select=${auSel}`, true);
-    const ev = (r?.value || []).filter(e =>
-      (e.targetResources || []).some(t => agentSpIds.has(t.id)) || /\bagent/i.test(e.activityDisplayName || '')
-    );
-    if (ev.length) {
-      STATE.data.agentAuditLog = ev.map(normalizeAudit);
-      STATE.data.agentAuditLogSource = 'directoryAudits · agent lifecycle';
-      return STATE.data.agentAuditLog;
-    }
-  } catch (e) { note(e); }
-
-  // Nothing found — record why so the UI can be specific.
-  STATE.data.agentAuditLog = [];
-  STATE.data.agentAuditLogError = lastErr;
-  STATE.data.agentAuditLogCode  = lastErr ? lastCode : 'noevents';
-  return STATE.data.agentAuditLog;
-}
 
 async function fetchAgentOwnersSponsors(agentSps) {
   if (STATE.data.agentOwnersSponsors) return STATE.data.agentOwnersSponsors;
@@ -4689,7 +4602,7 @@ function sortClassicTable(key) {
 
 function showAgentSection(name, scroll = false) {
   STATE.agentSection = name;
-  const sections = ['blueprints', 'identities', 'classic', 'risky', 'stale', 'audit', 'mcp'];
+  const sections = ['blueprints', 'identities', 'classic', 'risky', 'stale', 'localagents', 'mcp'];
   sections.forEach(s => {
     const sec = document.getElementById('section-' + s);
     const kpi = document.getElementById('kpi-agent-' + s);
@@ -5299,11 +5212,11 @@ async function loadAgents() {
             <div class="kpi-delta" id="kpi-stale-sub">Dormant · orphaned · expiring</div>
             <div class="kpi-icon">💤</div>
           </div>
-          <div class="kpi-card info" id="kpi-agent-audit" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('audit', true)">
-            <div class="kpi-label">Audit Log</div>
-            <div class="kpi-value text-blue" id="kpi-audit-val">…</div>
-            <div class="kpi-delta">Agent identity events</div>
-            <div class="kpi-icon">🕐</div>
+          <div class="kpi-card info" id="kpi-agent-localagents" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('localagents', true)">
+            <div class="kpi-label">Local Agents</div>
+            <div class="kpi-value text-blue" id="kpi-localagents-val">…</div>
+            <div class="kpi-delta" id="kpi-localagents-sub">Defender for Endpoint</div>
+            <div class="kpi-icon">💻</div>
           </div>
           <div class="kpi-card info" id="kpi-agent-mcp" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('mcp', true)">
             <div class="kpi-label">MCP Servers</div>
@@ -5456,15 +5369,15 @@ async function loadAgents() {
         <div id="stale-section-content"><div class="section-loading"><span class="spinner"></span>Analysing stale agents…</div></div>
       </div>
 
-      <!-- Agent Audit Log -->
-      <div id="section-audit">
+      <!-- Local Agents (Defender for Endpoint discovery · preview) -->
+      <div id="section-localagents">
         <div class="card">
           <div class="card-header">
-            <div class="card-title">🕐 Agent Identity Audit Log</div>
-            <span id="audit-src" class="data-source source-live">● sign-ins + directory audits</span>
+            <div class="card-title">💻 Local Agents on Endpoints</div>
+            <span id="localagents-src" class="data-source source-derived" style="font-size:10px">⚡ Defender for Endpoint · Advanced Hunting</span>
           </div>
-          <div id="audit-log-body" class="card-body">
-            <div class="empty-state text-muted">Loading audit events…</div>
+          <div id="localagents-body">
+            <div class="section-loading"><span class="spinner"></span>Loading local agents…</div>
           </div>
         </div>
       </div>
@@ -5481,91 +5394,69 @@ async function loadAgents() {
 
     `;
     renderAllAgentTables();
-    showAgentSection(STATE.agentSection || 'blueprints');
+    // Guard against a stale persisted selection (e.g. the removed 'audit' section)
+    const validSections = ['blueprints', 'identities', 'classic', 'risky', 'stale', 'localagents', 'mcp'];
+    showAgentSection(validSections.includes(STATE.agentSection) ? STATE.agentSection : 'blueprints');
     document.getElementById('cred-hygiene-content').innerHTML = renderCredentialHygieneHtml();
     renderStaleAgentsSection(agentSps, grants);
     // Owners/sponsors load in background — re-render tables when done
     fetchAgentOwnersSponsors(agentSps).then(() => { renderAllAgentTables(); renderStaleAgentsSection(agentSps, grants); });
     // Defender AI Assets card — loads async after the main render
     renderDefenderAssetsSection();
-    // Audit log loads in background — populate section when done
-    fetchAgentAuditLog().then(events => {
-      const auditEl = document.getElementById('audit-log-body');
-      const kpiAuditVal = document.getElementById('kpi-audit-val');
-      if (kpiAuditVal) kpiAuditVal.textContent = events.length;
-      const srcEl = document.getElementById('audit-src');
-      if (srcEl && STATE.data.agentAuditLogSource) srcEl.textContent = '● ' + STATE.data.agentAuditLogSource;
-      if (!auditEl) return;
-      if (!events.length) {
-        const code = STATE.data.agentAuditLogCode;
-        const agentN = STATE.data.agentSps?.length || 0;
-        if (code === 'forbidden') {
-          auditEl.innerHTML = permWarn('AuditLog.Read.All', STATE.data.agentAuditLogError || 'Access denied (403)')
-            + '<div style="font-size:11px;color:var(--text-dim);padding:6px 4px 0">Sign out and back in to refresh the token, then ensure a reader role (Reports Reader / Global Reader) is assigned.</div>';
-        } else if (code === 'unsupported') {
-          auditEl.innerHTML = '<div class="empty-state text-muted">Agent-identity audit filters aren\'t available in this tenant\'s Graph yet (preview schema), and no agent sign-in or lifecycle events were found in the current window.</div>';
-        } else {
-          auditEl.innerHTML = `<div class="empty-state text-muted">No agent sign-in or lifecycle events in the audit window.<br>
-            <span style="font-size:11px;color:var(--text-dim)">Agent identities often don't sign in interactively, so this can read 0 even with ${agentN} agent${agentN!==1?'s':''} present. Runtime usage (which agent did what) lives in the Purview unified audit, which needs the AuditLogsQuery.Read.All scope.</span></div>`;
-        }
+    // Local agents (Defender for Endpoint discovery) load in background
+    fetchLocalAiAgents().then(inv => {
+      const body   = document.getElementById('localagents-body');
+      const kpiVal = document.getElementById('kpi-localagents-val');
+      const kpiSub = document.getElementById('kpi-localagents-sub');
+      const srcEl  = document.getElementById('localagents-src');
+      if (kpiVal) kpiVal.textContent = inv?.ok ? inv.agents.length : '—';
+      if (kpiSub) kpiSub.textContent = inv?.ok
+        ? 'Defender for Endpoint discovery'
+        : inv?.code === 'forbidden' ? 'needs ThreatHunting.Read.All' : 'discovery unavailable';
+      if (srcEl && inv?.ok) { srcEl.textContent = '● Defender for Endpoint · Advanced Hunting'; srcEl.className = 'data-source source-live'; }
+      if (!body) return;
+      if (!inv?.ok) {
+        body.innerHTML = `<div class="card-body" style="font-size:12px;color:var(--text-muted)">${
+          inv?.code === 'forbidden'
+            ? '🔒 Needs <code>ThreatHunting.Read.All</code> — re-run admin consent, then sign out &amp; back in, to read local AI agents discovered by Defender for Endpoint.'
+            : inv?.code === 'unsupported'
+              ? 'ℹ️ Local AI agent discovery (preview) isn&#39;t available in this tenant — it requires Defender for Endpoint P2 / M365 E5 / Agent 365 / E7 with onboarded devices running Defender AV in active mode.'
+              : 'ℹ️ Local AI agent data unavailable — ' + esc(String(inv?.error || 'unknown error').slice(0, 160))}</div>`;
         return;
       }
-      const actIcon = op => {
-        if (/create/i.test(op)) return '✨';
-        if (/delete/i.test(op)) return '🗑️';
-        if (/update|patch/i.test(op)) return '✏️';
-        if (/assign|add.*owner|add.*sponsor/i.test(op)) return '👤';
-        if (/remove.*owner|remove.*sponsor/i.test(op)) return '➖';
-        if (/consent/i.test(op)) return '🔑';
-        return '📝';
-      };
-      const resultBadge = r => r === 'success'
-        ? '<span class="badge badge-low" style="font-size:10px">✅ Success</span>'
-        : r === 'failure'
-        ? '<span class="badge badge-critical" style="font-size:10px">❌ Failure</span>'
-        : `<span class="badge badge-medium" style="font-size:10px">${esc(r||'—')}</span>`;
-      auditEl.innerHTML = `
-        <div class="table-wrap" style="padding:0">
-          <table>
-            <thead><tr>
-              <th style="width:36px"></th>
-              <th>Activity</th>
-              <th>Target Agent</th>
-              <th>Initiated By</th>
-              <th>Result</th>
-              <th>Time</th>
-            </tr></thead>
-            <tbody>${events.map(ev => {
-              const target = (ev.targetResources||[])[0];
-              const targetName = target?.displayName || target?.id?.slice(0,18) || '—';
-              const actor = ev.initiatedBy?.user?.displayName || ev.initiatedBy?.user?.userPrincipalName
-                || ev.initiatedBy?.app?.displayName || '—';
-              const ts = ev.activityDateTime ? new Date(ev.activityDateTime) : null;
-              const rowBg = ev.result === 'failure' ? 'background:rgba(248,81,73,.04)' : '';
-              return `<tr style="${rowBg}">
-                <td style="text-align:center;font-size:16px">${actIcon(ev.activityDisplayName||'')}</td>
-                <td>
-                  <strong style="font-size:13px">${esc(ev.activityDisplayName||'—')}</strong>
-                  ${ev.resultReason ? `<br><span class="text-muted" style="font-size:10px">${esc(ev.resultReason)}</span>` : ''}
-                </td>
-                <td>
-                  <span style="font-size:12px">${esc(targetName)}</span>
-                  ${target?.id ? `<br><span class="mono text-muted" style="font-size:10px">${esc(target.id.slice(0,24))}…</span>` : ''}
-                </td>
-                <td class="text-muted" style="font-size:12px">${esc(actor)}</td>
-                <td>${resultBadge(ev.result)}</td>
-                <td class="mono text-muted" style="font-size:11px;white-space:nowrap">
-                  ${ts ? ts.toLocaleDateString() + '<br>' + ts.toLocaleTimeString() : '—'}
-                </td>
+      if (!inv.agents.length) {
+        body.innerHTML = `<div class="card-body"><div class="empty-state text-muted">${inv.note ? 'ℹ️ ' + esc(inv.note) : '✅ No local AI agents discovered on onboarded endpoints.'}<br><a href="https://security.microsoft.com/v2/aiassets" target="_blank" rel="noopener" style="color:var(--accent-blue);font-size:11px">Compare with AI Assets → Local agents ↗</a></div></div>`;
+        return;
+      }
+      body.innerHTML = `
+        <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">
+          Local AI agents, runtimes and MCP servers automatically discovered on onboarded devices. Known cloud clients (e.g. Claude Desktop) still send prompts to their provider — check the mapped residency.
+        </div>
+        <div class="table-wrap" style="max-height:420px;overflow-y:auto">
+          <table id="localagents-table">
+            <thead><tr><th>Agent / Runtime</th><th>Mapped Model</th><th>Provider / Vendor</th><th>Data Residency</th><th>Devices</th></tr></thead>
+            <tbody>${inv.agents.map(a => {
+              const det = detectModel(a.name || '');
+              const known = det.model !== 'Unknown';
+              const residency = known ? det.residency : 'Local / self-hosted';
+              const isLocalRes = /local|self-?hosted/i.test(residency);
+              const devNames = (a.devices || []).slice(0, 3).map(esc).join(', ');
+              return `<tr>
+                <td><strong style="font-size:13px">${esc(a.name)}</strong></td>
+                <td>${known ? esc(det.model) : '<span class="text-muted">—</span>'}</td>
+                <td class="text-muted">${known ? esc(det.provider) : esc(a.vendor || 'Local endpoint')}</td>
+                <td class="mono" style="font-size:11px">${esc(residency)} ${isLocalRes ? '<span class="text-low">✅ on-device</span>' : '<span class="text-critical">❌ cloud egress</span>'}</td>
+                <td style="font-size:12px"><strong>${a.deviceCount || '—'}</strong>${devNames ? `<br><span class="text-muted" style="font-size:10px" title="${esc((a.devices || []).join(', '))}">${devNames}${a.devices.length > 3 ? ` +${a.devices.length - 3} more` : ''}</span>` : ''}</td>
               </tr>`;
             }).join('')}
             </tbody>
           </table>
         </div>
         <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
-          ℹ️ Showing ${events.length} most recent AgentIdentity events · Source: <code>auditLogs/directoryAudits</code>
+          ℹ️ ${inv.note ? esc(inv.note) + ' · ' : ''}Source: Defender for Endpoint local-agent discovery (exposure graph / AgentsInfo) · discovery-only preview — no posture assessment or alerts for endpoint agents.
+          <a href="https://security.microsoft.com/v2/aiassets" target="_blank" rel="noopener" style="color:var(--accent-blue);margin-left:6px">Open AI Assets ↗</a>
         </div>`;
-    });
+    }).catch(() => {});
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
   }
@@ -7850,6 +7741,140 @@ const LINK_TYPE_INFO = {
   anonymousAccess: { label:'🔓 Anyone with the link', risk:'high'   },
 };
 
+// Actual file-access evidence — which SharePoint/OneDrive content AI apps really
+// read or wrote in the last 30 days. Office 365 file events in CloudAppEvents
+// (Defender XDR) carry the acting OAuth application id in RawEventData, so events
+// can be attributed to the detected AI apps. Same silent ThreatHunting.Read.All
+// token as the other Advanced Hunting cards; degrades to code: forbidden/unsupported.
+async function fetchAiFileAccessEvidence(appIds) {
+  if (STATE.data.aiFileEvidence !== undefined) return STATE.data.aiFileEvidence;
+  const base = { ok: false, byAppId: {}, code: 'error', error: null };
+  const ids = [...new Set((appIds || []).filter(Boolean).map(s => String(s).toLowerCase()))].slice(0, 40);
+  if (!ids.length) { STATE.data.aiFileEvidence = { ...base, ok: true, code: null, error: null }; return STATE.data.aiFileEvidence; }
+  const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
+  if (!token) {
+    STATE.data.aiFileEvidence = { ...base, code: 'forbidden', error: 'ThreatHunting.Read.All not consented.' };
+    return STATE.data.aiFileEvidence;
+  }
+  const kql = [
+    'CloudAppEvents',
+    '| where Timestamp > ago(30d)',
+    '| where ActionType in ("FileAccessed","FileDownloaded","FilePreviewed","FileModified","FileUploaded","FileSyncDownloadedFull")',
+    '| extend OAuthAppId = tolower(tostring(RawEventData.ApplicationId))',
+    `| where OAuthAppId in (${ids.map(i => `"${i}"`).join(',')})`,
+    '| extend FileName = tostring(RawEventData.SourceFileName), Site = tostring(RawEventData.SiteUrl)',
+    '| summarize Events = count(),',
+    '    Reads  = countif(ActionType in ("FileAccessed","FileDownloaded","FilePreviewed","FileSyncDownloadedFull")),',
+    '    Writes = countif(ActionType in ("FileModified","FileUploaded")),',
+    '    Files = dcountif(FileName, isnotempty(FileName)), FilesSample = make_set_if(FileName, isnotempty(FileName), 8),',
+    '    Sites = dcountif(Site, isnotempty(Site)),',
+    '    Users = dcount(AccountObjectId), UsersSample = make_set_if(AccountDisplayName, isnotempty(AccountDisplayName), 5),',
+    '    LastAccess = max(Timestamp)',
+    '  by OAuthAppId',
+  ].join(' ');
+  const isUnsupportedErr = msg => /failed to resolve table|could not be resolved|unknown table|does not refer to any known table|semantic error|failed to resolve scalar/i.test(msg || '');
+  try {
+    const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ Query: kql, Timespan: 'P30D' }),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      STATE.data.aiFileEvidence = { ...base, code: r.status === 403 ? 'forbidden' : isUnsupportedErr(text) ? 'unsupported' : 'error', error: text.slice(0, 300) };
+      return STATE.data.aiFileEvidence;
+    }
+    const data = await r.json();
+    const rows = Array.isArray(data.results) ? data.results : (Array.isArray(data.Results) ? data.Results : []);
+    const parseArr = v => { let d = v; if (typeof d === 'string') { try { d = JSON.parse(d); } catch { d = [d]; } } return Array.isArray(d) ? d.map(String).filter(Boolean) : []; };
+    const byAppId = {};
+    rows.forEach(row => {
+      const id = String(row.OAuthAppId || '').toLowerCase();
+      if (!id) return;
+      byAppId[id] = {
+        events: Number(row.Events) || 0,
+        reads:  Number(row.Reads)  || 0,
+        writes: Number(row.Writes) || 0,
+        files:  Number(row.Files)  || 0,
+        filesSample: parseArr(row.FilesSample),
+        sites:  Number(row.Sites)  || 0,
+        users:  Number(row.Users)  || 0,
+        usersSample: parseArr(row.UsersSample),
+        lastAccess: row.LastAccess || null,
+      };
+    });
+    STATE.data.aiFileEvidence = { ok: true, byAppId, code: null, error: null };
+  } catch (e) {
+    const msg = e.message || String(e);
+    STATE.data.aiFileEvidence = { ...base, code: isUnsupportedErr(msg) ? 'unsupported' : 'error', error: msg };
+  }
+  return STATE.data.aiFileEvidence;
+}
+
+// Fills the "What AI Actually Accessed" card + evidence KPI on the External
+// Sharing page. Candidates = every detected AI app/agent (not only those with
+// visible grants — evidence can reveal access the grant scan missed).
+async function renderAiFileEvidence(fileApps, aiApps) {
+  const body = document.getElementById('share-evidence-body');
+  if (!body) return;
+  const candidates = [...new Map([...fileApps, ...aiApps].map(s => [s.id, s])).values()].filter(sp => sp.appId);
+  const ev = await fetchAiFileAccessEvidence(candidates.map(sp => sp.appId));
+  const kpiVal = document.getElementById('kpi-share-files');
+  const kpiSub = document.getElementById('kpi-share-files-sub');
+  const srcEl  = document.getElementById('share-evidence-src');
+  if (!ev.ok) {
+    if (kpiVal) kpiVal.textContent = '—';
+    if (kpiSub) kpiSub.textContent = ev.code === 'forbidden' ? 'needs ThreatHunting.Read.All' : 'evidence unavailable';
+    if (!document.getElementById('share-evidence-body')) return;
+    body.innerHTML = `<div class="card-body" style="font-size:12px;color:var(--text-muted)">${
+      ev.code === 'forbidden'
+        ? '🔒 Needs <code>ThreatHunting.Read.All</code> — re-run admin consent, then sign out &amp; back in, to read file-access evidence from Defender XDR.'
+        : ev.code === 'unsupported'
+          ? 'ℹ️ <code>CloudAppEvents</code> is unavailable — connect the Office 365 app connector in Defender for Cloud Apps to get file-access evidence.'
+          : 'ℹ️ File-access evidence unavailable — ' + esc(String(ev.error || 'unknown error').slice(0, 160))}</div>`;
+    return;
+  }
+  if (srcEl) { srcEl.textContent = '● CloudAppEvents · Advanced Hunting (P30D)'; srcEl.className = 'data-source source-live'; }
+  const rows   = candidates.map(sp => ({ sp, e: ev.byAppId[(sp.appId || '').toLowerCase()] })).filter(r => r.e);
+  const silent = candidates.filter(sp => !ev.byAppId[(sp.appId || '').toLowerCase()]);
+  const totFiles  = rows.reduce((n, r) => n + r.e.files, 0);
+  const totWrites = rows.reduce((n, r) => n + r.e.writes, 0);
+  if (kpiVal) kpiVal.textContent = totFiles;
+  if (kpiSub) kpiSub.textContent = rows.length
+    ? `by ${rows.length} AI app${rows.length !== 1 ? 's' : ''}${totWrites ? ` · ${totWrites} write${totWrites !== 1 ? 's' : ''}` : ''}`
+    : 'no access observed';
+  // "How much" from Cloud Discovery, when the Shadow AI page has loaded it
+  const mcasApps = STATE.data.mcasApps || [];
+  const uploadFor = sp => {
+    const m = mcasApps.find(a => a.name && (_appNameMatches(a.name, sp.displayName || '') || _appNameMatches(sp.displayName || '', a.name || '')));
+    return m ? (m.trafficUploadedBytes ?? 0) : null;
+  };
+  body.innerHTML = `
+    ${rows.length ? `
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>App / Agent</th><th>Files Touched</th><th>Reads / Writes</th><th>Sites</th><th>Users</th><th>Data Uploaded</th><th>Last Access</th></tr></thead>
+        <tbody>${rows.sort((a, b) => b.e.files - a.e.files).map(({ sp, e }) => {
+          const upl = uploadFor(sp);
+          return `<tr style="${e.writes > 0 ? 'background:rgba(240,136,62,.04)' : ''}">
+            <td><strong style="font-size:13px">${esc(sp.displayName || '—')}</strong></td>
+            <td style="font-weight:700" title="Sample: ${esc(e.filesSample.join(', '))}">${e.files}${e.filesSample.length ? ' <span class="text-muted" style="font-size:10px;cursor:help">(hover: sample)</span>' : ''}</td>
+            <td style="font-size:12px">${e.reads} read${e.reads !== 1 ? 's' : ''}${e.writes ? ` · <span class="text-high" style="font-weight:600">${e.writes} write${e.writes !== 1 ? 's' : ''}</span>` : ''}</td>
+            <td>${e.sites || '—'}</td>
+            <td title="${esc(e.usersSample.join(', '))}">${e.users} 👤</td>
+            <td>${upl != null && upl > 0 ? `<span style="font-weight:600;color:var(--risk-medium)">↑ ${fmtBytes(upl)}</span>` : '<span class="text-muted">—</span>'}</td>
+            <td style="font-size:12px;color:var(--text-muted)">${mcasRelTime(e.lastAccess) || '—'}</td>
+          </tr>`;
+        }).join('')}
+        </tbody>
+      </table>
+    </div>` : `<div class="card-body"><div class="empty-state text-muted">✅ No SharePoint/OneDrive file access by detected AI apps observed in the last 30 days.</div></div>`}
+    ${rows.length && silent.length ? `<div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">✅ ${silent.length} other detected AI app${silent.length !== 1 ? 's' : ''} showed no file access in 30 days${silent.length <= 4 ? ` (${silent.map(s => esc(s.displayName || '')).join(', ')})` : ''}.</div>` : ''}
+    <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
+      ℹ️ Source: <code>CloudAppEvents</code> file events attributed to each app's OAuth id · requires the Office 365 app connector in Defender for Cloud Apps · Data Uploaded comes from Cloud Discovery when loaded · per-document Copilot evidence lives in Purview (unified audit).
+    </div>`;
+}
+
 async function loadExternalSharing() {
   const el = document.getElementById('sharing-content');
   try {
@@ -7901,16 +7926,26 @@ async function loadExternalSharing() {
       return { sp, scopes, canWrite, isAdmin, appRisk, scopeChips };
     }).sort((a,b) => ({'critical':4,'high':3,'medium':2,'low':1}[b.appRisk]||0) - ({'critical':4,'high':3,'medium':2,'low':1}[a.appRisk]||0));
 
-    // SharePoint settings detail rows
+    // SharePoint settings detail rows — each with a one-line "why this matters
+    // for AI" so the settings table explains itself instead of just scoring.
     const settingRows = spSettings ? [
-      { label:'External sharing capability',  value: capInfo.label,                                       risk: capInfo.risk },
-      { label:'Default sharing link type',    value: linkInfo.label,                                      risk: linkInfo.risk },
-      { label:'Default link permission',      value: spSettings.defaultLinkPermission === 'edit' ? '✏️ Edit (write access by default)' : spSettings.defaultLinkPermission === 'view' ? '👁️ View only' : (spSettings.defaultLinkPermission||'—'), risk: spSettings.defaultLinkPermission === 'edit' ? 'high' : 'low' },
-      { label:'External resharing allowed',   value: spSettings.isResharingByExternalUsersEnabled === false ? '✅ Blocked' : spSettings.isResharingByExternalUsersEnabled === true ? '⚠️ Allowed' : '—', risk: spSettings.isResharingByExternalUsersEnabled ? 'medium' : 'low' },
-      { label:'OneDrive sharing',             value: spSettings.isSharingInOneDriveEnabled === false ? '✅ Disabled' : spSettings.isSharingInOneDriveEnabled === true ? '⚠️ Enabled' : '—', risk: spSettings.isSharingInOneDriveEnabled ? 'medium' : 'low' },
-      { label:'Request files links (OneDrive)', value: spSettings.isOneDriveRequestFilesLinkEnabled === true ? '⚠️ Enabled' : spSettings.isOneDriveRequestFilesLinkEnabled === false ? '✅ Disabled' : '—', risk: spSettings.isOneDriveRequestFilesLinkEnabled ? 'medium' : 'low' },
-      { label:'Guest must match invited user', value: spSettings.isRequireAcceptingUserToMatchInvitedUserEnabled ? '✅ Enforced' : '⚠️ Not enforced', risk: spSettings.isRequireAcceptingUserToMatchInvitedUserEnabled ? 'low' : 'medium' },
+      { label:'External sharing capability',  value: capInfo.label,                                       risk: capInfo.risk,
+        why:'Anyone-with-link content is reachable by every AI app acting for a user who can open it.' },
+      { label:'Default sharing link type',    value: linkInfo.label,                                      risk: linkInfo.risk,
+        why:'Sets what new shares default to — anonymous-by-default steadily widens what AI can reach.' },
+      { label:'Default link permission',      value: spSettings.defaultLinkPermission === 'edit' ? '✏️ Edit (write access by default)' : spSettings.defaultLinkPermission === 'view' ? '👁️ View only' : (spSettings.defaultLinkPermission||'—'), risk: spSettings.defaultLinkPermission === 'edit' ? 'high' : 'low',
+        why:'Edit-by-default links let AI apps holding write scopes modify shared content, not just read it.' },
+      { label:'External resharing allowed',   value: spSettings.isResharingByExternalUsersEnabled === false ? '✅ Blocked' : spSettings.isResharingByExternalUsersEnabled === true ? '⚠️ Allowed' : '—', risk: spSettings.isResharingByExternalUsersEnabled ? 'medium' : 'low',
+        why:'Guests re-sharing content keeps growing the pool of files reachable through delegated AI access.' },
+      { label:'OneDrive sharing',             value: spSettings.isSharingInOneDriveEnabled === false ? '✅ Disabled' : spSettings.isSharingInOneDriveEnabled === true ? '⚠️ Enabled' : '—', risk: spSettings.isSharingInOneDriveEnabled ? 'medium' : 'low',
+        why:'Personal-drive shares are in scope for AI apps with Files.Read.All — often the least governed content.' },
+      { label:'Request files links (OneDrive)', value: spSettings.isOneDriveRequestFilesLinkEnabled === true ? '⚠️ Enabled' : spSettings.isOneDriveRequestFilesLinkEnabled === false ? '✅ Disabled' : '—', risk: spSettings.isOneDriveRequestFilesLinkEnabled ? 'medium' : 'low',
+        why:'Upload-request links create externally writable folders whose content AI apps can then read.' },
+      { label:'Guest must match invited user', value: spSettings.isRequireAcceptingUserToMatchInvitedUserEnabled ? '✅ Enforced' : '⚠️ Not enforced', risk: spSettings.isRequireAcceptingUserToMatchInvitedUserEnabled ? 'low' : 'medium',
+        why:'Unenforced, invitations can be redeemed by unintended accounts, widening who (and whose AI) can reach shares.' },
     ] : [];
+    // Settings currently amplifying AI exposure (feeds the third KPI)
+    const amplifiers = settingRows.filter(r => r.risk === 'high' || r.risk === 'medium');
 
     el.innerHTML = `
       <div style="position:sticky;top:52px;z-index:80;background:var(--bg-primary);padding-bottom:10px;margin-bottom:4px;border-bottom:1px solid var(--border)">
@@ -7928,30 +7963,26 @@ async function loadExternalSharing() {
           </div>
         </div>
 
-        <div class="kpi-row" style="grid-template-columns:repeat(4,1fr);margin:0">
-          <div class="kpi-card ${capInfo.risk}">
-            <div class="kpi-label">Tenant Sharing Level</div>
-            <div class="kpi-value" style="font-size:16px;line-height:1.3">${capInfo.icon}</div>
-            <div class="kpi-delta" style="font-size:10px">${capInfo.label.replace(/^[✅⚠️🔴ℹ️]\s*/,'')}</div>
-            <div class="kpi-icon">🌐</div>
+        <div class="kpi-row" style="grid-template-columns:repeat(3,1fr);margin:0">
+          <div class="kpi-card info">
+            <div class="kpi-label">Files Accessed by AI (30d)</div>
+            <div class="kpi-value text-blue" id="kpi-share-files">…</div>
+            <div class="kpi-delta" id="kpi-share-files-sub">querying CloudAppEvents evidence…</div>
+            <div class="kpi-icon">🔎</div>
           </div>
-          <div class="kpi-card ${fileAiApps.length > 0 ? (anonEnabled ? 'critical' : 'high') : 'low'}">
-            <div class="kpi-label">AI Apps with Files Access</div>
-            <div class="kpi-value ${fileAiApps.length > 0 ? (anonEnabled ? 'text-critical' : 'text-high') : 'text-low'}">${fileAiApps.length}</div>
-            <div class="kpi-delta">${fileAgents.length} agents · ${writeApps.length} with write</div>
+          <div class="kpi-card ${allFileApps.length > 0 ? (anonEnabled ? 'critical' : 'high') : 'low'}">
+            <div class="kpi-label">AI Apps with File Reach</div>
+            <div class="kpi-value ${allFileApps.length > 0 ? (anonEnabled ? 'text-critical' : 'text-high') : 'text-low'}">${allFileApps.length}</div>
+            <div class="kpi-delta">${writeApps.length} with write · ${adminConsentFileApps.length} tenant-wide</div>
             <div class="kpi-icon">📁</div>
           </div>
-          <div class="kpi-card ${adminConsentFileApps.length > 0 ? 'critical' : 'low'}">
-            <div class="kpi-label">Admin-Consented File Access</div>
-            <div class="kpi-value ${adminConsentFileApps.length > 0 ? 'text-critical' : 'text-low'}">${adminConsentFileApps.length}</div>
-            <div class="kpi-delta">Tenant-wide Files/Sites grants</div>
-            <div class="kpi-icon">🔑</div>
-          </div>
-          <div class="kpi-card ${linkInfo.risk}">
-            <div class="kpi-label">Default Link Type</div>
-            <div class="kpi-value" style="font-size:16px">🔗</div>
-            <div class="kpi-delta" style="font-size:10px">${linkInfo.label}</div>
-            <div class="kpi-icon">📎</div>
+          <div class="kpi-card ${spSettings ? (amplifiers.length ? (anonEnabled ? 'critical' : 'medium') : 'low') : 'info'}">
+            <div class="kpi-label">Amplifying Settings On</div>
+            <div class="kpi-value ${spSettings ? (amplifiers.length ? (anonEnabled ? 'text-critical' : 'text-medium') : 'text-low') : 'text-muted'}">${spSettings ? amplifiers.length : '—'}</div>
+            <div class="kpi-delta">${spSettings
+              ? (amplifiers.length ? amplifiers.slice(0, 2).map(a => a.label).join(' · ') + (amplifiers.length > 2 ? ` +${amplifiers.length - 2}` : '') : 'sharing configuration is tight')
+              : 'needs SharePointTenantSettings.Read.All'}</div>
+            <div class="kpi-icon">🌐</div>
           </div>
         </div>
       </div>
@@ -7994,68 +8025,20 @@ async function loadExternalSharing() {
           'No detected AI app or agent has Files/Sites permissions, so AI cannot read shared file content via Graph today.');
       })()}
 
-      <div class="grid-2" style="margin-bottom:16px">
-        <div class="card">
-          <div class="card-header">
-            <div class="card-title">🌐 SharePoint Sharing Settings</div>
-            <span class="data-source ${spSettings ? 'source-live' : 'source-derived'}" style="font-size:10px">
-              ${spSettings ? '● admin/sharepoint/settings' : '⚡ Not available — needs SharePointTenantSettings.Read.All'}
-            </span>
-          </div>
-          ${spSettings ? `
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Setting</th><th>Value</th><th>Risk</th></tr></thead>
-              <tbody>${settingRows.map(r => `<tr>
-                <td style="font-size:12px;color:var(--text-muted)">${esc(r.label)}</td>
-                <td style="font-size:12px">${esc(r.value)}</td>
-                <td>${riskBadge(r.risk)}</td>
-              </tr>`).join('')}</tbody>
-            </table>
-          </div>
-          <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
-            ℹ️ Source: <code>GET /admin/sharepoint/settings</code> · Requires SharePointTenantSettings.Read.All
-          </div>
-          ` : `
-          <div class="card-body">
-            ${STATE.data.spSettingsError ? permWarn('SharePointTenantSettings.Read.All', STATE.data.spSettingsError) : ''}
-            <div class="empty-state text-muted">SharePoint tenant settings unavailable. Grant <code>SharePointTenantSettings.Read.All</code> admin consent to see external sharing configuration.</div>
-          </div>
-          `}
+      <!-- 1 · Evidence — what AI apps actually read/wrote (fills in async) -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">🔎 1 · What AI Actually Accessed (30d)</div>
+          <span id="share-evidence-src" class="data-source source-derived" style="font-size:10px">⚡ CloudAppEvents · Advanced Hunting</span>
         </div>
-
-        <div class="card">
-          <div class="card-header">
-            <div class="card-title">📊 Exposure Risk Matrix</div>
-          </div>
-          <div class="card-body">
-            ${[
-              { label:'Anonymous sharing enabled',               val: anonEnabled,                          risk: anonEnabled?'high':'low' },
-              { label:'AI apps with Files.Read.All',             val: fileAiApps.length > 0,                risk: fileAiApps.length>0?'high':'low', count: fileAiApps.length },
-              { label:'Agents with Files access',                val: fileAgents.length > 0,                risk: fileAgents.length>0?'medium':'low', count: fileAgents.length },
-              { label:'Admin-consented Files access',            val: adminConsentFileApps.length > 0,      risk: adminConsentFileApps.length>0?'critical':'low', count: adminConsentFileApps.length },
-              { label:'AI apps with write access to SharePoint', val: writeApps.length > 0,                 risk: writeApps.length>0?'high':'low', count: writeApps.length },
-              { label:'Default link type is anonymous',          val: defaultLink==='anonymousAccess',      risk: defaultLink==='anonymousAccess'?'high':'low' },
-              { label:'External resharing by guests',            val: spSettings?.isResharingByExternalUsersEnabled===true, risk:'medium' },
-            ].map(r => `
-              <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border-subtle,rgba(48,54,61,.6))">
-                <span style="font-size:12px;color:var(--text-muted)">${esc(r.label)}</span>
-                <div style="display:flex;align-items:center;gap:8px">
-                  ${r.count !== undefined ? `<span style="font-size:11px;color:var(--text-dim)">${r.count}</span>` : ''}
-                  ${r.val === true
-                    ? `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(248,81,73,.1);color:var(--risk-${r.risk})">⚠️ Yes</span>`
-                    : r.val === false
-                    ? `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(63,185,80,.1);color:var(--risk-low)">✅ No</span>`
-                    : `<span style="font-size:11px;color:var(--text-dim)">—</span>`}
-                </div>
-              </div>`).join('')}
-          </div>
+        <div id="share-evidence-body">
+          <div class="section-loading"><span class="spinner"></span>Querying file-access evidence…</div>
         </div>
       </div>
 
       <div class="card" style="margin-bottom:16px">
         <div class="card-header">
-          <div class="card-title">📁 AI Apps &amp; Agents with SharePoint/OneDrive Access (${allFileApps.length})</div>
+          <div class="card-title">📂 2 · What AI Could Reach — Apps &amp; Agents with File Grants (${allFileApps.length})</div>
           <span class="data-source source-derived">⚡ Derived from OAuth2 grants</span>
         </div>
         ${allFileApps.length ? `
@@ -8089,6 +8072,37 @@ async function loadExternalSharing() {
             </tbody>
           </table>
         </div>` : '<div class="card-body empty-state text-muted">✅ No AI apps or agents have SharePoint/OneDrive file access grants.</div>'}
+      </div>
+
+      <!-- 3 · Root cause — the tenant settings that widen what delegated AI access reaches -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">🌐 3 · Settings That Amplify Exposure${spSettings ? ` (${amplifiers.length} of ${settingRows.length} active)` : ''}</div>
+          <span class="data-source ${spSettings ? 'source-live' : 'source-derived'}" style="font-size:10px">
+            ${spSettings ? '● admin/sharepoint/settings' : '⚡ needs SharePointTenantSettings.Read.All'}
+          </span>
+        </div>
+        ${spSettings ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Setting</th><th>Value</th><th>Risk</th><th>Why it matters for AI</th></tr></thead>
+            <tbody>${settingRows.map(r => `<tr style="${r.risk === 'high' ? 'background:rgba(248,81,73,.04)' : r.risk === 'medium' ? 'background:rgba(240,136,62,.03)' : ''}">
+              <td style="font-size:12px;color:var(--text-muted);white-space:nowrap">${esc(r.label)}</td>
+              <td style="font-size:12px;white-space:nowrap">${esc(r.value)}</td>
+              <td>${riskBadge(r.risk)}</td>
+              <td style="font-size:11px;color:var(--text-dim)">${esc(r.why)}</td>
+            </tr>`).join('')}</tbody>
+          </table>
+        </div>
+        <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
+          ℹ️ Source: <code>GET /admin/sharepoint/settings</code> · These settings grant AI nothing by themselves — they widen what the delegated access in section 2 can reach.
+        </div>
+        ` : `
+        <div class="card-body">
+          ${STATE.data.spSettingsError ? permWarn('SharePointTenantSettings.Read.All', STATE.data.spSettingsError) : ''}
+          <div class="empty-state text-muted">SharePoint tenant settings unavailable. Grant <code>SharePointTenantSettings.Read.All</code> admin consent to see external sharing configuration.</div>
+        </div>
+        `}
       </div>
 
       <div class="card">
@@ -8126,6 +8140,9 @@ async function loadExternalSharing() {
         </div>
       </div>
     `;
+
+    // Evidence loads async (Advanced Hunting) — fills the card + evidence KPI
+    renderAiFileEvidence(allFileApps, aiApps).catch(() => {});
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
   }
