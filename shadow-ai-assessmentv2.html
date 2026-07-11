@@ -2435,7 +2435,6 @@ async function loadDashboard() {
     const copilotLicensed = (dashCopilot && dashCopilot.userDetail && dashCopilot.userDetail.length) || 0;
     const copilotActive = dashCopilot?.summary?.totalActiveUsers
       ?? (dashCopilot?.userDetail || []).filter(u => u.teamsChatCount || u.wordCount || u.excelCount || u.powerPointCount || u.outlookCount).length;
-    const usersSummary = await usersSummaryP;
     // Normalise the live Defender AI detections into the alert-feed shape.
     const defenderAiAlerts = [
       ...((dashAgentThreat && dashAgentThreat.alerts) || []).map(r => ({
@@ -2682,24 +2681,6 @@ async function loadDashboard() {
     const dashCompliantModels = dashModels.filter(m => m.gdprOk).length;
     const dashGdprCompliant = dashModels.length > 0 && dashCompliantModels === dashModels.length;
 
-    // ── AI Risk Index (0–100, higher = worse) — transparent composite of the
-    //    four CISO dimensions minus credit for controls that actually mitigate.
-    const RISK_INDEX = (() => {
-      const shadowPts = { Critical:30, High:22, Medium:12, Low:4 }[cisoShadowRisk] || 0;
-      const llmPts    = cisoExternalLlm ? 18 : 0;
-      const resPts    = { High:18, Medium:10, Low:5, Safe:0 }[cisoDataRes] ?? 0;
-      const sensPts   = { High:22, Medium:12, Low:4 }[cisoSensitive] || 0;
-      let credit = 0;
-      if (hasE7Agent) credit += 5;
-      if (hasP2) credit += 4;
-      if (agentCaEnforced > 0) credit += 6;
-      return Math.max(0, Math.min(100, Math.round(shadowPts + llmPts + resPts + sensPts - credit)));
-    })();
-    const band = RISK_INDEX >= 70 ? { word:'Critical', color:'var(--risk-critical)', hex:'#f85149' }
-               : RISK_INDEX >= 45 ? { word:'High',     color:'var(--risk-high)',     hex:'#ff7b72' }
-               : RISK_INDEX >= 25 ? { word:'Elevated', color:'var(--risk-medium)',   hex:'#f0883e' }
-               :                    { word:'Low',       color:'var(--risk-low)',      hex:'#3fb950' };
-
     // §2 Security KPI cards — agent protection + DLP-for-AI coverage.
     const dimCard = (d, delay) => `<div class="dim-card dash-rise" style="border-left-color:${d.color};animation-delay:${delay}ms"${d.page ? ` onclick="navigate('${d.page}', document.querySelector('[onclick*=${d.page}]'))"` : ''}>
         <div class="dim-top"><div class="dim-label">${d.icon} ${esc(d.label)}</div><div class="dim-val" style="color:${d.color}">${esc(d.value)}</div></div>
@@ -2721,7 +2702,7 @@ async function loadDashboard() {
       { icon:'🤖', label:'AI Models',         n: aiModelCount,       color: aiNonGdpr>0?'var(--risk-high)':'var(--accent-blue)',            bar: aiNonGdpr>0?'warnbar':'',       sub: (aiNonGdpr>0?`${aiNonGdpr} non-GDPR`:'all GDPR-adequate') + trendMini('AI Models', aiModelCount), page:'models' },
       { icon:'⚡', label:'AI Agents',         n: agentIdentities,    color: riskyAgentsActive>0?'var(--risk-critical)':'var(--accent-blue)',bar: riskyAgentsActive>0?'critbar':'',sub: (riskyAgentsActive>0?`${riskyAgentsActive} with active risk`:'no active risk')+trendMini('Agent Identities', agentIdentities), page:'agents', numId:'dash-agent-count' },
       { icon:'💬', label:'Copilot Usage',     n: copilotActive,      color:'var(--accent-blue)',                                            bar:'',                              sub: copilotLicensed?`active · of ${copilotLicensed} licensed`:'active (30d)', page:'copilot' },
-      { icon:'👥', label:'AI Users',          n: usersSummary?.aiUsersTotal ?? aiUserCount, color: (usersSummary?.riskyPeople ?? riskyAiUsers.length)>0?'var(--risk-high)':'var(--accent-blue)', bar: (usersSummary?.riskyPeople ?? riskyAiUsers.length)>0?'warnbar':'', sub: usersSummary ? `of ${usersSummary.dirTotal} users${usersSummary.riskyPeople>0?` · ${usersSummary.riskyPeople} risky`:''}` : ((riskyAiUsers.length>0?`${riskyAiUsers.length} risky`:'none flagged risky')+trendMini('AI Users', aiUserCount)), page:'users' },
+      { icon:'👥', label:'AI Users',          n: aiUserCount,        color: riskyAiUsers.length>0?'var(--risk-high)':'var(--accent-blue)',  bar: riskyAiUsers.length>0?'warnbar':'', sub: (riskyAiUsers.length>0?`${riskyAiUsers.length} risky`:'none flagged risky'), page:'users', numId:'dash-aiusers-count', subId:'dash-aiusers-sub' },
       { icon:'🔑', label:'High-Risk Grants',  n: highRiskAi.length,  color: highRiskAi.length>0?'var(--risk-critical)':'var(--risk-low)',   bar: highRiskAi.length>0?'critbar':'',sub: highRiskAi.length>0?'Mail / Files / Calendar':'none granted', page:'shadow-apps' },
     ];
 
@@ -2741,19 +2722,25 @@ async function loadDashboard() {
     };
     // EU AI Act: high-level posture across data residency, governance guardrails,
     // human accountability and runtime oversight (heuristic, not a legal opinion).
+    // Agent accountability (ownerless blueprints) needs the owners/sponsors fetch,
+    // which only lands after the AI Agents page has loaded. When it hasn't, mark that
+    // dimension unverified rather than silently treating it as compliant.
+    const ownershipKnown = !!(STATE.data.agentSps && STATE.data.agentOwnersSponsors);
     const aiActGaps = [];
     if (aiNonGdpr>0 || outsideEu>0) aiActGaps.push('AI systems process data outside EU adequacy');
     if (!(dashDlpScope?.ok && dashDlpScope.configured)) aiActGaps.push('no DLP guardrails governing AI data');
-    if (ownerlessBp>0) aiActGaps.push(`${ownerlessBp} of ${totalBp} agent blueprint${totalBp!==1?'s':''} ownerless — no human accountability`);
+    if (ownershipKnown && ownerlessBp>0) aiActGaps.push(`${ownerlessBp} of ${totalBp} agent blueprint${totalBp!==1?'s':''} ownerless — no human accountability`);
     if (!hasE7Agent) aiActGaps.push('agent runtime oversight not licensed');
     const aiActOk = aiActGaps.length === 0;
     const aiActCard = {
       iconSvg: ICON_EUAIACT, label:'EU AI Act', page:'models',
-      value: aiActOk ? 'Compliant' : 'Not compliant',
+      value: aiActOk ? (ownershipKnown ? 'Compliant' : 'Likely OK') : 'Not compliant',
       color: aiActOk ? 'var(--risk-low)' : (aiActGaps.length>=3 ? 'var(--risk-critical)' : 'var(--risk-medium)'),
       why: aiActOk
-        ? 'AI inventory, DLP guardrails, EU residency and agent accountability in place'
-        : aiActGaps.slice(0,2).join(' · '),
+        ? (ownershipKnown
+            ? 'AI inventory, DLP guardrails, EU residency and agent accountability in place'
+            : 'Inventory, DLP guardrails and EU residency in place · agent accountability not yet verified')
+        : aiActGaps.slice(0,2).join(' · ') + (ownershipKnown ? '' : ' · agent accountability unverified'),
     };
     const complianceCard = d => `<div class="dim-card" style="border-left-color:${d.color};flex:1;margin:0;display:flex;flex-direction:column;justify-content:center"${d.page?` onclick="navigate('${d.page}', document.querySelector('[onclick*=${d.page}]'))"`:''}>
         <div class="dim-top"><div class="dim-label" style="display:inline-flex;align-items:center;gap:6px"><span style="display:inline-flex;width:20px;height:20px;flex-shrink:0">${d.iconSvg || ''}</span>${esc(d.label)}</div><div class="dim-val" style="color:${d.color}">${esc(d.value)}</div></div>
@@ -2849,11 +2836,9 @@ async function loadDashboard() {
       </div>
     `;
 
-    // ── Entrance animations: count-up numbers, spark bars, gauge & coverage rings
+    // ── Entrance animations: count-up numbers on the KPI tiles.
     requestAnimationFrame(() => {
       el.querySelectorAll('[data-count]').forEach(n => dashCountUp(n, +n.dataset.count));
-      el.querySelectorAll('.dim-spark > span[data-w]').forEach(s => { s.style.width = s.dataset.w + '%'; });
-      const g = document.getElementById('dash-gauge-val'); if (g) g.style.strokeDashoffset = String(100 - RISK_INDEX);
     });
 
     // Hero showcase map — its own instance/state key so it never clobbers the
@@ -2862,6 +2847,17 @@ async function loadDashboard() {
 
     updateDashShadowKpi();
     updateDashAgentKpi();
+
+    // AI Users tile: the authoritative count (same union the AI & Agent Users page
+    // headlines) needs an agent owners/sponsors fetch, so refine the tile async
+    // rather than blocking first paint on ~2 Graph calls per agent.
+    usersSummaryP.then(s => {
+      if (!s) return;
+      const c = document.getElementById('dash-aiusers-count');
+      const sub = document.getElementById('dash-aiusers-sub');
+      if (c) { c.dataset.count = s.aiUsersTotal; c.textContent = s.aiUsersTotal; }
+      if (sub) sub.textContent = `of ${s.dirTotal} users${s.riskyPeople>0?` · ${s.riskyPeople} risky`:''}`;
+    }).catch(() => {});
 
     // Persist this run's metrics so the next assessment can show trend deltas.
     saveDashSnapshot(curMetrics, { secureScore: secScore?.pct ?? null, overallRisk: cisoShadowRisk });
@@ -4266,40 +4262,6 @@ function getAgentType(sp) {
 const AGENT_WRITE_SCOPES = ['Mail.Send','Mail.ReadWrite','Files.ReadWrite.All','Calendars.ReadWrite',
   'Sites.ReadWrite.All','User.ReadWrite.All','Directory.ReadWrite.All'];
 const AGENT_KEYWORDS = ['agent','bot','automation','pipeline','workflow','copilot','assistant','automat'];
-
-// Permissions explicitly blocked for agent identities per Microsoft Agent ID platform docs
-// These cannot be consented to or exercised by agent service principals
-const BLOCKED_AGENT_PERMS = new Set([
-  // File & SharePoint access
-  'Files.Read.All','Files.ReadWrite.All',
-  'Sites.Read.All','Sites.ReadWrite.All','Sites.FullControl.All','Sites.Manage.All',
-  // Directory & identity write
-  'Directory.ReadWrite.All','Directory.Write.Restricted','Directory.AccessAsUser.All',
-  // Group management
-  'Group.ReadWrite.All','Group.Write.Restricted','GroupMember.ReadWrite.All',
-  // Application & consent management
-  'Application.ReadWrite.All','Application.ReadWrite.OwnedBy',
-  'AppRoleAssignment.ReadWrite.All','DelegatedPermissionGrant.ReadWrite.All',
-  // User lifecycle
-  'User.ReadWrite.All','User.DeleteRestore.All','User.EnableDisableAccount.All',
-  // Teams & chat
-  'Chat.Read.All','Chat.ReadWrite.All','ChannelMessage.Read.All',
-  'TeamMember.ReadWrite.All','Channel.Delete.All',
-  // Role management
-  'RoleManagement.ReadWrite.All','RoleManagement.ReadWrite.Directory',
-  'RoleAssignmentSchedule.ReadWrite.Directory','RoleEligibilitySchedule.ReadWrite.Directory',
-  'PrivilegedAccess.ReadWrite.AzureAD','PrivilegedAccess.ReadWrite.AzureADGroup',
-  // Custom security attributes
-  'CustomSecAttributeAssignment.ReadWrite.All','CustomSecAttributeDefinition.ReadWrite.All',
-  // Device management
-  'Device.ReadWrite.All','DeviceManagementConfiguration.Read.All',
-  // Policy
-  'Policy.ReadWrite.All','Policy.ReadWrite.ConditionalAccess',
-  // Auth methods
-  'UserAuthenticationMethod.Read.All','UserAuthenticationMethod.ReadWrite.All',
-  // Identity risk
-  'IdentityRiskyUser.ReadWrite.All','IdentityRiskyUser.ConfirmCompromised.All',
-]);
 
 const RISK_ORDER = { critical:3, high:2, medium:1, low:0 };
 
@@ -6064,8 +6026,10 @@ async function loadDataRisk() {
     // Fetch application-level permissions (appRoleAssignments) for each agent
     const agentAppPerms = await fetchAgentAppPerms(agentSps, sps);
 
-    // Which AI apps & agents actually hold data-reaching permissions.
-    const DATA_SCOPE_RE = /Files|Sites|Mail|Chat|ChannelMessage|Directory|People|Contacts|Calendars|Notes|Tasks|Group\.Read|Group\.ReadWrite/i;
+    // Which AI apps & agents actually hold data-reaching permissions. Anchored to
+    // the scope's resource prefix (Graph scopes are "Resource.Action") so the benign
+    // OIDC "email" scope doesn't match "Mail", etc.
+    const DATA_SCOPE_RE = /^(Files|Sites|Mail|Chat|ChannelMessage|Directory|People|Contacts|Calendars|Notes|Tasks|Group)\b/i;
     const aiDataApps = aiApps.filter(sp => getScopesForSp(sp.id, grants).some(s => DATA_SCOPE_RE.test(s)));
     const dataAgents = agentSps.filter(sp => getScopesForSp(sp.id, grants).some(s => DATA_SCOPE_RE.test(s)) || (agentAppPerms[sp.id]||[]).some(p => DATA_SCOPE_RE.test(p.role||'')));
 
