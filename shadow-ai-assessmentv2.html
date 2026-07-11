@@ -1930,19 +1930,41 @@ async function fetchDlpAiBlocks() {
     }
     return out;
   };
+  // DataSecurityEvents packs detected sensitive info types into a dynamic JSON
+  // array (SensitiveInfoTypeInfo); pull the human-readable names out of whichever
+  // property spelling the tenant returns.
+  const sitNames = v => {
+    try {
+      const arr = typeof v === 'string' ? JSON.parse(v) : v;
+      if (!Array.isArray(arr)) return [];
+      return [...new Set(arr.map(x => x && (x.SensitiveInfoTypeName || x.SensitiveInformationTypeName || x.Name || x.name)).filter(Boolean).map(String))];
+    } catch { return []; }
+  };
+  const NIL_GUID = /^0{8}-0{4}-0{4}-0{4}-0{12}$/;
   const secKey = t => { const ms = new Date(t).getTime(); return Number.isFinite(ms) ? Math.floor(ms / 1000) : String(t || ''); };
-  const finish = (rawRows, incidents = []) => {
+  const finish = async (rawRows, incidents = []) => {
     // Index the AI DLP incidents by app so a block row can borrow the file/policy
     // its own incident carries (in the incident title). Each incident enriches at
-    // most one row — matched on the same AI app within a 5-minute window.
+    // most one row. A same-file match binds within an hour; otherwise nearest-in-
+    // time within 15 minutes — AlertInfo Timestamps regularly trail the block event
+    // by 5-10 minutes, which the old 5-minute window missed (the block and its own
+    // incident then rendered as two separate rows).
     const incByApp = {};
     incidents.forEach(i => { i.sec = secKey(i.time); (incByApp[i.app] = incByApp[i.app] || []).push(i); });
     const matchInc = ev => {
       const list = incByApp[ev.app] || (ev.app === 'AI app' ? incByApp['AI app'] : null) || [];
       const esec = secKey(ev.time);
-      let best = null, bestD = Infinity;
-      list.forEach(i => { if (i._used) return; const d = Math.abs(i.sec - esec); if (d < bestD) { bestD = d; best = i; } });
-      return best && bestD <= 300 ? best : null;
+      const fname = ev.file && ev.file !== '—' ? ev.file.toLowerCase() : null;
+      let best = null, bestScore = -Infinity;
+      list.forEach(i => {
+        if (i._used) return;
+        const d = Math.abs(i.sec - esec);
+        const sameFile = !!(fname && i.file && i.file.toLowerCase() === fname);
+        if (d > (sameFile ? 3600 : 900)) return;
+        const score = (sameFile ? 1e6 : 0) - d;
+        if (score > bestScore) { bestScore = score; best = i; }
+      });
+      return best;
     };
     const events = rawRows.map(r0 => {
       const row = flatten(r0);
@@ -1957,6 +1979,11 @@ async function fetchDlpAiBlocks() {
         file: String(pick(row, ['FileName','ObjectName','FileNameOriginal','fileName']) || '—'),
         device: String(pick(row, ['DeviceName','deviceName']) || ''),
         policy: String(pick(row, ['PolicyName','DLPPolicyName','DlpPolicy','policyName']) || ''),
+        // Label NAME when the table carries one (DeviceFileEvents-style columns,
+        // sometimes flattened out of AdditionalFields); else the Purview label
+        // GUID from DataSecurityEvents — the renderer shows GUIDs as "labelled".
+        label: (() => { const l = String(pick(row, ['SensitivityLabel','SensitivitySubLabel','SensitivityLabelName','LabelName']) || pick(row, ['SensitivityLabelId','PreviousSensitivityLabelId']) || ''); return NIL_GUID.test(l) ? '' : l; })(),
+        sit: sitNames(row.SensitiveInfoTypeInfo ?? row.SensitiveInfoTypes),
         action, blocked, app, incident: false, severity: '', category: '',
       };
       // Endpoint block rows usually lack the file name and policy; the DLP incident
@@ -1982,6 +2009,18 @@ async function fetchDlpAiBlocks() {
         app: i.app, incident: true, severity: i.severity || '', category: i.category || '',
       });
     });
+    // DataSecurityEvents only carries SensitivityLabelId — resolve the GUID to the
+    // label's display name via the labels the app already fetches (cached). Even
+    // Purview's own Activity Explorer leaves this as a raw GUID.
+    if (events.some(e => e.label && _GUID_RE.test(e.label))) {
+      const labels = await fetchSensitivityLabels().catch(() => []);
+      const byId = new Map((labels || []).map(l => [String(l.id || '').toLowerCase(), l.name]).filter(([id, name]) => id && name));
+      events.forEach(e => {
+        if (!e.label || !_GUID_RE.test(e.label)) return;
+        const name = byId.get(e.label.toLowerCase());
+        if (name) { e.labelId = e.label; e.label = name; }
+      });
+    }
     // Dedupe: one user action is recorded as several rows (e.g. "File copied to
     // cloud" + "DLP rule matched") — collapse by time+user+device+file+app, keeping
     // a blocked (then incident-flagged) variant over an audited one. Time is
@@ -7718,6 +7757,43 @@ async function renderAiFileEvidence(fileApps, aiApps) {
 // to an external AI. Endpoint DLP blocks live in DeviceEvents / DataSecurityEvents,
 // which the cloud-side CloudAppEvents evidence can't see. Reuses fetchDlpAiBlocks().
 const _sevColor = s => s === 'high' ? 'var(--risk-critical)' : s === 'medium' ? 'var(--risk-high)' : s === 'low' ? 'var(--risk-medium)' : 'var(--text-muted)';
+// Advanced Hunting timestamps are UTC; we render browser-local time. The Defender
+// and Purview portals format the same event in *their* configured timezone (gear →
+// Time zone), so the three clocks can disagree by hours — spell out the zone and
+// keep raw UTC in the tooltip so any of them can be cross-checked.
+const _LOCAL_TZ = (() => { try { return new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' }).formatToParts(new Date()).find(p => p.type === 'timeZoneName')?.value || ''; } catch { return ''; } })();
+function dlpTimeCell(t) {
+  if (!t) return '—';
+  const d = new Date(t);
+  if (!Number.isFinite(d.getTime())) return esc(String(t));
+  const utc = d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+  return `<span title="${esc(utc + ' — the Defender/Purview portals display this event in their own timezone setting')}">${esc(d.toLocaleString())}${_LOCAL_TZ ? ` <span style="opacity:.55;font-size:9px">${esc(_LOCAL_TZ)}</span>` : ''}</span>`;
+}
+const _GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// One DLP-to-AI event row, shared by the sharing-tab and labels-tab tables so the
+// label / info-type / timezone enrichment stays in lockstep between them.
+function dlpEventRow(e) {
+  const labelChip = e.label
+    ? `<br><span style="font-size:10px;color:var(--accent-blue)" title="${esc(_GUID_RE.test(e.label) ? 'Sensitivity label id ' + e.label + ' (name not resolvable — needs InformationProtectionPolicy.Read)' : 'Sensitivity label' + (e.labelId ? ' · ' + e.labelId : ''))}">🏷️ ${esc(_GUID_RE.test(e.label) ? 'labelled' : e.label)}</span>`
+    : '';
+  const sits = e.sit && e.sit.length
+    ? `<br><span class="text-muted" style="font-size:10px" title="${esc('Detected sensitive info types: ' + e.sit.join(', '))}">🔍 ${esc(e.sit.slice(0, 2).join(', '))}${e.sit.length > 2 ? ` +${e.sit.length - 2}` : ''}</span>`
+    : '';
+  return `<tr${e.blocked ? ' style="background:rgba(248,81,73,.04)"' : ''}>
+    <td class="mono text-muted" style="font-size:11px;white-space:nowrap">${dlpTimeCell(e.time)}</td>
+    <td style="font-size:12px">${esc(e.user)}${e.device ? `<br><span class="text-muted" style="font-size:10px">${esc(e.device)}</span>` : ''}</td>
+    <td style="font-size:12px">${esc(e.file)}${labelChip}${sits}</td>
+    <td style="font-size:12px">${esc(e.app)}</td>
+    <td>${e.blocked ? '<span class="badge badge-critical" style="font-size:10px">🚫 Blocked</span>' : '<span class="badge badge-medium" style="font-size:10px">⚠️ Audited</span>'}${e.incident ? ` <span class="badge" style="font-size:9px;background:var(--risk-critical);color:#fff" title="${esc((e.category ? e.category + ' · ' : '') + 'Escalated to a Defender incident')}">🔺 Incident</span>` : ''}</td>
+    <td class="text-muted" style="font-size:11px">${esc(e.policy || '—')}</td>
+  </tr>`;
+}
+function dlpTableFooter() {
+  return `<div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
+      ℹ️ Source: endpoint DLP &amp; Purview policy-violation events (Advanced Hunting). Full detail in <a href="https://purview.microsoft.com/datalossprevention/activityexplorer" target="_blank" rel="noopener" style="color:var(--accent-blue)">Purview → Activity Explorer</a>.
+      Times are your local timezone${_LOCAL_TZ ? ` (${esc(_LOCAL_TZ)})` : ''} — hover for UTC; the Defender &amp; Purview portals use their own timezone setting, so portal times can differ by hours.
+    </div>`;
+}
 // Strip shown above the DLP blocks table: the block(s) that escalated to a
 // Defender AI incident, with the document + policy parsed from the incident title.
 function dlpIncidentStrip(bl) {
@@ -7725,6 +7801,7 @@ function dlpIncidentStrip(bl) {
   if (!inc.length) return '';
   const rows = inc.slice(0, 8).map(i => `<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-size:11px;color:var(--text-muted);line-height:1.6">
     <span style="color:${_sevColor(i.severity)};font-size:9px">●</span>
+    ${i.time ? `<span class="mono" style="font-size:10px">${dlpTimeCell(i.time)}</span><span style="color:var(--text-dim)">·</span>` : ''}
     <strong style="color:var(--text-primary)">${esc(i.file || 'document')}</strong>
     <span style="color:var(--text-dim)">·</span>${esc(i.policy || 'DLP policy')}
     <span style="color:var(--text-dim)">→</span>${esc(i.app)}
@@ -7773,20 +7850,11 @@ async function renderShareDlpBlocks() {
     <div class="table-wrap dlp-blocks-scroll">
       <table class="dlp-blocks-table">
         <thead><tr><th>When</th><th>User</th><th>File</th><th>AI App</th><th>Action</th><th>Policy</th></tr></thead>
-        <tbody>${bl.events.slice(0, 50).map(e => `<tr${e.blocked ? ' style="background:rgba(248,81,73,.04)"' : ''}>
-          <td class="mono text-muted" style="font-size:11px;white-space:nowrap">${e.time ? new Date(e.time).toLocaleString() : '—'}</td>
-          <td style="font-size:12px">${esc(e.user)}${e.device ? `<br><span class="text-muted" style="font-size:10px">${esc(e.device)}</span>` : ''}</td>
-          <td style="font-size:12px">${esc(e.file)}</td>
-          <td style="font-size:12px">${esc(e.app)}</td>
-          <td>${e.blocked ? '<span class="badge badge-critical" style="font-size:10px">🚫 Blocked</span>' : '<span class="badge badge-medium" style="font-size:10px">⚠️ Audited</span>'}${e.incident ? ` <span class="badge" style="font-size:9px;background:var(--risk-critical);color:#fff" title="${esc((e.category ? e.category + ' · ' : '') + 'Escalated to a Defender incident')}">🔺 Incident</span>` : ''}</td>
-          <td class="text-muted" style="font-size:11px">${esc(e.policy || '—')}</td>
-        </tr>`).join('')}
+        <tbody>${bl.events.slice(0, 50).map(dlpEventRow).join('')}
         </tbody>
       </table>
     </div>
-    <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
-      ℹ️ Source: endpoint DLP &amp; Purview policy-violation events (Advanced Hunting). Full detail in <a href="https://purview.microsoft.com/datalossprevention/activityexplorer" target="_blank" rel="noopener" style="color:var(--accent-blue)">Purview → Activity Explorer</a>.
-    </div>`;
+    ${dlpTableFooter()}`;
 }
 
 async function loadExternalSharing() {
@@ -8693,20 +8761,11 @@ async function loadSensitivityLabels() {
         <div class="table-wrap dlp-blocks-scroll">
           <table class="dlp-blocks-table">
             <thead><tr><th>When</th><th>User</th><th>File</th><th>AI App</th><th>Action</th><th>Policy</th></tr></thead>
-            <tbody>${bl.events.slice(0, 50).map(e => `<tr${e.blocked ? ' style="background:rgba(248,81,73,.04)"' : ''}>
-              <td class="mono text-muted" style="font-size:11px;white-space:nowrap">${e.time ? new Date(e.time).toLocaleString() : '—'}</td>
-              <td style="font-size:12px">${esc(e.user)}${e.device ? `<br><span class="text-muted" style="font-size:10px">${esc(e.device)}</span>` : ''}</td>
-              <td style="font-size:12px">${esc(e.file)}</td>
-              <td style="font-size:12px">${esc(e.app)}</td>
-              <td>${e.blocked ? '<span class="badge badge-critical" style="font-size:10px">🚫 Blocked</span>' : '<span class="badge badge-medium" style="font-size:10px">⚠️ Audited</span>'}${e.incident ? ` <span class="badge" style="font-size:9px;background:var(--risk-critical);color:#fff" title="${esc((e.category ? e.category + ' · ' : '') + 'Escalated to a Defender incident')}">🔺 Incident</span>` : ''}</td>
-              <td class="text-muted" style="font-size:11px">${esc(e.policy || '—')}</td>
-            </tr>`).join('')}
+            <tbody>${bl.events.slice(0, 50).map(dlpEventRow).join('')}
             </tbody>
           </table>
         </div>
-        <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
-          ℹ️ Source: endpoint DLP &amp; Purview policy-violation events (Advanced Hunting). Full detail in <a href="https://purview.microsoft.com/datalossprevention/activityexplorer" target="_blank" rel="noopener" style="color:var(--accent-blue)">Purview → Activity Explorer</a>.
-        </div>`;
+        ${dlpTableFooter()}`;
     }).catch(() => {});
   } catch (e) {
     el.innerHTML = permWarn('InformationProtectionPolicy.Read', e.message);
