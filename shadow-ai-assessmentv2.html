@@ -2322,7 +2322,7 @@ function saveDashSnapshot(metrics, extra) {
 // Shared AI-alert derivation — used by the dashboard's Alerts section (the standalone
 // Alerts page was folded into the Dashboard). Combines Graph-derived findings with
 // AI-scoped Defender XDR alerts and returns a prioritised, severity-counted feed.
-function buildAiAlerts({ aiApps, grants, signIns, riskyUsers, secAlerts, agentSps }) {
+function buildAiAlerts({ aiApps, grants, signIns, riskyUsers, secAlerts, agentSps, defenderAiAlerts }) {
   const aiSignIns = (signIns || []).filter(s => AI_KEYWORDS.some(k => (s.appDisplayName || '').toLowerCase().includes(k)));
   const riskyAiSignIns = aiSignIns.filter(s => s.riskLevelAggregated && !['none', 'low'].includes(s.riskLevelAggregated));
   const derived = [];
@@ -2345,15 +2345,26 @@ function buildAiAlerts({ aiApps, grants, signIns, riskyUsers, secAlerts, agentSp
   const AI_ALERT_RE = /genai|gen-ai|copilot|chatgpt|openai|\bgpt\b|claude|anthropic|gemini|\bllm\b|\bmcp\b|ai agent|agent tool|agent identity|agent runtime|model context|prompt inject|jailbreak|xpia|cross-prompt|generative orchestration/i;
   const isAiAlert = a => AI_ALERT_RE.test(((a.title||'')+' '+(a.description||'')+' '+(a.category||'')).toLowerCase());
   const aiSecAlerts = (secAlerts || []).filter(isAiAlert);
-  const allAlerts = [
+  // Real Defender AI detections that DON'T come through security/alerts_v2 — agent
+  // threat alerts and DLP-to-AI incidents are surfaced via Advanced Hunting, so the
+  // caller passes them in already-normalised. These are the live, tenant-specific
+  // detections a CISO most wants on the dashboard.
+  const defAi = defenderAiAlerts || [];
+  const allAlertsRaw = [
+    ...defAi,
     ...derived,
     ...aiSecAlerts.map(a => ({ sev: a.severity||'medium', title: a.title, desc: a.description, icon:'🛡️', source:'Defender'+(a.category?' · '+a.category:'')+(a.status?' · '+a.status:''), url: a.alertWebUrl||null, status: a.status||null })),
   ];
+  // The same detection can arrive both as a live Advanced-Hunting alert and via
+  // alerts_v2 — keep the first (live detections are ordered first) by title.
+  const seenTitle = new Set();
+  const allAlerts = allAlertsRaw.filter(a => { const k = (a.title||'').toLowerCase().trim(); if (seenTitle.has(k)) return false; seenTitle.add(k); return true; });
   const sevOrd = { critical:0, high:1, medium:2, low:3, informational:4 };
   allAlerts.sort((a, b) => (sevOrd[(a.sev||'').toLowerCase()] ?? 5) - (sevOrd[(b.sev||'').toLowerCase()] ?? 5));
   const sevCounts = { critical:0, high:0, medium:0, low:0, informational:0 };
   allAlerts.forEach(a => { const k = (a.sev||'').toLowerCase(); if (k in sevCounts) sevCounts[k]++; else sevCounts.informational++; });
-  return { allAlerts, sevCounts, derivedCount: derived.length, defenderCount: aiSecAlerts.length, hiddenAlerts: (secAlerts||[]).length - aiSecAlerts.length };
+  const defenderCount = allAlerts.filter(a => a.source && /^Defender/i.test(a.source)).length;
+  return { allAlerts, sevCounts, derivedCount: allAlerts.length - defenderCount, defenderCount, hiddenAlerts: (secAlerts||[]).length - aiSecAlerts.length };
 }
 
 async function loadDashboard() {
@@ -2366,7 +2377,14 @@ async function loadDashboard() {
     // fetchGrantPolicies also populates STATE.data.authPolicy + secDefaults.
     const govDataP = Promise.all([ fetchGrantPolicies().catch(() => []), fetchTenantRegion().catch(() => null) ]);
     // Alerts feed (folded in from the removed AI Security Alerts page) + DLP-for-AI coverage.
-    const alertDataP = Promise.all([ fetchSecurityAlerts().catch(() => []), fetchDlpProtectionScope().catch(() => null) ]);
+    // Also pull the real Defender AI detections that don't arrive via alerts_v2:
+    // agent threat alerts (AlertInfo) and DLP-to-AI incidents (fetchDlpAiBlocks).
+    const alertDataP = Promise.all([
+      fetchSecurityAlerts().catch(() => []),
+      fetchDlpProtectionScope().catch(() => null),
+      fetchAgentThreatAlerts().catch(() => ({ ok: false, alerts: [] })),
+      fetchDlpAiBlocks().catch(() => ({ ok: false, incidents: [] })),
+    ]);
     const [sps, grants, signIns, users, riskyUsers, caP, skus, spSettings, labels] = await Promise.all([
       fetchServicePrincipals(), fetchOAuth2Grants(), fetchSignIns(),
       fetchUsers(), fetchRiskyUsers(), fetchCAPolicies(),
@@ -2408,7 +2426,22 @@ async function loadDashboard() {
     const defenderList = await defenderListP;
     // fetchGrantPolicies (first element) ran for its side-effect: STATE.data.authPolicy + secDefaults
     const [, dashTenantRegion] = await govDataP;
-    const [dashSecAlerts, dashDlpScope] = await alertDataP;
+    const [dashSecAlerts, dashDlpScope, dashAgentThreat, dashDlpBlocks] = await alertDataP;
+    // Normalise the live Defender AI detections into the alert-feed shape.
+    const defenderAiAlerts = [
+      ...((dashAgentThreat && dashAgentThreat.alerts) || []).map(r => ({
+        sev: String(r.Severity || 'medium').toLowerCase(),
+        title: r.Title || 'AI/agent threat detection',
+        desc: [r.Category, r.ServiceSource].filter(Boolean).join(' · ') || 'Microsoft Defender detection',
+        icon: '🛡️', source: 'Defender · ' + (r.Category || 'AI/Agent alert'), page: 'protection',
+      })),
+      ...((dashDlpBlocks && dashDlpBlocks.incidents) || []).map(i => ({
+        sev: String(i.severity || 'high').toLowerCase(),
+        title: `DLP block → ${i.app || 'AI app'}: ${i.file || 'document'}`,
+        desc: `${i.policy || 'DLP policy'}${i.category ? ' · ' + i.category : ''} — escalated to a Defender incident`,
+        icon: '🔺', source: 'Defender incident' + (i.category ? ' · ' + i.category : ''), page: 'labels',
+      })),
+    ];
     const dashModelCounts = {};
     signIns.forEach(s => { const n = s.appDisplayName || ''; if (AI_KEYWORDS.some(k => n.toLowerCase().includes(k))) dashModelCounts[n] = (dashModelCounts[n] || 0) + 1; });
     const dashMcasAiApps = (STATE.data.mcasApps || []).filter(a => {
@@ -2636,7 +2669,7 @@ async function loadDashboard() {
     const govAiLeavesEu = aiNonGdpr > 0;   // non-GDPR models → AI inferencing leaves EU
 
     // ── §4 Alerts feed + §2 compliance roll-ups ───────────────────────────────
-    const dashAlerts = buildAiAlerts({ aiApps, grants, signIns, riskyUsers, secAlerts: dashSecAlerts, agentSps: STATE.data.agentSps || [] });
+    const dashAlerts = buildAiAlerts({ aiApps, grants, signIns, riskyUsers, secAlerts: dashSecAlerts, agentSps: STATE.data.agentSps || [], defenderAiAlerts });
     const dashCompliantModels = dashModels.filter(m => m.gdprOk).length;
     const dashGdprCompliant = dashModels.length > 0 && dashCompliantModels === dashModels.length;
 
