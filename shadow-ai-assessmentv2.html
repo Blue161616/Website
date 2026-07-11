@@ -2390,6 +2390,9 @@ async function loadDashboard() {
       fetchDlpAiBlocks().catch(() => ({ ok: false, incidents: [] })),
       fetchCopilotUsage().catch(() => ({ summary: null, userDetail: [] })),
     ]);
+    // Shared AI-users population (same union the AI & Agent Users page headlines)
+    // so the dashboard KPI can't disagree with that page.
+    const usersSummaryP = fetchAiUsersSummary().catch(() => null);
     const [sps, grants, signIns, users, riskyUsers, caP, skus, spSettings, labels] = await Promise.all([
       fetchServicePrincipals(), fetchOAuth2Grants(), fetchSignIns(),
       fetchUsers(), fetchRiskyUsers(), fetchCAPolicies(),
@@ -2435,6 +2438,7 @@ async function loadDashboard() {
     const copilotLicensed = (dashCopilot && dashCopilot.userDetail && dashCopilot.userDetail.length) || 0;
     const copilotActive = dashCopilot?.summary?.totalActiveUsers
       ?? (dashCopilot?.userDetail || []).filter(u => u.teamsChatCount || u.wordCount || u.excelCount || u.powerPointCount || u.outlookCount).length;
+    const usersSummary = await usersSummaryP;
     // Normalise the live Defender AI detections into the alert-feed shape.
     const defenderAiAlerts = [
       ...((dashAgentThreat && dashAgentThreat.alerts) || []).map(r => ({
@@ -2720,32 +2724,55 @@ async function loadDashboard() {
       { icon:'🤖', label:'AI Models',         n: aiModelCount,       color: aiNonGdpr>0?'var(--risk-high)':'var(--accent-blue)',            bar: aiNonGdpr>0?'warnbar':'',       sub: (aiNonGdpr>0?`${aiNonGdpr} non-GDPR`:'all GDPR-adequate') + trendMini('AI Models', aiModelCount), page:'models' },
       { icon:'⚡', label:'AI Agents',         n: agentIdentities,    color: riskyAgentsActive>0?'var(--risk-critical)':'var(--accent-blue)',bar: riskyAgentsActive>0?'critbar':'',sub: (riskyAgentsActive>0?`${riskyAgentsActive} with active risk`:'no active risk')+trendMini('Agent Identities', agentIdentities), page:'agents', numId:'dash-agent-count' },
       { icon:'💬', label:'Copilot Usage',     n: copilotActive,      color:'var(--accent-blue)',                                            bar:'',                              sub: copilotLicensed?`active · of ${copilotLicensed} licensed`:'active (30d)', page:'copilot' },
-      { icon:'👥', label:'AI Users',          n: aiUserCount,        color: riskyAiUsers.length>0?'var(--risk-high)':'var(--accent-blue)',  bar: riskyAiUsers.length>0?'warnbar':'', sub: (riskyAiUsers.length>0?`${riskyAiUsers.length} risky`:'none flagged risky')+trendMini('AI Users', aiUserCount), page:'users' },
+      { icon:'👥', label:'AI Users',          n: usersSummary?.aiUsersTotal ?? aiUserCount, color: (usersSummary?.riskyPeople ?? riskyAiUsers.length)>0?'var(--risk-high)':'var(--accent-blue)', bar: (usersSummary?.riskyPeople ?? riskyAiUsers.length)>0?'warnbar':'', sub: usersSummary ? `of ${usersSummary.dirTotal} users${usersSummary.riskyPeople>0?` · ${usersSummary.riskyPeople} risky`:''}` : ((riskyAiUsers.length>0?`${riskyAiUsers.length} risky`:'none flagged risky')+trendMini('AI Users', aiUserCount)), page:'users' },
       { icon:'🔑', label:'High-Risk Grants',  n: highRiskAi.length,  color: highRiskAi.length>0?'var(--risk-critical)':'var(--risk-low)',   bar: highRiskAi.length>0?'critbar':'',sub: highRiskAi.length>0?'Mail / Files / Calendar':'none granted', page:'shadow-apps' },
     ];
+
+    // ── §1 Compliance verdicts — high-level GDPR & EU AI Act posture ──────────
+    const outsideEu = dashResCounts['Outside EU'] || 0;
+    // GDPR: every AI model EU/GDPR-adequate AND inferencing doesn't leave the EU boundary.
+    const gdprOk = dashModels.length > 0 && dashGdprCompliant && !(govInEu && govAiLeavesEu);
+    const gdprCard = {
+      icon:'🇪🇺', label:'GDPR Compliance', page:'models',
+      value: dashModels.length ? (gdprOk ? 'Compliant' : 'Not compliant') : '—',
+      color: dashModels.length===0 ? 'var(--text-muted)' : gdprOk ? 'var(--risk-low)' : 'var(--risk-critical)',
+      why: dashModels.length
+        ? (gdprOk
+            ? `All ${dashModels.length} AI model${dashModels.length!==1?'s':''} EU/GDPR-adequate${govInEu?' · tenant data resides in EU':''}`
+            : [ aiNonGdpr>0 ? `${aiNonGdpr} of ${dashModels.length} model${dashModels.length!==1?'s':''} not EU/GDPR-adequate` : '', (govInEu && govAiLeavesEu) ? 'AI inferencing leaves the EU data boundary' : '' ].filter(Boolean).join(' · ') || 'Data may transfer outside the EU')
+        : 'No AI models detected yet',
+    };
+    // EU AI Act: high-level posture across data residency, governance guardrails,
+    // human accountability and runtime oversight (heuristic, not a legal opinion).
+    const aiActGaps = [];
+    if (aiNonGdpr>0 || outsideEu>0) aiActGaps.push('AI systems process data outside EU adequacy');
+    if (!(dashDlpScope?.ok && dashDlpScope.configured)) aiActGaps.push('no DLP guardrails governing AI data');
+    if (ownerlessBp>0) aiActGaps.push(`${ownerlessBp} of ${totalBp} agent blueprint${totalBp!==1?'s':''} ownerless — no human accountability`);
+    if (!hasE7Agent) aiActGaps.push('agent runtime oversight not licensed');
+    const aiActOk = aiActGaps.length === 0;
+    const aiActCard = {
+      icon:'⚖️', label:'EU AI Act', page:'protection',
+      value: aiActOk ? 'Compliant' : 'Not compliant',
+      color: aiActOk ? 'var(--risk-low)' : (aiActGaps.length>=3 ? 'var(--risk-critical)' : 'var(--risk-medium)'),
+      why: aiActOk
+        ? 'AI inventory, DLP guardrails, EU residency and agent accountability in place'
+        : aiActGaps.slice(0,2).join(' · '),
+    };
+    const complianceCard = d => `<div class="dim-card" style="border-left-color:${d.color};flex:1;margin:0;display:flex;flex-direction:column;justify-content:center"${d.page?` onclick="navigate('${d.page}', document.querySelector('[onclick*=${d.page}]'))"`:''}>
+        <div class="dim-top"><div class="dim-label">${d.icon} ${esc(d.label)}</div><div class="dim-val" style="color:${d.color}">${esc(d.value)}</div></div>
+        <div class="dim-why">${esc(d.why)}</div></div>`;
 
     el.innerHTML = `
       <!-- ═══════════ §1 · COMPLIANCE ═══════════ -->
       <div class="dash-band dash-rise" style="--band:rgba(63,185,80,.45);--band-t:#5fd06f">
         <span class="dash-band-t">🛡️ Compliance</span>
-        <span class="dash-band-s">AI risk posture &amp; data residency — EU/GDPR at a glance</span>
-        <span class="dash-band-badge" style="color:${band.color}">${band.word} · ${RISK_INDEX}/100</span>
+        <span class="dash-band-s">Are we lawful? GDPR &amp; EU AI Act posture at a glance</span>
+        <span class="dash-band-badge"><span style="color:${gdprCard.color}">GDPR ${dashModels.length ? (gdprOk ? '✅' : '❌') : '—'}</span><span style="color:var(--text-dim);margin:0 8px">·</span><span style="color:${aiActCard.color}">EU AI Act ${aiActOk ? '✅' : '❌'}</span></span>
       </div>
       <div class="hero-grid dash-rise" style="animation-delay:60ms">
-        <div class="hero-card">
-          <div style="position:absolute;top:14px;left:0;right:0;text-align:center;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.1em">🛡️ AI Risk Index</div>
-          <div class="gauge-wrap" style="margin-top:14px">
-            <svg viewBox="0 0 220 220" width="220" height="220">
-              <circle cx="110" cy="110" r="90" fill="none" stroke="var(--bg-secondary)" stroke-width="14" pathLength="100"></circle>
-              <circle id="dash-gauge-val" class="gauge-val" cx="110" cy="110" r="90" fill="none" stroke="${band.hex}" stroke-width="14" pathLength="100" stroke-dasharray="100" stroke-dashoffset="100" transform="rotate(-90 110 110)"></circle>
-            </svg>
-            <div class="gauge-center">
-              <div class="gauge-num" style="color:${band.color}" data-count="${RISK_INDEX}">0</div>
-              <div class="gauge-word" style="color:${band.color}">${band.word}</div>
-              <div class="gauge-sub">of 100 · higher = worse</div>
-            </div>
-          </div>
-          <div style="font-size:11px;color:var(--text-dim);margin-top:10px;text-align:center;max-width:250px;line-height:1.5">Composite of shadow-AI, external-LLM, residency &amp; data-exposure signals, minus mitigation credit</div>
+        <div style="display:flex;flex-direction:column;gap:12px">
+          ${complianceCard(gdprCard)}
+          ${complianceCard(aiActCard)}
         </div>
         <div class="hero-map">
           <div class="map-cap">
@@ -6382,82 +6409,109 @@ function sortUsersTable(key) {
   renderUsersTable();
 }
 
+// Single source of truth for the "AI & Agent Users" population, shared by the
+// Users page and the Dashboard KPI so the two can never disagree. Computes the
+// union of humans who touch AI (AI-app sign-ins, agent ownership/sponsorship,
+// Identity-Protection risk, Copilot activity) plus agent (service) identities.
+// Cached in STATE.data.aiUsersSummary; also seeds the STATE fields the table
+// renderers read.
+async function fetchAiUsersSummary() {
+  if (STATE.data.aiUsersSummary) return STATE.data.aiUsersSummary;
+  const [users, signIns, riskyUsers, sps, copilotUsage] = await Promise.all([
+    fetchUsers(), fetchSignIns(), fetchRiskyUsers(),
+    fetchServicePrincipals().catch(() => []),
+    fetchCopilotUsage().catch(() => ({ userDetail: [], summary: null })),
+  ]);
+  const aiSignIns = signIns.filter(s => AI_KEYWORDS.some(k => (s.appDisplayName||'').toLowerCase().includes(k)));
+  const userAiApps = {};
+  aiSignIns.forEach(s => {
+    if (!s.userPrincipalName) return;
+    if (!userAiApps[s.userPrincipalName]) userAiApps[s.userPrincipalName] = new Set();
+    userAiApps[s.userPrincipalName].add(s.appDisplayName);
+  });
+  const activeRiskyUsers = riskyUsers.filter(u => u.riskLevel && u.riskLevel !== 'none');
+  const riskySet = new Set(activeRiskyUsers.map(u => u.userPrincipalName));
+  const riskyDetailMap = Object.fromEntries(activeRiskyUsers.map(u => [u.userPrincipalName, u]));
+
+  // ── Copilot users (largest "interacting with AI" population) ──────────────
+  const copilotByUpn = {};
+  (copilotUsage.userDetail || []).forEach(d => { const k = (d.userPrincipalName || '').toLowerCase(); if (k) copilotByUpn[k] = d; });
+
+  // ── Agent ownership — which humans own/sponsor agents (users ↔ agents) ────
+  // Reuse the Agents-page cache; otherwise derive a lightweight agent SP set and
+  // fetch owners/sponsors (cached in STATE.data.agentOwnersSponsors).
+  const agentSps = STATE.data.agentSps || sps.filter(sp =>
+    AGENT_KEYWORDS.some(k => (sp.displayName||'').toLowerCase().includes(k)) ||
+    (sp.tags||[]).some(t => /agentidentity|agentblueprint/i.test(t)) ||
+    sp.servicePrincipalType === 'ServiceIdentity');
+  const agentOwnersSponsors = STATE.data.agentOwnersSponsors || await fetchAgentOwnersSponsors(agentSps).catch(() => ({}));
+  const agentSpById = new Map(agentSps.map(sp => [sp.id, sp]));
+  // owner/sponsor display-name → the agents they're accountable for
+  const ownedByName = {};
+  Object.entries(agentOwnersSponsors).forEach(([spId, os]) => {
+    const nm = agentSpById.get(spId)?.displayName || 'agent';
+    (os?.owners   || []).forEach(n => { const k = (n||'').toLowerCase(); if (!k) return; (ownedByName[k] = ownedByName[k] || { owns:new Set(), sponsors:new Set() }).owns.add(nm); });
+    (os?.sponsors || []).forEach(n => { const k = (n||'').toLowerCase(); if (!k) return; (ownedByName[k] = ownedByName[k] || { owns:new Set(), sponsors:new Set() }).sponsors.add(nm); });
+  });
+  const agentsForUser = u => ownedByName[(u.displayName||'').toLowerCase()] || ownedByName[(u.userPrincipalName||'').toLowerCase()] || null;
+  const copilotForUser = u => copilotByUpn[(u.userPrincipalName||'').toLowerCase()] || null;
+
+  // AI-relevant spans: AI-app sign-ins, agent (service) users, Identity-Protection
+  // risk, Copilot activity, and agent ownership/sponsorship.
+  const isAgentUser = u => !!u.agentId
+    || /^(\w+?)AgentUser-[0-9a-f-]{36}/i.test(u.displayName || '')
+    || /^(\w+?)AgentUser-[0-9a-f-]{36}/i.test(u.userPrincipalName || '')
+    || /agentuser/i.test(u.userPrincipalName || '');
+  const isAiRelevant = u => (userAiApps[u.userPrincipalName]?.size > 0) || isAgentUser(u)
+    || riskySet.has(u.userPrincipalName) || !!copilotForUser(u) || !!agentsForUser(u);
+  const aiUsers = users.filter(isAiRelevant);
+
+  // Reconcile the "Using AI Apps" count with the table: AI-app UPNs seen in sign-in logs
+  // but absent from the directory fetch (guests / external / beyond page) get synthetic rows.
+  const userByUpn = new Map(users.map(u => [(u.userPrincipalName||'').toLowerCase(), u]));
+  const signInOnly = Object.keys(userAiApps)
+    .filter(upn => !userByUpn.has((upn||'').toLowerCase()))
+    .map(upn => ({ userPrincipalName: upn, displayName: upn.split('@')[0], accountEnabled: undefined, _signInOnly: true }));
+
+  // Split humans from agent (service) identities — they answer different questions.
+  const peopleUsers = aiUsers.filter(u => !isAgentUser(u)).concat(signInOnly);
+  const agentUsers  = aiUsers.filter(isAgentUser);
+
+  // Seed the STATE fields the table renderers / sorters read.
+  STATE.data.users = peopleUsers;
+  STATE.data.agentUsers = agentUsers;
+  STATE.data.userAiApps = userAiApps;
+  STATE.data.riskySet = riskySet;
+  STATE.data.riskyDetailMap = riskyDetailMap;
+  STATE.data.copilotByUpn = copilotByUpn;
+  STATE.data.ownedByName = ownedByName;
+  STATE.data.usersAgentSpById = agentSpById;
+
+  const summary = {
+    users, copilotUsage, userAiApps, activeRiskyUsers, riskySet,
+    agentSps, agentOwnersSponsors, agentSpById, agentsForUser, copilotForUser,
+    peopleUsers, agentUsers, aiUsers,
+    // headline counts (shared by both views)
+    dirTotal: users.length,
+    aiUsersTotal: aiUsers.length,
+    peopleCount: peopleUsers.length,
+    agentUserCount: agentUsers.length,
+    highRiskCount: peopleUsers.filter(u => userRiskLevel(u) === 'high').length,
+    copilotActiveCount: peopleUsers.filter(u => { const d = copilotForUser(u); return d && d.lastActivityDate; }).length,
+    agentOwnerCount: peopleUsers.filter(u => agentsForUser(u)).length,
+    riskyPeople: peopleUsers.filter(u => riskySet.has(u.userPrincipalName)).length,
+  };
+  STATE.data.aiUsersSummary = summary;
+  return summary;
+}
+
 async function loadUsers() {
   const el = document.getElementById('users-content');
   try {
-    const [users, signIns, riskyUsers, sps, copilotUsage] = await Promise.all([
-      fetchUsers(), fetchSignIns(), fetchRiskyUsers(),
-      fetchServicePrincipals().catch(() => []),
-      fetchCopilotUsage().catch(() => ({ userDetail: [], summary: null })),
-    ]);
-    const aiSignIns = signIns.filter(s => AI_KEYWORDS.some(k => (s.appDisplayName||'').toLowerCase().includes(k)));
-    const userAiApps = {};
-    aiSignIns.forEach(s => {
-      if (!s.userPrincipalName) return;
-      if (!userAiApps[s.userPrincipalName]) userAiApps[s.userPrincipalName] = new Set();
-      userAiApps[s.userPrincipalName].add(s.appDisplayName);
-    });
-    const activeRiskyUsers = riskyUsers.filter(u => u.riskLevel && u.riskLevel !== 'none');
-    const riskySet = new Set(activeRiskyUsers.map(u => u.userPrincipalName));
-    const riskyDetailMap = Object.fromEntries(activeRiskyUsers.map(u => [u.userPrincipalName, u]));
-
-    // ── Copilot users (largest "interacting with AI" population) ──────────────
-    const copilotByUpn = {};
-    (copilotUsage.userDetail || []).forEach(d => { const k = (d.userPrincipalName || '').toLowerCase(); if (k) copilotByUpn[k] = d; });
-    STATE.data.copilotByUpn = copilotByUpn;
-
-    // ── Agent ownership — which humans own/sponsor agents (users ↔ agents) ────
-    // Reuse the Agents-page cache; otherwise derive a lightweight agent SP set and
-    // fetch owners/sponsors (cached in STATE.data.agentOwnersSponsors).
-    const agentSps = STATE.data.agentSps || sps.filter(sp =>
-      AGENT_KEYWORDS.some(k => (sp.displayName||'').toLowerCase().includes(k)) ||
-      (sp.tags||[]).some(t => /agentidentity|agentblueprint/i.test(t)) ||
-      sp.servicePrincipalType === 'ServiceIdentity');
-    const agentOwnersSponsors = STATE.data.agentOwnersSponsors || await fetchAgentOwnersSponsors(agentSps).catch(() => ({}));
-    const agentSpById = new Map(agentSps.map(sp => [sp.id, sp]));
-    STATE.data.usersAgentSpById = agentSpById;
-    // owner/sponsor display-name → the agents they're accountable for
-    const ownedByName = {};
-    Object.entries(agentOwnersSponsors).forEach(([spId, os]) => {
-      const nm = agentSpById.get(spId)?.displayName || 'agent';
-      (os?.owners   || []).forEach(n => { const k = (n||'').toLowerCase(); if (!k) return; (ownedByName[k] = ownedByName[k] || { owns:new Set(), sponsors:new Set() }).owns.add(nm); });
-      (os?.sponsors || []).forEach(n => { const k = (n||'').toLowerCase(); if (!k) return; (ownedByName[k] = ownedByName[k] || { owns:new Set(), sponsors:new Set() }).sponsors.add(nm); });
-    });
-    STATE.data.ownedByName = ownedByName;
-    const agentsForUser = u => ownedByName[(u.displayName||'').toLowerCase()] || ownedByName[(u.userPrincipalName||'').toLowerCase()] || null;
-    const copilotForUser = u => copilotByUpn[(u.userPrincipalName||'').toLowerCase()] || null;
-
-    // AI-relevant now spans four signals: AI-app sign-ins, agent (service) users,
-    // Identity-Protection risk, Copilot activity, and agent ownership/sponsorship.
-    const isAgentUser = u => !!u.agentId
-      || /^(\w+?)AgentUser-[0-9a-f-]{36}/i.test(u.displayName || '')
-      || /^(\w+?)AgentUser-[0-9a-f-]{36}/i.test(u.userPrincipalName || '')
-      || /agentuser/i.test(u.userPrincipalName || '');
-    const isAiRelevant = u => (userAiApps[u.userPrincipalName]?.size > 0) || isAgentUser(u)
-      || riskySet.has(u.userPrincipalName) || !!copilotForUser(u) || !!agentsForUser(u);
-    const aiUsers = users.filter(isAiRelevant);
-
-    // Reconcile the "Using AI Apps" count with the table: AI-app UPNs seen in sign-in logs
-    // but absent from the directory fetch (guests / external / beyond page) get synthetic rows.
-    const userByUpn = new Map(users.map(u => [(u.userPrincipalName||'').toLowerCase(), u]));
-    const signInOnly = Object.keys(userAiApps)
-      .filter(upn => !userByUpn.has((upn||'').toLowerCase()))
-      .map(upn => ({ userPrincipalName: upn, displayName: upn.split('@')[0], accountEnabled: undefined, _signInOnly: true }));
-
-    // Split humans from agent (service) identities — they answer different questions.
-    const peopleUsers = aiUsers.filter(u => !isAgentUser(u)).concat(signInOnly);
-    const agentUsers  = aiUsers.filter(isAgentUser);
-
-    STATE.data.users = peopleUsers;   // renderUsersTable renders the people table
-    STATE.data.agentUsers = agentUsers;
-    STATE.data.userAiApps = userAiApps;
-    STATE.data.riskySet = riskySet;
-    STATE.data.riskyDetailMap = riskyDetailMap;
-
-    const highRiskCount  = peopleUsers.filter(u => userRiskLevel(u) === 'high').length;
-    const agentUserCount = agentUsers.length;
-    const copilotActiveCount = peopleUsers.filter(u => { const d = copilotForUser(u); return d && d.lastActivityDate; }).length;
-    const agentOwnerCount    = peopleUsers.filter(u => agentsForUser(u)).length;
+    const { users, copilotUsage, userAiApps, activeRiskyUsers,
+            agentSps, agentOwnersSponsors, agentSpById, agentsForUser,
+            aiUsers, agentUsers,
+            highRiskCount, agentUserCount, copilotActiveCount, agentOwnerCount } = await fetchAiUsersSummary();
     // Real backing agent for an agent (service) user: resolve agentId → the SP.
     const backingAgentFor = u => u.agentId ? (agentSpById.get(u.agentId) || agentSps.find(sp => sp.appId === u.agentId) || null) : null;
     const agentSvc = u => {
