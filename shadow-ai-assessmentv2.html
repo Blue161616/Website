@@ -2388,6 +2388,7 @@ async function loadDashboard() {
       fetchDlpProtectionScope().catch(() => null),
       fetchAgentThreatAlerts().catch(() => ({ ok: false, alerts: [] })),
       fetchDlpAiBlocks().catch(() => ({ ok: false, incidents: [] })),
+      fetchCopilotUsage().catch(() => ({ summary: null, userDetail: [] })),
     ]);
     const [sps, grants, signIns, users, riskyUsers, caP, skus, spSettings, labels] = await Promise.all([
       fetchServicePrincipals(), fetchOAuth2Grants(), fetchSignIns(),
@@ -2430,7 +2431,10 @@ async function loadDashboard() {
     const defenderList = await defenderListP;
     // fetchGrantPolicies (first element) ran for its side-effect: STATE.data.authPolicy + secDefaults
     const [, dashTenantRegion] = await govDataP;
-    const [dashSecAlerts, dashDlpScope, dashAgentThreat, dashDlpBlocks] = await alertDataP;
+    const [dashSecAlerts, dashDlpScope, dashAgentThreat, dashDlpBlocks, dashCopilot] = await alertDataP;
+    const copilotLicensed = (dashCopilot && dashCopilot.userDetail && dashCopilot.userDetail.length) || 0;
+    const copilotActive = dashCopilot?.summary?.totalActiveUsers
+      ?? (dashCopilot?.userDetail || []).filter(u => u.teamsChatCount || u.wordCount || u.excelCount || u.powerPointCount || u.outlookCount).length;
     // Normalise the live Defender AI detections into the alert-feed shape.
     const defenderAiAlerts = [
       ...((dashAgentThreat && dashAgentThreat.alerts) || []).map(r => ({
@@ -2695,22 +2699,11 @@ async function loadDashboard() {
                : RISK_INDEX >= 25 ? { word:'Elevated', color:'var(--risk-medium)',   hex:'#f0883e' }
                :                    { word:'Low',       color:'var(--risk-low)',      hex:'#3fb950' };
 
-    // Executive dimensions (drive the cards next to the gauge)
-    const sevFrac = w => ({ Critical:1, High:.82, Detected:.68, Elevated:.55, Medium:.5, Low:.28, Safe:.12, 'None detected':.1 }[w] ?? .4);
-    const dims = [
-      { icon:'👻', label:'Shadow AI Risk',          value: cisoShadowRisk,                                 color: cisoRiskColor,                                            why: cisoWhyShadow,    page:'shadow-apps' },
-      { icon:'🔌', label:'External LLM Usage',       value: cisoExternalLlm ? 'Detected' : 'None detected', color: cisoExternalLlm ? 'var(--risk-medium)':'var(--risk-low)', why: cisoWhyLlm,       page:'models' },
-      { icon:'🌍', label:'Data Residency Risk',      value: cisoDataRes,                                    color: cisoDataResColor,                                         why: cisoWhyDataRes,   page:'models' },
-      { icon:'🏷️', label:'Sensitive Data Exposure',  value: cisoSensitive,                                  color: cisoSensColor,                                            why: cisoWhySensitive, page:'labels' },
-    ];
-    // Split the exec dims across §2 (compliance) and §3 (risk); Data Residency → compliance KPI row.
-    const riskDims = dims.filter(d => d.label !== 'Data Residency Risk');
+    // §2 Security KPI cards — agent protection + DLP-for-AI coverage.
     const dimCard = (d, delay) => `<div class="dim-card dash-rise" style="border-left-color:${d.color};animation-delay:${delay}ms"${d.page ? ` onclick="navigate('${d.page}', document.querySelector('[onclick*=${d.page}]'))"` : ''}>
         <div class="dim-top"><div class="dim-label">${d.icon} ${esc(d.label)}</div><div class="dim-val" style="color:${d.color}">${esc(d.value)}</div></div>
         <div class="dim-why">${esc(d.why)}</div></div>`;
-    const complianceDims = [
-      { icon:'🇪🇺', label:'GDPR Compliance',     value: dashModels.length ? (dashGdprCompliant ? 'Compliant' : `${dashModels.length - dashCompliantModels} non-compliant`) : '—', color: dashModels.length===0?'var(--text-muted)':dashGdprCompliant?'var(--risk-low)':'var(--risk-critical)', why: dashModels.length?`${dashCompliantModels}/${dashModels.length} AI models EU-adequate`:'No AI models detected', page:'models' },
-      { icon:'🛡️', label:'EU Data Boundary',     value: govInEu ? (govAiLeavesEu ? 'Data leaves EU' : 'In EU') : (dashTenantRegion?.regionScope ? 'Outside EU' : '—'), color: govInEu ? (govAiLeavesEu?'var(--risk-medium)':'var(--risk-low)') : (dashTenantRegion?.regionScope?'var(--risk-medium)':'var(--text-muted)'), why: govInEu ? (govAiLeavesEu?'M365 at rest in EU — inferencing leaves EU':'M365 data at rest stays in EU') : ('Tenant region '+esc(dashTenantRegion?.subScope||dashTenantRegion?.regionLabel||'unknown')), page:'models' },
+    const securityDims = [
       { icon:'🛡️', label:'Agent Security',       value: hasE7Agent ? 'Protected' : 'Not protected', color: hasE7Agent ? 'var(--risk-low)' : 'var(--risk-critical)', why: hasE7Agent ? 'Agent 365 / M365 E7 licensed — agent protections available' : 'No Agent 365 / M365 E7 license — agent protections unavailable', page:'protection' },
       { icon:'🔐', label:'DLP for AI',           value: dashDlpScope?.ok ? (dashDlpScope.configured?'Active':'No scope') : (dashDlpScope?.code==='forbidden'?'Scope needed':'—'), color: dashDlpScope?.ok?(dashDlpScope.configured?'var(--risk-low)':'var(--risk-medium)'):'var(--text-muted)', why: dashDlpScope?.ok?(dashDlpScope.configured?`${dashDlpScope.total} scope${dashDlpScope.total!==1?'s':''}${dashDlpScope.blocking?' · blocking':''}`:'No DLP policy targets this user'):'Purview DLP-for-AI coverage', page:'labels' },
     ];
@@ -2725,15 +2718,20 @@ async function loadDashboard() {
     const tiles = [
       { icon:'👻', label:'Shadow AI Apps',    n: mcasAll.length,     color: mcasUnsanctioned>0?'var(--risk-critical)':'var(--accent-blue)', bar: mcasUnsanctioned>0?'critbar':'', sub: (mcasUnsanctioned>0?`${mcasUnsanctioned} unsanctioned`:'0 unsanctioned') + trendMini('Shadow AI Apps', mcasAll.length), page:'shadow-apps', numId:'dash-shadow-count', subId:'dash-shadow-delta' },
       { icon:'🤖', label:'AI Models',         n: aiModelCount,       color: aiNonGdpr>0?'var(--risk-high)':'var(--accent-blue)',            bar: aiNonGdpr>0?'warnbar':'',       sub: (aiNonGdpr>0?`${aiNonGdpr} non-GDPR`:'all GDPR-adequate') + trendMini('AI Models', aiModelCount), page:'models' },
-      { icon:'🪪', label:'Agent Identities',  n: agentIdentities,    color: riskyAgentsActive>0?'var(--risk-critical)':'var(--accent-blue)',bar: riskyAgentsActive>0?'critbar':'',sub: (riskyAgentsActive>0?`${riskyAgentsActive} with active risk`:'no active risk')+trendMini('Agent Identities', agentIdentities), page:'agents', numId:'dash-agent-count' },
+      { icon:'⚡', label:'AI Agents',         n: agentIdentities,    color: riskyAgentsActive>0?'var(--risk-critical)':'var(--accent-blue)',bar: riskyAgentsActive>0?'critbar':'',sub: (riskyAgentsActive>0?`${riskyAgentsActive} with active risk`:'no active risk')+trendMini('Agent Identities', agentIdentities), page:'agents', numId:'dash-agent-count' },
+      { icon:'💬', label:'Copilot Usage',     n: copilotActive,      color:'var(--accent-blue)',                                            bar:'',                              sub: copilotLicensed?`active · of ${copilotLicensed} licensed`:'active (30d)', page:'copilot' },
       { icon:'👥', label:'AI Users',          n: aiUserCount,        color: riskyAiUsers.length>0?'var(--risk-high)':'var(--accent-blue)',  bar: riskyAiUsers.length>0?'warnbar':'', sub: (riskyAiUsers.length>0?`${riskyAiUsers.length} risky`:'none flagged risky')+trendMini('AI Users', aiUserCount), page:'users' },
-      { icon:'📈', label:'AI Sign-ins (30d)', n: aiSignIns.length,   color:'var(--accent-blue)',                                            bar:'',                              sub:'AI-related events', page:'models', numId:'dash-signins-count', subId:'dash-signins-delta' },
       { icon:'🔑', label:'High-Risk Grants',  n: highRiskAi.length,  color: highRiskAi.length>0?'var(--risk-critical)':'var(--risk-low)',   bar: highRiskAi.length>0?'critbar':'',sub: highRiskAi.length>0?'Mail / Files / Calendar':'none granted', page:'shadow-apps' },
     ];
 
     el.innerHTML = `
-      <!-- ═══ HERO: AI Risk Index + executive dimensions ═══ -->
-      <div class="hero-grid dash-rise">
+      <!-- ═══════════ §1 · COMPLIANCE ═══════════ -->
+      <div class="dash-band dash-rise" style="--band:rgba(63,185,80,.45);--band-t:#5fd06f">
+        <span class="dash-band-t">🛡️ Compliance</span>
+        <span class="dash-band-s">AI risk posture &amp; data residency — EU/GDPR at a glance</span>
+        <span class="dash-band-badge" style="color:${band.color}">${band.word} · ${RISK_INDEX}/100</span>
+      </div>
+      <div class="hero-grid dash-rise" style="animation-delay:60ms">
         <div class="hero-card">
           <div style="position:absolute;top:14px;left:0;right:0;text-align:center;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.1em">🛡️ AI Risk Index</div>
           <div class="gauge-wrap" style="margin-top:14px">
@@ -2764,112 +2762,25 @@ async function loadDashboard() {
         </div>
       </div>
 
-      <!-- ═══════════ §2 · AI COMPLIANCE & POSTURE ═══════════ -->
-      <div class="dash-band dash-rise" style="animation-delay:90ms;--band:rgba(63,185,80,.45);--band-t:#5fd06f">
-        <span class="dash-band-t">🛡️ AI Compliance &amp; Posture</span>
-        <span class="dash-band-s">Are we set up correctly &amp; lawfully?</span>
-        <span class="dash-band-badge" style="color:${dashModels.length===0?'var(--text-muted)':dashGdprCompliant?'var(--risk-low)':'var(--risk-critical)'}">${dashModels.length ? (dashGdprCompliant ? 'GDPR ✅' : 'GDPR ❌') : '—'} · Gov ${govScore}%</span>
-      </div>
-      <div class="dim-grid-4 dash-rise" style="animation-delay:100ms;margin-bottom:16px">
-        ${complianceDims.map((d, i) => dimCard(d, 100 + i*55)).join('')}
-      </div>
-
-      <!-- Governance & Data Residency  |  Microsoft Secure Score -->
-      <div class="grid-2 dash-rise" style="animation-delay:150ms;margin-bottom:16px">
-        <div class="card" style="margin-bottom:0">
-          <div class="card-header">
-            <div class="card-title">⚖️ Governance &amp; Data Residency</div>
-            <span class="data-source source-live"><span class="pulse-dot"></span> CA · Auth policy · Tenant region</span>
-          </div>
-          <div class="card-body">
-            <div style="display:flex;align-items:center;gap:20px;margin-bottom:14px" title="Score drivers — ${esc(govDrivers)}">
-              <div style="text-align:center;padding-right:20px;border-right:1px solid var(--border)">
-                <div style="font-size:34px;font-weight:800;line-height:1;color:${scoreColor(govScore)}">${govScore}<span style="font-size:14px;color:var(--text-dim)">%</span></div>
-                <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;margin-top:4px">Governance Score</div>
-              </div>
-              <div style="font-size:12px;color:var(--text-muted)">${govAiBlockCa.length} AI-specific CA policies · region ${esc(dashTenantRegion?.subScope || dashTenantRegion?.regionLabel || govOrg.countryLetterCode || '—')}</div>
-            </div>
-            <div style="display:flex;flex-wrap:wrap;gap:8px">
-              ${[
-                { ok: govInEu && !govAiLeavesEu, warn: govInEu && govAiLeavesEu, label: govInEu ? (govAiLeavesEu ? 'EU tenant · AI inferencing leaves EU' : 'EU Data Boundary · at rest') : (dashTenantRegion?.regionScope ? 'Tenant outside EU' : 'Tenant region unknown') },
-                { ok: govSecDefaults.isEnabled, label: govSecDefaults.isEnabled ? 'Security Defaults on' : 'Security Defaults OFF' },
-                { ok: !govUsersCanRegisterApps, label: govUsersCanRegisterApps ? 'Users CAN register apps' : 'App registration restricted' },
-                { ok: !govOrg.onPremisesSyncEnabled, neutral: true, label: govOrg.onPremisesSyncEnabled ? 'Hybrid (AD sync)' : 'Cloud-only' },
-              ].map(c => {
-                const cfg = c.neutral ? ['var(--text-muted)','●'] : c.ok ? ['var(--risk-low)','✅'] : c.warn ? ['var(--risk-medium)','◐'] : ['var(--risk-critical)','❌'];
-                return `<span style="display:inline-flex;align-items:center;gap:6px;font-size:11px;padding:5px 11px;border-radius:20px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-muted)"><span style="color:${cfg[0]}">${cfg[1]}</span>${esc(c.label)}</span>`;
-              }).join('')}
-            </div>
-          </div>
-        </div>
-        <div class="card" style="margin-bottom:0">
-          <div class="card-header">
-            <div class="card-title">Microsoft Secure Score</div>
-            ${secScore ? `<span class="data-source source-live" style="font-size:10px"><span class="pulse-dot"></span> Live</span>` : `<span style="font-size:10px;color:var(--text-dim)">⚠️ Heuristic</span>`}
-          </div>
-          <div class="risk-score-wrap">
-            <div class="risk-score-ring">
-              <canvas id="dash-risk-donut" width="130" height="130"></canvas>
-              <div class="risk-score-center">
-                <div class="risk-score-number" style="font-size:${secScore?'24px':'32px'};color:${secScore
-                  ? (secScore.pct >= 70 ? 'var(--risk-low)' : secScore.pct >= 40 ? 'var(--risk-medium)' : 'var(--risk-critical)')
-                  : scoreColor(overallRisk)}">${secScore ? secScore.pct + '%' : overallRisk}</div>
-                <div class="risk-score-label">${secScore ? 'Secure Score' : 'Risk'}</div>
-              </div>
-            </div>
-            <div class="risk-legend">
-              ${secScore
-                ? ['Identity','Data','Device','Apps'].filter(c => secScore.categories[c]).map(cat => {
-                    const d = secScore.categories[cat];
-                    const pct = d.max > 0 ? (d.earned / d.max * 100).toFixed(1) + '%' : '—';
-                    const colors = { Identity:'#a371f7', Data:'#39d353', Device:'#388bfd', Apps:'#e3b341' };
-                    return `<div class="risk-legend-item"><div class="risk-legend-dot" style="background:${colors[cat]}"></div><span style="flex:1">${cat}</span><strong>${pct}</strong></div>`;
-                  }).join('')
-                : `<div class="risk-legend-item"><div class="risk-legend-dot" style="background:var(--risk-critical)"></div><span style="flex:1">Critical</span><strong>${critCount}</strong></div>
-                   <div class="risk-legend-item"><div class="risk-legend-dot" style="background:var(--risk-high)"></div><span style="flex:1">High</span><strong>${highCount}</strong></div>
-                   <div class="risk-legend-item"><div class="risk-legend-dot" style="background:var(--risk-medium)"></div><span style="flex:1">Medium</span><strong>${medCount}</strong></div>
-                   <div class="risk-legend-item"><div class="risk-legend-dot" style="background:var(--risk-low)"></div><span style="flex:1">Low</span><strong>${lowCount}</strong></div>`
-              }
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- ═══════════ §3 · AI RISK & EXPOSURE ═══════════ -->
-      <div class="dash-band dash-rise" style="animation-delay:200ms;--band:rgba(248,81,73,.45);--band-t:#ff7b72">
-        <span class="dash-band-t">⚠️ AI Risk &amp; Exposure</span>
-        <span class="dash-band-s">What's actually dangerous right now?</span>
-      </div>
-      <div class="dim-grid dash-rise" style="grid-template-columns:repeat(3,1fr);animation-delay:210ms;margin-bottom:16px">
-        ${riskDims.map((d, i) => dimCard(d, 210 + i*55)).join('')}
-      </div>
-
-      <!-- AI Attack Surface tiles -->
-      <div class="section-header dash-rise" style="animation-delay:230ms;margin-bottom:10px">
-        <div><div class="section-title" style="font-size:13px">AI Attack Surface</div><div class="section-sub">Everything AI-touching — click a tile to open its inventory</div></div>
-      </div>
-      <div class="attack-grid dash-rise" style="animation-delay:245ms">
-        ${tiles.map(t => `
-          <div class="attack-tile ${t.bar}" onclick="navigate('${t.page}', document.querySelector('[onclick*=${t.page}]'))">
-            <span class="attack-arrow">↗</span>
-            <div class="attack-ico">${t.icon}</div>
-            <div class="attack-num" ${t.numId ? `id="${t.numId}"` : ''} style="color:${t.color}" data-count="${t.n}">0</div>
-            <div class="attack-lbl">${esc(t.label)}</div>
-            <div class="attack-sub" ${t.subId ? `id="${t.subId}"` : ''}>${t.sub}</div>
-          </div>`).join('')}
-      </div>
-
-      <!-- ═══════════ §4 · AI SECURITY ALERTS ═══════════ -->
-      <div class="dash-band dash-rise" style="animation-delay:280ms;--band:rgba(240,136,62,.45);--band-t:#f0883e">
-        <span class="dash-band-t">🚨 AI Security Alerts</span>
-        <span class="dash-band-s">${dashAlerts.derivedCount} derived · ${dashAlerts.defenderCount} AI-scoped Defender${dashAlerts.hiddenAlerts > 0 ? ` · ${dashAlerts.hiddenAlerts} non-AI hidden` : ''}</span>
+      <!-- ═══════════ §2 · SECURITY ═══════════ -->
+      <div class="dash-band dash-rise" style="animation-delay:150ms;--band:rgba(63,185,80,.45);--band-t:#5fd06f">
+        <span class="dash-band-t">🛡️ Security</span>
+        <span class="dash-band-s">Are agent &amp; data protections in place?</span>
         <span class="dash-band-badge">${['critical','high','medium','informational'].filter(k => dashAlerts.sevCounts[k] > 0).map(k => {
           const c = { critical:'var(--risk-critical)', high:'var(--risk-high)', medium:'var(--risk-medium)', informational:'var(--accent-blue)' }[k];
           const l = { critical:'Critical', high:'High', medium:'Medium', informational:'Info' }[k];
           return `<span style="color:${c};margin-left:10px">${l} ${dashAlerts.sevCounts[k]}</span>`;
         }).join('') || '<span style="color:var(--risk-low)">✅ Clear</span>'}</span>
       </div>
-      <div class="card dash-rise" style="animation-delay:290ms;margin-top:0">
+      <div class="grid-2 dash-rise" style="animation-delay:160ms;margin-bottom:16px">
+        ${securityDims.map((d, i) => dimCard(d, 160 + i*55)).join('')}
+      </div>
+
+      <!-- AI Security Alerts feed -->
+      <div class="section-header dash-rise" style="animation-delay:200ms;margin-bottom:10px">
+        <div><div class="section-title" style="font-size:13px">🚨 AI Security Alerts</div><div class="section-sub">${dashAlerts.derivedCount} derived · ${dashAlerts.defenderCount} AI-scoped Defender${dashAlerts.hiddenAlerts > 0 ? ` · ${dashAlerts.hiddenAlerts} non-AI hidden` : ''}</div></div>
+      </div>
+      <div class="card dash-rise" style="animation-delay:210ms;margin-top:0">
         <div class="card-body no-pad">
           ${dashAlerts.allAlerts.length ? dashAlerts.allAlerts.map((a, i) => {
             const sev = (a.sev || 'medium').toLowerCase();
@@ -2896,6 +2807,22 @@ async function loadDashboard() {
           </div>` : ''}
         </div>
       </div>
+
+      <!-- ═══════════ §3 · EXPOSURE ═══════════ -->
+      <div class="dash-band dash-rise" style="animation-delay:260ms;--band:rgba(56,139,253,.45);--band-t:#79c0ff">
+        <span class="dash-band-t">📊 Exposure</span>
+        <span class="dash-band-s">Everything AI-touching — click a tile to open its inventory</span>
+      </div>
+      <div class="attack-grid dash-rise" style="animation-delay:270ms">
+        ${tiles.map(t => `
+          <div class="attack-tile ${t.bar}" onclick="navigate('${t.page}', document.querySelector('[onclick*=${t.page}]'))">
+            <span class="attack-arrow">↗</span>
+            <div class="attack-ico">${t.icon}</div>
+            <div class="attack-num" ${t.numId ? `id="${t.numId}"` : ''} style="color:${t.color}" data-count="${t.n}">0</div>
+            <div class="attack-lbl">${esc(t.label)}</div>
+            <div class="attack-sub" ${t.subId ? `id="${t.subId}"` : ''}>${t.sub}</div>
+          </div>`).join('')}
+      </div>
     `;
 
     // ── Entrance animations: count-up numbers, spark bars, gauge & coverage rings
@@ -2909,43 +2836,11 @@ async function loadDashboard() {
     // AI Models page map. Deferred a frame so the grid cell has a resolved height.
     requestAnimationFrame(() => renderModelResidencyMap(dashModels, dashTenantRegion, 'dash-residency-map', 'dashResidencyMap'));
 
-    // Charts
-    Chart.defaults.color = '#8b949e';
-    Chart.defaults.borderColor = '#30363d';
-    destroyChart('dash-risk-donut');
-    const CAT_COLORS = { Identity:'#a371f7', Data:'#39d353', Device:'#388bfd', Apps:'#e3b341' };
-    STATE.charts['dash-risk-donut'] = new Chart(document.getElementById('dash-risk-donut'), {
-      type: 'doughnut',
-      data: secScore ? {
-        labels: ['Achieved', 'Remaining'],
-        datasets: [{ data: [secScore.pct, 100 - secScore.pct],
-          backgroundColor: ['#388bfd', 'rgba(48,54,61,0.5)'], borderWidth: 0 }]
-      } : {
-        labels: ['Critical','High','Medium','Low'],
-        datasets: [{ data: [critCount,highCount,medCount,lowCount],
-          backgroundColor: ['#f85149','#ff7b72','#f0883e','#3fb950'], borderWidth: 0 }]
-      },
-      options: { cutout:'70%', responsive:true, maintainAspectRatio:true, plugins:{legend:{display:false}} },
-    });
-
     updateDashShadowKpi();
     updateDashAgentKpi();
 
     // Persist this run's metrics so the next assessment can show trend deltas.
     saveDashSnapshot(curMetrics, { secureScore: secScore?.pct ?? null, overallRisk: cisoShadowRisk });
-
-    // Background: refine the AI Sign-ins KPI tile with targeted, server-side-filtered
-    // data (appId-matched) so the count is accurate in high-volume tenants.
-    fetchAiSignInsForChart(aiApps).then(targeted => {
-      if (!targeted) return;
-      const totalAiSignIns = targeted.length;
-      const countEl = document.getElementById('dash-signins-count');
-      const deltaEl = document.getElementById('dash-signins-delta');
-      if (countEl) countEl.textContent = totalAiSignIns;
-      if (deltaEl) deltaEl.textContent = totalAiSignIns > 0
-        ? totalAiSignIns + ' AI-related (appId matched)'
-        : '0 AI-related';
-    }).catch(() => {});
   } catch (e) {
     el.innerHTML = `<div class="perm-warn">⚠️ Could not load dashboard: ${esc(e.message)}</div>`;
   }
