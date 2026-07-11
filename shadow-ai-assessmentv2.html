@@ -1538,13 +1538,6 @@ async function fetchAiAgentInventory() {
     sourceLabel: null,
     code: 'error',
     error: null,
-    noAuth: 0,
-    makerCreds: 0,
-    anthropicCount: 0,
-    mcpCount: 0,
-    hardCodedCount: 0,
-    genOrchCount: 0,
-    modelHints: [],
   };
 
   const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
@@ -1589,39 +1582,6 @@ async function fetchAiAgentInventory() {
         const data = await r.json();
         const rows = Array.isArray(data.results) ? data.results : (Array.isArray(data.Results) ? data.Results : []);
 
-      let noAuth = 0;
-      let makerCreds = 0;
-      let anthropicCount = 0;
-      let mcpCount = 0;
-      let hardCodedCount = 0;
-      let genOrchCount = 0;
-      const modelHints = new Set();
-
-      rows.forEach(row => {
-        const rowText = JSON.stringify(row || {}).toLowerCase();
-        const authText = [
-          row.AuthenticationType, row.authenticationType,
-          row.AuthType, row.authType,
-          row.AgentAuthenticationType, row.agentAuthenticationType,
-          row.IdentityType, row.identityType,
-        ].filter(Boolean).join(' ').toLowerCase();
-
-        if (/(^|[\s_\-])(none|noauth|no_auth|anonymous|unauthenticated)([\s_\-]|$)/i.test(authText)) noAuth++;
-        if (/maker credential|author credential|creator credential|makercredentials|authorcredentials/i.test(rowText)) makerCreds++;
-        if (/anthropic|claude/i.test(rowText)) anthropicCount++;
-        if (/\bmcp\b|model context protocol/i.test(rowText)) mcpCount++;
-        if (/hard[\s\-]?coded|embedded credential|plaintext\s(secret|password)|connection string/i.test(rowText)) hardCodedCount++;
-        if (/generative orchestration|gen\s*orch|orchestration/i.test(rowText)) genOrchCount++;
-
-        Object.entries(row || {}).forEach(([k, v]) => {
-          if (!/(model|provider|llm|engine)/i.test(k)) return;
-          if (typeof v !== 'string') return;
-          const s = v.trim();
-          if (!s || s.length > 80) return;
-          modelHints.add(s);
-        });
-      });
-
         const matchedTable = q.split(/\s+/)[0];
         const SRC_LABELS = {
           AgentsInfo:   'AgentsInfo (unified inventory)',
@@ -1635,13 +1595,6 @@ async function fetchAiAgentInventory() {
           sourceLabel: SRC_LABELS[matchedTable] || matchedTable,
           code: null,
           error: null,
-          noAuth,
-          makerCreds,
-          anthropicCount,
-          mcpCount,
-          hardCodedCount,
-          genOrchCount,
-          modelHints: [...modelHints].slice(0, 40),
         };
         return STATE.data.aiAgentInv;
       } catch (e) {
@@ -1998,20 +1951,25 @@ async function fetchDlpAiBlocks() {
     return STATE.data.dlpAiBlocks;
   };
 
+  // pack_all() serialises EVERY column to JSON, so the keyword scan never
+  // references a column that might not exist (RemoteUrl/RawEventData vary by
+  // table — referencing a missing one throws "column not found" and the whole
+  // strategy silently falls through, which is why blocks read as 0).
+  const dlpSignal = '"dlp","block","restrict","confidential","sensitiv","policyname","enforcement","quarantine"';
   // Strategy 1 — DataSecurityEvents (Purview policy-violation events, preview).
   let rows = await tryRun([
     'DataSecurityEvents', '| where Timestamp > ago(30d)',
-    '| extend _raw = tostring(RawEventData)',
-    `| where _raw has_any (${kwList}) or RemoteUrl has_any (${kwList})`,
+    '| extend _all = tostring(pack_all())',
+    `| where _all has_any (${kwList})`,
     '| take 200',
   ].join(' '));
   // Strategy 2 — DeviceEvents endpoint-DLP cloud egress (the "File copied to cloud" path).
   if (!rows?.length) {
     rows = await tryRun([
       'DeviceEvents', '| where Timestamp > ago(30d)',
-      '| where ActionType has_any ("Cloud","Upload","Dlp","Sensitive")',
-      '| extend _raw = tostring(AdditionalFields)',
-      `| where _raw has_any (${kwList}) or RemoteUrl has_any (${kwList})`,
+      '| extend _all = tostring(pack_all())',
+      `| where _all has_any (${kwList})`,
+      `| where _all has_any (${dlpSignal}) or ActionType has_any ("Cloud","Upload","Dlp","Sensitive","Copied")`,
       '| take 200',
     ].join(' '));
   }
@@ -2019,9 +1977,9 @@ async function fetchDlpAiBlocks() {
   if (!rows?.length) {
     rows = await tryRun([
       'CloudAppEvents', '| where Timestamp > ago(30d)',
-      '| where ActionType has_any ("Dlp","Block","Restrict","Upload")',
-      '| extend _raw = tostring(RawEventData)',
-      `| where _raw has_any (${kwList})`,
+      '| extend _all = tostring(pack_all())',
+      `| where _all has_any (${kwList})`,
+      `| where _all has_any (${dlpSignal})`,
       '| take 200',
     ].join(' '));
   }
@@ -7203,10 +7161,15 @@ async function fetchAgentRuntimeBehaviors() {
 // Near-real-time agent threat detections — surfaced as alerts in AlertInfo.
 async function fetchAgentThreatAlerts() {
   if (STATE.data.agentThreatAlerts !== undefined) return STATE.data.agentThreatAlerts;
+  // Scope strictly to AI-agent detections. Generic security keywords (credential,
+  // secret, exfiltrat, poison, bare "agent") also match non-AI endpoint alerts like
+  // "Mimikatz credential theft tool", so match only the AI category or AI-specific
+  // phrases (prompt injection, jailbreak, XPIA, agent tool invocation, MCP …).
   const kql = [
     'AlertInfo',
     '| where Timestamp > ago(30d)',
-    '| where Title has_any("agent","prompt inject","jailbreak","XPIA","exfiltrat","credential","secret","poison") or Category has_any("AI","Agent")',
+    '| where Category has_any("AI","Agent")',
+    '   or Title has_any("AI agent","agent tool","agent identity","agent runtime","prompt inject","jailbreak","XPIA","cross-prompt","cross prompt","model context protocol","generative orchestration","copilot agent")',
     '| project Timestamp, Title, Severity, Category, ServiceSource',
     '| order by Timestamp desc | take 50',
   ].join(' ');
