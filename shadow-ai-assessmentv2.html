@@ -538,8 +538,8 @@
       <button class="nav-item" onclick="navigate('agents',this)"><span class="nav-icon">⚡</span>AI Agents</button>
       <button class="nav-item" onclick="navigate('copilot',this)"><span class="nav-icon">💬</span>Copilot Usage</button>
       <div class="nav-section-label">Data Security</div>
-      <button class="nav-item" onclick="navigate('sharing',this)"><span class="nav-icon">🌐</span>External Sharing</button>
-      <button class="nav-item" onclick="navigate('labels',this)"><span class="nav-icon">🏷️</span>Sensitivity Labels</button>
+      <button class="nav-item" onclick="navigate('sharing',this)"><span class="nav-icon">🌐</span>SharePoint/OneDrive Sharing</button>
+      <button class="nav-item" onclick="navigate('labels',this)"><span class="nav-icon">🏷️</span>Purview Sensitivity Labels</button>
       <button class="nav-item" onclick="navigate('data-risk',this)"><span class="nav-icon">🔐</span>Data Risk</button>
       <div class="nav-section-label">Governance</div>
       <button class="nav-item" onclick="navigate('protection',this)"><span class="nav-icon">🛡️</span>Agent 365 Security</button>
@@ -1523,8 +1523,10 @@ async function fetchIdProtectionAgentStats() {
   return STATE.data.idProtectionAgentStats;
 }
 
-// Live AI agent inventory from Defender Advanced Hunting.
-// Uses AgentsInfo (legacy source retained by Defender in many tenants).
+// Live AI agent inventory from Defender Advanced Hunting. Prefers the GA unified
+// AgentsInfo table (which replaced AIAgentsInfo in June 2026); only falls through
+// to the deprecated AIAgentsInfo as a last resort. `source`/`sourceLabel` record
+// which table actually answered, so the UI can show accurate provenance.
 async function fetchAiAgentInventory() {
   if (STATE.data.aiAgentInv !== undefined) return STATE.data.aiAgentInv;
 
@@ -1532,6 +1534,8 @@ async function fetchAiAgentInventory() {
     ok: false,
     rows: [],
     total: 0,
+    source: null,
+    sourceLabel: null,
     code: 'error',
     error: null,
     noAuth: 0,
@@ -1618,10 +1622,17 @@ async function fetchAiAgentInventory() {
         });
       });
 
+        const matchedTable = q.split(/\s+/)[0];
+        const SRC_LABELS = {
+          AgentsInfo:   'AgentsInfo (unified inventory)',
+          AIAgentsInfo: 'AIAgentsInfo (deprecated legacy table)',
+        };
         STATE.data.aiAgentInv = {
           ok: true,
           rows,
           total: rows.length,
+          source: matchedTable,
+          sourceLabel: SRC_LABELS[matchedTable] || matchedTable,
           code: null,
           error: null,
           noAuth,
@@ -1911,6 +1922,116 @@ async function fetchDlpProtectionScope() {
   return STATE.data.dlpScope;
 }
 
+// Purview DLP *events* where a labelled/sensitive item was blocked (or audited) on
+// its way to an EXTERNAL AI app — the actual proof a policy fired. Endpoint DLP
+// cloud-upload blocks live in DeviceEvents / DataSecurityEvents (Advanced Hunting),
+// NOT CloudAppEvents — which is why a browser upload to Claude is invisible to the
+// cloud-side "Labelled Content Touched by AI" card. Same silent ThreatHunting token.
+const AI_EGRESS_KEYWORDS = ['claude','anthropic','chatgpt','openai.com','gemini','bard','perplexity','deepseek','mistral','huggingface','character.ai','poe.com','x.ai','grok','copilot.microsoft.com'];
+function _aiEgressApp(text) {
+  const t = (text || '').toLowerCase();
+  if (/claude|anthropic/.test(t)) return 'Anthropic (Claude)';
+  if (/chatgpt|openai\.com/.test(t)) return 'OpenAI (ChatGPT)';
+  if (/gemini|\bbard\b/.test(t)) return 'Google (Gemini)';
+  if (/perplexity/.test(t)) return 'Perplexity';
+  if (/deepseek/.test(t)) return 'DeepSeek';
+  if (/mistral/.test(t)) return 'Mistral';
+  if (/huggingface/.test(t)) return 'HuggingFace';
+  if (/character\.ai/.test(t)) return 'Character.AI';
+  if (/poe\.com/.test(t)) return 'Poe';
+  if (/x\.ai|grok/.test(t)) return 'xAI (Grok)';
+  return 'AI app';
+}
+async function fetchDlpAiBlocks() {
+  if (STATE.data.dlpAiBlocks !== undefined) return STATE.data.dlpAiBlocks;
+  const base = { ok: false, events: [], total: 0, blocked: 0, byApp: {}, code: 'error', error: null, note: null };
+  const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
+  if (!token) { STATE.data.dlpAiBlocks = { ...base, code: 'forbidden', error: 'ThreatHunting.Read.All not consented.' }; return STATE.data.dlpAiBlocks; }
+
+  const kwList = AI_EGRESS_KEYWORDS.map(k => `"${k}"`).join(',');
+  const isUnsupportedErr = msg => /failed to resolve table|could not be resolved|unknown table|does not refer to any known table|semantic error|failed to resolve scalar|column.+(not found|does not exist)/i.test(msg || '');
+  let lastErr = null, anySuccess = false;
+  const tryRun = async kql => {
+    try {
+      const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+        method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ Query: kql }),
+      });
+      if (!r.ok) { const e = new Error((await r.text()).slice(0, 300)); e.status = r.status; throw e; }
+      anySuccess = true;
+      const data = await r.json();
+      return Array.isArray(data.results) ? data.results : (Array.isArray(data.Results) ? data.Results : []);
+    } catch (e) { lastErr = e; return null; }
+  };
+  const pick = (row, keys) => { for (const k of keys) { if (row[k] != null && String(row[k]).trim() !== '') return row[k]; } return null; };
+  // Endpoint DLP nests PolicyName / EnforcementMode inside AdditionalFields (or
+  // RawEventData) JSON — flatten those onto the row so pick() can reach them.
+  const flatten = row => {
+    const out = { ...row };
+    for (const k of ['AdditionalFields', 'RawEventData']) {
+      const v = row[k];
+      if (typeof v === 'string' && v.trim().startsWith('{')) { try { Object.assign(out, JSON.parse(v)); } catch { } }
+      else if (v && typeof v === 'object') Object.assign(out, v);
+    }
+    return out;
+  };
+  const finish = rawRows => {
+    const events = rawRows.map(r0 => {
+      const row = flatten(r0);
+      const raw = JSON.stringify(r0 || '');
+      const action = String(pick(row, ['ActionType','Action','EnforcementMode','DlpAction','action']) || '');
+      const blocked = /block|restrict|prevent/i.test(action) || /block|restrict|prevent/i.test(raw);
+      const target = String(pick(row, ['RemoteUrl','TargetDomain','DestinationDomain','CloudService','Url','remoteUrl']) || '');
+      const app = _aiEgressApp(target || raw);
+      return {
+        time: pick(row, ['Timestamp','timestamp']),
+        user: String(pick(row, ['AccountUpn','RequestAccountUpn','AccountName','InitiatingProcessAccountUpn','InitiatingProcessAccountName','UserId','User']) || '—'),
+        file: String(pick(row, ['FileName','ObjectName','FileNameOriginal','fileName']) || '—'),
+        device: String(pick(row, ['DeviceName','deviceName']) || ''),
+        policy: String(pick(row, ['PolicyName','DLPPolicyName','DlpPolicy','policyName']) || ''),
+        action, blocked, app,
+      };
+    });
+    const byApp = {};
+    events.forEach(e => { (byApp[e.app] = byApp[e.app] || { total: 0, blocked: 0 }); byApp[e.app].total++; if (e.blocked) byApp[e.app].blocked++; });
+    STATE.data.dlpAiBlocks = { ok: true, events: events.sort((a, b) => new Date(b.time) - new Date(a.time)), total: events.length, blocked: events.filter(e => e.blocked).length, byApp, code: null, error: null, note: null };
+    return STATE.data.dlpAiBlocks;
+  };
+
+  // Strategy 1 — DataSecurityEvents (Purview policy-violation events, preview).
+  let rows = await tryRun([
+    'DataSecurityEvents', '| where Timestamp > ago(30d)',
+    '| extend _raw = tostring(RawEventData)',
+    `| where _raw has_any (${kwList}) or RemoteUrl has_any (${kwList})`,
+    '| take 200',
+  ].join(' '));
+  // Strategy 2 — DeviceEvents endpoint-DLP cloud egress (the "File copied to cloud" path).
+  if (!rows?.length) {
+    rows = await tryRun([
+      'DeviceEvents', '| where Timestamp > ago(30d)',
+      '| where ActionType has_any ("Cloud","Upload","Dlp","Sensitive")',
+      '| extend _raw = tostring(AdditionalFields)',
+      `| where _raw has_any (${kwList}) or RemoteUrl has_any (${kwList})`,
+      '| take 200',
+    ].join(' '));
+  }
+  // Strategy 3 — CloudAppEvents DLP-style egress actions (some tenants surface here).
+  if (!rows?.length) {
+    rows = await tryRun([
+      'CloudAppEvents', '| where Timestamp > ago(30d)',
+      '| where ActionType has_any ("Dlp","Block","Restrict","Upload")',
+      '| extend _raw = tostring(RawEventData)',
+      `| where _raw has_any (${kwList})`,
+      '| take 200',
+    ].join(' '));
+  }
+  if (rows?.length) return finish(rows);
+  if (anySuccess) { STATE.data.dlpAiBlocks = { ...base, ok: true, note: 'Hunting tables reachable — no DLP-to-AI egress events in 30 days.' }; return STATE.data.dlpAiBlocks; }
+  const msg = lastErr?.message || 'unknown error';
+  STATE.data.dlpAiBlocks = { ...base, code: lastErr?.status === 403 ? 'forbidden' : isUnsupportedErr(msg) ? 'unsupported' : 'error', error: msg };
+  return STATE.data.dlpAiBlocks;
+}
+
 async function fetchGrantPolicies() {
   if (STATE.data.grantPolicies) return STATE.data.grantPolicies;
   try {
@@ -2010,7 +2131,7 @@ const PAGE_TITLES = {
   dashboard:'Dashboard','shadow-apps':'Shadow AI Apps',models:'AI Models',
   agents:'AI Agents','data-risk':'Data Risk & Consent',
   users:'AI & Agent Users',licenses:'Licenses',
-  protection:'Agent 365 Security',sharing:'External Sharing Exposure',labels:'Sensitivity Label Exposure',
+  protection:'Agent 365 Security',sharing:'SharePoint/OneDrive Sharing',labels:'Purview Sensitivity Labels',
   copilot:'M365 Copilot Usage',
 };
 
@@ -2151,67 +2272,6 @@ function dashCountUp(eln, to, dur = 950) {
   requestAnimationFrame(step);
 }
 
-// Bucket sign-in events into the last `days` calendar days (UTC), tracking
-// per-day event counts and unique users. Shared by the initial dashboard
-// render and the background targeted re-render.
-function buildDailySignInBuckets(signIns, days = 30) {
-  const todayUTC = new Date(); todayUTC.setUTCHours(0, 0, 0, 0);
-  const buckets = Array.from({ length: days }, (_, i) => {
-    const d = new Date(todayUTC.getTime() - (days - 1 - i) * 86400000);
-    return { label: d.toLocaleDateString('en', { month: 'short', day: 'numeric' }), count: 0, users: new Set() };
-  });
-  (signIns || []).forEach(s => {
-    const day = new Date(s.createdDateTime); day.setUTCHours(0, 0, 0, 0);
-    const idx = Math.round((todayUTC.getTime() - day.getTime()) / 86400000);
-    if (idx >= 0 && idx < days) {
-      buckets[days - 1 - idx].count++;
-      if (s.userPrincipalName) buckets[days - 1 - idx].users.add(s.userPrincipalName);
-    }
-  });
-  return buckets;
-}
-
-// (Re)render the dashboard sign-in bar chart from pre-built day buckets.
-function renderDashSignInChart(buckets) {
-  destroyChart('dash-signins');
-  const canvas = document.getElementById('dash-signins-chart');
-  if (!canvas) return;
-  STATE.charts['dash-signins'] = new Chart(canvas, {
-    type: 'bar',
-    data: {
-      labels: buckets.map(b => b.label),
-      datasets: [
-        { label: 'Sign-ins', data: buckets.map(b => b.count), backgroundColor: 'rgba(56,139,253,.6)', borderRadius: 3 },
-        { label: 'Unique users', data: buckets.map(b => b.users.size), backgroundColor: 'rgba(163,113,247,.5)', borderRadius: 3 },
-      ],
-    },
-    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom', labels: { boxWidth: 10, padding: 10 } } },
-      scales: { x: { grid: { display: false }, ticks: { font: { size: 10 } } }, y: { beginAtZero: true, grid: { color: 'rgba(48,54,61,.5)' } } } },
-  });
-}
-
-// Aggregate the 30 daily buckets into 7-day groups (last group may be partial).
-// Used for low-volume tenants where 30 single-day bars look sparse/noisy.
-function groupBucketsWeekly(daily) {
-  const groups = [];
-  for (let i = 0; i < daily.length; i += 7) {
-    const chunk = daily.slice(i, i + 7);
-    const users = new Set();
-    let count = 0;
-    chunk.forEach(b => { count += b.count; b.users.forEach(u => users.add(u)); });
-    const endDay = chunk[chunk.length - 1].label.replace(/^[A-Za-z]+\s/, ''); // strip month from end label
-    groups.push({ label: `${chunk[0].label}–${endDay}`, count, users });
-  }
-  return groups;
-}
-
-// Choose daily vs weekly buckets based on how sparse the activity is. Returns the
-// display buckets plus a `weekly` flag so the chart title can reflect the grouping.
-function dashSignInDisplayBuckets(signIns) {
-  const daily = buildDailySignInBuckets(signIns, 30);
-  const weekly = daily.filter(b => b.count > 0).length <= 8; // ≤8 active days ⇒ too sparse for daily
-  return { buckets: weekly ? groupBucketsWeekly(daily) : daily, weekly };
-}
 
 // ── Dashboard trend snapshot (persisted per-tenant in localStorage) ──────────
 // Lets the dashboard show "▲/▼ since <date>" deltas vs the previous assessment.
@@ -2369,9 +2429,6 @@ async function loadDashboard() {
     const medCount  = aiApps.filter(sp => riskByApp.get(sp.id) === 'medium').length;
     const lowCount  = aiApps.filter(sp => riskByApp.get(sp.id) === 'low').length;
 
-    // sign-in timeline (last 30 days bucketed by calendar day, UTC)
-    const { buckets, weekly: signinsWeekly } = dashSignInDisplayBuckets(aiSignIns);
-
     // Diagnostics: what each API actually returned
     const riskyAgentsDiag = STATE.data.riskyAgents || [];
     const riskyAgentsActive = riskyAgentsDiag.filter(a => a.riskLevel && a.riskLevel !== 'none').length;
@@ -2528,21 +2585,6 @@ async function loadDashboard() {
     actions.sort((a,b) => SEV[a.sev].o - SEV[b.sev].o);
     const topActions = actions.slice(0, 5);
 
-    // ── Assessment coverage / blind-spots ─────────────────────────────────────
-    // Surfaces which telemetry feeds actually returned data, so the reader knows what
-    // the assessment could NOT see (a 0/error feed silently weakens every finding).
-    const coverage = [
-      { label:'Service Principals',           ok: !STATE.data.spError,         err: STATE.data.spError },
-      { label:'OAuth Grants',                 ok: !STATE.data.grantsError,     err: STATE.data.grantsError, partial: !!STATE.data.grantsNote },
-      { label:'Sign-in Logs',                 ok: !STATE.data.signInsError,    err: STATE.data.signInsError, partial: !STATE.data.signInsError && signIns.length === 0 },
-      { label:'Defender for Cloud Apps',      ok: Array.isArray(STATE.data.mcasApps) && STATE.data.mcasApps.length > 0 },
-      { label:'Identity Protection · Users',  ok: !STATE.data.riskyUsersError,  err: STATE.data.riskyUsersError },
-      { label:'Identity Protection · Agents', ok: !STATE.data.riskyAgentsError, err: STATE.data.riskyAgentsError, partial: STATE.data.riskyAgentsUsedFallback },
-      { label:'Microsoft Secure Score',       ok: !!STATE.data.secureScore },
-      { label:'Conditional Access',           ok: !STATE.data.caError,         err: STATE.data.caError },
-    ];
-    const covConnected = coverage.filter(c => c.ok && !c.partial).length;
-
     // ── Governance (moved from the dissolved Compliance page) ─────────────────
     const govAuthPolicy  = STATE.data.authPolicy || {};
     const govSecDefaults = STATE.data.secDefaults || {};
@@ -2597,8 +2639,8 @@ async function loadDashboard() {
         <div class="dim-why">${esc(d.why)}</div></div>`;
     const complianceDims = [
       { icon:'🇪🇺', label:'GDPR Compliance',     value: dashModels.length ? (dashGdprCompliant ? 'Compliant' : `${dashModels.length - dashCompliantModels} non-compliant`) : '—', color: dashModels.length===0?'var(--text-muted)':dashGdprCompliant?'var(--risk-low)':'var(--risk-critical)', why: dashModels.length?`${dashCompliantModels}/${dashModels.length} AI models EU-adequate`:'No AI models detected', page:'models' },
-      { icon:'🛡️', label:'EU Data Boundary',     value: govInEu ? (govAiLeavesEu ? 'AI leaves EU' : 'In EU') : (dashTenantRegion?.regionScope ? 'Outside EU' : '—'), color: govInEu ? (govAiLeavesEu?'var(--risk-medium)':'var(--risk-low)') : (dashTenantRegion?.regionScope?'var(--risk-medium)':'var(--text-muted)'), why: govInEu ? (govAiLeavesEu?'M365 at rest in EU — inferencing leaves EU':'M365 data at rest stays in EU') : ('Tenant region '+esc(dashTenantRegion?.subScope||dashTenantRegion?.regionLabel||'unknown')), page:'models' },
-      { icon:'⚖️', label:'AI Governance Score',  value: govScore+'%', color: scoreColor(govScore), why:`${govAiBlockCa.length} AI-specific CA · Security Defaults ${govSecDefaults.isEnabled?'on':'OFF'}`, page:'protection' },
+      { icon:'🛡️', label:'EU Data Boundary',     value: govInEu ? (govAiLeavesEu ? 'Data leaves EU' : 'In EU') : (dashTenantRegion?.regionScope ? 'Outside EU' : '—'), color: govInEu ? (govAiLeavesEu?'var(--risk-medium)':'var(--risk-low)') : (dashTenantRegion?.regionScope?'var(--risk-medium)':'var(--text-muted)'), why: govInEu ? (govAiLeavesEu?'M365 at rest in EU — inferencing leaves EU':'M365 data at rest stays in EU') : ('Tenant region '+esc(dashTenantRegion?.subScope||dashTenantRegion?.regionLabel||'unknown')), page:'models' },
+      { icon:'🛡️', label:'Agent Security',       value: hasE7Agent ? 'Protected' : 'Not protected', color: hasE7Agent ? 'var(--risk-low)' : 'var(--risk-critical)', why: hasE7Agent ? 'Agent 365 / M365 E7 licensed — agent protections available' : 'No Agent 365 / M365 E7 license — agent protections unavailable', page:'protection' },
       { icon:'🔐', label:'DLP for AI',           value: dashDlpScope?.ok ? (dashDlpScope.configured?'Active':'No scope') : (dashDlpScope?.code==='forbidden'?'Scope needed':'—'), color: dashDlpScope?.ok?(dashDlpScope.configured?'var(--risk-low)':'var(--risk-medium)'):'var(--text-muted)', why: dashDlpScope?.ok?(dashDlpScope.configured?`${dashDlpScope.total} scope${dashDlpScope.total!==1?'s':''}${dashDlpScope.blocking?' · blocking':''}`:'No DLP policy targets this user'):'Purview DLP-for-AI coverage', page:'labels' },
     ];
 
@@ -2722,50 +2764,6 @@ async function loadDashboard() {
         </div>
       </div>
 
-      <!-- ═══ Coverage + Licensing ═══ -->
-      <div class="grid-2 dash-rise" style="animation-delay:180ms">
-        <div class="card" style="margin-bottom:0">
-          <div class="card-header">
-            <div class="card-title">🛰️ Assessment Coverage</div>
-            <span style="font-size:11px;color:var(--text-muted)">telemetry feeds connected</span>
-          </div>
-          <div class="card-body" style="display:flex;align-items:center;gap:18px">
-            <div class="cov-ring">
-              <svg viewBox="0 0 76 76" width="76" height="76">
-                <circle cx="38" cy="38" r="32" fill="none" stroke="var(--bg-secondary)" stroke-width="7" pathLength="100"></circle>
-                <circle id="dash-cov-fill" class="cov-fill" cx="38" cy="38" r="32" fill="none" stroke="${covConnected===coverage.length?'var(--risk-low)':'var(--accent-blue)'}" stroke-width="7" pathLength="100" stroke-dasharray="100" stroke-dashoffset="100" transform="rotate(-90 38 38)"></circle>
-              </svg>
-              <div class="cov-center"><div style="font-size:18px;font-weight:800;line-height:1">${covConnected}<span style="font-size:11px;color:var(--text-dim)">/${coverage.length}</span></div></div>
-            </div>
-            <div style="flex:1;display:flex;flex-wrap:wrap;gap:6px">
-              ${coverage.map(c => {
-                const state = c.err ? 'err' : c.partial ? 'partial' : c.ok ? 'ok' : 'none';
-                const cfg = { ok:['var(--risk-low)','●'], partial:['var(--risk-medium)','◐'], err:['var(--risk-critical)','○'], none:['var(--text-dim)','○'] }[state];
-                return `<span title="${esc(c.err ? c.err.slice(0,140) : state)}" style="display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 9px;border-radius:20px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-muted)"><span style="color:${cfg[0]};font-size:11px;line-height:1">${cfg[1]}</span>${esc(c.label)}</span>`;
-              }).join('')}
-            </div>
-          </div>
-        </div>
-        <div class="card" style="margin-bottom:0">
-          <div class="card-header">
-            <div class="card-title">🪪 Licensing &amp; Enforcement</div>
-            <span style="font-size:11px;color:var(--text-muted)">can we mitigate?</span>
-          </div>
-          <div class="card-body" style="display:flex;flex-wrap:wrap;gap:8px;align-content:flex-start">
-            ${[
-              { ok: hasE7Agent,          label: 'Microsoft 365 E7 / Agent 365' },
-              { ok: hasP2,               label: 'Entra ID P2' },
-              { ok: hasCopilot,          label: 'Microsoft 365 Copilot' },
-              { ok: agentCaEnforced > 0, label: 'Agents covered by enforced CA', warn: agentCa.length > 0 && agentCaEnforced === 0 },
-            ].map(c => {
-              const cfg = c.ok ? ['var(--risk-low)','✅'] : c.warn ? ['var(--risk-medium)','◐'] : ['var(--risk-critical)','❌'];
-              return `<span style="display:inline-flex;align-items:center;gap:6px;font-size:11px;padding:5px 11px;border-radius:20px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-muted)"><span style="color:${cfg[0]}">${cfg[1]}</span>${esc(c.label)}</span>`;
-            }).join('')}
-            ${(!hasE7Agent || !hasP2 || (agentCa.length > 0 && agentCaEnforced === 0)) ? `<div style="width:100%;font-size:11px;color:var(--text-dim);margin-top:2px">❌ / ◐ limit what you can mitigate — see <a onclick="navigate('protection', document.querySelector('[onclick*=protection]'))" style="color:var(--accent-blue);cursor:pointer">Agent 365 Security</a>.</div>` : ''}
-          </div>
-        </div>
-      </div>
-
       <!-- ═══════════ §3 · AI RISK & EXPOSURE ═══════════ -->
       <div class="dash-band dash-rise" style="animation-delay:200ms;--band:rgba(248,81,73,.45);--band-t:#ff7b72">
         <span class="dash-band-t">⚠️ AI Risk &amp; Exposure</span>
@@ -2788,17 +2786,6 @@ async function loadDashboard() {
             <div class="attack-lbl">${esc(t.label)}</div>
             <div class="attack-sub" ${t.subId ? `id="${t.subId}"` : ''}>${t.sub}</div>
           </div>`).join('')}
-      </div>
-
-      <!-- Sign-in timeline -->
-      <div class="card dash-rise" style="animation-delay:260ms;margin-top:16px">
-        <div class="card-header">
-          <div class="card-title">AI App Sign-ins (last 30 days) <span id="dash-signins-mode" style="font-size:10px;color:var(--text-dim);font-weight:400">· ${signinsWeekly ? 'weekly' : 'daily'}</span></div>
-          <span class="data-source source-live"><span class="pulse-dot"></span> Live</span>
-        </div>
-        <div class="card-body">
-          <div class="chart-container" style="height:200px"><canvas id="dash-signins-chart"></canvas></div>
-        </div>
       </div>
 
       <!-- ═══════════ §4 · AI SECURITY ALERTS ═══════════ -->
@@ -2845,7 +2832,6 @@ async function loadDashboard() {
       el.querySelectorAll('[data-count]').forEach(n => dashCountUp(n, +n.dataset.count));
       el.querySelectorAll('.dim-spark > span[data-w]').forEach(s => { s.style.width = s.dataset.w + '%'; });
       const g = document.getElementById('dash-gauge-val'); if (g) g.style.strokeDashoffset = String(100 - RISK_INDEX);
-      const cov = document.getElementById('dash-cov-fill'); if (cov) cov.style.strokeDashoffset = String(100 - Math.round(covConnected / coverage.length * 100));
     });
 
     // Hero showcase map — its own instance/state key so it never clobbers the
@@ -2856,7 +2842,6 @@ async function loadDashboard() {
     Chart.defaults.color = '#8b949e';
     Chart.defaults.borderColor = '#30363d';
     destroyChart('dash-risk-donut');
-    renderDashSignInChart(buckets);
     const CAT_COLORS = { Identity:'#a371f7', Data:'#39d353', Device:'#388bfd', Apps:'#e3b341' };
     STATE.charts['dash-risk-donut'] = new Chart(document.getElementById('dash-risk-donut'), {
       type: 'doughnut',
@@ -2878,12 +2863,10 @@ async function loadDashboard() {
     // Persist this run's metrics so the next assessment can show trend deltas.
     saveDashSnapshot(curMetrics, { secureScore: secScore?.pct ?? null, overallRisk: cisoShadowRisk });
 
-    // Background: re-render sign-in chart with targeted, server-side-filtered data
-    // so high-volume tenants show the full 30-day history instead of just today.
+    // Background: refine the AI Sign-ins KPI tile with targeted, server-side-filtered
+    // data (appId-matched) so the count is accurate in high-volume tenants.
     fetchAiSignInsForChart(aiApps).then(targeted => {
       if (!targeted) return;
-
-      // Update the Sign-in Events KPI card to reflect the targeted AI count
       const totalAiSignIns = targeted.length;
       const countEl = document.getElementById('dash-signins-count');
       const deltaEl = document.getElementById('dash-signins-delta');
@@ -2891,13 +2874,6 @@ async function loadDashboard() {
       if (deltaEl) deltaEl.textContent = totalAiSignIns > 0
         ? totalAiSignIns + ' AI-related (appId matched)'
         : '0 AI-related';
-
-      // Only re-render chart if targeted data differs from the initial keyword-filtered set
-      if (targeted === STATE.data.signIns) return;
-      const disp = dashSignInDisplayBuckets(targeted);
-      renderDashSignInChart(disp.buckets);
-      const modeEl = document.getElementById('dash-signins-mode');
-      if (modeEl) modeEl.textContent = '· ' + (disp.weekly ? 'weekly' : 'daily');
     }).catch(() => {});
   } catch (e) {
     el.innerHTML = `<div class="perm-warn">⚠️ Could not load dashboard: ${esc(e.message)}</div>`;
@@ -4842,9 +4818,9 @@ async function renderDefenderAssetsSection() {
     const msg = list.code === 'forbidden'
       ? '🔒 <strong>ThreatHunting.Read.All</strong> not consented — sign out &amp; back in (or re-run admin consent) to read the Defender AI Assets table.'
       : list.code === 'unsupported'
-      ? 'ℹ️ The legacy Defender AI inventory source used by this app has been deprecated. Verify AI asset posture directly in Defender.'
+      ? 'ℹ️ The Defender AI inventory tables (AgentsInfo) aren\'t available in this tenant. Verify AI asset posture directly in Defender.'
       : list.code === 'schema'
-      ? '⚠️ The legacy Defender AI inventory query no longer matches the current Advanced Hunting schema. Review the query or Defender error details.'
+      ? '⚠️ The Defender AI inventory query no longer matches the current Advanced Hunting schema. Review the query or Defender error details.'
       : 'ℹ️ Defender AI Assets unavailable — ' + esc(list.error || 'unknown error');
     if (badgeEl) badgeEl.textContent = 'unavailable';
     if (kpiVal) kpiVal.textContent = '—';
@@ -6142,7 +6118,7 @@ async function loadDataRisk() {
       <div class="section-header" style="margin-bottom:12px">
         <div>
           <div class="section-title">AI Permissions &amp; Identity Risk</div>
-          <div class="section-sub">The control plane across <strong>all</strong> data categories — who &amp; what can touch data, which agents hold platform-blocked permissions, and which identities are compromised. Files-specific evidence &amp; sharing settings live on <a onclick="navigate('sharing', document.querySelector('[onclick*=sharing]'))" style="color:var(--accent-blue);cursor:pointer">External Sharing</a>.</div>
+          <div class="section-sub">The control plane across <strong>all</strong> data categories — who &amp; what can touch data, which agents hold platform-blocked permissions, and which identities are compromised. Files-specific evidence &amp; sharing settings live on <a onclick="navigate('sharing', document.querySelector('[onclick*=sharing]'))" style="color:var(--accent-blue);cursor:pointer">SharePoint/OneDrive Sharing</a>.</div>
         </div>
       </div>
 
@@ -7507,88 +7483,30 @@ async function loadProtection() {
         const huntingReachable = !!aiAgentInv?.ok;
         const hasRecentAgents = (inv.total || 0) > 0;
 
-        const statCell = (label, value, color, sub, risk) => `
-          <div>
-            <div style="font-size:11px;color:var(--text-muted);margin-bottom:2px">${label}</div>
-            <div style="font-size:22px;font-weight:700;color:${color};line-height:1">${value}</div>
-            <div style="font-size:10px;color:var(--text-dim);margin-top:2px">${sub}</div>
-            ${risk ? `<div style="margin-top:5px"><span style="font-size:9px;text-transform:uppercase;letter-spacing:.4px;padding:2px 6px;border-radius:4px;background:${color}1a;color:${color};border:1px solid ${color}33;font-weight:600;white-space:nowrap">⚠ ${risk}</span></div>` : ''}
-          </div>`;
-
         const liveBlock = huntingReachable
           ? `<div class="card" style="margin-bottom:16px">
               <div class="card-header">
                 <div class="card-title">🗂️ AI Agent Inventory (live)</div>
-                <span class="data-source source-live" style="font-size:10px">● security/runHuntingQuery · legacy AI inventory source</span>
+                <span class="data-source source-live" style="font-size:10px">● security/runHuntingQuery · ${esc(inv.sourceLabel || 'Advanced Hunting')}</span>
               </div>
               <div class="card-body">
                 <div style="margin-bottom:14px">
                   ${hasRecentAgents
                       ? `<span style="display:inline-flex;align-items:center;gap:8px;padding:6px 16px;border-radius:8px;background:rgba(63,185,80,.12);border:1px solid rgba(63,185,80,.3);font-size:13px;font-weight:700;color:var(--risk-low)">✅ Security for AI agents — Connected</span>
-                        <span style="font-size:11px;color:var(--text-muted);margin-left:10px">inferred from ${inv.total} active agent${inv.total !== 1 ? 's' : ''} in the legacy inventory source</span>`
+                        <span style="font-size:11px;color:var(--text-muted);margin-left:10px">inferred from ${inv.total} active agent${inv.total !== 1 ? 's' : ''} in <strong>${esc(inv.sourceLabel || 'the inventory source')}</strong></span>`
                     : `<span style="display:inline-flex;align-items:center;gap:8px;padding:6px 16px;border-radius:8px;background:rgba(56,139,253,.12);border:1px solid rgba(56,139,253,.28);font-size:13px;font-weight:700;color:var(--accent-blue)">ℹ️ Advanced Hunting reachable</span>
                        <span style="font-size:11px;color:var(--text-muted);margin-left:10px">No active agents observed in the last 30 days — verify the toggle below.</span>`}
                 </div>
-                <div style="display:flex;align-items:flex-start;gap:20px;flex-wrap:wrap">
-                  ${statCell(
-                    inv.noAuth > 0 ? '⚠️ No Authentication' : 'No Authentication',
-                    inv.noAuth,
-                    inv.noAuth > 0 ? 'var(--risk-critical)' : 'var(--risk-low)',
-                    'No tool or user authentication detected',
-                    'Public access'
-                  )}
-                  <div style="width:1px;background:var(--border);height:48px;flex-shrink:0"></div>
-                  ${statCell(
-                    inv.makerCreds > 0 ? '⚠️ Maker Credentials' : 'Maker Credentials',
-                    inv.makerCreds,
-                    inv.makerCreds > 0 ? 'var(--risk-medium)' : 'var(--risk-low)',
-                    'Actions using author credentials',
-                    'Privilege abuse'
-                  )}
-                  <div style="width:1px;background:var(--border);height:48px;flex-shrink:0"></div>
-                  ${statCell(
-                    inv.anthropicCount > 0 ? '⚠️ Anthropic Claude (non-GDPR)' : 'Anthropic Claude',
-                    inv.anthropicCount,
-                    inv.anthropicCount > 0 ? 'var(--risk-high)' : 'var(--risk-low)',
-                    'Agents using Claude models (not EU data boundary)',
-                    'Data residency'
-                  )}
-                  <div style="width:1px;background:var(--border);height:48px;flex-shrink:0"></div>
-                  ${statCell(
-                    inv.mcpCount > 0 ? '⚠️ MCP Servers' : 'MCP Servers',
-                    inv.mcpCount,
-                    inv.mcpCount > 0 ? 'var(--risk-medium)' : 'var(--risk-low)',
-                    'Agents with Model Context Protocol tools',
-                    'External execution'
-                  )}
-                  <div style="width:1px;background:var(--border);height:48px;flex-shrink:0"></div>
-                  ${statCell(
-                    inv.hardCodedCount > 0 ? '⚠️ Hard-coded Credentials' : 'Hard-coded Credentials',
-                    inv.hardCodedCount,
-                    inv.hardCodedCount > 0 ? 'var(--risk-critical)' : 'var(--risk-low)',
-                    'Connectors with embedded credentials',
-                    'Credential exposure'
-                  )}
-                  <div style="width:1px;background:var(--border);height:48px;flex-shrink:0"></div>
-                  ${statCell(
-                    inv.genOrchCount > 0 ? '⚠️ Generative Orchestration' : 'Generative Orchestration',
-                    inv.genOrchCount,
-                    inv.genOrchCount > 0 ? 'var(--risk-medium)' : 'var(--risk-low)',
-                    'Generative orchestration metadata detected',
-                    'Prompt injection'
-                  )}
-                </div>
-
-<div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Live from the legacy Defender AI inventory source (P30D). No-auth agents are publicly accessible — review with owners. Maker-credential agents embed the creator's account in actions.</div>
+                <div style="font-size:11px;color:var(--text-dim)">Live from Defender <strong>${esc(inv.sourceLabel || 'AI inventory')}</strong> via Advanced Hunting (P30D).</div>
               </div>
             </div>`
           : `<div style="margin-bottom:16px;padding:10px 14px;border-radius:8px;background:rgba(56,139,253,.06);border:1px solid rgba(56,139,253,.2);font-size:12px;color:var(--text-muted)">
               ${inv.code === 'forbidden'
-                ? '🔒 <strong>Live agent inventory needs <code>ThreatHunting.Read.All</code>.</strong> Sign out &amp; back in (or re-run admin consent) to read Defender&#39;s legacy AI inventory source via Advanced Hunting — it will then replace the manual checks below with the live inventory.'
+                ? '🔒 <strong>Live agent inventory needs <code>ThreatHunting.Read.All</code>.</strong> Sign out &amp; back in (or re-run admin consent) to read Defender&#39;s AI inventory (AgentsInfo) via Advanced Hunting — it will then replace the manual checks below with the live inventory.'
                 : inv.code === 'unsupported'
-                  ? 'ℹ️ The legacy Advanced Hunting inventory source is unavailable or deprecated in this tenant. Verify the configuration below in the Defender portal.' + (inv.error ? `<div style="margin-top:6px;font-size:11px;color:var(--text-dim)">Details: ${esc(String(inv.error).slice(0, 220))}</div>` : '')
+                  ? 'ℹ️ The Defender AI inventory tables (AgentsInfo) aren&#39;t available in this tenant. Verify the configuration below in the Defender portal.' + (inv.error ? `<div style="margin-top:6px;font-size:11px;color:var(--text-dim)">Details: ${esc(String(inv.error).slice(0, 220))}</div>` : '')
                   : inv.code === 'schema'
-                    ? '⚠️ The live legacy inventory query no longer matches the current Advanced Hunting schema. Review the query or Defender error details, then verify the configuration below in the Defender portal.'
+                    ? '⚠️ The live inventory query no longer matches the current Advanced Hunting schema. Review the query or Defender error details, then verify the configuration below in the Defender portal.'
                   : 'ℹ️ Live agent inventory unavailable via Advanced Hunting — verify the configuration below in the Defender portal.'}
             </div>`;
 
@@ -7889,6 +7807,58 @@ async function renderAiFileEvidence(fileApps, aiApps) {
     </div>`;
 }
 
+// Fills the "Files Blocked From AI by DLP" card on the SharePoint/OneDrive Sharing
+// page — the enforcement counterpart to section 1: files DLP stopped on their way
+// to an external AI. Endpoint DLP blocks live in DeviceEvents / DataSecurityEvents,
+// which the cloud-side CloudAppEvents evidence can't see. Reuses fetchDlpAiBlocks().
+async function renderShareDlpBlocks() {
+  const body = document.getElementById('share-dlp-body');
+  if (!body) return;
+  const bl = await fetchDlpAiBlocks().catch(() => ({ ok: false, code: 'error' }));
+  const badge = document.getElementById('share-dlp-src');
+  if (bl?.ok && badge) { badge.textContent = '● DeviceEvents / DataSecurityEvents · Advanced Hunting'; badge.className = 'data-source source-live'; }
+  if (!document.getElementById('share-dlp-body')) return;
+  if (!bl?.ok) {
+    body.innerHTML = `<div class="card-body" style="font-size:12px;color:var(--text-muted)">${
+      bl?.code === 'forbidden'
+        ? '🔒 Needs <code>ThreatHunting.Read.All</code> — re-run admin consent, then sign out &amp; back in, to read DLP block events for AI uploads.'
+        : bl?.code === 'unsupported'
+          ? 'ℹ️ The DLP event tables (DeviceEvents / DataSecurityEvents) aren&#39;t queryable in this tenant — endpoint DLP or the Purview event preview may not be onboarded. Verify in <a href="https://purview.microsoft.com/datalossprevention/activityexplorer" target="_blank" style="color:var(--accent-blue)">Purview → Activity Explorer</a>.'
+          : 'ℹ️ DLP block events unavailable — ' + esc(String(bl?.error || 'unknown error').slice(0, 160))}</div>`;
+    return;
+  }
+  if (!bl.events.length) {
+    body.innerHTML = `<div class="card-body"><div class="empty-state text-muted">${bl.note ? esc(bl.note) : '✅ No DLP-blocked file uploads to external AI in the last 30 days.'}<br><span style="font-size:11px">A block <em>here</em> means DLP stopped a file before it reached an AI app — the enforcement proof section 1 can&#39;t show.</span></div></div>`;
+    return;
+  }
+  const appChips = Object.entries(bl.byApp).sort((a, b) => b[1].total - a[1].total)
+    .map(([app, c]) => `<span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 10px;border-radius:20px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-muted)"><span style="color:var(--risk-critical)">🚫</span>${esc(app)} <strong style="color:var(--text-primary)">${c.blocked}</strong>${c.total > c.blocked ? `<span style="color:var(--text-dim)"> / ${c.total}</span>` : ''}</span>`).join('');
+  body.innerHTML = `
+    <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+      <div><span style="font-size:22px;font-weight:800;color:var(--risk-critical);line-height:1">${bl.blocked}</span> <span style="font-size:11px;color:var(--text-muted)">blocked</span></div>
+      ${bl.total > bl.blocked ? `<div><span style="font-size:22px;font-weight:800;color:var(--risk-medium);line-height:1">${bl.total - bl.blocked}</span> <span style="font-size:11px;color:var(--text-muted)">audited</span></div>` : ''}
+      <div style="display:flex;gap:6px;flex-wrap:wrap">${appChips}</div>
+    </div>
+    <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Files DLP stopped (or audited) on their way to an external AI app — the enforcement counterpart to section 1's cloud-side access evidence.</div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>When</th><th>User</th><th>File</th><th>AI App</th><th>Action</th><th>Policy</th></tr></thead>
+        <tbody>${bl.events.slice(0, 50).map(e => `<tr${e.blocked ? ' style="background:rgba(248,81,73,.04)"' : ''}>
+          <td class="mono text-muted" style="font-size:11px;white-space:nowrap">${e.time ? new Date(e.time).toLocaleString() : '—'}</td>
+          <td style="font-size:12px">${esc(e.user)}${e.device ? `<br><span class="text-muted" style="font-size:10px">${esc(e.device)}</span>` : ''}</td>
+          <td style="font-size:12px">${esc(e.file)}</td>
+          <td style="font-size:12px">${esc(e.app)}</td>
+          <td>${e.blocked ? '<span class="badge badge-critical" style="font-size:10px">🚫 Blocked</span>' : '<span class="badge badge-medium" style="font-size:10px">⚠️ Audited</span>'}</td>
+          <td class="text-muted" style="font-size:11px">${esc(e.policy || '—')}</td>
+        </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
+      ℹ️ Source: endpoint DLP &amp; Purview policy-violation events (Advanced Hunting). Full detail in <a href="https://purview.microsoft.com/datalossprevention/activityexplorer" target="_blank" rel="noopener" style="color:var(--accent-blue)">Purview → Activity Explorer</a>.
+    </div>`;
+}
+
 async function loadExternalSharing() {
   const el = document.getElementById('sharing-content');
   try {
@@ -7965,7 +7935,7 @@ async function loadExternalSharing() {
       <div style="position:sticky;top:52px;z-index:80;background:var(--bg-primary);padding-bottom:10px;margin-bottom:4px;border-bottom:1px solid var(--border)">
         <div class="section-header" style="margin-bottom:10px">
           <div>
-            <div class="section-title">External Sharing Exposure</div>
+            <div class="section-title">SharePoint/OneDrive Sharing</div>
             <div class="section-sub">SharePoint/OneDrive sharing configuration × AI app permission analysis</div>
           </div>
           <div style="display:flex;align-items:center;gap:8px">
@@ -8047,6 +8017,17 @@ async function loadExternalSharing() {
         </div>
         <div id="share-evidence-body">
           <div class="section-loading"><span class="spinner"></span>Querying file-access evidence…</div>
+        </div>
+      </div>
+
+      <!-- 1b · DLP blocks — sensitive files STOPPED on the way to an external AI -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">🚫 1b · Files Blocked From AI by DLP (30d)</div>
+          <span id="share-dlp-src" class="data-source source-derived" style="font-size:10px">⚡ DeviceEvents / DataSecurityEvents · Advanced Hunting</span>
+        </div>
+        <div id="share-dlp-body">
+          <div class="section-loading"><span class="spinner"></span>Checking for DLP-blocked uploads to AI…</div>
         </div>
       </div>
 
@@ -8157,6 +8138,7 @@ async function loadExternalSharing() {
 
     // Evidence loads async (Advanced Hunting) — fills the card + evidence KPI
     renderAiFileEvidence(allFileApps, aiApps).catch(() => {});
+    renderShareDlpBlocks().catch(() => {});
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
   }
@@ -8239,6 +8221,9 @@ async function loadSensitivityLabels() {
       // Enforcement counterpart — labels classify, DLP enforces what flows to AI
       fetchDlpProtectionScope().catch(() => null),
     ]);
+    // DLP *events* — actual blocks of labelled/sensitive items to external AI (30d).
+    // Loads in the background and fills its card when ready (Advanced Hunting).
+    const dlpBlocksP = fetchDlpAiBlocks().catch(() => ({ ok: false, code: 'error' }));
     const aiApps   = sps.filter(isAiApp);
     const agentSps = STATE.data.agentSps || sps.filter(sp => AGENT_KEYWORDS.some(k=>(sp.displayName||'').toLowerCase().includes(k)) || sp.servicePrincipalType==='ServiceIdentity');
 
@@ -8327,7 +8312,7 @@ async function loadSensitivityLabels() {
       <div style="position:sticky;top:52px;z-index:80;background:var(--bg-primary);padding-bottom:10px;margin-bottom:4px;border-bottom:1px solid var(--border)">
         <div class="section-header" style="margin-bottom:10px">
           <div>
-            <div class="section-title">Sensitivity Label Exposure</div>
+            <div class="section-title">Purview Sensitivity Labels</div>
             <div class="section-sub">Microsoft Purview labels × AI app permission reach analysis</div>
           </div>
           <span class="data-source ${labels.length ? 'source-live' : 'source-derived'}">
@@ -8607,6 +8592,17 @@ async function loadSensitivityLabels() {
         </div>
       </div>
 
+      <!-- DLP blocks to external AI — actual policy-fired events (Advanced Hunting) -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">🚫 DLP Blocks to External AI (30d)</div>
+          <span id="dlp-blocks-badge" class="data-source source-derived" style="font-size:10px">⚡ DeviceEvents / DataSecurityEvents · Advanced Hunting</span>
+        </div>
+        <div id="dlp-blocks-body">
+          <div class="section-loading" style="padding:20px"><span class="spinner"></span>Checking for DLP-blocked uploads to AI…</div>
+        </div>
+      </div>
+
       <div class="card">
         <div class="card-header"><div class="card-title">🔐 Sensitivity Label Security Guidance</div></div>
         <div class="card-body">
@@ -8740,6 +8736,55 @@ async function loadSensitivityLabels() {
 
     // Labelled-content evidence loads async (Advanced Hunting) — fills the card above
     renderLabelledAccessEvidence(labels, highSensLabels, criticalExposure, [...appsWithLabeledAccess, ...aiApps]).catch(() => {});
+
+    // DLP-blocks-to-AI evidence loads async — the "did DLP actually stop an upload
+    // to Claude/ChatGPT" card. Cloud-side CloudAppEvents can't see endpoint blocks;
+    // this reads DeviceEvents / DataSecurityEvents where the policy actually fired.
+    dlpBlocksP.then(bl => {
+      const body  = document.getElementById('dlp-blocks-body');
+      const badge = document.getElementById('dlp-blocks-badge');
+      if (!body) return;
+      if (bl?.ok && badge) { badge.textContent = '● DeviceEvents / DataSecurityEvents · Advanced Hunting'; badge.className = 'data-source source-live'; }
+      if (!bl?.ok) {
+        body.innerHTML = `<div class="card-body" style="font-size:12px;color:var(--text-muted)">${
+          bl?.code === 'forbidden'
+            ? '🔒 Needs <code>ThreatHunting.Read.All</code> — re-run admin consent, then sign out &amp; back in, to read DLP block events for AI uploads.'
+            : bl?.code === 'unsupported'
+              ? 'ℹ️ The DLP event tables (DeviceEvents / DataSecurityEvents) aren&#39;t queryable in this tenant — endpoint DLP or the Purview event preview may not be onboarded. Verify blocks directly in <a href="https://purview.microsoft.com/datalossprevention/activityexplorer" target="_blank" style="color:var(--accent-blue)">Purview → Activity Explorer</a>.'
+              : 'ℹ️ DLP block events unavailable — ' + esc(String(bl?.error || 'unknown error').slice(0, 160))}</div>`;
+        return;
+      }
+      if (!bl.events.length) {
+        body.innerHTML = `<div class="card-body"><div class="empty-state text-muted">${bl.note ? esc(bl.note) : '✅ No DLP-blocked uploads of sensitive content to external AI in the last 30 days.'}<br><span style="font-size:11px">A block <em>here</em> means DLP did its job — this is the enforcement proof the cloud-side card can&#39;t show.</span></div></div>`;
+        return;
+      }
+      const appChips = Object.entries(bl.byApp).sort((a, b) => b[1].total - a[1].total)
+        .map(([app, c]) => `<span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 10px;border-radius:20px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-muted)"><span style="color:var(--risk-critical)">🚫</span>${esc(app)} <strong style="color:var(--text-primary)">${c.blocked}</strong>${c.total > c.blocked ? `<span style="color:var(--text-dim)"> / ${c.total}</span>` : ''}</span>`).join('');
+      body.innerHTML = `
+        <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+          <div><span style="font-size:22px;font-weight:800;color:var(--risk-critical);line-height:1">${bl.blocked}</span> <span style="font-size:11px;color:var(--text-muted)">blocked</span></div>
+          ${bl.total > bl.blocked ? `<div><span style="font-size:22px;font-weight:800;color:var(--risk-medium);line-height:1">${bl.total - bl.blocked}</span> <span style="font-size:11px;color:var(--text-muted)">audited</span></div>` : ''}
+          <div style="display:flex;gap:6px;flex-wrap:wrap">${appChips}</div>
+        </div>
+        <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Sensitive-content uploads that Purview DLP stopped (or audited) on their way to an external AI app — the enforcement proof the cloud-side evidence card can&#39;t see.</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>When</th><th>User</th><th>File</th><th>AI App</th><th>Action</th><th>Policy</th></tr></thead>
+            <tbody>${bl.events.slice(0, 50).map(e => `<tr${e.blocked ? ' style="background:rgba(248,81,73,.04)"' : ''}>
+              <td class="mono text-muted" style="font-size:11px;white-space:nowrap">${e.time ? new Date(e.time).toLocaleString() : '—'}</td>
+              <td style="font-size:12px">${esc(e.user)}${e.device ? `<br><span class="text-muted" style="font-size:10px">${esc(e.device)}</span>` : ''}</td>
+              <td style="font-size:12px">${esc(e.file)}</td>
+              <td style="font-size:12px">${esc(e.app)}</td>
+              <td>${e.blocked ? '<span class="badge badge-critical" style="font-size:10px">🚫 Blocked</span>' : '<span class="badge badge-medium" style="font-size:10px">⚠️ Audited</span>'}</td>
+              <td class="text-muted" style="font-size:11px">${esc(e.policy || '—')}</td>
+            </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+        <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
+          ℹ️ Source: endpoint DLP &amp; Purview policy-violation events (Advanced Hunting). Full detail in <a href="https://purview.microsoft.com/datalossprevention/activityexplorer" target="_blank" rel="noopener" style="color:var(--accent-blue)">Purview → Activity Explorer</a>.
+        </div>`;
+    }).catch(() => {});
   } catch (e) {
     el.innerHTML = permWarn('InformationProtectionPolicy.Read', e.message);
   }
