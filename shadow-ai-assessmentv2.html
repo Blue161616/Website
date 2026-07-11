@@ -1898,7 +1898,7 @@ function _aiEgressApp(text) {
 }
 async function fetchDlpAiBlocks() {
   if (STATE.data.dlpAiBlocks !== undefined) return STATE.data.dlpAiBlocks;
-  const base = { ok: false, events: [], total: 0, blocked: 0, byApp: {}, code: 'error', error: null, note: null };
+  const base = { ok: false, events: [], total: 0, blocked: 0, byApp: {}, incidents: [], incidentCount: 0, code: 'error', error: null, note: null };
   const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
   if (!token) { STATE.data.dlpAiBlocks = { ...base, code: 'forbidden', error: 'ThreatHunting.Read.All not consented.' }; return STATE.data.dlpAiBlocks; }
 
@@ -1929,7 +1929,20 @@ async function fetchDlpAiBlocks() {
     }
     return out;
   };
-  const finish = rawRows => {
+  const secKey = t => { const ms = new Date(t).getTime(); return Number.isFinite(ms) ? Math.floor(ms / 1000) : String(t || ''); };
+  const finish = (rawRows, incidents = []) => {
+    // Index the AI DLP incidents by app so a block row can borrow the file/policy
+    // its own incident carries (in the incident title). Each incident enriches at
+    // most one row — matched on the same AI app within a 5-minute window.
+    const incByApp = {};
+    incidents.forEach(i => { i.sec = secKey(i.time); (incByApp[i.app] = incByApp[i.app] || []).push(i); });
+    const matchInc = ev => {
+      const list = incByApp[ev.app] || (ev.app === 'AI app' ? incByApp['AI app'] : null) || [];
+      const esec = secKey(ev.time);
+      let best = null, bestD = Infinity;
+      list.forEach(i => { if (i._used) return; const d = Math.abs(i.sec - esec); if (d < bestD) { bestD = d; best = i; } });
+      return best && bestD <= 300 ? best : null;
+    };
     const events = rawRows.map(r0 => {
       const row = flatten(r0);
       const raw = JSON.stringify(r0 || '');
@@ -1937,28 +1950,53 @@ async function fetchDlpAiBlocks() {
       const blocked = /block|restrict|prevent/i.test(action) || /block|restrict|prevent/i.test(raw);
       const target = String(pick(row, ['RemoteUrl','TargetDomain','DestinationDomain','CloudService','Url','remoteUrl']) || '');
       const app = _aiEgressApp(target || raw);
-      return {
+      const ev = {
         time: pick(row, ['Timestamp','timestamp']),
         user: String(pick(row, ['AccountUpn','RequestAccountUpn','AccountName','InitiatingProcessAccountUpn','InitiatingProcessAccountName','UserId','User']) || '—'),
         file: String(pick(row, ['FileName','ObjectName','FileNameOriginal','fileName']) || '—'),
         device: String(pick(row, ['DeviceName','deviceName']) || ''),
         policy: String(pick(row, ['PolicyName','DLPPolicyName','DlpPolicy','policyName']) || ''),
-        action, blocked, app,
+        action, blocked, app, incident: false, severity: '', category: '',
       };
+      // Endpoint block rows usually lack the file name and policy; the DLP incident
+      // the same block raised has both in its title — borrow them when they line up.
+      const inc = matchInc(ev);
+      if (inc) {
+        inc._used = true;
+        ev.incident = true;
+        ev.severity = inc.severity || ev.severity;
+        ev.category = inc.category || ev.category;
+        if ((ev.file === '—' || !ev.file) && inc.file) ev.file = inc.file;
+        if (!ev.policy && inc.policy) ev.policy = inc.policy;
+      }
+      return ev;
+    });
+    // Incidents with no matching endpoint row still belong on the list — the raw
+    // block may live in a table we can't read, but the incident proves it happened.
+    incidents.forEach(i => {
+      if (i._used) return;
+      events.push({
+        time: i.time, user: '—', file: i.file || '—', device: '',
+        policy: i.policy || '', action: 'DLP policy matched', blocked: true,
+        app: i.app, incident: true, severity: i.severity || '', category: i.category || '',
+      });
     });
     // Dedupe: one user action is recorded as several rows (e.g. "File copied to
     // cloud" + "DLP rule matched") — collapse by time+user+device+file+app, keeping
-    // a blocked variant over an audited one.
+    // a blocked (then incident-flagged) variant over an audited one. Time is
+    // truncated to whole seconds: the rows share a second but differ in sub-second
+    // precision, which would otherwise defeat the key.
+    const better = (e, prev) => !prev || (e.blocked && !prev.blocked) || (e.incident && !prev.incident);
     const seen = new Map();
     events.forEach(e => {
-      const key = [e.time, e.user, e.device, e.file, e.app].join('|');
-      const prev = seen.get(key);
-      if (!prev || (e.blocked && !prev.blocked)) seen.set(key, e);
+      const key = [secKey(e.time), e.user, e.device, e.file, e.app].join('|');
+      if (better(e, seen.get(key))) seen.set(key, e);
     });
     const deduped = [...seen.values()].sort((a, b) => new Date(b.time) - new Date(a.time));
     const byApp = {};
     deduped.forEach(e => { (byApp[e.app] = byApp[e.app] || { total: 0, blocked: 0 }); byApp[e.app].total++; if (e.blocked) byApp[e.app].blocked++; });
-    STATE.data.dlpAiBlocks = { ok: true, events: deduped, total: deduped.length, blocked: deduped.filter(e => e.blocked).length, byApp, code: null, error: null, note: null };
+    const cleanInc = incidents.map(({ _used, sec, ...rest }) => rest);
+    STATE.data.dlpAiBlocks = { ok: true, events: deduped, total: deduped.length, blocked: deduped.filter(e => e.blocked).length, byApp, incidents: cleanInc, incidentCount: cleanInc.length, code: null, error: null, note: null };
     return STATE.data.dlpAiBlocks;
   };
 
@@ -1994,7 +2032,31 @@ async function fetchDlpAiBlocks() {
       '| take 200',
     ].join(' '));
   }
-  if (rows?.length) return finish(rows);
+  // ── AI DLP incidents ─────────────────────────────────────────────────────
+  // A DLP block on an AI upload is also raised as a Defender alert/incident whose
+  // TITLE embeds the document and policy, e.g. "DLP policy (Block Confidential Data
+  // to Claude) matched for document (Confidential.docx)". That title is the only
+  // place the file name reliably appears, so parse it to fill the File / Policy
+  // columns and to flag which blocks escalated to an incident.
+  const incRows = await tryRun([
+    'AlertInfo', '| where Timestamp > ago(30d)',
+    `| where Title has_any (${kwList})`,
+    '| where Title has "DLP" or Title has "policy" or Title has "document"',
+    '| project Timestamp, Title, Severity, Category',
+    '| order by Timestamp desc | take 100',
+  ].join(' '));
+  const incSeen = new Set();
+  const incidents = (incRows || []).map(a => {
+    const title = String(a.Title || '');
+    const file = (title.match(/document\s*\(([^)]+)\)/i) || title.match(/for\s+["'(]?([^\s"'()]+\.[a-z0-9]{2,6})/i) || [])[1] || null;
+    const policy = (title.match(/policy\s*\(([^)]+)\)/i) || [])[1] || null;
+    return { time: a.Timestamp, title, file, policy, app: _aiEgressApp(title), severity: String(a.Severity || '').toLowerCase(), category: String(a.Category || '') };
+  }).filter(i => {
+    const key = [i.file || i.title, i.policy, i.app].join('|');
+    if (incSeen.has(key)) return false; incSeen.add(key); return true;
+  });
+
+  if (rows?.length || incidents.length) return finish(rows || [], incidents);
   if (anySuccess) { STATE.data.dlpAiBlocks = { ...base, ok: true, note: 'Hunting tables reachable — no DLP-to-AI egress events in 30 days.' }; return STATE.data.dlpAiBlocks; }
   const msg = lastErr?.message || 'unknown error';
   STATE.data.dlpAiBlocks = { ...base, code: lastErr?.status === 403 ? 'forbidden' : isUnsupportedErr(msg) ? 'unsupported' : 'error', error: msg };
@@ -2276,9 +2338,12 @@ function buildAiAlerts({ aiApps, grants, signIns, riskyUsers, secAlerts, agentSp
   const allPrincipalGrants = (grants || []).filter(g => g.consentType === 'AllPrincipals' && (aiApps || []).some(a => a.id === g.clientId));
   if (allPrincipalGrants.length) derived.push({ sev:'high', title:`${allPrincipalGrants.length} tenant-wide consent grant(s) to AI apps`, desc:`Admin-consented for all users: ${allPrincipalGrants.slice(0,3).map(g=>(aiApps||[]).find(a=>a.id===g.clientId)?.displayName||g.clientId).join(', ')}. Every user silently holds these.`, icon:'🔐', page:'data-risk' });
 
-  const aiNames = [...(aiApps || []), ...(agentSps || [])].map(s => (s.displayName||'').toLowerCase()).filter(n => n.length > 4);
-  const AI_ALERT_RE = /genai|gen-ai|copilot|chatgpt|openai|\bgpt\b|claude|anthropic|gemini|\bllm\b|\bmcp\b|ai agent|agent identity|model context|prompt injection|jailbreak/i;
-  const isAiAlert = a => { const t = ((a.title||'')+' '+(a.description||'')+' '+(a.category||'')).toLowerCase(); return AI_ALERT_RE.test(t) || AI_KEYWORDS.some(k => t.includes(k)) || aiNames.some(n => t.includes(n)); };
+  // Curated AI-security terms only — mirrors the Agent 365 Security card's precise
+  // filter. The broad AI_KEYWORDS app catalog is NOT used here: it contains generic
+  // words (e.g. "replicate", the AI vendor) that false-match ordinary alert text
+  // like the "Wacatac" malware description ("…can replicate and spread…").
+  const AI_ALERT_RE = /genai|gen-ai|copilot|chatgpt|openai|\bgpt\b|claude|anthropic|gemini|\bllm\b|\bmcp\b|ai agent|agent tool|agent identity|agent runtime|model context|prompt inject|jailbreak|xpia|cross-prompt|generative orchestration/i;
+  const isAiAlert = a => AI_ALERT_RE.test(((a.title||'')+' '+(a.description||'')+' '+(a.category||'')).toLowerCase());
   const aiSecAlerts = (secAlerts || []).filter(isAiAlert);
   const allAlerts = [
     ...derived,
@@ -7785,6 +7850,29 @@ async function renderAiFileEvidence(fileApps, aiApps) {
 // page — the enforcement counterpart to section 1: files DLP stopped on their way
 // to an external AI. Endpoint DLP blocks live in DeviceEvents / DataSecurityEvents,
 // which the cloud-side CloudAppEvents evidence can't see. Reuses fetchDlpAiBlocks().
+const _sevColor = s => s === 'high' ? 'var(--risk-critical)' : s === 'medium' ? 'var(--risk-high)' : s === 'low' ? 'var(--risk-medium)' : 'var(--text-muted)';
+// Strip shown above the DLP blocks table: the block(s) that escalated to a
+// Defender AI incident, with the document + policy parsed from the incident title.
+function dlpIncidentStrip(bl) {
+  const inc = (bl && bl.incidents) || [];
+  if (!inc.length) return '';
+  const rows = inc.slice(0, 8).map(i => `<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-size:11px;color:var(--text-muted);line-height:1.6">
+    <span style="color:${_sevColor(i.severity)};font-size:9px">●</span>
+    <strong style="color:var(--text-primary)">${esc(i.file || 'document')}</strong>
+    <span style="color:var(--text-dim)">·</span>${esc(i.policy || 'DLP policy')}
+    <span style="color:var(--text-dim)">→</span>${esc(i.app)}
+    ${i.category ? `<span style="color:var(--text-dim)">·</span><span style="color:var(--risk-high)">${esc(i.category)}</span>` : ''}
+    ${i.severity ? `<span class="badge" style="font-size:9px;background:${_sevColor(i.severity)};color:#fff;text-transform:capitalize">${esc(i.severity)}</span>` : ''}
+  </div>`).join('');
+  return `<div style="padding:9px 16px;border-bottom:1px solid var(--border);background:rgba(248,81,73,.06)">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:5px">
+      <span style="font-size:12px;font-weight:700;color:var(--risk-critical)">🔺 ${inc.length} AI incident${inc.length !== 1 ? 's' : ''} raised</span>
+      <span style="font-size:10px;color:var(--text-dim)">— the DLP block escalated to a Defender incident (Incidents &amp; alerts queue)</span>
+    </div>
+    ${rows}
+  </div>`;
+}
+
 async function renderShareDlpBlocks() {
   const body = document.getElementById('share-dlp-body');
   if (!body) return;
@@ -7813,6 +7901,7 @@ async function renderShareDlpBlocks() {
       ${bl.total > bl.blocked ? `<div><span style="font-size:22px;font-weight:800;color:var(--risk-medium);line-height:1">${bl.total - bl.blocked}</span> <span style="font-size:11px;color:var(--text-muted)">audited</span></div>` : ''}
       <div style="display:flex;gap:6px;flex-wrap:wrap">${appChips}</div>
     </div>
+    ${dlpIncidentStrip(bl)}
     <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Files DLP stopped (or audited) on their way to an external AI app — the enforcement counterpart to section 1's cloud-side access evidence.</div>
     <div class="table-wrap dlp-blocks-scroll">
       <table class="dlp-blocks-table">
@@ -7822,7 +7911,7 @@ async function renderShareDlpBlocks() {
           <td style="font-size:12px">${esc(e.user)}${e.device ? `<br><span class="text-muted" style="font-size:10px">${esc(e.device)}</span>` : ''}</td>
           <td style="font-size:12px">${esc(e.file)}</td>
           <td style="font-size:12px">${esc(e.app)}</td>
-          <td>${e.blocked ? '<span class="badge badge-critical" style="font-size:10px">🚫 Blocked</span>' : '<span class="badge badge-medium" style="font-size:10px">⚠️ Audited</span>'}</td>
+          <td>${e.blocked ? '<span class="badge badge-critical" style="font-size:10px">🚫 Blocked</span>' : '<span class="badge badge-medium" style="font-size:10px">⚠️ Audited</span>'}${e.incident ? ` <span class="badge" style="font-size:9px;background:var(--risk-critical);color:#fff" title="${esc((e.category ? e.category + ' · ' : '') + 'Escalated to a Defender incident')}">🔺 Incident</span>` : ''}</td>
           <td class="text-muted" style="font-size:11px">${esc(e.policy || '—')}</td>
         </tr>`).join('')}
         </tbody>
@@ -8732,6 +8821,7 @@ async function loadSensitivityLabels() {
           ${bl.total > bl.blocked ? `<div><span style="font-size:22px;font-weight:800;color:var(--risk-medium);line-height:1">${bl.total - bl.blocked}</span> <span style="font-size:11px;color:var(--text-muted)">audited</span></div>` : ''}
           <div style="display:flex;gap:6px;flex-wrap:wrap">${appChips}</div>
         </div>
+        ${dlpIncidentStrip(bl)}
         <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Sensitive-content uploads that Purview DLP stopped (or audited) on their way to an external AI app — the enforcement proof the cloud-side evidence card can&#39;t see.</div>
         <div class="table-wrap dlp-blocks-scroll">
           <table class="dlp-blocks-table">
@@ -8741,7 +8831,7 @@ async function loadSensitivityLabels() {
               <td style="font-size:12px">${esc(e.user)}${e.device ? `<br><span class="text-muted" style="font-size:10px">${esc(e.device)}</span>` : ''}</td>
               <td style="font-size:12px">${esc(e.file)}</td>
               <td style="font-size:12px">${esc(e.app)}</td>
-              <td>${e.blocked ? '<span class="badge badge-critical" style="font-size:10px">🚫 Blocked</span>' : '<span class="badge badge-medium" style="font-size:10px">⚠️ Audited</span>'}</td>
+              <td>${e.blocked ? '<span class="badge badge-critical" style="font-size:10px">🚫 Blocked</span>' : '<span class="badge badge-medium" style="font-size:10px">⚠️ Audited</span>'}${e.incident ? ` <span class="badge" style="font-size:9px;background:var(--risk-critical);color:#fff" title="${esc((e.category ? e.category + ' · ' : '') + 'Escalated to a Defender incident')}">🔺 Incident</span>` : ''}</td>
               <td class="text-muted" style="font-size:11px">${esc(e.policy || '—')}</td>
             </tr>`).join('')}
             </tbody>
