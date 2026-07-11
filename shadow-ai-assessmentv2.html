@@ -284,7 +284,8 @@
     .source-derived{color:var(--gold);}
 
     /* ── Height-capped tables: scroll inside the card, header stays pinned ── */
-    #model-risk-table th,#def-assets-table th,#localagents-table th{position:sticky;top:0;z-index:2;}
+    #model-risk-table th,#def-assets-table th,#localagents-table th,.dlp-blocks-table th{position:sticky;top:0;z-index:2;}
+    .dlp-blocks-scroll{max-height:360px;overflow-y:auto;}
 
     /* ═══════════════ Dashboard redesign ═══════════════ */
     /* Staggered entrance */
@@ -1945,9 +1946,19 @@ async function fetchDlpAiBlocks() {
         action, blocked, app,
       };
     });
+    // Dedupe: one user action is recorded as several rows (e.g. "File copied to
+    // cloud" + "DLP rule matched") — collapse by time+user+device+file+app, keeping
+    // a blocked variant over an audited one.
+    const seen = new Map();
+    events.forEach(e => {
+      const key = [e.time, e.user, e.device, e.file, e.app].join('|');
+      const prev = seen.get(key);
+      if (!prev || (e.blocked && !prev.blocked)) seen.set(key, e);
+    });
+    const deduped = [...seen.values()].sort((a, b) => new Date(b.time) - new Date(a.time));
     const byApp = {};
-    events.forEach(e => { (byApp[e.app] = byApp[e.app] || { total: 0, blocked: 0 }); byApp[e.app].total++; if (e.blocked) byApp[e.app].blocked++; });
-    STATE.data.dlpAiBlocks = { ok: true, events: events.sort((a, b) => new Date(b.time) - new Date(a.time)), total: events.length, blocked: events.filter(e => e.blocked).length, byApp, code: null, error: null, note: null };
+    deduped.forEach(e => { (byApp[e.app] = byApp[e.app] || { total: 0, blocked: 0 }); byApp[e.app].total++; if (e.blocked) byApp[e.app].blocked++; });
+    STATE.data.dlpAiBlocks = { ok: true, events: deduped, total: deduped.length, blocked: deduped.filter(e => e.blocked).length, byApp, code: null, error: null, note: null };
     return STATE.data.dlpAiBlocks;
   };
 
@@ -7803,8 +7814,8 @@ async function renderShareDlpBlocks() {
       <div style="display:flex;gap:6px;flex-wrap:wrap">${appChips}</div>
     </div>
     <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Files DLP stopped (or audited) on their way to an external AI app — the enforcement counterpart to section 1's cloud-side access evidence.</div>
-    <div class="table-wrap">
-      <table>
+    <div class="table-wrap dlp-blocks-scroll">
+      <table class="dlp-blocks-table">
         <thead><tr><th>When</th><th>User</th><th>File</th><th>AI App</th><th>Action</th><th>Policy</th></tr></thead>
         <tbody>${bl.events.slice(0, 50).map(e => `<tr${e.blocked ? ' style="background:rgba(248,81,73,.04)"' : ''}>
           <td class="mono text-muted" style="font-size:11px;white-space:nowrap">${e.time ? new Date(e.time).toLocaleString() : '—'}</td>
@@ -8352,14 +8363,19 @@ async function loadSensitivityLabels() {
         </div>
       </div>` : ''}
 
-      <!-- Evidence: labelled content actually touched by AI (fills in async) -->
+      <!-- Evidence: labelled content AI accessed (cloud-side) AND was blocked from (endpoint DLP) -->
       <div class="card" style="margin-bottom:16px">
         <div class="card-header">
-          <div class="card-title">🔎 Labelled Content Touched by AI (30d)</div>
-          <span id="label-evidence-src" class="data-source source-derived" style="font-size:10px">⚡ CloudAppEvents · Advanced Hunting</span>
+          <div class="card-title">🔎 Labelled Content — Accessed &amp; Blocked by AI (30d)</div>
+          <span id="label-evidence-src" class="data-source source-derived" style="font-size:10px">⚡ CloudAppEvents · DeviceEvents · Advanced Hunting</span>
         </div>
+        <div style="padding:8px 16px 2px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em">✅ Accessed — cloud-side (CloudAppEvents)</div>
         <div id="label-evidence-body">
           <div class="section-loading"><span class="spinner"></span>Querying labelled-file evidence…</div>
+        </div>
+        <div style="padding:8px 16px 2px;border-top:1px solid var(--border);font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em">🚫 Blocked by DLP — endpoint (DeviceEvents / DataSecurityEvents)</div>
+        <div id="label-dlp-body">
+          <div class="section-loading"><span class="spinner"></span>Checking for DLP-blocked uploads to AI…</div>
         </div>
       </div>
 
@@ -8555,17 +8571,6 @@ async function loadSensitivityLabels() {
         </div>
       </div>
 
-      <!-- DLP blocks to external AI — actual policy-fired events (Advanced Hunting) -->
-      <div class="card" style="margin-bottom:16px">
-        <div class="card-header">
-          <div class="card-title">🚫 DLP Blocks to External AI (30d)</div>
-          <span id="dlp-blocks-badge" class="data-source source-derived" style="font-size:10px">⚡ DeviceEvents / DataSecurityEvents · Advanced Hunting</span>
-        </div>
-        <div id="dlp-blocks-body">
-          <div class="section-loading" style="padding:20px"><span class="spinner"></span>Checking for DLP-blocked uploads to AI…</div>
-        </div>
-      </div>
-
       <div class="card">
         <div class="card-header"><div class="card-title">🔐 Sensitivity Label Security Guidance</div></div>
         <div class="card-body">
@@ -8704,10 +8709,8 @@ async function loadSensitivityLabels() {
     // to Claude/ChatGPT" card. Cloud-side CloudAppEvents can't see endpoint blocks;
     // this reads DeviceEvents / DataSecurityEvents where the policy actually fired.
     dlpBlocksP.then(bl => {
-      const body  = document.getElementById('dlp-blocks-body');
-      const badge = document.getElementById('dlp-blocks-badge');
+      const body = document.getElementById('label-dlp-body');
       if (!body) return;
-      if (bl?.ok && badge) { badge.textContent = '● DeviceEvents / DataSecurityEvents · Advanced Hunting'; badge.className = 'data-source source-live'; }
       if (!bl?.ok) {
         body.innerHTML = `<div class="card-body" style="font-size:12px;color:var(--text-muted)">${
           bl?.code === 'forbidden'
@@ -8730,8 +8733,8 @@ async function loadSensitivityLabels() {
           <div style="display:flex;gap:6px;flex-wrap:wrap">${appChips}</div>
         </div>
         <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Sensitive-content uploads that Purview DLP stopped (or audited) on their way to an external AI app — the enforcement proof the cloud-side evidence card can&#39;t see.</div>
-        <div class="table-wrap">
-          <table>
+        <div class="table-wrap dlp-blocks-scroll">
+          <table class="dlp-blocks-table">
             <thead><tr><th>When</th><th>User</th><th>File</th><th>AI App</th><th>Action</th><th>Policy</th></tr></thead>
             <tbody>${bl.events.slice(0, 50).map(e => `<tr${e.blocked ? ' style="background:rgba(248,81,73,.04)"' : ''}>
               <td class="mono text-muted" style="font-size:11px;white-space:nowrap">${e.time ? new Date(e.time).toLocaleString() : '—'}</td>
