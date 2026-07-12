@@ -9799,6 +9799,91 @@ function copilotReadinessHtml(labels, mip, spSettings) {
     </div>`;
 }
 
+// Near-real-time Copilot activity from the audit trail: every Copilot prompt is
+// logged as a CopilotInteraction event in CloudAppEvents within minutes, while
+// the official usage report is a daily snapshot with 24-72h data latency. This
+// is what proves "I used Copilot yesterday" when the report still says zero.
+async function fetchCopilotInteractions() {
+  if (STATE.data.copilotInteractions !== undefined) return STATE.data.copilotInteractions;
+  const base = { ok: false, hosts: [], total: 0, last: null, code: 'error', error: null };
+  const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
+  if (!token) { STATE.data.copilotInteractions = { ...base, code: 'forbidden' }; return STATE.data.copilotInteractions; }
+  const kql = [
+    'CloudAppEvents',
+    '| where Timestamp > ago(7d)',
+    '| where ActionType == "CopilotInteraction"',
+    '| extend Host = tostring(parse_json(tostring(RawEventData.CopilotEventData)).AppHost)',
+    '| extend Host = iff(isempty(Host), tostring(RawEventData.AppHost), Host)',
+    '| extend Host = iff(isempty(Host), "Unknown", Host)',
+    '| summarize Events = count(), Users = dcount(AccountObjectId), LastSeen = max(Timestamp) by Host',
+    '| order by Events desc | take 20',
+  ].join(' ');
+  try {
+    const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ Query: kql, Timespan: 'P7D' }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      STATE.data.copilotInteractions = { ...base, code: r.status === 403 ? 'forbidden' : /failed to resolve|unknown table|semantic error/i.test(t) ? 'unsupported' : 'error', error: t.slice(0, 200) };
+      return STATE.data.copilotInteractions;
+    }
+    const data = await r.json();
+    const rows = Array.isArray(data.results) ? data.results : (Array.isArray(data.Results) ? data.Results : []);
+    const hosts = rows.map(x => ({ host: String(x.Host || 'Unknown'), events: Number(x.Events) || 0, users: Number(x.Users) || 0, last: x.LastSeen || null }));
+    STATE.data.copilotInteractions = {
+      ok: true, hosts,
+      total: hosts.reduce((n, h) => n + h.events, 0),
+      last: hosts.reduce((m, h) => (!m || (h.last && h.last > m)) ? h.last : m, null),
+      code: null, error: null,
+    };
+  } catch (e) {
+    STATE.data.copilotInteractions = { ...base, error: e.message || String(e) };
+  }
+  return STATE.data.copilotInteractions;
+}
+
+const _COPILOT_HOST_ICON = { 'Microsoft Teams': '💬', Teams: '💬', Word: '📝', Excel: '📊', PowerPoint: '📽️', Outlook: '📧', OneNote: '📓', Loop: '🔁', 'Copilot Studio': '🤖', Office: '🏠', Bing: '🔎', Edge: '🌐' };
+async function renderCopilotLiveInteractions() {
+  const slot = document.getElementById('copilot-live-slot');
+  if (!slot) return;
+  const ci = await fetchCopilotInteractions().catch(() => null);
+  if (!document.getElementById('copilot-live-slot')) return;
+  if (!ci?.ok) {
+    slot.innerHTML = ci?.code === 'forbidden'
+      ? '<div style="margin-bottom:20px;padding:9px 12px;border-radius:6px;background:rgba(56,139,253,.06);border:1px solid rgba(56,139,253,.2);font-size:11px;color:var(--text-muted)">ℹ️ Live interaction evidence needs <code>ThreatHunting.Read.All</code> — the usage report above lags 24–72 h, so recent activity may be missing there.</div>'
+      : '';
+    return;
+  }
+  const max = Math.max(...ci.hosts.map(h => h.events), 1);
+  slot.innerHTML = `<div class="card" style="margin-bottom:20px;border-top:3px solid var(--accent-blue)">
+    <div class="card-header">
+      <div class="card-title">⚡ Live Copilot Interactions — audit trail (7d)</div>
+      <span class="data-source source-live" style="font-size:10px">● CloudAppEvents · CopilotInteraction · near-real-time</span>
+    </div>
+    <div class="card-body" style="padding:14px">
+      ${ci.hosts.length ? `
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px">
+        <strong style="color:var(--text-primary);font-size:15px">${ci.total}</strong> interaction${ci.total !== 1 ? 's' : ''} across <strong>${ci.hosts.length}</strong> app${ci.hosts.length !== 1 ? 's' : ''} in 7 days · last: ${dlpTimeCell(ci.last)}
+      </div>
+      ${ci.hosts.map(h => `
+      <div style="margin-bottom:10px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">
+          <span style="font-size:12px">${_COPILOT_HOST_ICON[h.host] || '🤖'} ${esc(h.host)}</span>
+          <span style="font-size:11px;color:var(--text-muted)">${h.users} user${h.users !== 1 ? 's' : ''} · <strong style="color:var(--accent-blue)">${h.events}</strong> · last ${h.last ? new Date(h.last).toLocaleDateString() : '—'}</span>
+        </div>
+        <div style="background:var(--bg-secondary);border-radius:4px;height:6px;overflow:hidden">
+          <div style="background:var(--accent-blue);height:100%;width:${Math.round(h.events / max * 100)}%;border-radius:4px"></div>
+        </div>
+      </div>`).join('')}`
+      : '<div style="font-size:12px;color:var(--text-muted)">✅ No CopilotInteraction audit events in the last 7 days.</div>'}
+      <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim)">
+        ℹ️ This audit view is minutes-fresh; the official usage report ${ci.hosts.length ? 'above/below' : ''} is a daily snapshot with 24–72 h data latency — recent activity appears <strong>here first</strong>.
+      </div>
+    </div>
+  </div>`;
+}
+
 async function loadCopilotUsage() {
   const el = document.getElementById('copilot-content');
   el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Loading Copilot usage data…</div>';
@@ -9869,6 +9954,8 @@ async function loadCopilotUsage() {
           </div>
         </div>
 
+        <div id="copilot-live-slot"></div>
+
         ${licensed ? `
         <div class="card" style="margin-bottom:16px">
           <div class="card-header">
@@ -9883,6 +9970,7 @@ async function loadCopilotUsage() {
 
         ${copilotReadinessHtml(rLabels, rMip, rSp)}` : ''}
       `;
+      renderCopilotLiveInteractions().catch(() => {});
       return;
     }
 
@@ -9954,6 +10042,8 @@ async function loadCopilotUsage() {
           <div class="kpi-icon">🏆</div>
         </div>
       </div>
+
+      <div id="copilot-live-slot"></div>
 
       ${apps.length > 0 ? `
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
@@ -10075,6 +10165,7 @@ async function loadCopilotUsage() {
         <div style="font-size:12px;color:var(--text-muted)">This may mean M365 Copilot is not licensed in this tenant, or <code>Reports.Read.All</code> admin consent has not been granted.</div>
       </div>` : ''}
     `;
+    renderCopilotLiveInteractions().catch(() => {});
   } catch (e) {
     el.innerHTML = permWarn('Reports.Read.All', e.message);
   }
