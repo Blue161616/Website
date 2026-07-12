@@ -7812,7 +7812,39 @@ async function fetchAiFileAccessEvidence(appIds) {
         lastAccess: row.LastAccess || null,
       };
     });
-    STATE.data.aiFileEvidence = { ok: true, byAppId, code: null, error: null };
+    // Second pass — label lookup by FILE NAME. CloudAppEvents stamps
+    // SensitivityLabelId on only some action types (sync/modify, often not
+    // FileAccessed), so resolve each touched file's label from ANY event that
+    // carried it, regardless of which app performed that event.
+    const fileLabels = {};
+    const names = [...new Set(Object.values(byAppId).flatMap(e => e.filesSample || []))].slice(0, 60);
+    if (names.length) {
+      try {
+        const kql2 = [
+          'CloudAppEvents',
+          '| where Timestamp > ago(30d)',
+          '| where ActionType startswith "File"',
+          '| extend FileName = tostring(RawEventData.SourceFileName), SensLabelId = tolower(tostring(RawEventData.SensitivityLabelId))',
+          '| where isnotempty(SensLabelId) and isnotempty(FileName)',
+          `| where FileName in (${names.map(n => JSON.stringify(n)).join(',')})`,
+          '| summarize LabelIds = make_set(SensLabelId, 5) by FileName',
+        ].join(' ');
+        const r2 = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ Query: kql2, Timespan: 'P30D' }),
+        });
+        if (r2.ok) {
+          const d2 = await r2.json();
+          const rows2 = Array.isArray(d2.results) ? d2.results : (Array.isArray(d2.Results) ? d2.Results : []);
+          rows2.forEach(row => {
+            const fn = String(row.FileName || '').toLowerCase();
+            if (fn) fileLabels[fn] = parseArr(row.LabelIds).map(s => s.toLowerCase());
+          });
+        }
+      } catch { /* enrichment only — stamped labels still render without it */ }
+    }
+    STATE.data.aiFileEvidence = { ok: true, byAppId, fileLabels, code: null, error: null };
   } catch (e) {
     const msg = e.message || String(e);
     STATE.data.aiFileEvidence = { ...base, code: isUnsupportedErr(msg) ? 'unsupported' : 'error', error: msg };
@@ -8202,33 +8234,42 @@ async function renderLabelledAccessEvidence(labels, highSensLabels, criticalExpo
   const labelById = new Map((labels || []).map(l => [String(l.id).toLowerCase(), l]));
   const isHigh    = l => !!l && highSensLabels.some(h => h.id === l.id);
   const isExposed = l => !!l && criticalExposure.some(c => c.id === l.id);
-  const labelChip = id => {
+  const labelChip = (id, inferred) => {
     const l = labelById.get(id);
     const name = l ? l.name : id.slice(0, 8) + '…';
     const col = isExposed(l) ? 'var(--risk-critical)' : isHigh(l) ? 'var(--risk-high)' : 'var(--text-muted)';
     const bg  = isExposed(l) ? 'rgba(248,81,73,.12)' : isHigh(l) ? 'rgba(240,136,62,.12)' : 'rgba(139,148,158,.12)';
-    return `<span style="display:inline-block;margin:1px 2px;padding:1px 7px;border-radius:10px;font-size:10px;background:${bg};color:${col}">${isHigh(l) ? '⚠️ ' : ''}${esc(name)}${l && l.hasProtection === true ? ' 🔒' : ''}</span>`;
+    const title = inferred ? ' title="Label matched via the file name — this file carries the label on other CloudAppEvents rows, but the stamp is missing on this app&#39;s events"' : '';
+    return `<span${title} style="display:inline-block;margin:1px 2px;padding:1px 7px;border-radius:10px;font-size:10px;background:${bg};color:${col};${inferred ? 'border:1px dashed ' + col : ''}">${isHigh(l) ? '⚠️ ' : ''}${esc(name)}${inferred ? ' <span style="opacity:.7">· via file</span>' : ''}${l && l.hasProtection === true ? ' 🔒' : ''}</span>`;
   };
+  // Labels the app's own events were stamped with, plus labels inferred from the
+  // touched file names (the same file carries the label on other events).
+  const fileLabels = ev.fileLabels || {};
+  rows.forEach(r => {
+    const stamped = new Set(r.e.labelIds || []);
+    r.inferred = [...new Set((r.e.filesSample || []).flatMap(f => fileLabels[String(f).toLowerCase()] || []))].filter(id => !stamped.has(id));
+  });
   const totEvents   = rows.reduce((n, r) => n + (r.e.events || 0), 0);
   const totLabeled  = rows.reduce((n, r) => n + (r.e.labeledEvents || 0), 0);
-  const allLabelIds = [...new Set(rows.flatMap(r => r.e.labelIds || []))];
+  const anyInferred = rows.some(r => r.inferred.length);
+  const allLabelIds = [...new Set(rows.flatMap(r => [...(r.e.labelIds || []), ...r.inferred]))];
   const highTouched = allLabelIds.filter(id => isHigh(labelById.get(id)));
   body.innerHTML = `
     <div style="padding:10px 16px;font-size:12px;color:var(--text-muted);border-bottom:1px solid var(--border)">
       ${highTouched.length
-        ? `🔴 <strong style="color:var(--risk-critical)">AI apps touched content carrying ${highTouched.length} high-sensitivity label${highTouched.length !== 1 ? 's' : ''}</strong> — ${totLabeled} labelled of ${totEvents} file event${totEvents !== 1 ? 's' : ''} in 30 days.`
-        : totLabeled
-          ? `${totLabeled} labelled of ${totEvents} file event${totEvents !== 1 ? 's' : ''} by AI apps in 30 days — none carrying high-sensitivity labels.`
+        ? `🔴 <strong style="color:var(--risk-critical)">AI apps touched content carrying ${highTouched.length} high-sensitivity label${highTouched.length !== 1 ? 's' : ''}</strong> — ${totLabeled ? `${totLabeled} labelled of ` : ''}${totEvents} file event${totEvents !== 1 ? 's' : ''} in 30 days${anyInferred ? ' · labels partly matched via file name' : ''}.`
+        : (totLabeled || anyInferred)
+          ? `${totLabeled} labelled of ${totEvents} file event${totEvents !== 1 ? 's' : ''} by AI apps in 30 days${anyInferred ? ' · plus labels matched via file name' : ''} — none carrying high-sensitivity labels.`
           : `${totEvents} file event${totEvents !== 1 ? 's' : ''} by AI apps in 30 days — no label metadata on the events themselves (CloudAppEvents stamps <code>SensitivityLabelId</code> only on some action types); check the file names.`}
     </div>
     <div class="table-wrap">
       <table>
         <thead><tr><th>App / Agent</th><th>File Events</th><th>Labelled</th><th>Labels Seen</th><th>Files Touched</th><th>Users</th></tr></thead>
-        <tbody>${rows.sort((a, b) => (b.e.labeledEvents || 0) - (a.e.labeledEvents || 0) || (b.e.events || 0) - (a.e.events || 0)).map(({ sp, e }) => `<tr${e.labeledEvents ? ' style="background:rgba(240,136,62,.04)"' : ''}>
+        <tbody>${rows.sort((a, b) => ((b.e.labeledEvents || 0) + b.inferred.length) - ((a.e.labeledEvents || 0) + a.inferred.length) || (b.e.events || 0) - (a.e.events || 0)).map(({ sp, e, inferred }) => `<tr${(e.labeledEvents || inferred.length) ? ' style="background:rgba(240,136,62,.04)"' : ''}>
           <td><strong style="font-size:13px">${esc(sp.displayName || '—')}</strong>${e.lastAccess ? `<br><span class="mono text-muted" style="font-size:10px">last ${new Date(e.lastAccess).toLocaleDateString()}</span>` : ''}</td>
           <td style="font-size:12px"><strong>${e.events}</strong> <span class="text-muted" style="font-size:10px">${e.reads}r · ${e.writes}w</span></td>
           <td style="font-weight:700;color:${e.labeledEvents ? 'var(--risk-high)' : 'var(--text-dim)'}">${e.labeledEvents || 0}</td>
-          <td>${(e.labelIds || []).map(labelChip).join('') || '<span class="text-muted">—</span>'}</td>
+          <td>${[...(e.labelIds || []).map(id => labelChip(id, false)), ...inferred.map(id => labelChip(id, true))].join('') || '<span class="text-muted">—</span>'}</td>
           <td style="font-size:11px;color:var(--text-muted)" title="${esc((e.filesSample || []).join(', '))}">${(e.filesSample || []).slice(0, 3).map(esc).join(', ') || '—'}${(e.filesSample || []).length > 3 ? ` +${e.filesSample.length - 3}` : ''}</td>
           <td style="font-size:12px" title="${esc((e.usersSample || []).join(', '))}">${e.users || 0}</td>
         </tr>`).join('')}
