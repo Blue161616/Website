@@ -6325,12 +6325,21 @@ function renderUsersTable() {
 
   if (!sorted.length) {
     tbody.innerHTML = '<tr><td colspan="8" class="empty-state text-muted">No AI users found — no Copilot activity, AI-app sign-ins, agent ownership, or Identity Protection risk detected.</td></tr>';
+    const h = document.getElementById('users-scroll-hint');
+    if (h) h.style.display = 'none';
     return;
   }
 
   const chip = (bg, color, label, title) => `<span${title?` title="${esc(title)}"`:''} style="display:inline-block;margin:1px;padding:1px 6px;border-radius:3px;font-size:10px;background:${bg};color:${color}">${label}</span>`;
 
   const limit = STATE.usersShowAll ? sorted.length : 50;
+  // The card shows ~6 rows and scrolls; tell the user how many rows are in there.
+  const _hint = document.getElementById('users-scroll-hint');
+  if (_hint) {
+    const shown = Math.min(sorted.length, limit);
+    _hint.style.display = shown > 6 ? '' : 'none';
+    _hint.textContent = `↕ ${shown} users — scroll for more`;
+  }
   tbody.innerHTML = sorted.slice(0, limit).map(u => {
     const upn = u.userPrincipalName;
     const initials = (u.displayName||'?').split(' ').map(n=>n[0]).join('').slice(0,2).toUpperCase();
@@ -6575,7 +6584,8 @@ async function loadUsers() {
           <div class="card-title">👤 AI Users (people)</div>
           <span class="data-source source-derived">⚡ Derived from sign-ins &amp; Identity Protection</span>
         </div>
-        <div class="table-wrap">
+        <!-- Capped at ~6 rows; the rest stays reachable by scrolling (sticky header) -->
+        <div class="table-wrap tbl-scroll" style="max-height:384px">
           <table id="users-table">
             <thead><tr>
               ${makeSortableTh('User', 'name', 'sortUsersTable')}
@@ -6590,6 +6600,7 @@ async function loadUsers() {
             <tbody id="users-tbody"></tbody>
           </table>
         </div>
+        <div id="users-scroll-hint" style="display:none;text-align:center;padding:6px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim)"></div>
       </div>
 
       <div class="card">
@@ -8177,11 +8188,15 @@ async function renderLabelledAccessEvidence(labels, highSensLabels, criticalExpo
     return;
   }
   if (srcEl) { srcEl.textContent = '● CloudAppEvents · Advanced Hunting (P30D)'; srcEl.className = 'data-source source-live'; }
+  // Keep every candidate with ANY file activity — CloudAppEvents only stamps
+  // SensitivityLabelId on some action types (sync/modify, often not FileAccessed),
+  // so requiring labelled events hid real AI access to labelled files. The file
+  // names still tell the story when the label column is empty on the event.
   const rows = candidates
     .map(sp => ({ sp, e: ev.byAppId[(sp.appId || '').toLowerCase()] }))
-    .filter(r => r.e && (r.e.labeledEvents || 0) > 0);
+    .filter(r => r.e && (r.e.events || 0) > 0);
   if (!rows.length) {
-    body.innerHTML = '<div class="card-body"><div class="empty-state text-muted">✅ No AI access to labelled content observed in the last 30 days.</div></div>';
+    body.innerHTML = '<div class="card-body"><div class="empty-state text-muted">✅ No SharePoint/OneDrive file activity by AI apps observed in the last 30 days.</div></div>';
     return;
   }
   const labelById = new Map((labels || []).map(l => [String(l.id).toLowerCase(), l]));
@@ -8194,28 +8209,34 @@ async function renderLabelledAccessEvidence(labels, highSensLabels, criticalExpo
     const bg  = isExposed(l) ? 'rgba(248,81,73,.12)' : isHigh(l) ? 'rgba(240,136,62,.12)' : 'rgba(139,148,158,.12)';
     return `<span style="display:inline-block;margin:1px 2px;padding:1px 7px;border-radius:10px;font-size:10px;background:${bg};color:${col}">${isHigh(l) ? '⚠️ ' : ''}${esc(name)}${l && l.hasProtection === true ? ' 🔒' : ''}</span>`;
   };
+  const totEvents   = rows.reduce((n, r) => n + (r.e.events || 0), 0);
   const totLabeled  = rows.reduce((n, r) => n + (r.e.labeledEvents || 0), 0);
   const allLabelIds = [...new Set(rows.flatMap(r => r.e.labelIds || []))];
   const highTouched = allLabelIds.filter(id => isHigh(labelById.get(id)));
   body.innerHTML = `
     <div style="padding:10px 16px;font-size:12px;color:var(--text-muted);border-bottom:1px solid var(--border)">
       ${highTouched.length
-        ? `🔴 <strong style="color:var(--risk-critical)">AI apps touched content carrying ${highTouched.length} high-sensitivity label${highTouched.length !== 1 ? 's' : ''}</strong> — ${totLabeled} labelled file event${totLabeled !== 1 ? 's' : ''} in 30 days.`
-        : `${totLabeled} labelled file event${totLabeled !== 1 ? 's' : ''} by AI apps in 30 days — none carrying high-sensitivity labels.`}
+        ? `🔴 <strong style="color:var(--risk-critical)">AI apps touched content carrying ${highTouched.length} high-sensitivity label${highTouched.length !== 1 ? 's' : ''}</strong> — ${totLabeled} labelled of ${totEvents} file event${totEvents !== 1 ? 's' : ''} in 30 days.`
+        : totLabeled
+          ? `${totLabeled} labelled of ${totEvents} file event${totEvents !== 1 ? 's' : ''} by AI apps in 30 days — none carrying high-sensitivity labels.`
+          : `${totEvents} file event${totEvents !== 1 ? 's' : ''} by AI apps in 30 days — no label metadata on the events themselves (CloudAppEvents stamps <code>SensitivityLabelId</code> only on some action types); check the file names.`}
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>App / Agent</th><th>Labelled File Events</th><th>Labels Seen</th></tr></thead>
-        <tbody>${rows.sort((a, b) => (b.e.labeledEvents || 0) - (a.e.labeledEvents || 0)).map(({ sp, e }) => `<tr>
-          <td><strong style="font-size:13px">${esc(sp.displayName || '—')}</strong></td>
-          <td style="font-weight:700">${e.labeledEvents}</td>
+        <thead><tr><th>App / Agent</th><th>File Events</th><th>Labelled</th><th>Labels Seen</th><th>Files Touched</th><th>Users</th></tr></thead>
+        <tbody>${rows.sort((a, b) => (b.e.labeledEvents || 0) - (a.e.labeledEvents || 0) || (b.e.events || 0) - (a.e.events || 0)).map(({ sp, e }) => `<tr${e.labeledEvents ? ' style="background:rgba(240,136,62,.04)"' : ''}>
+          <td><strong style="font-size:13px">${esc(sp.displayName || '—')}</strong>${e.lastAccess ? `<br><span class="mono text-muted" style="font-size:10px">last ${new Date(e.lastAccess).toLocaleDateString()}</span>` : ''}</td>
+          <td style="font-size:12px"><strong>${e.events}</strong> <span class="text-muted" style="font-size:10px">${e.reads}r · ${e.writes}w</span></td>
+          <td style="font-weight:700;color:${e.labeledEvents ? 'var(--risk-high)' : 'var(--text-dim)'}">${e.labeledEvents || 0}</td>
           <td>${(e.labelIds || []).map(labelChip).join('') || '<span class="text-muted">—</span>'}</td>
+          <td style="font-size:11px;color:var(--text-muted)" title="${esc((e.filesSample || []).join(', '))}">${(e.filesSample || []).slice(0, 3).map(esc).join(', ') || '—'}${(e.filesSample || []).length > 3 ? ` +${e.filesSample.length - 3}` : ''}</td>
+          <td style="font-size:12px" title="${esc((e.usersSample || []).join(', '))}">${e.users || 0}</td>
         </tr>`).join('')}
         </tbody>
       </table>
     </div>
     <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
-      ℹ️ Labelled events = file operations by the app where the file carried a sensitivity label (<code>SensitivityLabelId</code> on <code>CloudAppEvents</code>) · 🔒 = label enforces encryption, so third-party AI received ciphertext.
+      ℹ️ Labelled = file operations where the event carried a sensitivity label (<code>SensitivityLabelId</code> on <code>CloudAppEvents</code>) — labels aren&#39;t stamped on every action type, so a labelled file can appear under unlabelled events (check Files Touched) · 🔒 = label enforces encryption, so third-party AI received ciphertext.
     </div>`;
 }
 
