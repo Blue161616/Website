@@ -573,6 +573,7 @@
       <div class="topbar-spacer"></div>
       <div style="display:flex;align-items:center;gap:8px">
         <span id="scan-status" style="font-size:12px;color:var(--text-muted)"></span>
+        <button class="btn btn-ghost" onclick="generateAssessmentReport()" title="Executive summary of everything assessed in this session — print to PDF or save as Word">📄 Report</button>
         <button class="btn btn-primary" id="btn-refresh" onclick="refreshAll()">🔍 Refresh Data</button>
       </div>
     </header>
@@ -2168,7 +2169,14 @@ async function fetchDlpAiBlocks() {
       const row = flatten(r0);
       const raw = JSON.stringify(r0 || '');
       const action = String(pick(row, ['ActionType','Action','EnforcementMode','DlpAction','action']) || '');
-      const blocked = /block|restrict|prevent/i.test(action) || /block|restrict|prevent/i.test(raw);
+      const policyName = String(pick(row, ['PolicyName','DLPPolicyName','DlpPolicy','policyName']) || '');
+      const ruleName   = String(pick(row, ['RuleName','DlpRuleName','ruleName']) || '');
+      // The raw-JSON fallback must not read the POLICY NAME ("Block Confidential
+      // Data to Claude") as a block verdict on rows Purview merely audited —
+      // strip policy/rule names before scanning for enforcement keywords.
+      let rawScan = raw;
+      [policyName, ruleName].filter(Boolean).forEach(n => { rawScan = rawScan.split(n).join(''); });
+      const blocked = /block|restrict|prevent/i.test(action) || /block|restrict|prevent/i.test(rawScan);
       const target = String(pick(row, ['RemoteUrl','TargetDomain','DestinationDomain','CloudService','Url','remoteUrl']) || '');
       const app = _aiEgressApp(target || raw);
       const ev = {
@@ -2176,7 +2184,7 @@ async function fetchDlpAiBlocks() {
         user: String(pick(row, ['AccountUpn','RequestAccountUpn','AccountName','InitiatingProcessAccountUpn','InitiatingProcessAccountName','UserId','User']) || '—'),
         file: String(pick(row, ['FileName','ObjectName','FileNameOriginal','fileName']) || '—'),
         device: String(pick(row, ['DeviceName','deviceName']) || ''),
-        policy: String(pick(row, ['PolicyName','DLPPolicyName','DlpPolicy','policyName']) || ''),
+        policy: policyName,
         // Label NAME when the table carries one (DeviceFileEvents-style columns,
         // sometimes flattened out of AdditionalFields); else the Purview label
         // GUID from DataSecurityEvents — the renderer shows GUIDs as "labelled".
@@ -5190,9 +5198,9 @@ async function renderDefenderAssetsSection() {
       </label>
       <span style="margin-left:auto;font-size:11px;color:var(--text-dim)" id="def-assets-count">${agents.length} agents</span>
     </div>
-    <!-- Height-capped: with many agents this card otherwise pushes the section
-         content selected via the KPI cards far below the fold -->
-    <div class="table-wrap" style="max-height:420px;overflow-y:auto">
+    <!-- Height-capped at ~14 rows: with many agents this card otherwise pushes
+         the section content selected via the KPI cards far below the fold -->
+    <div class="table-wrap tbl-scroll" style="max-height:650px">
       <table id="def-assets-table">
         <thead><tr>
           <th>Agent Name</th>
@@ -6187,7 +6195,7 @@ async function loadDataRisk() {
            Each card is a button that jumps to the matching half of the card. -->
       <div class="kpi-row" style="grid-template-columns:repeat(4,1fr)">
         <div class="kpi-card info" style="cursor:pointer" onclick="document.getElementById('label-evidence-body')?.scrollIntoView({behavior:'smooth',block:'center'})" title="Jump to the accessed evidence">
-          <div class="kpi-label">Labelled Events Accessed</div>
+          <div class="kpi-label">AI File Activity (Cloud)</div>
           <div class="kpi-value" id="kpi-dr-accessed">…</div>
           <div class="kpi-delta" id="kpi-dr-accessed-sub">CloudAppEvents · 30d</div>
           <div class="kpi-icon">🔎</div>
@@ -6258,14 +6266,19 @@ async function loadDataRisk() {
           if (kHsSub)  kHsSub.textContent  = why;
           return;
         }
+        // Same row set as the evidence card (ALL file activity, labelled subset
+        // highlighted) — the KPI must never contradict the card below it.
         const uniq = [...new Map(candidates.map(s => [s.id, s])).values()].filter(sp => sp.appId);
-        const rows = uniq.map(sp => evd.byAppId[(sp.appId || '').toLowerCase()]).filter(e => e && (e.labeledEvents || 0) > 0);
+        const rows = uniq.map(sp => evd.byAppId[(sp.appId || '').toLowerCase()]).filter(e => e && (e.events || 0) > 0);
+        const totEvents  = rows.reduce((n, e) => n + (e.events || 0), 0);
         const totLabeled = rows.reduce((n, e) => n + (e.labeledEvents || 0), 0);
         const highSet = new Set(highSensLabels.map(l => String(l.id).toLowerCase()));
         const highTouched = [...new Set(rows.flatMap(e => e.labelIds || []))].filter(id => highSet.has(String(id).toLowerCase()));
-        kAcc.textContent = totLabeled;
-        kAcc.className = 'kpi-value ' + (totLabeled ? 'text-high' : 'text-low');
-        if (kAccSub) kAccSub.textContent = rows.length ? `labelled file events by ${rows.length} AI app${rows.length !== 1 ? 's' : ''}` : '✅ no labelled access observed (30d)';
+        kAcc.textContent = totEvents;
+        kAcc.className = 'kpi-value ' + (totEvents ? 'text-high' : 'text-low');
+        if (kAccSub) kAccSub.textContent = totEvents
+          ? `file events by ${rows.length} AI app${rows.length !== 1 ? 's' : ''} · ${totLabeled} label-stamped`
+          : '✅ no AI file activity observed (30d)';
         kHs.textContent = highTouched.length;
         kHs.className = 'kpi-value ' + (highTouched.length ? 'text-critical' : 'text-low');
         if (kHsSub) kHsSub.textContent = highTouched.length ? 'high-sensitivity labels seen in AI events' : '✅ none touched by AI (30d)';
@@ -8821,6 +8834,71 @@ function fillLabelDlpCard(bl) {
 
 // ── MCP SERVER INVENTORY ──────────────────────────────────────────────────
 
+// ═══ EXECUTIVE ASSESSMENT REPORT ═════════════════════════════════════════════
+// Builds a printable executive summary from whatever this session has already
+// assessed (STATE.data caches — no new queries). Sections without cached data
+// are listed as "not assessed", nudging the reader to open those pages first.
+function generateAssessmentReport() {
+  const D = STATE.data, esc2 = esc;
+  const sps = D.servicePrincipals || D.sps || [];
+  const aiApps = sps.filter ? sps.filter(isAiApp) : [];
+  const mcp = sps.filter ? sps.filter(sp => MCP_KNOWN_APPIDS.has(sp.appId) || (sp.tags || []).some(t => /\bmcp\b/i.test(t)) || MCP_RE.test(sp.displayName || '') || MCP_RE.test(sp.description || '')) : [];
+  const dlp = D.dlpAiBlocks, posture = D.agentPosture, gov = D.oauthGov, mcas = D.mcasApps, labels = D.sensitivityLabels;
+  const govFlags = gov?.ok ? Object.values(gov.byAppId).filter(g => g.highUnused > 0).length : null;
+  const missing = [];
+  const row = (label, value, detail) => value === null || value === undefined
+    ? (missing.push(label), '')
+    : `<tr><td>${label}</td><td class="v">${value}</td><td class="d">${detail || ''}</td></tr>`;
+  const finding = (sev, text) => `<li class="${sev}"><strong>${sev.toUpperCase()}</strong> — ${text}</li>`;
+  const findings = [];
+  if (dlp?.ok && dlp.blocked) findings.push(finding('high', `${dlp.blocked} sensitive-content upload${dlp.blocked !== 1 ? 's' : ''} to external AI apps blocked by Purview DLP (30d)${dlp.incidentCount ? `, ${dlp.incidentCount} escalated to Defender incidents` : ''}.`));
+  if (posture?.ok && posture.flaggedAgents) findings.push(finding('high', `${posture.flaggedAgents} AI agent${posture.flaggedAgents !== 1 ? 's' : ''} flagged across ${posture.flaggedChecks} of ${posture.ranChecks} AgentsInfo security-posture checks (MCP tools, missing instructions, sharing, ownership).`));
+  if (govFlags) findings.push(finding('medium', `${govFlags} OAuth app${govFlags !== 1 ? 's' : ''} hold high-privilege permissions that are granted but unused — revoke candidates (app governance).`));
+  if (mcas?.length) { const uns = mcas.filter(a => /unsanctioned/i.test(a.sanctionedState || a.status || '')).length; if (uns) findings.push(finding('medium', `${uns} network-discovered GenAI app${uns !== 1 ? 's are' : ' is'} unsanctioned (Defender for Cloud Apps).`)); }
+  const w = window.open('', '_blank');
+  if (!w) { alert('Popup blocked — allow popups to generate the report.'); return; }
+  w.document.write(`<!doctype html><html><head><title>Shadow AI Security Assessment — ${esc2(D.org?.displayName || 'Tenant')}</title><style>
+    body{font-family:'Segoe UI',system-ui,sans-serif;color:#1a1f24;max-width:820px;margin:32px auto;padding:0 24px;line-height:1.55}
+    h1{font-size:22px;margin-bottom:2px} h2{font-size:15px;margin:26px 0 8px;border-bottom:2px solid #dde3ea;padding-bottom:4px}
+    .sub{color:#5a6572;font-size:12px;margin-bottom:18px}
+    table{width:100%;border-collapse:collapse;font-size:13px} td{padding:6px 10px;border-bottom:1px solid #e8ecf1} td.v{font-weight:700;white-space:nowrap} td.d{color:#5a6572;font-size:12px}
+    ul{padding-left:18px;font-size:13px} li{margin-bottom:6px} li.high strong{color:#c0392b} li.medium strong{color:#b9770e}
+    .note{font-size:11px;color:#8a94a0;margin-top:24px;border-top:1px solid #e8ecf1;padding-top:10px}
+    .btn{position:fixed;top:14px;right:16px;padding:8px 18px;background:#1f6feb;color:#fff;border:none;border-radius:7px;font-weight:600;cursor:pointer}
+    @media print{.btn{display:none}}
+  </style></head><body>
+    <button class="btn" onclick="window.print()">🖨️ Print / Save as PDF</button>
+    <h1>Shadow AI Security Assessment</h1>
+    <div class="sub">${esc2(D.org?.displayName || 'Tenant')} · generated ${new Date().toLocaleString()} · by ${esc2(STATE.account?.username || '—')} · sources: Microsoft Graph, Defender XDR Advanced Hunting, Purview, Defender for Cloud Apps</div>
+    <h2>AI Inventory</h2>
+    <table>
+      ${row('AI apps (Entra service principals)', sps.length ? aiApps.length : null, 'OAuth-integrated GenAI applications')}
+      ${row('Shadow AI apps (network-discovered)', mcas ? mcas.length : null, 'Defender for Cloud Apps discovery')}
+      ${row('AI agents', D.agentSps ? D.agentSps.length : null, 'blueprints, agent identities, classic automation')}
+      ${row('MCP servers (service principals)', sps.length ? mcp.length : null, 'Model Context Protocol hosts & clients')}
+      ${row('Sensitivity labels', labels ? labels.length : null, 'Microsoft Purview taxonomy')}
+    </table>
+    <h2>Key Findings</h2>
+    ${findings.length ? `<ul>${findings.join('')}</ul>` : '<p style="font-size:13px">No high-priority findings in the assessed areas — or the relevant pages have not been opened this session.</p>'}
+    <h2>Enforcement Evidence (30 days)</h2>
+    <table>
+      ${row('DLP blocks en route to AI', dlp?.ok ? dlp.blocked : null, dlp?.ok ? `${dlp.total - dlp.blocked} additional events audited` : '')}
+      ${row('Defender AI incidents', dlp?.ok ? (dlp.incidentCount || 0) : null, 'DLP blocks escalated to the incident queue')}
+      ${row('Agent posture checks flagged', posture?.ok ? `${posture.flaggedChecks} / ${posture.ranChecks}` : null, posture?.ok ? `${posture.flaggedAgents} distinct agents flagged` : '')}
+    </table>
+    <h2>Recommended Actions</h2>
+    <ul>
+      ${dlp?.ok && dlp.blocked ? '<li>Review the DLP-blocked uploads and confirm policy coverage extends to all detected AI apps.</li>' : ''}
+      ${posture?.ok && posture.flaggedAgents ? '<li>Remediate flagged agents: assign owners, document tools in instructions, restrict org-wide sharing, remove unused MCP servers.</li>' : ''}
+      ${govFlags ? '<li>Revoke high-privilege OAuth permissions that show no usage in app governance.</li>' : ''}
+      <li>Re-run this assessment after remediation and compare the dashboard trend deltas.</li>
+    </ul>
+    ${missing.length ? `<div class="note">⚠️ Not assessed this session (open the matching page, then regenerate): ${missing.map(esc2).join(' · ')}</div>` : ''}
+    <div class="note">Generated by Shadow AI Security Assessment V2 — data reflects the signed-in analyst's delegated access at generation time.</div>
+  </body></html>`);
+  w.document.close();
+}
+
 // ═══ ADVANCED-HUNTING ENRICHMENT CARDS ═══════════════════════════════════════
 // OAuthAppInfo (app governance) · GraphApiAuditEvents (observed Graph activity)
 // · DeviceNetworkEvents (endpoint AI traffic) · Azure tables (Azure-hosted AI).
@@ -8849,10 +8927,12 @@ function _ensureSlot(containerId, slotId) {
   return s;
 }
 function _huntErrCard(title, src, r) {
+  // Table simply not present in the tenant (licensing/onboarding) → render
+  // NOTHING: an empty-capability card is noise on every page load.
+  if (_huntNA(r.error)) return '';
   return `<div class="card" style="margin:16px 0"><div class="card-header"><div class="card-title">${title}</div><span class="data-source source-derived" style="font-size:10px">${src}</span></div>
     <div class="card-body" style="font-size:12px;color:var(--text-muted)">${
       (r.forbidden || r.status === 403) ? '🔒 Needs <code>ThreatHunting.Read.All</code>.'
-      : _huntNA(r.error) ? 'ℹ️ Table not available in this tenant — check licensing/onboarding for this source.'
       : 'ℹ️ Unavailable — ' + esc(String(r.error || '').slice(0, 160))}</div></div>`;
 }
 
@@ -9415,7 +9495,13 @@ async function renderMcpMaliciousIndicators(mcpSps, grants) {
   // "Claude Sentinel MCP Server" vs "Microsoft Sentinel MCP Claude" occupy the
   // same mental slot — the classic typosquat/shadow pattern.
   const STOP = new Set(['mcp', 'server', 'servers', 'microsoft', 'agent', 'the', 'for']);
-  const sig = n => String(n || '').toLowerCase().replace(/\(.*?\)/g, '').split(/[^a-z0-9]+/).filter(t => t.length > 2 && !STOP.has(t)).sort().join('·');
+  // All-generic names (every word a stopword) still group by their full token
+  // set — two SPs literally both named "MCP Server" are the strongest collision.
+  const sig = n => {
+    const toks = String(n || '').toLowerCase().replace(/\(.*?\)/g, '').split(/[^a-z0-9]+/).filter(Boolean);
+    const s = toks.filter(t => t.length > 2 && !STOP.has(t)).sort().join('·');
+    return s || toks.sort().join('·');
+  };
   const bySig = new Map();
   mcpSps.forEach(sp => { const s = sig(sp.displayName); if (!s) return; if (!bySig.has(s)) bySig.set(s, []); bySig.get(s).push(sp); });
   const dupGroups = [...bySig.values()].filter(v => v.length > 1);
@@ -10003,9 +10089,11 @@ function _appNameMatches(mcasName, signInAppName) {
   if (m === s) return true;
   const mt = _sigTokens(m), st = _sigTokens(s);
   if (!mt.length || !st.length) return false;
-  // Every distinctive token of one name must appear in the other:
+  // Every distinctive token of one name must appear in the other — as WHOLE
+  // tokens, not substrings ("cli" must not match "client"):
   // "Anthropic Claude" ↔ "Claude", "Microsoft 365 Copilot Chat" ↔ "M365 Copilot".
-  return mt.every(t => s.includes(t)) || st.every(t => m.includes(t));
+  const mset = new Set(mt), sset = new Set(st);
+  return mt.every(t => sset.has(t)) || st.every(t => mset.has(t));
 }
 
 function _usersFromSignIns(appName) {
