@@ -6118,198 +6118,6 @@ function renderStaleAgentsSection(agentSps, grants) {
   `;
 }
 
-// ── SENSITIVE DATA REACHABILITY ───────────────────────────────────────────
-
-const DATA_REACH_CATS = [
-  { key:'sharepoint', label:'SharePoint/OneDrive', icon:'📁', scopes:['Files.Read.All','Files.ReadWrite.All','Sites.Read.All','Sites.ReadWrite.All','Sites.FullControl.All','Sites.Manage.All'] },
-  { key:'teams',      label:'Teams / Chat',        icon:'💬', scopes:['Chat.Read.All','Chat.ReadWrite.All','ChannelMessage.Read.All','TeamMember.Read.All','Team.ReadBasic.All','TeamSettings.Read.All'] },
-  { key:'mail',       label:'Mail',                icon:'📧', scopes:['Mail.Read','Mail.ReadWrite','Mail.Send','Mail.ReadBasic','MailboxSettings.Read','MailboxSettings.ReadWrite'] },
-  { key:'calendar',   label:'Calendar',            icon:'📅', scopes:['Calendars.Read','Calendars.ReadWrite','Calendars.Read.Shared','Calendars.ReadWrite.Shared'] },
-  { key:'directory',  label:'Directory / HR',      icon:'👥', scopes:['User.Read.All','User.ReadWrite.All','Directory.Read.All','Directory.ReadWrite.All','People.Read.All','OrgContact.Read.All'] },
-];
-
-// Which reachability categories CloudAppEvents can actually evidence. Files, mail
-// and Teams surface in Office 365 activity; calendar & directory reads don't, so
-// those columns stay permission-only (clearly marked).
-const REACH_EVIDENCE_CAT = { sharepoint: 'files', mail: 'mail', teams: 'teams' };
-
-// Broad activity evidence per app across files / mail / Teams (30d). Same silent
-// ThreatHunting.Read.All token as the other Advanced Hunting cards.
-async function fetchAiActivityEvidence(appIds) {
-  if (STATE.data.aiActivityEvidence !== undefined) return STATE.data.aiActivityEvidence;
-  const base = { ok: false, byAppId: {}, code: 'error', error: null };
-  const ids = [...new Set((appIds || []).filter(Boolean).map(s => String(s).toLowerCase()))].slice(0, 40);
-  if (!ids.length) { STATE.data.aiActivityEvidence = { ok: true, byAppId: {}, code: null, error: null }; return STATE.data.aiActivityEvidence; }
-  const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
-  if (!token) { STATE.data.aiActivityEvidence = { ...base, code: 'forbidden', error: 'ThreatHunting.Read.All not consented.' }; return STATE.data.aiActivityEvidence; }
-  const kql = [
-    'CloudAppEvents',
-    '| where Timestamp > ago(30d)',
-    '| extend OAuthAppId = tolower(tostring(RawEventData.ApplicationId))',
-    `| where OAuthAppId in (${ids.map(i => `"${i}"`).join(',')})`,
-    '| extend Cat = case(',
-    '    ActionType has_any("File","Sync","Sharing"), "files",',
-    '    ActionType has "Mail" or ActionType == "Send", "mail",',
-    '    ActionType has_any("Message","Chat","Channel","Team"), "teams",',
-    '    "other")',
-    '| where Cat != "other"',
-    '| summarize Events = count(), Last = max(Timestamp) by OAuthAppId, Cat',
-  ].join(' ');
-  const isUnsupportedErr = msg => /failed to resolve table|could not be resolved|unknown table|does not refer to any known table|semantic error|failed to resolve scalar/i.test(msg || '');
-  try {
-    const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
-      method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ Query: kql, Timespan: 'P30D' }),
-    });
-    if (!r.ok) { const t = await r.text(); STATE.data.aiActivityEvidence = { ...base, code: r.status === 403 ? 'forbidden' : isUnsupportedErr(t) ? 'unsupported' : 'error', error: t.slice(0, 300) }; return STATE.data.aiActivityEvidence; }
-    const data = await r.json();
-    const rows = Array.isArray(data.results) ? data.results : (Array.isArray(data.Results) ? data.Results : []);
-    const byAppId = {};
-    rows.forEach(row => {
-      const id = String(row.OAuthAppId || '').toLowerCase();
-      const cat = String(row.Cat || '');
-      if (!id || !cat) return;
-      (byAppId[id] = byAppId[id] || {})[cat] = { events: Number(row.Events) || 0, last: row.Last || null };
-    });
-    STATE.data.aiActivityEvidence = { ok: true, byAppId, code: null, error: null };
-  } catch (e) {
-    const msg = e.message || String(e);
-    STATE.data.aiActivityEvidence = { ...base, code: isUnsupportedErr(msg) ? 'unsupported' : 'error', error: msg };
-  }
-  return STATE.data.aiActivityEvidence;
-}
-
-// evidence: result of fetchAiActivityEvidence, or null for permission-only mode.
-function renderDataReachabilityHtml(agentSps, grants, appPerms, evidence) {
-  const rows = agentSps.map(sp => {
-    const delegated = getScopesForSp(sp.id, grants);
-    const appRoles  = (appPerms?.[sp.id] || []).map(p => p.role);
-    const allPerms  = new Set([...delegated, ...appRoles]);
-    const cats = DATA_REACH_CATS.filter(c => c.scopes.some(s => allPerms.has(s)));
-    return { sp, cats, allPerms };
-  }).filter(r => r.cats.length > 0)
-    .sort((a, b) => b.cats.length - a.cats.length);
-
-  const totalExposed = rows.length;
-  const highRisk = rows.filter(r => r.cats.length >= 3).length;
-  const evOk  = evidence?.ok;
-  const evFor = id => evOk ? (evidence.byAppId[(id || '').toLowerCase()] || null) : null;
-  // Confirmed = has scope AND observed activity in an evidence-capable category
-  const confirmedAgents = evOk ? rows.filter(r => {
-    const e = evFor(r.sp.appId); if (!e) return false;
-    return r.cats.some(c => { const ek = REACH_EVIDENCE_CAT[c.key]; return ek && e[ek]?.events > 0; });
-  }).length : 0;
-
-  const headline = evOk
-    ? (confirmedAgents > 0
-        ? `<span style="font-size:11px;color:var(--risk-critical)">🔴 ${confirmedAgents} agent${confirmedAgents !== 1 ? 's' : ''} observed actually accessing data · ${totalExposed} with permissions</span>`
-        : `<span style="font-size:11px;color:var(--risk-low)">✅ No observed data access · ${totalExposed} agent${totalExposed !== 1 ? 's' : ''} hold reach permissions</span>`)
-    : (totalExposed > 0
-        ? `<span style="font-size:11px;color:var(--risk-high)">${totalExposed} agent${totalExposed !== 1 ? 's' : ''} can reach sensitive data · ${highRisk} with 3+ categories</span>`
-        : '<span style="font-size:11px;color:var(--risk-low)">✅ No agents with sensitive data access detected</span>');
-
-  const cell = (r, c) => {
-    const match = r.cats.find(rc => rc.key === c.key);
-    if (!match) return '<td style="text-align:center;color:var(--text-dim);font-size:12px">—</td>';
-    const matchedScopes = match.scopes.filter(s => r.allPerms.has(s));
-    const ek = REACH_EVIDENCE_CAT[c.key];
-    const e  = evFor(r.sp.appId);
-    if (evOk && ek) {
-      const hit = e?.[ek];
-      if (hit?.events > 0) {
-        const rel = mcasRelTime(hit.last);
-        return `<td style="text-align:center" title="${esc(matchedScopes.join(', '))} · ${hit.events} event${hit.events !== 1 ? 's' : ''}${rel ? ' · ' + rel : ''}"><span style="color:var(--risk-critical);font-size:15px">✦</span><br><span style="font-size:9px;color:var(--risk-critical)">${hit.events} obs</span></td>`;
-      }
-      // scope but no observed activity → potential only
-      return `<td style="text-align:center" title="${esc(matchedScopes.join(', '))} · no activity observed in 30d"><span style="color:var(--text-dim);font-size:14px">◇</span></td>`;
-    }
-    // evidence not available for this category (calendar/directory) or not loaded
-    return `<td style="text-align:center" title="${esc(matchedScopes.join(', '))}${evOk ? ' · no activity evidence for this category' : ''}"><span style="color:${evOk ? 'var(--risk-medium)' : 'var(--risk-high)'};font-size:14px">✦</span></td>`;
-  };
-
-  const legend = evOk
-    ? '<span style="color:var(--risk-critical)">✦ observed</span> · <span style="color:var(--text-dim)">◇ permission, no activity (files/mail/Teams)</span> · <span style="color:var(--risk-medium)">✦ permission only (calendar/directory)</span>'
-    : (evidence
-        ? `⚠️ Activity evidence unavailable (${evidence.code === 'forbidden' ? 'needs ThreatHunting.Read.All' : evidence.code === 'unsupported' ? 'connect the Office 365 connector in Defender for Cloud Apps' : 'query error'}) — showing potential access from permissions only.`
-        : 'Loading activity evidence…');
-
-  return '<div class="card">'
-    + '<div class="card-header">'
-    + '<div class="card-title">📂 Data Reachability — Observed vs Potential</div>'
-    + '<div style="display:flex;align-items:center;gap:10px">'
-    + headline
-    + `<span class="data-source ${evOk ? 'source-live' : 'source-derived'}">${evOk ? '● CloudAppEvents × grants' : '⚡ appRoleAssignments · oauth2PermissionGrants'}</span>`
-    + '</div>'
-    + '</div>'
-    + (rows.length ? (
-        `<div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">${legend}</div>`
-      + '<div class="table-wrap"><table>'
-      + '<thead><tr><th>Agent</th>'
-      + DATA_REACH_CATS.map(c => {
-          const link = c.key === 'sharepoint'
-            ? ` <a onclick="navigate('sharing', document.querySelector('[onclick*=sharing]'))" style="color:var(--accent-blue);cursor:pointer;font-size:9px;font-weight:400" title="File-access deep-dive with evidence & sharing settings">(details ↗)</a>`
-            : '';
-          return '<th style="text-align:center;white-space:nowrap">' + c.icon + ' ' + c.label + link + '</th>';
-        }).join('')
-      + '</tr></thead><tbody>'
-      + rows.map(r => {
-          const typeInfo = getAgentType(r.sp);
-          return '<tr>'
-            + '<td>'
-            + '<strong style="font-size:13px">' + esc(r.sp.displayName) + '</strong>'
-            + '<span style="font-size:10px;color:var(--text-muted);margin-left:6px">' + esc(typeInfo.label || typeInfo.type) + '</span>'
-            + (r.cats.length >= 3 ? '<span class="badge badge-high" style="font-size:10px;margin-left:6px">⚠️ Broad access</span>' : '')
-            + '</td>'
-            + DATA_REACH_CATS.map(c => cell(r, c)).join('')
-            + '</tr>';
-        }).join('')
-      + '</tbody></table></div>'
-      + `<div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">ℹ️ <strong>Observed</strong> = the agent's OAuth id actually appears in <code>CloudAppEvents</code> for that category in 30 days. Calendar &amp; Directory have no Office-365 activity signal, so they stay permission-only. Files drill down on <a onclick="navigate('sharing', document.querySelector('[onclick*=sharing]'))" style="color:var(--accent-blue);cursor:pointer">External Sharing</a>.</div>`
-    ) : '<div class="card-body"><div class="empty-state text-muted">No agents with access to sensitive data categories detected.</div></div>')
-    + '</div>';
-}
-
-// ── DATA RISK ─────────────────────────────────────────────────────────────
-
-async function fetchAgentAppPerms(agentSps, allSps) {
-  if (STATE.data.agentAppPerms) return STATE.data.agentAppPerms;
-
-  // Step 1: fetch all appRoleAssignments for agents in parallel
-  const rawPerms = {};
-  await Promise.all(agentSps.slice(0, 80).map(async sp => {
-    try {
-      const d = await gget(`${GRAPH}/servicePrincipals/${sp.id}/appRoleAssignments?$select=resourceId,resourceDisplayName,appRoleId`);
-      rawPerms[sp.id] = (d.value||[]).filter(a => a.appRoleId && a.appRoleId !== '00000000-0000-0000-0000-000000000000');
-    } catch { rawPerms[sp.id] = []; }
-  }));
-
-  // Step 2: collect unique resource SPs referenced across all assignments
-  const allAssignments = Object.values(rawPerms).flat();
-  const uniqueResourceIds = [...new Set(allAssignments.map(a => a.resourceId).filter(Boolean))];
-
-  // Step 3: build role-name map — allSps has no appRoles field so fetch resource SPs individually
-  // (typically 3-5 well-known SPs: MS Graph, SharePoint, Exchange, etc.)
-  const roleBySpId = {};
-  await Promise.all(uniqueResourceIds.map(async id => {
-    try {
-      const d = await gget(`${GRAPH}/servicePrincipals/${id}?$select=id,appRoles`);
-      roleBySpId[id] = {};
-      for (const r of (d.appRoles||[])) roleBySpId[id][r.id] = r.value || r.displayName || r.id;
-    } catch { roleBySpId[id] = {}; }
-  }));
-
-  // Step 4: resolve role names
-  const result = {};
-  for (const [spId, assignments] of Object.entries(rawPerms)) {
-    result[spId] = assignments.map(a => ({
-      resource: a.resourceDisplayName || '',
-      role: roleBySpId[a.resourceId]?.[a.appRoleId] || a.appRoleId
-    }));
-  }
-  STATE.data.agentAppPerms = result;
-  return result;
-}
-
 async function loadDataRisk() {
   const el = document.getElementById('risk-content');
   try {
@@ -6319,15 +6127,6 @@ async function loadDataRisk() {
     ]);
     const aiApps = sps.filter(isAiApp);
 
-    // Scope exposure breakdown
-    const scopeUsage = {};
-    grants.filter(g => aiApps.some(a => a.id === g.clientId)).forEach(g => {
-      (g.scope||'').split(' ').filter(Boolean).forEach(s => {
-        scopeUsage[s] = (scopeUsage[s]||0) + 1;
-      });
-    });
-    const topScopes = Object.entries(scopeUsage).sort((a,b)=>b[1]-a[1]).slice(0,10);
-
     // Derive agent SPs (use cache from AI Agents tab if available)
     const agentSps = STATE.data.agentSps || sps.filter(sp => {
       const tags = (sp.tags||[]).map(t=>t.toLowerCase());
@@ -6336,26 +6135,46 @@ async function loadDataRisk() {
         || sp.servicePrincipalType === 'ServiceIdentity';
     });
 
-    // Fetch application-level permissions (appRoleAssignments) for each agent
-    const agentAppPerms = await fetchAgentAppPerms(agentSps, sps);
-
-    // Which AI apps & agents actually hold data-reaching permissions. Anchored to
-    // the scope's resource prefix (Graph scopes are "Resource.Action") so the benign
-    // OIDC "email" scope doesn't match "Mail", etc.
-    const DATA_SCOPE_RE = /^(Files|Sites|Mail|Chat|ChannelMessage|Directory|People|Contacts|Calendars|Notes|Tasks|Group)\b/i;
-    const aiDataApps = aiApps.filter(sp => getScopesForSp(sp.id, grants).some(s => DATA_SCOPE_RE.test(s)));
-    const dataAgents = agentSps.filter(sp => getScopesForSp(sp.id, grants).some(s => DATA_SCOPE_RE.test(s)) || (agentAppPerms[sp.id]||[]).some(p => DATA_SCOPE_RE.test(p.role||'')));
-
-    // AI apps with email-related OAuth scopes (Mail.Read / Mail.ReadWrite / Mail.Send)
-    const MAIL_SCOPES = ['Mail.Read','Mail.ReadWrite','Mail.Send'];
-    const mailboxAiApps = aiApps.filter(sp => getScopesForSp(sp.id, grants).some(s => MAIL_SCOPES.includes(s)));
-
     const navLink = (page, label) => `<a onclick="navigate('${page}', document.querySelector('[onclick*=${page}]'))" style="color:var(--accent-blue);cursor:pointer">${label}</a>`;
     el.innerHTML = `
       <div class="section-header" style="margin-bottom:12px">
         <div>
           <div class="section-title">Data Accessible &amp; Shared by AI</div>
-          <div class="section-sub">What AI apps &amp; agents can reach across your data — and what Purview DLP stopped on its way to an external AI. File sharing settings live on ${navLink('sharing','SharePoint/OneDrive Sharing')}.</div>
+          <div class="section-sub">Labelled content AI actually touched (cloud-side) and what Purview DLP stopped on its way to an external AI. Permission reach &amp; sharing settings live on ${navLink('sharing','SharePoint/OneDrive Sharing')}; the label taxonomy on ${navLink('labels','Purview Sensitivity Labels')}.</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn btn-ghost" style="font-size:11px" onclick="navigate('labels', document.querySelector('[onclick*=labels]'))">🏷️ Label taxonomy</button>
+          <button class="btn btn-ghost" style="font-size:11px" onclick="navigate('sharing', document.querySelector('[onclick*=sharing]'))">📂 Sharing settings</button>
+          <a class="btn btn-ghost" style="font-size:11px;text-decoration:none" href="https://purview.microsoft.com/datalossprevention/activityexplorer" target="_blank" rel="noopener">↗ Activity Explorer</a>
+        </div>
+      </div>
+
+      <!-- Headline KPIs — the four numbers that matter from the evidence below.
+           Each card is a button that jumps to the matching half of the card. -->
+      <div class="kpi-row" style="grid-template-columns:repeat(4,1fr)">
+        <div class="kpi-card info" style="cursor:pointer" onclick="document.getElementById('label-evidence-body')?.scrollIntoView({behavior:'smooth',block:'center'})" title="Jump to the accessed evidence">
+          <div class="kpi-label">Labelled Events Accessed</div>
+          <div class="kpi-value" id="kpi-dr-accessed">…</div>
+          <div class="kpi-delta" id="kpi-dr-accessed-sub">CloudAppEvents · 30d</div>
+          <div class="kpi-icon">🔎</div>
+        </div>
+        <div class="kpi-card info" style="cursor:pointer" onclick="document.getElementById('label-evidence-body')?.scrollIntoView({behavior:'smooth',block:'center'})" title="Jump to the accessed evidence">
+          <div class="kpi-label">High-Sens Labels Touched</div>
+          <div class="kpi-value" id="kpi-dr-highsens">…</div>
+          <div class="kpi-delta" id="kpi-dr-highsens-sub">by AI apps · 30d</div>
+          <div class="kpi-icon">🏷️</div>
+        </div>
+        <div class="kpi-card ${dlpBlocks?.blocked ? 'critical' : 'low'}" style="cursor:pointer" onclick="document.getElementById('label-dlp-body')?.scrollIntoView({behavior:'smooth',block:'center'})" title="Jump to the blocked evidence">
+          <div class="kpi-label">Blocked from AI by DLP</div>
+          <div class="kpi-value ${dlpBlocks?.blocked ? 'text-critical' : 'text-low'}">${dlpBlocks?.ok ? dlpBlocks.blocked : '—'}</div>
+          <div class="kpi-delta">${dlpBlocks?.ok ? (dlpBlocks.blocked ? `files stopped en route to AI${dlpBlocks.total > dlpBlocks.blocked ? ` · ${dlpBlocks.total - dlpBlocks.blocked} audited` : ''}` : '✅ none blocked (30d)') : 'needs ThreatHunting.Read.All'}</div>
+          <div class="kpi-icon">🚫</div>
+        </div>
+        <div class="kpi-card ${dlpBlocks?.incidentCount ? 'critical' : 'low'}" style="cursor:pointer" onclick="document.getElementById('label-dlp-body')?.scrollIntoView({behavior:'smooth',block:'center'})" title="Jump to the blocked evidence">
+          <div class="kpi-label">Defender Incidents</div>
+          <div class="kpi-value ${dlpBlocks?.incidentCount ? 'text-critical' : 'text-low'}">${dlpBlocks?.ok ? (dlpBlocks.incidentCount || 0) : '—'}</div>
+          <div class="kpi-delta">${dlpBlocks?.ok ? (dlpBlocks.incidentCount ? 'DLP blocks escalated to Defender incidents' : '✅ no escalations (30d)') : 'needs ThreatHunting.Read.All'}</div>
+          <div class="kpi-icon">🔺</div>
         </div>
       </div>
 
@@ -6375,79 +6194,7 @@ async function loadDataRisk() {
           <div class="section-loading"><span class="spinner"></span>Checking for DLP-blocked uploads to AI…</div>
         </div>
       </div>
-
-      <div class="kpi-row" style="grid-template-columns:repeat(4,1fr)">
-        <div class="kpi-card ${aiDataApps.length ? 'high' : 'low'}">
-          <div class="kpi-label">AI Apps with Data Access</div>
-          <div class="kpi-value ${aiDataApps.length ? 'text-high' : 'text-low'}">${aiDataApps.length}</div>
-          <div class="kpi-delta">hold Files / Mail / Chat / Directory scopes</div>
-          <div class="kpi-icon">🤖</div>
-        </div>
-        <div class="kpi-card ${dataAgents.length ? 'high' : 'low'}">
-          <div class="kpi-label">Agents with Data Access</div>
-          <div class="kpi-value ${dataAgents.length ? 'text-high' : 'text-low'}">${dataAgents.length}</div>
-          <div class="kpi-delta">of ${agentSps.length} agents hold reach permissions</div>
-          <div class="kpi-icon">⚡</div>
-        </div>
-        <div class="kpi-card ${mailboxAiApps.length > 0 ? 'high' : 'low'}">
-          <div class="kpi-label">Mailbox Access (AI Apps)</div>
-          <div class="kpi-value ${mailboxAiApps.length > 0 ? 'text-high' : 'text-low'}">${mailboxAiApps.length}</div>
-          <div class="kpi-delta">${mailboxAiApps.length > 0 ? mailboxAiApps.slice(0,2).map(sp=>esc(sp.displayName)).join(', ')+(mailboxAiApps.length>2?'…':'') : '✅ No mailbox grants to AI apps'}</div>
-          <div class="kpi-icon">📧</div>
-        </div>
-        <div class="kpi-card ${dlpBlocks?.blocked ? 'critical' : 'low'}"${dlpBlocks?.ok ? ` style="cursor:pointer" onclick="document.getElementById('label-evidence-card')?.scrollIntoView({behavior:'smooth'})"` : ''}>
-          <div class="kpi-label">Blocked from AI by DLP</div>
-          <div class="kpi-value ${dlpBlocks?.blocked ? 'text-critical' : 'text-low'}">${dlpBlocks?.ok ? dlpBlocks.blocked : '—'}</div>
-          <div class="kpi-delta">${dlpBlocks?.ok ? (dlpBlocks.blocked ? `files stopped en route to AI (30d)${dlpBlocks.incidentCount ? ` · 🔺 ${dlpBlocks.incidentCount} incident${dlpBlocks.incidentCount!==1?'s':''}` : ''}` : '✅ none blocked (30d)') : 'needs ThreatHunting.Read.All'}</div>
-          <div class="kpi-icon">🚫</div>
-        </div>
-      </div>
-
-      <div id="data-reach-card" style="margin-bottom:16px">${renderDataReachabilityHtml(agentSps, grants, agentAppPerms, null)}</div>
-
-      <div class="grid-2">
-        <div class="card">
-          <div class="card-header"><div class="card-title">🔑 OAuth Scope Exposure (AI Apps)</div><span class="data-source source-live">● Live</span></div>
-          <div class="card-body">
-            ${topScopes.map(([scope, count]) => {
-              const isHigh = HIGH_RISK_SCOPES.includes(scope);
-              const color = isHigh ? 'var(--risk-critical)' : 'var(--accent-blue)';
-              const pct = Math.round(count / Math.max(topScopes[0][1],1) * 100);
-              return `<div class="progress-row">
-                <div class="progress-label" style="color:${isHigh?'var(--risk-high)':'var(--text-muted)'}">${isHigh?'⚠️ ':''}${esc(scope)}</div>
-                <div class="progress-bar-bg"><div class="progress-bar-fill" style="width:${pct}%;background:${color}"></div></div>
-                <div class="progress-val">${count}</div>
-              </div>`;
-            }).join('') || '<div class="empty-state text-muted">No scope data</div>'}
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-header"><div class="card-title">📤 Data Shared via AI (DLP)</div>${dlpBlocks?.ok ? '<span class="data-source source-live">● DeviceEvents · Advanced Hunting</span>' : ''}</div>
-          <div class="card-body">
-            ${dlpBlocks?.ok
-              ? (dlpBlocks.total ? `
-                <div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
-                  <div><span style="font-size:24px;font-weight:800;color:var(--risk-critical);line-height:1">${dlpBlocks.blocked}</span> <span style="font-size:11px;color:var(--text-muted)">blocked</span></div>
-                  ${dlpBlocks.total > dlpBlocks.blocked ? `<div><span style="font-size:24px;font-weight:800;color:var(--risk-medium);line-height:1">${dlpBlocks.total - dlpBlocks.blocked}</span> <span style="font-size:11px;color:var(--text-muted)">audited</span></div>` : ''}
-                  ${dlpBlocks.incidentCount ? `<div style="font-size:12px;color:var(--risk-critical);font-weight:700">🔺 ${dlpBlocks.incidentCount} incident${dlpBlocks.incidentCount!==1?'s':''}</div>` : ''}
-                </div>
-                <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
-                  ${Object.entries(dlpBlocks.byApp||{}).sort((a,b)=>b[1].total-a[1].total).map(([app,c])=>`<span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 10px;border-radius:20px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-muted)"><span style="color:var(--risk-critical)">🚫</span>${esc(app)} <strong style="color:var(--text-primary)">${c.blocked}</strong></span>`).join('')}
-                </div>
-                <div style="font-size:11px;color:var(--text-dim)">Files Purview DLP stopped on their way to an external AI app. Full evidence on ${navLink('labels','Purview Sensitivity Labels')} &amp; ${navLink('sharing','SharePoint/OneDrive Sharing')}.</div>
-              ` : `<div class="empty-state text-muted">${dlpBlocks.note ? esc(dlpBlocks.note) : '✅ No files blocked from AI by DLP in the last 30 days.'}<br><span style="font-size:11px">This is the enforcement proof for what AI could exfiltrate. Label &amp; sharing exposure on ${navLink('labels','Purview Sensitivity Labels')}.</span></div>`)
-              : `<div class="empty-state text-muted">${dlpBlocks?.code==='forbidden' ? '🔒 Needs <code>ThreatHunting.Read.All</code> to read DLP-to-AI block events.' : 'ℹ️ DLP block evidence unavailable in this tenant.'}<br><span style="font-size:11px">Label &amp; sharing exposure on ${navLink('labels','Purview Sensitivity Labels')} &amp; ${navLink('sharing','SharePoint/OneDrive Sharing')}.</span></div>`}
-          </div>
-        </div>
-      </div>
     `;
-
-    // Evidence-back the reachability matrix async — turns "potential" into
-    // "observed" for files/mail/Teams from CloudAppEvents.
-    fetchAiActivityEvidence(agentSps.map(sp => sp.appId)).then(ev => {
-      const card = document.getElementById('data-reach-card');
-      if (card) card.innerHTML = renderDataReachabilityHtml(agentSps, grants, agentAppPerms, ev);
-    }).catch(() => {});
 
     // Labelled-content evidence card (moved from the labels page). The DLP half
     // is already fetched; the accessed half needs label context, recomputed here
@@ -6472,7 +6219,33 @@ async function loadDataRisk() {
       const reachableHighSens = highSensLabels.filter(reachable);
       const protectionKnown = (labels || []).some(l => l.hasProtection !== undefined);
       const criticalExposure = protectionKnown ? reachableHighSens.filter(l => l.hasProtection !== true) : reachableHighSens;
-      return renderLabelledAccessEvidence(labels, highSensLabels, criticalExposure, [...appsWithLabeledAccess, ...aiApps]);
+      const candidates = [...appsWithLabeledAccess, ...aiApps];
+      return renderLabelledAccessEvidence(labels, highSensLabels, criticalExposure, candidates).then(() => {
+        // Headline KPIs from the evidence renderLabelledAccessEvidence just
+        // fetched (cached in STATE.data.aiFileEvidence — no second query).
+        const kAcc = document.getElementById('kpi-dr-accessed'), kAccSub = document.getElementById('kpi-dr-accessed-sub');
+        const kHs  = document.getElementById('kpi-dr-highsens'), kHsSub  = document.getElementById('kpi-dr-highsens-sub');
+        if (!kAcc || !kHs) return;
+        const evd = STATE.data.aiFileEvidence;
+        if (!evd?.ok) {
+          kAcc.textContent = '—'; kHs.textContent = '—';
+          const why = evd?.code === 'forbidden' ? 'needs ThreatHunting.Read.All' : 'evidence unavailable';
+          if (kAccSub) kAccSub.textContent = why;
+          if (kHsSub)  kHsSub.textContent  = why;
+          return;
+        }
+        const uniq = [...new Map(candidates.map(s => [s.id, s])).values()].filter(sp => sp.appId);
+        const rows = uniq.map(sp => evd.byAppId[(sp.appId || '').toLowerCase()]).filter(e => e && (e.labeledEvents || 0) > 0);
+        const totLabeled = rows.reduce((n, e) => n + (e.labeledEvents || 0), 0);
+        const highSet = new Set(highSensLabels.map(l => String(l.id).toLowerCase()));
+        const highTouched = [...new Set(rows.flatMap(e => e.labelIds || []))].filter(id => highSet.has(String(id).toLowerCase()));
+        kAcc.textContent = totLabeled;
+        kAcc.className = 'kpi-value ' + (totLabeled ? 'text-high' : 'text-low');
+        if (kAccSub) kAccSub.textContent = rows.length ? `labelled file events by ${rows.length} AI app${rows.length !== 1 ? 's' : ''}` : '✅ no labelled access observed (30d)';
+        kHs.textContent = highTouched.length;
+        kHs.className = 'kpi-value ' + (highTouched.length ? 'text-critical' : 'text-low');
+        if (kHsSub) kHsSub.textContent = highTouched.length ? 'high-sensitivity labels seen in AI events' : '✅ none touched by AI (30d)';
+      });
     }).catch(() => {});
   } catch (e) {
     el.innerHTML = permWarn('Multiple permissions', e.message);
@@ -8171,22 +7944,6 @@ async function loadExternalSharing() {
 
     // Per-app risk rows
     const allFileApps = [...new Map([...fileAiApps,...fileAgents].map(s=>[s.id,s])).values()];
-    const appRows = allFileApps.map(sp => {
-      const scopes   = getScopesForSp(sp.id, grants).filter(s => FILE_ACCESS_SCOPES.includes(s));
-      const canWrite = scopes.some(s => FILE_WRITE_SCOPES.includes(s));
-      const isAdmin  = grants.some(g => g.clientId===sp.id && g.consentType==='AllPrincipals');
-      const appRisk  = (anonEnabled && isAdmin) ? 'critical'
-                     : (anonEnabled || (isAdmin && canWrite)) ? 'high'
-                     : isAdmin ? 'medium' : 'low';
-      const scopeChips = scopes.map(s => {
-        const risky = FILE_WRITE_SCOPES.includes(s);
-        return `<span style="display:inline-block;margin:1px 2px;padding:1px 6px;border-radius:3px;font-size:10px;
-          background:${risky?'rgba(248,81,73,.12)':'rgba(56,139,253,.08)'};
-          color:${risky?'var(--risk-high)':'var(--accent-blue)'}">${esc(s)}</span>`;
-      }).join('');
-      return { sp, scopes, canWrite, isAdmin, appRisk, scopeChips };
-    }).sort((a,b) => ({'critical':4,'high':3,'medium':2,'low':1}[b.appRisk]||0) - ({'critical':4,'high':3,'medium':2,'low':1}[a.appRisk]||0));
-
     // SharePoint settings detail rows — each with a one-line "why this matters
     // for AI" so the settings table explains itself instead of just scoring.
     const settingRows = spSettings ? [
@@ -8286,50 +8043,10 @@ async function loadExternalSharing() {
           'No detected AI app or agent has Files/Sites permissions, so AI cannot read shared file content via Graph today.');
       })()}
 
-      <!-- Access/blocked evidence lives on the Data Risk page (labelled-content
-           evidence card); this page keeps the settings & grant reachability view. -->
+      <!-- Root cause — the tenant settings that widen what delegated AI access reaches -->
       <div class="card" style="margin-bottom:16px">
         <div class="card-header">
-          <div class="card-title">📂 1 · What AI Could Reach — Apps &amp; Agents with File Grants (${allFileApps.length})</div>
-          <span class="data-source source-derived">⚡ Derived from OAuth2 grants</span>
-        </div>
-        ${allFileApps.length ? `
-        <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">
-          These apps have been granted permission to access SharePoint/OneDrive files. Combined with the tenant sharing settings above, they can read (and in some cases write) any content the sharing policy allows.
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr>
-              <th>App / Agent</th>
-              <th>File Scopes</th>
-              <th>Consent</th>
-              <th>Write Access</th>
-              <th>Exposure Risk</th>
-            </tr></thead>
-            <tbody>${appRows.map(({sp, scopes, canWrite, isAdmin, appRisk, scopeChips}) => `<tr style="${appRisk==='critical'?'background:rgba(248,81,73,.04)':appRisk==='high'?'background:rgba(240,136,62,.03)':''}">
-              <td>
-                <strong style="font-size:13px">${esc(sp.displayName||'—')}</strong>
-                <span style="font-size:10px;color:var(--text-muted);margin-left:6px">${esc(getAgentType(sp).label || (isAiApp(sp)?'AI App':'SP'))}</span>
-                <br><span class="mono text-muted" style="font-size:10px">${esc((sp.appId||sp.id||'').slice(0,22))}…</span>
-              </td>
-              <td>${scopeChips}</td>
-              <td>${isAdmin
-                ? '<span class="badge badge-critical" style="font-size:10px">🏢 Admin (tenant-wide)</span>'
-                : '<span class="badge badge-medium" style="font-size:10px">👤 User delegated</span>'}</td>
-              <td style="text-align:center">${canWrite
-                ? '<span style="color:var(--risk-high);font-weight:600">✏️ Write</span>'
-                : '<span style="color:var(--risk-low)">👁️ Read</span>'}</td>
-              <td>${riskBadge(appRisk)}</td>
-            </tr>`).join('')}
-            </tbody>
-          </table>
-        </div>` : '<div class="card-body empty-state text-muted">✅ No AI apps or agents have SharePoint/OneDrive file access grants.</div>'}
-      </div>
-
-      <!-- 3 · Root cause — the tenant settings that widen what delegated AI access reaches -->
-      <div class="card" style="margin-bottom:16px">
-        <div class="card-header">
-          <div class="card-title">🌐 2 · Settings That Amplify Exposure${spSettings ? ` (${amplifiers.length} of ${settingRows.length} active)` : ''}</div>
+          <div class="card-title">🌐 SharePoint/OneDrive Sharing Settings${spSettings ? ` (${amplifiers.length} of ${settingRows.length} amplify exposure)` : ''}</div>
           <span class="data-source ${spSettings ? 'source-live' : 'source-derived'}" style="font-size:10px">
             ${spSettings ? '● admin/sharepoint/settings' : '⚡ needs SharePointTenantSettings.Read.All'}
           </span>
@@ -8347,7 +8064,7 @@ async function loadExternalSharing() {
           </table>
         </div>
         <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">
-          ℹ️ Source: <code>GET /admin/sharepoint/settings</code> · These settings grant AI nothing by themselves — they widen what the delegated access in section 2 can reach.
+          ℹ️ Source: <code>GET /admin/sharepoint/settings</code> · These settings grant AI nothing by themselves — they widen what delegated AI file access can reach.
         </div>
         ` : `
         <div class="card-body">
@@ -8738,52 +8455,6 @@ async function loadSensitivityLabels() {
         </div>
       </div>` : ''}
 
-      <!-- Purview DLP for AI — enforcement counterpart to labels (moved from Compliance) -->
-      <div class="card" style="margin-bottom:16px">
-        <div class="card-header">
-          <div class="card-title">🛡️ Purview DLP for AI — Coverage</div>
-          ${dlpScope?.ok
-            ? (dlpScope.configured
-                ? `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(63,185,80,.12);color:var(--risk-low);border:1px solid rgba(63,185,80,.3)">✅ DLP policies active</span>`
-                : `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.12);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">⚠️ No DLP scope returned</span>`)
-            : `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.12);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">${dlpScope?.code === 'forbidden' ? '🔒 Needs ProtectionScopes.Compute.User' : dlpScope?.code === 'unsupported' ? 'ℹ️ Not onboarded' : '⚠️ Manual check required'}</span>`}
-        </div>
-        <div class="card-body">
-          <p style="font-size:12px;color:var(--text-muted);margin-bottom:14px">
-            Labels <strong>classify</strong> content; Purview <strong>DLP enforces</strong> what can flow to AI apps (e.g. blocking pasted secrets into ChatGPT, or restricting Microsoft 365 Copilot prompts by sensitivity label). This is a <strong>coverage signal</strong>: it reads whether DLP / collection policies are active for the signed-in user via the Purview <code>protectionScopes/compute</code> API — it does <em>not</em> expose policy definitions (those are PowerShell-only).
-          </p>
-          ${dlpScope?.ok
-            ? `<div style="padding:9px 12px;border-radius:6px;background:${dlpScope.configured ? 'rgba(63,185,80,.08)' : 'rgba(240,136,62,.08)'};border:1px solid ${dlpScope.configured ? 'rgba(63,185,80,.25)' : 'rgba(240,136,62,.25)'};font-size:12px;color:var(--text-muted)">
-                ${dlpScope.configured ? '✅' : '⚠️'} <strong style="color:${dlpScope.configured ? 'var(--risk-low)' : 'var(--risk-medium)'}">${dlpScope.configured
-                    ? `DLP / collection policies apply to this user (${dlpScope.total} scope${dlpScope.total !== 1 ? 's' : ''}).`
-                    : 'No DLP or collection policy scope returned for this user.'}</strong>
-                ${dlpScope.configured
-                    ? `${dlpScope.inline ? 'Includes <strong>real-time (inline)</strong> evaluation. ' : 'Offline evaluation only. '}${dlpScope.blocking ? 'At least one policy <strong>blocks/restricts</strong> activity.' : 'No blocking action in scope.'}`
-                    : 'Either no DLP policy targets this account, or the tenant isn’t onboarded to Purview data security for AI.'}
-                <span class="data-source source-live" style="font-size:10px;margin-left:6px">● /me/dataSecurityAndGovernance/protectionScopes/compute</span>
-              </div>`
-            : `<div style="display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid rgba(48,54,61,.4)">
-                <div>
-                  <span style="font-size:12px;font-weight:600;color:var(--text-primary)">DLP-for-AI coverage unknown</span>
-                  <span style="font-size:11px;color:var(--text-muted);margin-left:8px">${dlpScope?.code === 'forbidden'
-                      ? 'Grant the scope and re-run admin consent to read live coverage.'
-                      : dlpScope?.code === 'unsupported'
-                        ? 'Tenant not onboarded to Purview data security for AI (preview).'
-                        : 'Could not read protection scope.'}</span>
-                </div>
-                <a href="https://purview.microsoft.com/datasecurityposturemanagement" target="_blank"
-                  style="font-size:11px;padding:2px 10px;border-radius:10px;background:rgba(240,136,62,.1);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25);text-decoration:none">
-                  ${dlpScope?.code === 'forbidden' ? '🔒 Grant ProtectionScopes.Compute.User' : '⚠️ Check in Purview →'}
-                </a>
-              </div>`}
-          <div style="margin-top:12px;font-size:11px;color:var(--text-dim)">
-            📍 Purview portal → Data Loss Prevention → Policies (<em>Microsoft 365 Copilot</em> &amp; <em>Devices / generative-AI</em> locations). Policy definitions are managed via <code>Get-DlpCompliancePolicy</code> (Security &amp; Compliance PowerShell).
-            &nbsp;·&nbsp;
-            <a href="https://learn.microsoft.com/en-us/purview/dlp-microsoft365-copilot-location-learn-about" target="_blank" style="color:var(--accent-blue)">Documentation →</a>
-          </div>
-        </div>
-      </div>
-
       <div class="card">
         <div class="card-header"><div class="card-title">🔐 Sensitivity Label Security Guidance</div></div>
         <div class="card-body">
@@ -8833,12 +8504,19 @@ async function loadSensitivityLabels() {
             const defaultResolved = canDetermineDefault;
             const mandatoryResolved = isMandatoryDoc !== undefined;
             const bothResolved = (defaultResolved || kqlPolicy?.ok) && (mandatoryResolved || kqlPolicy?.ok);
-            const resolvedCard = (icon, title, valueHtml, sourceLabel) => `
-              <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:14px">
-                <div style="font-weight:600;font-size:12px;margin-bottom:6px">${icon} ${title}</div>
-                <div style="font-size:13px;font-weight:700;margin-bottom:6px">${valueHtml}</div>
+            // Bold verdict cards: green/red rail + tinted background so the two
+            // policy verdicts read at a glance instead of blending into the page.
+            const resolvedCard = (icon, title, valueHtml, sourceLabel, state) => {
+              const col = state === 'ok' ? 'var(--risk-low)' : state === 'bad' ? 'var(--risk-critical)' : 'var(--text-muted)';
+              const bg  = state === 'ok' ? 'rgba(63,185,80,.09)' : state === 'bad' ? 'rgba(248,81,73,.09)' : 'var(--bg-secondary)';
+              const bd  = state === 'ok' ? 'rgba(63,185,80,.4)'  : state === 'bad' ? 'rgba(248,81,73,.45)' : 'var(--border)';
+              return `
+              <div style="background:${bg};border:1px solid ${bd};border-left:4px solid ${col};border-radius:10px;padding:16px 18px;box-shadow:0 2px 10px rgba(0,0,0,.25)">
+                <div style="font-weight:700;font-size:11px;margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted)">${icon} ${title}</div>
+                <div style="font-size:17px;font-weight:800;margin-bottom:8px;line-height:1.25">${valueHtml}</div>
                 <div class="data-source source-live" style="font-size:10px">● Read from ${esc(sourceLabel)}</div>
               </div>`;
+            };
             const defaultManualCard = `
               <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:14px">
                 <div style="font-weight:600;font-size:12px;margin-bottom:6px">🎯 Default label for documents</div>
@@ -8871,14 +8549,16 @@ async function loadSensitivityLabels() {
                     : kqlPolicy.totalEvents > 0
                       ? `<span style="color:var(--risk-high)">⚠️ Non-compliant — no default label activity</span>`
                       : `<span style="color:var(--text-muted)">ℹ️ No label events in 30 days — verify in Purview</span>`,
-                  _kqlSrc + ' · KQL')
+                  _kqlSrc + ' · KQL',
+                  kqlPolicy?.defaultCount > 0 ? 'ok' : kqlPolicy?.totalEvents > 0 ? 'bad' : 'unknown')
               : defaultManualCard;
             const defaultCardHtml = defaultResolved
               ? resolvedCard('🎯', 'Default label for documents',
                   hasDefaultLabel
                     ? `<span style="color:var(--risk-low)">✅ Compliant — ${esc(defaultLabelName)}</span>`
                     : `<span style="color:var(--risk-high)">⚠️ Non-compliant — no default label set</span>`,
-                  STATE.data.mipPolicySettingsSource || 'sensitivity labels · isDefault')
+                  STATE.data.mipPolicySettingsSource || 'sensitivity labels · isDefault',
+                  hasDefaultLabel ? 'ok' : 'bad')
               : defaultManualCard;
             const kqlMandatoryCard = kqlPolicy?.ok
               ? resolvedCard('🔒', 'Mandatory labelling',
@@ -8887,14 +8567,16 @@ async function loadSensitivityLabels() {
                     : kqlPolicy.totalEvents > 0
                       ? `<span style="color:var(--risk-high)">⚠️ Non-compliant — not enforced</span>`
                       : `<span style="color:var(--text-muted)">ℹ️ No label events in 30 days — verify in Purview</span>`,
-                  _kqlSrc + ' · KQL')
+                  _kqlSrc + ' · KQL',
+                  kqlPolicy?.mandatoryCount > 0 ? 'ok' : kqlPolicy?.totalEvents > 0 ? 'bad' : 'unknown')
               : mandatoryManualCard;
             const mandatoryCardHtml = mandatoryResolved
               ? resolvedCard('🔒', 'Mandatory labelling',
                   isMandatoryDoc
                     ? `<span style="color:var(--risk-low)">✅ Compliant — required</span>`
                     : `<span style="color:var(--risk-high)">⚠️ Non-compliant — not required</span>`,
-                  STATE.data.mipPolicySettingsSource || 'policy settings')
+                  STATE.data.mipPolicySettingsSource || 'policy settings',
+                  isMandatoryDoc ? 'ok' : 'bad')
               : kqlMandatoryCard;
             const intro = kqlPolicy?.ok
               ? `Policy settings checked via KQL (InformationProtectionEvents, last 30 days)${(defaultResolved || mandatoryResolved) ? ' and Purview label-policy settings.' : '.'}`
@@ -8913,6 +8595,52 @@ async function loadSensitivityLabels() {
           })()}
         </div>
       </div>
+      <!-- Purview DLP for AI — enforcement counterpart — after the guidance card per page priority -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">🛡️ Purview DLP for AI — Coverage</div>
+          ${dlpScope?.ok
+            ? (dlpScope.configured
+                ? `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(63,185,80,.12);color:var(--risk-low);border:1px solid rgba(63,185,80,.3)">✅ DLP policies active</span>`
+                : `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.12);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">⚠️ No DLP scope returned</span>`)
+            : `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(240,136,62,.12);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25)">${dlpScope?.code === 'forbidden' ? '🔒 Needs ProtectionScopes.Compute.User' : dlpScope?.code === 'unsupported' ? 'ℹ️ Not onboarded' : '⚠️ Manual check required'}</span>`}
+        </div>
+        <div class="card-body">
+          <p style="font-size:12px;color:var(--text-muted);margin-bottom:14px">
+            Labels <strong>classify</strong> content; Purview <strong>DLP enforces</strong> what can flow to AI apps (e.g. blocking pasted secrets into ChatGPT, or restricting Microsoft 365 Copilot prompts by sensitivity label). This is a <strong>coverage signal</strong>: it reads whether DLP / collection policies are active for the signed-in user via the Purview <code>protectionScopes/compute</code> API — it does <em>not</em> expose policy definitions (those are PowerShell-only).
+          </p>
+          ${dlpScope?.ok
+            ? `<div style="padding:9px 12px;border-radius:6px;background:${dlpScope.configured ? 'rgba(63,185,80,.08)' : 'rgba(240,136,62,.08)'};border:1px solid ${dlpScope.configured ? 'rgba(63,185,80,.25)' : 'rgba(240,136,62,.25)'};font-size:12px;color:var(--text-muted)">
+                ${dlpScope.configured ? '✅' : '⚠️'} <strong style="color:${dlpScope.configured ? 'var(--risk-low)' : 'var(--risk-medium)'}">${dlpScope.configured
+                    ? `DLP / collection policies apply to this user (${dlpScope.total} scope${dlpScope.total !== 1 ? 's' : ''}).`
+                    : 'No DLP or collection policy scope returned for this user.'}</strong>
+                ${dlpScope.configured
+                    ? `${dlpScope.inline ? 'Includes <strong>real-time (inline)</strong> evaluation. ' : 'Offline evaluation only. '}${dlpScope.blocking ? 'At least one policy <strong>blocks/restricts</strong> activity.' : 'No blocking action in scope.'}`
+                    : 'Either no DLP policy targets this account, or the tenant isn’t onboarded to Purview data security for AI.'}
+                <span class="data-source source-live" style="font-size:10px;margin-left:6px">● /me/dataSecurityAndGovernance/protectionScopes/compute</span>
+              </div>`
+            : `<div style="display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid rgba(48,54,61,.4)">
+                <div>
+                  <span style="font-size:12px;font-weight:600;color:var(--text-primary)">DLP-for-AI coverage unknown</span>
+                  <span style="font-size:11px;color:var(--text-muted);margin-left:8px">${dlpScope?.code === 'forbidden'
+                      ? 'Grant the scope and re-run admin consent to read live coverage.'
+                      : dlpScope?.code === 'unsupported'
+                        ? 'Tenant not onboarded to Purview data security for AI (preview).'
+                        : 'Could not read protection scope.'}</span>
+                </div>
+                <a href="https://purview.microsoft.com/datasecurityposturemanagement" target="_blank"
+                  style="font-size:11px;padding:2px 10px;border-radius:10px;background:rgba(240,136,62,.1);color:var(--risk-medium);border:1px solid rgba(240,136,62,.25);text-decoration:none">
+                  ${dlpScope?.code === 'forbidden' ? '🔒 Grant ProtectionScopes.Compute.User' : '⚠️ Check in Purview →'}
+                </a>
+              </div>`}
+          <div style="margin-top:12px;font-size:11px;color:var(--text-dim)">
+            📍 Purview portal → Data Loss Prevention → Policies (<em>Microsoft 365 Copilot</em> &amp; <em>Devices / generative-AI</em> locations). Policy definitions are managed via <code>Get-DlpCompliancePolicy</code> (Security &amp; Compliance PowerShell).
+            &nbsp;·&nbsp;
+            <a href="https://learn.microsoft.com/en-us/purview/dlp-microsoft365-copilot-location-learn-about" target="_blank" style="color:var(--accent-blue)">Documentation →</a>
+          </div>
+        </div>
+      </div>
+
     `;
 
   } catch (e) {
