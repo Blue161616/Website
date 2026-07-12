@@ -9096,6 +9096,7 @@ async function loadMcpServers() {
 
       <!-- AgentsInfo-attached MCP servers (Microsoft Learn MCP etc.) fill in here -->
       <div id="mcp-agents-slot"></div>
+      <div id="mcp-mal-slot"><div class="section-loading"><span class="spinner"></span>Running malicious-MCP indicator checks…</div></div>
 
       <div class="card">
         <div class="card-header">
@@ -9138,6 +9139,9 @@ async function loadMcpServers() {
 
     // Initial render of the table (with default sort: risk desc)
     renderMcpTable();
+
+    // Malicious-MCP indicator checks — async, fills #mcp-mal-slot
+    renderMcpMaliciousIndicators(uniqueMcp, grants).catch(() => {});
 
     // MCP servers ATTACHED TO AGENTS — Defender AgentsInfo (McpServers column).
     // A different lens than the SP registry above: Copilot Studio attachments
@@ -9206,6 +9210,133 @@ async function loadMcpServers() {
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
   }
+}
+
+// ── Malicious-MCP indicator checks ─────────────────────────────────────────
+// Heuristics for the MCP threat classes that ARE detectable from identity and
+// telemetry data: name shadowing, over-consent, consent-rush after creation,
+// and off-hours runtime activity. Tool poisoning and rug pulls live in the
+// tool MANIFEST, which no Graph API exposes — the footer says so explicitly
+// rather than implying coverage.
+async function renderMcpMaliciousIndicators(mcpSps, grants) {
+  const slot = document.getElementById('mcp-mal-slot');
+  if (!slot) return;
+  const MS_ORGS = new Set(['f8cdef31-a31e-4b4a-93e4-5f571e91255a', '72f988bf-86f1-41af-91ab-2d7cd011db47']);
+  const ownTenant = (STATE.data.org?.id || STATE.account?.tenantId || '').toLowerCase();
+  const isExternal = sp => { const o = (sp.appOwnerOrganizationId || '').toLowerCase(); return !!o && !MS_ORGS.has(o) && o !== ownTenant; };
+  const parseArr = v => { let d = v; if (typeof d === 'string') { try { d = JSON.parse(d); } catch { d = [d]; } } return Array.isArray(d) ? d.map(String).filter(Boolean) : []; };
+
+  // 1 — Name shadowing: same distinctive tokens, different app registration.
+  // "Claude Sentinel MCP Server" vs "Microsoft Sentinel MCP Claude" occupy the
+  // same mental slot — the classic typosquat/shadow pattern.
+  const STOP = new Set(['mcp', 'server', 'servers', 'microsoft', 'agent', 'the', 'for']);
+  const sig = n => String(n || '').toLowerCase().replace(/\(.*?\)/g, '').split(/[^a-z0-9]+/).filter(t => t.length > 2 && !STOP.has(t)).sort().join('·');
+  const bySig = new Map();
+  mcpSps.forEach(sp => { const s = sig(sp.displayName); if (!s) return; if (!bySig.has(s)) bySig.set(s, []); bySig.get(s).push(sp); });
+  const dupGroups = [...bySig.values()].filter(v => v.length > 1);
+
+  // 2 — External publisher holding tenant-wide admin consent.
+  const extWide = mcpSps.filter(sp => isExternal(sp) && grants.some(g => g.clientId === sp.id && g.consentType === 'AllPrincipals'));
+
+  // 3 — Consent granted within 48h of SP creation (AuditLogs) — attacker-planted
+  // apps typically get consented immediately; organic apps rarely do.
+  const nameById = new Map(mcpSps.map(sp => [sp.id, sp]));
+  const nameLc = new Map(mcpSps.map(sp => [(sp.displayName || '').toLowerCase(), sp]));
+  const consentP = (async () => {
+    const d = await gget(`${GRAPH}/auditLogs/directoryAudits?$filter=activityDisplayName eq 'Consent to application'&$top=50`);
+    const per = new Map();
+    (d.value || []).forEach(ev => {
+      (ev.targetResources || []).forEach(t => {
+        const sp = nameById.get(t.id) || nameLc.get((t.displayName || '').toLowerCase());
+        if (!sp) return;
+        const created = sp.createdDateTime ? new Date(sp.createdDateTime) : null;
+        const when = new Date(ev.activityDateTime);
+        const hrs = created ? Math.round((when - created) / 3600000) : null;
+        const h = { sp, when, hrs, rush: hrs !== null && hrs >= 0 && hrs <= 48, by: ev.initiatedBy?.user?.userPrincipalName || '—' };
+        const k = sp.id;
+        if (!per.has(k) || when < per.get(k).when) per.set(k, h);
+      });
+    });
+    return [...per.values()];
+  })();
+
+  // 4 — Off-hours runtime activity by the MCP identity (CloudAppEvents, UTC).
+  const offP = (async () => {
+    const ids = [...new Set(mcpSps.map(sp => (sp.appId || '').toLowerCase()).filter(Boolean))].slice(0, 40);
+    if (!ids.length) return { rows: [] };
+    const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
+    if (!token) return { error: 'needs ThreatHunting.Read.All' };
+    const kql = [
+      'CloudAppEvents', '| where Timestamp > ago(30d)',
+      '| extend AppId = tolower(tostring(RawEventData.ApplicationId))',
+      `| where AppId in (${ids.map(i => `"${i}"`).join(',')})`,
+      '| extend Hr = hourofday(Timestamp)',
+      '| summarize Events = count(), OffHours = countif(Hr >= 20 or Hr < 5), Actions = make_set(ActionType, 12), LastSeen = max(Timestamp) by AppId',
+    ].join(' ');
+    const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ Query: kql, Timespan: 'P30D' }),
+    });
+    if (!r.ok) return { error: (await r.text()).slice(0, 160) };
+    const data = await r.json();
+    return { rows: Array.isArray(data.results) ? data.results : (Array.isArray(data.Results) ? data.Results : []) };
+  })();
+
+  const [consentRes, offRes] = await Promise.allSettled([consentP, offP]);
+  const consents = consentRes.status === 'fulfilled' ? consentRes.value : null;
+  const consentErr = consentRes.status === 'rejected' ? String(consentRes.reason?.message || consentRes.reason).slice(0, 140) : null;
+  const off = offRes.status === 'fulfilled' ? offRes.value : { error: String(offRes.reason?.message || offRes.reason).slice(0, 140) };
+  const rush = (consents || []).filter(h => h.rush);
+  const offByApp = new Map((off.rows || []).map(r => [String(r.AppId || '').toLowerCase(), r]));
+  const offFlagged = mcpSps.map(sp => ({ sp, r: offByApp.get((sp.appId || '').toLowerCase()) })).filter(x => x.r && Number(x.r.OffHours) > 0);
+
+  const chip = sp => `<strong>${esc(sp.displayName || '—')}</strong> <span class="mono text-muted" style="font-size:10px">${esc((sp.appId || sp.id || '').slice(0, 18))}…</span>`;
+  const checkRow = (icon, sev, title, desc, n, err, bodyHtml) => {
+    const col = { critical: 'var(--risk-critical)', high: 'var(--risk-high)', medium: 'var(--risk-medium)' }[sev] || 'var(--text-muted)';
+    const badge = err
+      ? `<span class="badge" style="font-size:10px;background:var(--bg-hover);color:var(--text-dim)" title="${esc(err)}">n/a</span>`
+      : n === 0
+        ? '<span class="badge badge-low" style="font-size:10px">✅ 0</span>'
+        : `<span class="badge" style="font-size:10px;background:${col};color:#fff">${n} flagged</span>`;
+    return `<details${n > 0 ? ' open' : ''} style="border-bottom:1px solid rgba(48,54,61,.5)">
+      <summary style="display:flex;align-items:center;gap:10px;padding:10px 16px;cursor:pointer;list-style:none">
+        <span style="width:3px;align-self:stretch;border-radius:2px;background:${col};flex-shrink:0"></span>
+        <span style="font-size:15px">${icon}</span>
+        <span style="flex:1;min-width:0">
+          <span style="font-size:13px;font-weight:600;display:block">${esc(title)}</span>
+          <span style="font-size:11px;color:var(--text-muted)">${esc(desc)}</span>
+        </span>
+        ${badge}
+      </summary>
+      <div style="padding:2px 16px 12px 32px;font-size:12px">${bodyHtml || (err ? `<span style="color:var(--text-dim)">${esc(err)}</span>` : '<span style="color:var(--risk-low)">✅ Nothing flagged.</span>')}</div>
+    </details>`;
+  };
+
+  slot.innerHTML = `<div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <div class="card-title">🕵️ Malicious-MCP Indicators</div>
+      <span class="data-source source-live" style="font-size:10px">● Entra grants · directoryAudits · CloudAppEvents</span>
+    </div>
+    ${checkRow('👥', 'high', 'Name shadowing / confusable servers',
+      'Different app registrations whose names collapse to the same distinctive words — the typosquat pattern that binds agents or users to the wrong server.',
+      dupGroups.length, null,
+      dupGroups.length ? dupGroups.map(g => `<div style="padding:4px 0">${g.map(sp => `${chip(sp)} <span style="font-size:10px;color:${isExternal(sp) ? 'var(--risk-high)' : 'var(--text-dim)'}">${isExternal(sp) ? 'external' : 'internal/MS'}</span>`).join(' <span style="color:var(--text-dim)">↔</span> ')}</div>`).join('') : '')}
+    ${checkRow('🔓', 'high', 'External publisher with tenant-wide consent',
+      'An MCP server from another tenant that every user in this tenant silently trusts — the widest possible blast radius if it turns malicious.',
+      extWide.length, null,
+      extWide.length ? extWide.map(sp => `<div style="padding:3px 0">${chip(sp)} · admin-consented for all users</div>`).join('') : '')}
+    ${checkRow('⏱️', 'critical', 'Consent granted within 48h of creation',
+      'Attacker-planted apps typically get consented immediately after registration; organically adopted apps rarely do (last 50 consent events checked).',
+      consents === null ? null : rush.length, consentErr || (consents === null ? 'audit log unavailable' : null),
+      rush.length ? rush.map(h => `<div style="padding:3px 0">${chip(h.sp)} · consented <strong>${h.hrs}h</strong> after creation on ${h.when.toLocaleDateString()} by ${esc(h.by)}</div>`).join('') : '')}
+    ${checkRow('🌙', 'medium', 'Off-hours activity (20:00–05:00 UTC)',
+      'MCP identities performing Office 365 operations outside working hours — worth explaining for any human-triggered tool (30d, CloudAppEvents).',
+      off.error ? null : offFlagged.length, off.error || null,
+      offFlagged.length ? offFlagged.map(({ sp, r }) => `<div style="padding:3px 0">${chip(sp)} · <strong>${r.OffHours}</strong> of ${r.Events} events off-hours · ${parseArr(r.Actions).slice(0, 4).map(esc).join(', ')} · last ${r.LastSeen ? new Date(r.LastSeen).toLocaleDateString() : '—'}</div>`).join('') : '')}
+    <div style="padding:8px 16px;font-size:11px;color:var(--text-dim)">
+      ⚠️ Not covered by any API: <strong>tool poisoning</strong> (hidden instructions in tool descriptions) and <strong>rug pulls</strong> (manifest changes after approval) — review tool manifests at onboarding and diff them on change. <a href="https://learn.microsoft.com/en-us/security/ai-security/mcp-security" target="_blank" rel="noopener" style="color:var(--accent-blue)">MCP security guidance ↗</a>
+    </div>
+  </div>`;
 }
 
 // ── CONSENT HISTORY TIMELINE ──────────────────────────────────────────────
