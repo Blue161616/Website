@@ -9140,58 +9140,66 @@ async function loadMcpServers() {
     // MCP servers ATTACHED TO AGENTS — Defender AgentsInfo (McpServers column).
     // A different lens than the SP registry above: Copilot Studio attachments
     // (Microsoft Learn / Sentinel / Triage MCP …) never appear as Entra service
-    // principals, so without this the page misses them entirely. Cached — no
-    // extra query when the AI Agents or Agent 365 Security page already ran.
-    fetchAiAgentInventory().then(inv => {
+    // principals, so without this the page misses them entirely. Aggregated
+    // SERVER-SIDE: the cached inventory is an arbitrary take-500 row sample,
+    // which silently under-reports on tenants with many AgentsInfo snapshots.
+    (async () => {
       const slot = document.getElementById('mcp-agents-slot');
-      if (!slot || !inv?.ok) return;
-      // Raw take-500 rows: dedupe per agent keeping the newest snapshot row.
-      const latest = new Map();
-      (inv.rows || []).forEach(r => {
-        const id = String(r.AgentId || r.Name || '');
-        if (!id) return;
-        const prev = latest.get(id);
-        if (!prev || new Date(r.Timestamp || 0) > new Date(prev.Timestamp || 0)) latest.set(id, r);
-      });
-      const byServer = new Map();
-      latest.forEach(r => {
-        if (String(r.LifecycleStatus || '') === 'Deleted') return;
-        let arr = r.McpServers;
-        if (typeof arr === 'string') { try { arr = JSON.parse(arr); } catch { arr = []; } }
-        if (!Array.isArray(arr)) return;
-        arr.forEach(m => {
-          const name = String((m && (m.name || m.Name)) || '').trim();
-          if (!name) return;
-          const e = byServer.get(name) || { name, agents: new Set(), platforms: new Set() };
-          e.agents.add(String(r.Name || 'agent'));
-          if (r.Platform) e.platforms.add(String(r.Platform));
-          byServer.set(name, e);
+      if (!slot) return;
+      const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
+      if (!token) return;
+      const kql = [
+        'AgentsInfo',
+        '| summarize arg_max(Timestamp, *) by AgentId',
+        '| where LifecycleStatus != "Deleted"',
+        '| where array_length(McpServers) > 0',
+        '| mv-expand Mcp = McpServers',
+        '| extend McpName = tostring(Mcp.name)',
+        '| where isnotempty(McpName)',
+        '| summarize Agents = make_set(Name, 50), Platforms = make_set(Platform, 10), AgentCount = dcount(AgentId) by McpName',
+        '| order by AgentCount desc',
+      ].join(' ');
+      try {
+        const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+          method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ Query: kql, Timespan: 'P30D' }),
         });
-      });
-      if (!byServer.size) return;
-      const rows = [...byServer.values()].sort((a, b) => b.agents.size - a.agents.size);
-      slot.innerHTML = `<div class="card" style="margin-top:16px">
-        <div class="card-header">
-          <div class="card-title">🧩 MCP Servers Attached to Agents (${rows.length})</div>
-          <span class="data-source source-live" style="font-size:10px">● AgentsInfo (McpServers) · Advanced Hunting (P30D)</span>
-        </div>
-        <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">
-          Declared inside agent configurations (Copilot Studio etc.) — these don&#39;t exist as Entra service principals, so the registry above can&#39;t see them. Same source as the 🔌 posture check on the AI Agents page.
-        </div>
-        <div class="table-wrap" style="max-height:320px;overflow-y:auto">
-          <table>
-            <thead><tr><th>MCP Server</th><th>Used by</th><th>Agents</th><th>Platforms</th></tr></thead>
-            <tbody>${rows.map(s => { const ag = [...s.agents]; return `<tr>
-              <td><strong style="font-size:13px">${esc(s.name)}</strong></td>
-              <td style="font-weight:700">${ag.length} agent${ag.length !== 1 ? 's' : ''}</td>
-              <td style="font-size:11px;color:var(--text-muted)" title="${esc(ag.join(', '))}">${ag.slice(0, 3).map(esc).join(', ')}${ag.length > 3 ? ` +${ag.length - 3}` : ''}</td>
-              <td style="font-size:12px;color:var(--text-muted)">${[...s.platforms].map(esc).join(', ') || '—'}</td>
-            </tr>`; }).join('')}
-            </tbody>
-          </table>
-        </div>
-      </div>`;
-    }).catch(() => {});
+        if (!r.ok) throw new Error((await r.text()).slice(0, 200));
+        const data = await r.json();
+        const rows = Array.isArray(data.results) ? data.results : (Array.isArray(data.Results) ? data.Results : []);
+        const parseArr = v => { let d = v; if (typeof d === 'string') { try { d = JSON.parse(d); } catch { d = [d]; } } return Array.isArray(d) ? d.map(String).filter(Boolean) : []; };
+        if (!rows.length) {
+          slot.innerHTML = `<div class="card" style="margin-bottom:16px"><div class="card-body" style="font-size:12px;color:var(--text-muted)">✅ No MCP servers declared inside agent configurations (AgentsInfo · 30d).</div></div>`;
+          return;
+        }
+        slot.innerHTML = `<div class="card" style="margin-bottom:16px">
+          <div class="card-header">
+            <div class="card-title">🧩 MCP Servers Attached to Agents (${rows.length})</div>
+            <span class="data-source source-live" style="font-size:10px">● AgentsInfo (McpServers) · Advanced Hunting (P30D)</span>
+          </div>
+          <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">
+            Declared inside agent configurations (Copilot Studio etc.) — these don&#39;t exist as Entra service principals, so the registry above can&#39;t see them. Same source as the 🔌 posture check on the AI Agents page.
+          </div>
+          <div class="table-wrap" style="max-height:320px;overflow-y:auto">
+            <table>
+              <thead><tr><th>MCP Server</th><th>Used by</th><th>Agents</th><th>Platforms</th></tr></thead>
+              <tbody>${rows.map(row => {
+                const ag = parseArr(row.Agents), pf = parseArr(row.Platforms);
+                const n = Number(row.AgentCount) || ag.length;
+                return `<tr>
+                <td><strong style="font-size:13px">${esc(String(row.McpName || '—'))}</strong></td>
+                <td style="font-weight:700">${n} agent${n !== 1 ? 's' : ''}</td>
+                <td style="font-size:11px;color:var(--text-muted)" title="${esc(ag.join(', '))}">${ag.slice(0, 3).map(esc).join(', ')}${ag.length > 3 ? ` +${ag.length - 3}` : ''}</td>
+                <td style="font-size:12px;color:var(--text-muted)">${pf.map(esc).join(', ') || '—'}</td>
+              </tr>`; }).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>`;
+      } catch (e) {
+        slot.innerHTML = `<div class="card" style="margin-bottom:16px"><div class="card-body" style="font-size:12px;color:var(--text-muted)">ℹ️ Agent-attached MCP servers unavailable — ${esc(String(e.message || e).slice(0, 160))}</div></div>`;
+      }
+    })();
 
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
