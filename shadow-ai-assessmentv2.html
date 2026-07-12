@@ -2150,7 +2150,7 @@ async function fetchDlpAiBlocks() {
     const incByApp = {};
     incidents.forEach(i => { i.sec = secKey(i.time); (incByApp[i.app] = incByApp[i.app] || []).push(i); });
     const matchInc = ev => {
-      const list = incByApp[ev.app] || (ev.app === 'AI app' ? incByApp['AI app'] : null) || [];
+      const list = incByApp[ev.app] || [];
       const esec = secKey(ev.time);
       const fname = ev.file && ev.file !== '—' ? ev.file.toLowerCase() : null;
       let best = null, bestScore = -Infinity;
@@ -2184,28 +2184,7 @@ async function fetchDlpAiBlocks() {
         sit: sitNames(row.SensitiveInfoTypeInfo ?? row.SensitiveInfoTypes),
         action, blocked, app, incident: false, severity: '', category: '',
       };
-      // Endpoint block rows usually lack the file name and policy; the DLP incident
-      // the same block raised has both in its title — borrow them when they line up.
-      const inc = matchInc(ev);
-      if (inc) {
-        inc._used = true;
-        ev.incident = true;
-        ev.severity = inc.severity || ev.severity;
-        ev.category = inc.category || ev.category;
-        if ((ev.file === '—' || !ev.file) && inc.file) ev.file = inc.file;
-        if (!ev.policy && inc.policy) ev.policy = inc.policy;
-      }
       return ev;
-    });
-    // Incidents with no matching endpoint row still belong on the list — the raw
-    // block may live in a table we can't read, but the incident proves it happened.
-    incidents.forEach(i => {
-      if (i._used) return;
-      events.push({
-        time: i.time, user: '—', file: i.file || '—', device: '',
-        policy: i.policy || '', action: 'DLP policy matched', blocked: true,
-        app: i.app, incident: true, severity: i.severity || '', category: i.category || '',
-      });
     });
     // DataSecurityEvents only carries SensitivityLabelId — resolve the GUID to the
     // label's display name via the labels the app already fetches (cached). Even
@@ -2221,16 +2200,40 @@ async function fetchDlpAiBlocks() {
     }
     // Dedupe: one user action is recorded as several rows (e.g. "File copied to
     // cloud" + "DLP rule matched") — collapse by time+user+device+file+app, keeping
-    // a blocked (then incident-flagged) variant over an audited one. Time is
+    // the blocked variant over an audited one. Time is
     // truncated to whole seconds: the rows share a second but differ in sub-second
     // precision, which would otherwise defeat the key.
-    const better = (e, prev) => !prev || (e.blocked && !prev.blocked) || (e.incident && !prev.incident);
+    const better = (e, prev) => !prev || (e.blocked && !prev.blocked);
     const seen = new Map();
     events.forEach(e => {
       const key = [secKey(e.time), e.user, e.device, e.file, e.app].join('|');
       if (better(e, seen.get(key))) seen.set(key, e);
     });
-    const deduped = [...seen.values()].sort((a, b) => new Date(b.time) - new Date(a.time));
+    const deduped = [...seen.values()];
+    // Incident enrichment AFTER dedupe: borrowing the incident's file/policy onto
+    // a row before collapsing would change that row's dedupe key and leave its
+    // sub-second siblings behind as duplicates (one upload → two visible rows).
+    deduped.forEach(ev => {
+      const inc = matchInc(ev);
+      if (!inc) return;
+      inc._used = true;
+      ev.incident = true;
+      ev.severity = inc.severity || ev.severity;
+      ev.category = inc.category || ev.category;
+      if ((ev.file === '—' || !ev.file) && inc.file) ev.file = inc.file;
+      if (!ev.policy && inc.policy) ev.policy = inc.policy;
+    });
+    // Incidents with no matching endpoint row still belong on the list — the raw
+    // block may live in a table we can't read, but the incident proves it happened.
+    incidents.forEach(i => {
+      if (i._used) return;
+      deduped.push({
+        time: i.time, user: '—', file: i.file || '—', device: '',
+        policy: i.policy || '', action: 'DLP policy matched', blocked: true,
+        app: i.app, incident: true, severity: i.severity || '', category: i.category || '',
+      });
+    });
+    deduped.sort((a, b) => new Date(b.time) - new Date(a.time));
     const byApp = {};
     deduped.forEach(e => { (byApp[e.app] = byApp[e.app] || { total: 0, blocked: 0 }); byApp[e.app].total++; if (e.blocked) byApp[e.app].blocked++; });
     const cleanInc = incidents.map(({ _used, sec, ...rest }) => rest);
@@ -4990,6 +4993,15 @@ function sortClassicTable(key) {
   renderClassicTable();
 }
 
+// Cross-page jump to a specific agents-page section. navigate() only runs
+// loadAgents once per session, so when the page is already rendered the section
+// must be switched live; when it isn't, STATE.agentSection steers the loader.
+function gotoAgentSection(name) {
+  STATE.agentSection = name;
+  navigate('agents', document.querySelector('[onclick*=agents]'));
+  if (document.getElementById('section-' + name)) showAgentSection(name, true);
+}
+
 function showAgentSection(name, scroll = false) {
   STATE.agentSection = name;
   const sections = ['defender', 'posture', 'blueprints', 'identities', 'classic', 'risky', 'stale', 'localagents'];
@@ -6220,24 +6232,9 @@ async function loadDataRisk() {
     // from the cached label list with the same rules the labels page uses.
     fillLabelDlpCard(dlpBlocks);
     fetchSensitivityLabels().then(labels => {
-      const appsWithLabeledAccess = [...new Map([...aiApps, ...agentSps].map(s => [s.id, s])).values()]
-        .filter(sp => getScopesForSp(sp.id, grants).some(s => LABELED_READ_SCOPES.includes(s)));
-      const sensitivity = l => l.sensitivity ?? l.priority ?? 0;
-      const maxSens = (labels || []).reduce((m, l) => Math.max(m, sensitivity(l)), 0);
-      const highSensLabels = (labels || []).filter(l => sensitivity(l) > 0 && sensitivity(l) >= maxSens * 0.6);
-      const reachable = label => {
-        const formats = label.contentFormats || [];
-        return appsWithLabeledAccess.some(sp => {
-          const scopes = getScopesForSp(sp.id, grants);
-          if (formats.includes('file') && scopes.some(s => ['Files.Read.All','Files.ReadWrite.All','Sites.Read.All','Sites.ReadWrite.All'].includes(s))) return true;
-          if (formats.includes('email') && scopes.some(s => ['Mail.Read','Mail.ReadWrite','Mail.Read.Shared'].includes(s))) return true;
-          if (formats.includes('teamwork') && scopes.some(s => ['Chat.Read.All','ChannelMessage.Read.All'].includes(s))) return true;
-          return false;
-        });
-      };
-      const reachableHighSens = highSensLabels.filter(reachable);
-      const protectionKnown = (labels || []).some(l => l.hasProtection !== undefined);
-      const criticalExposure = protectionKnown ? reachableHighSens.filter(l => l.hasProtection !== true) : reachableHighSens;
+      // Same rules as the Purview page — shared helper, so the two can't drift.
+      const { appsWithLabeledAccess, highSensLabels, criticalExposure } =
+        computeLabelExposure(labels, [...aiApps, ...agentSps], grants);
       const candidates = [...appsWithLabeledAccess, ...aiApps];
       return renderLabelledAccessEvidence(labels, highSensLabels, criticalExposure, candidates).then(() => {
         // Headline KPIs from the evidence renderLabelledAccessEvidence just
@@ -7725,7 +7722,7 @@ async function loadProtection() {
         const cls = n === null ? 'info' : n === 0 ? 'low' : c.sev;
         const col = n === null ? 'var(--text-dim)' : n === 0 ? 'var(--risk-low)'
           : ({ critical: 'var(--risk-critical)', high: 'var(--risk-high)', medium: 'var(--risk-medium)' }[c.sev] || 'var(--text-muted)');
-        return `<div class="kpi-card ${cls}" style="cursor:pointer" title="${esc(c.desc)}" onclick="STATE.agentSection='posture';navigate('agents', document.querySelector('[onclick*=agents]'))">
+        return `<div class="kpi-card ${cls}" style="cursor:pointer" title="${esc(c.desc)}" onclick="gotoAgentSection('posture')">
           <div class="kpi-label" style="font-size:9.5px">${esc(c.title)}</div>
           <div class="kpi-value" style="color:${col}">${n === null ? '—' : n}</div>
           <div class="kpi-delta">${n === null ? (c.unsupported ? 'table n/a' : 'query error') : n === 0 ? '✅ clear' : `agent${n !== 1 ? 's' : ''} flagged`}</div>
@@ -8218,6 +8215,39 @@ const LABEL_CONTENT_ICONS = { file:'📄', email:'📧', meeting:'📅', schemat
 
 // Scopes that give AI apps read access to labeled content
 const LABELED_READ_SCOPES  = ['Files.Read.All','Files.ReadWrite.All','Sites.Read.All','Sites.ReadWrite.All','Mail.Read','Mail.ReadWrite','Mail.Read.Shared','Chat.Read.All'];
+
+// Shared label-exposure context — the single source of truth for the Purview
+// page verdicts AND the Data Risk KPIs. Previously each page carried its own
+// copy of these rules, which would silently drift apart when one was tuned.
+function computeLabelExposure(labels, candidateSps, grants) {
+  const all = labels || [];
+  const appsWithLabeledAccess = [...new Map((candidateSps || []).map(s => [s.id, s])).values()]
+    .filter(sp => getScopesForSp(sp.id, grants).some(s => LABELED_READ_SCOPES.includes(s)));
+  // Which AI apps/agents can reach a label's content formats
+  const labelRiskFor = label => {
+    const formats = label.contentFormats || [];
+    return appsWithLabeledAccess.filter(sp => {
+      const scopes = getScopesForSp(sp.id, grants);
+      if (formats.includes('file')  && scopes.some(s => ['Files.Read.All','Files.ReadWrite.All','Sites.Read.All','Sites.ReadWrite.All'].includes(s))) return true;
+      if (formats.includes('email') && scopes.some(s => ['Mail.Read','Mail.ReadWrite','Mail.Read.Shared'].includes(s))) return true;
+      if (formats.includes('teamwork') && scopes.some(s => ['Chat.Read.All','ChannelMessage.Read.All'].includes(s))) return true;
+      return false;
+    });
+  };
+  const sensitivity = l => l.sensitivity ?? l.priority ?? 0;
+  // High-sensitivity = top 40% of the tenant's sensitivity range
+  const maxSens = all.reduce((m, l) => Math.max(m, sensitivity(l)), 0);
+  const highSensLabels = all.filter(l => sensitivity(l) > 0 && sensitivity(l) >= maxSens * 0.6);
+  // Purview encryption is the actual restriction mechanism: an encrypted label
+  // hands third-party AI ciphertext; marking-only labels don't restrict reads.
+  const labelProtected  = l => l.hasProtection === true ? true : l.hasProtection === false ? false : undefined;
+  const protectionKnown = all.some(l => l.hasProtection !== undefined);
+  const reachableHighSens  = highSensLabels.filter(l => labelRiskFor(l).length > 0);
+  const protectedReachable = reachableHighSens.filter(l => labelProtected(l) === true);
+  // True exposure = reachable high-sens labels WITHOUT encryption
+  const criticalExposure = protectionKnown ? reachableHighSens.filter(l => labelProtected(l) !== true) : reachableHighSens;
+  return { appsWithLabeledAccess, labelRiskFor, sensitivity, highSensLabels, labelProtected, protectionKnown, reachableHighSens, protectedReachable, criticalExposure };
+}
 const LABELED_WRITE_SCOPES = ['Files.ReadWrite.All','Sites.ReadWrite.All','Mail.ReadWrite','Files.ReadWrite'];
 
 // Evidence: labelled content actually touched by AI apps (30d). Reuses the shared
@@ -8311,10 +8341,10 @@ async function loadSensitivityLabels() {
     const aiApps   = sps.filter(isAiApp);
     const agentSps = STATE.data.agentSps || sps.filter(sp => AGENT_KEYWORDS.some(k=>(sp.displayName||'').toLowerCase().includes(k)) || sp.servicePrincipalType==='ServiceIdentity');
 
-    // AI apps/agents with read access to labelled content types
-    const appsWithLabeledAccess = [...new Map([...aiApps,...agentSps].map(s=>[s.id,s])).values()].filter(sp =>
-      getScopesForSp(sp.id, grants).some(s => LABELED_READ_SCOPES.includes(s))
-    );
+    // Label-exposure context — shared with the Data Risk page (single source of truth)
+    const { appsWithLabeledAccess, labelRiskFor, sensitivity, highSensLabels,
+            labelProtected, protectionKnown, protectedReachable, criticalExposure } =
+      computeLabelExposure(labels, [...aiApps, ...agentSps], grants);
 
     // Auto-labeling signals visible to Microsoft Graph. NOTE: tenant-level Purview
     // "Auto-labeling policies" (autoSensitivityLabelPolicy) are NOT exposed as a Graph
@@ -8359,38 +8389,6 @@ async function loadSensitivityLabels() {
       const pid = l.parent.id;
       (childrenByParent[pid] = childrenByParent[pid] || []).push(l);
     });
-
-    // For each label determine if AI apps can reach it
-    const labelRiskFor = (label) => {
-      const formats = label.contentFormats || [];
-      const reachable = appsWithLabeledAccess.filter(sp => {
-        const scopes = getScopesForSp(sp.id, grants);
-        if (formats.includes('file')  && scopes.some(s => ['Files.Read.All','Files.ReadWrite.All','Sites.Read.All','Sites.ReadWrite.All'].includes(s))) return true;
-        if (formats.includes('email') && scopes.some(s => ['Mail.Read','Mail.ReadWrite','Mail.Read.Shared'].includes(s))) return true;
-        if (formats.includes('teamwork') && scopes.some(s => ['Chat.Read.All','ChannelMessage.Read.All'].includes(s))) return true;
-        return false;
-      });
-      return reachable;
-    };
-
-    const sensitivity = l => l.sensitivity ?? l.priority ?? 0;
-
-    // High-sensitivity labels (top 30% by sensitivity score)
-    const maxSens = labels.reduce((m,l) => Math.max(m, sensitivity(l)), 0);
-    const highSensLabels = labels.filter(l => sensitivity(l) > 0 && sensitivity(l) >= maxSens * 0.6);
-
-    // Purview encryption is the actual restriction mechanism: an encrypted label
-    // hands third-party AI apps ciphertext they cannot decrypt, marking-only labels
-    // don't restrict reading at all. hasProtection comes from the beta endpoints;
-    // when the fallback endpoint doesn't expose it, we degrade to reach-only logic.
-    const labelProtected  = l => l.hasProtection === true ? true : l.hasProtection === false ? false : undefined;
-    const protectionKnown = labels.some(l => l.hasProtection !== undefined);
-    const reachableHighSens  = highSensLabels.filter(l => labelRiskFor(l).length > 0);
-    const protectedReachable = reachableHighSens.filter(l => labelProtected(l) === true);
-    // True exposure = reachable high-sens labels WITHOUT encryption
-    const criticalExposure = protectionKnown
-      ? reachableHighSens.filter(l => labelProtected(l) !== true)
-      : reachableHighSens;
 
     el.innerHTML = `
       <div style="position:sticky;top:52px;z-index:80;background:var(--bg-primary);padding-bottom:10px;margin-bottom:4px;border-bottom:1px solid var(--border)">
