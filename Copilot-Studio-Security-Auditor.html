@@ -188,19 +188,34 @@
 const REDIRECT = location.origin + location.pathname;
 // Your published app's client ID. Public (not a secret) — baked in so users just sign in.
 const DEFAULT_CLIENT_ID = '96e9b5f4-e974-4355-ae9f-4487099ef210';
+// Shadow AI portal handoff: opened via ?clientId=…&redirect=…&hint=… (or, with a
+// bare URL, via the 'sai-portal-handoff' record the portal keeps on this origin)
+// the auditor reuses the portal's app registration + shared localStorage MSAL
+// cache and signs in silently. The portal's redirect URI is used because it is
+// the one registered on that app registration (this page's own URL isn't).
+const _qs = new URLSearchParams(location.search);
+let _portalRec = null;
+try { _portalRec = JSON.parse(localStorage.getItem('sai-portal-handoff') || 'null'); } catch(e){}
+const HANDOFF_CID      = _qs.get('clientId') || (_portalRec && _portalRec.clientId) || null;
+const HANDOFF_REDIRECT = _qs.get('redirect') || (_portalRec && _portalRec.redirect) || null;
+const HANDOFF_HINT     = _qs.get('hint') || null;
 let msalApp = null;
 
 function initMsal(clientId){
+  const redirectUri = (HANDOFF_CID && clientId === HANDOFF_CID && HANDOFF_REDIRECT) ? HANDOFF_REDIRECT : REDIRECT;
   msalApp = new msal.PublicClientApplication({
-    auth: { clientId, authority: 'https://login.microsoftonline.com/organizations', redirectUri: REDIRECT },
-    cache: { cacheLocation: 'sessionStorage' }
+    auth: { clientId, authority: 'https://login.microsoftonline.com/organizations', redirectUri },
+    // localStorage so a portal handoff can reuse the portal's cached session
+    cache: { cacheLocation: 'localStorage' }
   });
 }
 async function ensureSignedIn(){
   if (!msalApp.getAllAccounts().length) {
-    await msalApp.loginPopup({ scopes: ['https://graph.microsoft.com/User.Read'] });
+    await msalApp.loginPopup({ scopes: ['https://graph.microsoft.com/User.Read'],
+                               ...(HANDOFF_HINT ? { loginHint: HANDOFF_HINT } : {}) });
   }
-  const acct = msalApp.getAllAccounts()[0];
+  const accts = msalApp.getAllAccounts();
+  const acct = (HANDOFF_HINT && accts.find(a=>(a.username||'').toLowerCase()===HANDOFF_HINT.toLowerCase())) || accts[0];
   msalApp.setActiveAccount(acct);
   document.getElementById('acct').textContent = acct.username;
   document.getElementById('signout').style.display = '';
@@ -440,7 +455,9 @@ async function runScan(){
   const envs = document.getElementById('envs').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
   if (!clientId){ status('Enter the app registration Client ID first.'); return; }
   if (!envs.length){ status('Enter at least one environment URL.'); return; }
-  localStorage.setItem('cs_clientId', clientId);
+  // Don't persist a portal-handoff clientId: standalone opens would then use a
+  // registration whose redirect URIs don't include this page (AADSTS50011).
+  if (clientId !== HANDOFF_CID) localStorage.setItem('cs_clientId', clientId);
   localStorage.setItem('cs_envs', envs.join('\n'));
   const opts = { components: document.getElementById('optComponents').checked, sharing: document.getElementById('optSharing').checked };
   const btn = document.getElementById('scanBtn'); btn.disabled = true;
@@ -770,11 +787,43 @@ function render(){
   }
 }
 
-// restore last config
-document.getElementById('clientId').value = localStorage.getItem('cs_clientId')||DEFAULT_CLIENT_ID;
+// restore last config — a portal handoff clientId takes precedence
+document.getElementById('clientId').value = HANDOFF_CID || localStorage.getItem('cs_clientId') || DEFAULT_CLIENT_ID;
 // Show the public IP + location on a detailed map as soon as the app starts.
 window.addEventListener('load', () => { try { detectPublicIp(); } catch(e){ console.warn('public IP detect failed', e); } });
 document.getElementById('envs').value     = localStorage.getItem('cs_envs')||'';
+
+// Portal handoff boot: pick up the portal's cached session silently, discover
+// the user's environments, and run the scan — one click in the portal lands on
+// live results. Every token here is silent-only; if consent for Dataverse is
+// missing the auto-run stops with a status message and the normal
+// "Sign in & scan" button takes over (its popup can prompt for consent).
+window.addEventListener('load', async () => {
+  if (!HANDOFF_CID) return;
+  try {
+    initMsal(HANDOFF_CID);
+    const accts = msalApp.getAllAccounts();
+    const acct = (HANDOFF_HINT && accts.find(a=>(a.username||'').toLowerCase()===HANDOFF_HINT.toLowerCase())) || accts[0];
+    if (!acct) { status('Opened from the portal but no cached session found — click "Sign in & scan".'); return; }
+    msalApp.setActiveAccount(acct);
+    document.getElementById('acct').textContent = acct.username;
+    document.getElementById('signout').style.display = '';
+    status('Signed in from the portal as ' + acct.username + ' — discovering environments…');
+    const token = (await msalApp.acquireTokenSilent({ scopes: [GDS + '/.default'], account: acct })).accessToken;
+    const r = await fetch(GDS + '/api/discovery/v2.0/Instances?$select=ApiUrl,FriendlyName',
+                          { headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' } });
+    if (!r.ok) throw new Error('discovery ' + r.status);
+    const inst = (await r.json()).value || [];
+    const urls = inst.map(i => (i.ApiUrl||'').replace(/\/$/,'')).filter(Boolean);
+    if (!urls.length){ status('Signed in as ' + acct.username + ' — no environments returned; enter URLs manually, then scan.'); return; }
+    document.getElementById('envs').value = urls.join('\n');
+    localStorage.setItem('cs_envs', urls.join('\n'));
+    status('Signed in as ' + acct.username + ' — found ' + urls.length + ' environment(s), starting scan…');
+    await runScan();
+  } catch (e) {
+    status('Portal session found, but a silent token was refused (' + (e.message||e) + ').\nClick "Sign in & scan" — the popup can complete any missing consent.');
+  }
+});
 </script>
 </body>
 </html>
