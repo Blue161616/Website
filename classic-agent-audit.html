@@ -425,8 +425,27 @@
 
 // ── App registration (hardcoded for multi-tenant deployment) ───────────────
 const APP_TENANT_ID   = '82d2b6a0-7115-44c1-a787-4e01392b852a';
-const APP_CLIENT_ID   = 'd2e4a0c6-3bdc-4323-88a7-1eb614180147';
-const APP_REDIRECT_URI = 'https://blue16.nl/classic-agent-audit.html';
+// Standalone defaults — overridden when the Shadow AI portal hands off its own
+// app registration via ?clientId=…&redirect=…&hint=…. Same registration means
+// the already-consented scopes cover this audit and sign-in is silent SSO.
+const _handoff = new URLSearchParams(location.search);
+// The handoff can also be implicit: the portal (same origin) keeps its MSAL
+// cache in localStorage, and the cache key names embed the clientId — discover
+// it so even a bare link to this page reuses the existing portal session.
+function _cachedMsalClientId() {
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const m = /^msal\.token\.keys\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(localStorage.key(i) || '');
+      if (m) return m[1];
+    }
+  } catch { }
+  return null;
+}
+const _cachedCid = _cachedMsalClientId();
+const APP_CLIENT_ID    = _handoff.get('clientId') || _cachedCid || 'd2e4a0c6-3bdc-4323-88a7-1eb614180147';
+const APP_REDIRECT_URI = _handoff.get('redirect')
+  || (location.protocol === 'https:' ? location.origin + location.pathname : 'https://blue16.nl/classic-agent-audit.html');
+const APP_LOGIN_HINT   = _handoff.get('hint') || null;
 
 // ── Constants ──────────────────────────────────────────────────────────────
 const GRAPH      = 'https://graph.microsoft.com/v1.0';
@@ -480,7 +499,9 @@ function buildMsal() {
       authority: 'https://login.microsoftonline.com/organizations',
       redirectUri: APP_REDIRECT_URI,
     },
-    cache: { cacheLocation: 'sessionStorage' },
+    // localStorage so a portal-handoff tab can reuse the portal's cached session
+    // (same origin + same clientId) without any interactive sign-in.
+    cache: { cacheLocation: 'localStorage' },
   });
 }
 
@@ -509,12 +530,13 @@ async function doLogin() {
     await msalApp.initialize();
 
     const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+    const loginReq = { scopes: SCOPES, ...(APP_LOGIN_HINT ? { loginHint: APP_LOGIN_HINT } : {}) };
     let result;
     if (isMobile) {
-      await msalApp.loginRedirect({ scopes: SCOPES });
+      await msalApp.loginRedirect(loginReq);
       return; // page reloads
     } else {
-      result = await msalApp.loginPopup({ scopes: SCOPES });
+      result = await msalApp.loginPopup(loginReq);
     }
 
     currentAccount = result.account;
@@ -534,6 +556,43 @@ async function doLogout() {
   }
   location.reload();
 }
+
+// Portal handoff: when the Shadow AI portal opened this page with its own app
+// registration, sign in silently so the user lands straight in the audit.
+// Order of attempts:
+//   1. Same-origin cache pickup — the portal signed in with this clientId and a
+//      localStorage MSAL cache, so the account and tokens are already readable
+//      here. No network, no iframe, immune to third-party-cookie blocking.
+//   2. ssoSilent — hidden iframe against the Entra session cookie (fallback for
+//      a stale/absent cache).
+//   3. Give the Sign-in button back — its popup then completes without prompts.
+window.addEventListener('DOMContentLoaded', async () => {
+  if (!_handoff.get('clientId') && !_cachedCid) return; // no portal session to reuse
+  const btn = document.getElementById('btn-login');
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="loading-spin"></span> Signing you in from the portal…';
+  // MSAL loads async from CDN — wait for it briefly before attempting SSO.
+  for (let i = 0; i < 50 && typeof msal === 'undefined'; i++) await new Promise(r => setTimeout(r, 100));
+  try {
+    if (typeof msal === 'undefined') throw new Error('MSAL not loaded');
+    msalApp = buildMsal();
+    await msalApp.initialize();
+    const accounts = msalApp.getAllAccounts();
+    const account = (APP_LOGIN_HINT && accounts.find(a => (a.username || '').toLowerCase() === APP_LOGIN_HINT.toLowerCase())) || accounts[0] || null;
+    let result = account
+      ? await msalApp.acquireTokenSilent({ scopes: SCOPES, account }).catch(() => null)
+      : null;
+    if (!result) result = await msalApp.ssoSilent({ scopes: SCOPES, ...(APP_LOGIN_HINT ? { loginHint: APP_LOGIN_HINT } : {}) });
+    currentAccount = result.account;
+    accessToken = result.accessToken;
+    showApp();
+    startAudit();
+  } catch {
+    btn.disabled = false;
+    btn.innerHTML = orig; // fall back to manual sign-in
+  }
+});
 
 function showLoginErr(msg) {
   const el = document.getElementById('login-error');
