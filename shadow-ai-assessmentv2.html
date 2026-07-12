@@ -288,6 +288,8 @@
     /* ── Height-capped tables: scroll inside the card, header stays pinned ── */
     #model-risk-table th,#def-assets-table th,#localagents-table th,.dlp-blocks-table th{position:sticky;top:0;z-index:2;}
     .dlp-blocks-scroll{max-height:360px;overflow-y:auto;}
+    /* AI Security Alerts feed: cap at ~4 rows (63px each), scroll the rest */
+    .dash-alerts-scroll{max-height:252px;overflow-y:auto;overscroll-behavior:contain;}
     .tbl-scroll{max-height:420px;overflow-y:auto;}
     .tbl-scroll thead th{position:sticky;top:0;z-index:2;background:var(--bg-card);}
 
@@ -1698,6 +1700,173 @@ async function fetchDefenderAiAgentsList() {
   return STATE.data.defenderAgentList;
 }
 
+// ── AI AGENT SECURITY POSTURE ───────────────────────────────────────────────
+// The six AgentsInfo hunting checks from the Azure-Sentinel repo
+// (github.com/Azure/Azure-Sentinel → Hunting Queries → AI Agents), run verbatim
+// through the same Graph hunting endpoint as the inventory. Each check joins
+// IdentityInfo to resolve owner object-ids to UPNs.
+const _POSTURE_IDUPN = String.raw`let IdentityIdtoUPN = materialize (IdentityInfo | where isnotempty(AccountObjectId) and isnotempty(AccountUpn) | summarize arg_max(Timestamp, AccountUpn) by AccountObjectId | project AccountObjectId = tostring(AccountObjectId), AccountUpn);`;
+const AGENT_POSTURE_CHECKS = [
+  {
+    id: 'creds', icon: '🔑', sev: 'critical', title: 'Hard-coded credentials in tools or config',
+    desc: 'Secrets (API keys, tokens, basic-auth) embedded in declared tools, triggers, MCP servers, skills, capabilities, or raw agent config.',
+    rec: 'Never embed credentials in agent logic — use Azure Key Vault / environment variables or secured input fields. Rotate any exposed secret immediately.',
+    detail: r => 'Credential pattern matched in agent configuration',
+    kql: String.raw`let suspicious_patterns = @"(AKIA[0-9A-Z]{16})|(AIza[0-9A-Za-z_\-]{35})|(xox[baprs]-[0-9a-zA-Z]{10,48})|(ghp_[A-Za-z0-9]{36,59})|(sk_(live|test)_[A-Za-z0-9]{24})|(SG\.[A-Za-z0-9]{22}\.[A-Za-z0-9]{43})|(\d{8}:[\w\-]{35})|(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)|(Authorization\s*:\s*Basic\s+[A-Za-z0-9=:+]+)|([A-Za-z]+:\/\/[^\/\s""']+:[^\/\s""']+@[^\/\s""']+)";` + '\n' + _POSTURE_IDUPN + String.raw`
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| where LifecycleStatus != "Deleted"
+| extend ToolsStr = tostring(DeclaredTools), TriggersStr = tostring(Triggers), McpStr = tostring(McpServers), SkillsStr = tostring(Skills), CapsStr = tostring(Capabilities), RawStr = tostring(RawAgentInfo)
+| where ToolsStr matches regex suspicious_patterns or TriggersStr matches regex suspicious_patterns or McpStr matches regex suspicious_patterns or SkillsStr matches regex suspicious_patterns or CapsStr matches regex suspicious_patterns or RawStr matches regex suspicious_patterns or Instructions matches regex suspicious_patterns
+| extend OwnerId = tostring(Owners[0])
+| join kind=leftouter IdentityIdtoUPN on $left.OwnerId == $right.AccountObjectId
+| project-rename OwnerUpn = AccountUpn
+| project CreatedDateTime, AgentId, Name, Platform, OwnerUpn`,
+  },
+  {
+    id: 'mcp', icon: '🔌', sev: 'medium', title: 'MCP tool configured',
+    desc: 'Agents with Model Context Protocol servers attached — extended capabilities that widen the attack surface if misconfigured or unnecessary.',
+    rec: 'Confirm with the owner the MCP tool is still required; review its configuration for least privilege and remove unused MCP servers.',
+    detail: r => _postureList(r.McpServersConfigured).join(', '),
+    kql: _POSTURE_IDUPN + String.raw`
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| where LifecycleStatus != "Deleted"
+| where array_length(McpServers) > 0
+| extend OwnerId = tostring(Owners[0])
+| join kind=leftouter IdentityIdtoUPN on $left.OwnerId == $right.AccountObjectId
+| project-rename OwnerUpn = AccountUpn
+| mv-expand Mcp = McpServers
+| extend McpName = tostring(Mcp.name)
+| where isnotempty(McpName)
+| summarize McpServersConfigured = make_set(McpName) by AgentId, Name, Platform, CreatedDateTime, OwnerUpn`,
+  },
+  {
+    id: 'missingtools', icon: '🧰', sev: 'medium', title: 'Tools not mentioned in instructions',
+    desc: 'Configured tools the agent instructions never reference — ungoverned capabilities the agent may use in unintended ways.',
+    rec: 'Document every configured tool in the agent instructions (purpose + usage constraints), or remove tools that are not meant to be used.',
+    detail: r => 'Missing: ' + _postureList(r.MissingTools).join(', '),
+    kql: _POSTURE_IDUPN + String.raw`
+let LatestAgents = materialize (AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted");
+let AgentToolNames = LatestAgents
+| where array_length(DeclaredTools) > 0
+| mv-expand Tool = DeclaredTools
+| extend ToolName = tostring(Tool.name)
+| where isnotempty(ToolName)
+| summarize ToolNames = make_set(ToolName) by AgentId;
+LatestAgents
+| where isnotempty(Instructions) and Instructions != "N/A"
+| join kind=inner AgentToolNames on AgentId
+| mv-apply ToolName = ToolNames to typeof(string) on (where Instructions !has ToolName | summarize MissingTools = make_list(ToolName))
+| where array_length(MissingTools) > 0
+| extend OwnerId = tostring(Owners[0])
+| join kind=leftouter IdentityIdtoUPN on $left.OwnerId == $right.AccountObjectId
+| project-rename OwnerUpn = AccountUpn
+| project CreatedDateTime, AgentId, Name, Platform, MissingTools, OwnerUpn`,
+  },
+  {
+    id: 'orgwide', icon: '🌐', sev: 'high', title: 'Shared organization-wide',
+    desc: 'Agents shared with the entire organization (SharedWith contains "*") — any user can invoke them and whatever data or tools they reach.',
+    rec: 'Restrict to specific users or groups unless org-wide access is a deliberate business decision with governance in place.',
+    detail: r => 'SharedWith: * (everyone)',
+    kql: _POSTURE_IDUPN + String.raw`
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| where LifecycleStatus != "Deleted"
+| where array_length(SharedWith) > 0
+| mv-expand Shared = SharedWith to typeof(string)
+| where tostring(Shared) == "*"
+| extend OwnerId = tostring(Owners[0])
+| join kind=leftouter IdentityIdtoUPN on $left.OwnerId == $right.AccountObjectId
+| project-rename OwnerUpn = AccountUpn
+| project CreatedDateTime, AgentId, Name, Platform, OwnerUpn`,
+  },
+  {
+    id: 'orphaned', icon: '👻', sev: 'high', title: 'Orphaned — all owners disabled or gone',
+    desc: 'Agents whose owners are all disabled or removed — nobody is accountable for configuration, updates, or misuse.',
+    rec: 'Assign a new active owner or retire the agent; review agent ownership regularly.',
+    detail: r => 'Disabled/missing owners: ' + (_postureList(r.DisabledOwnerUpns).join(', ') || _postureList(r.DisabledOrMissingOwners).join(', ')),
+    ownerKey: 'DisabledOwnerUpn',
+    kql: String.raw`let EnabledAccountIds = materialize (IdentityInfo | where IsAccountEnabled == 1 | distinct AccountObjectId = tostring(AccountObjectId));` + '\n' + _POSTURE_IDUPN + String.raw`
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| where LifecycleStatus != "Deleted"
+| where array_length(Owners) > 0
+| mv-expand Owner = Owners to typeof(string)
+| extend OwnerId = tostring(Owner)
+| where isnotempty(OwnerId)
+| summarize OwnerIds = make_set(OwnerId) by AgentId, Name, Platform, CreatedDateTime
+| mv-apply OwnerId = OwnerIds to typeof(string) on (where OwnerId !in (EnabledAccountIds) | summarize DisabledOrMissingOwners = make_list(OwnerId))
+| where array_length(DisabledOrMissingOwners) == array_length(OwnerIds)
+| mv-expand DisabledOwnerId = DisabledOrMissingOwners to typeof(string)
+| join kind=leftouter IdentityIdtoUPN on $left.DisabledOwnerId == $right.AccountObjectId
+| extend ResolvedOwner = coalesce(AccountUpn, DisabledOwnerId)
+| summarize DisabledOwnerUpns = make_set(ResolvedOwner), DisabledOrMissingOwners = take_any(DisabledOrMissingOwners) by AgentId, Name, Platform, CreatedDateTime
+| extend DisabledOwnerUpn = tostring(DisabledOwnerUpns[0])`,
+  },
+  {
+    id: 'noinstructions', icon: '📝', sev: 'high', title: 'Published without instructions',
+    desc: 'Published agents with no configured instructions — prime targets for prompt injection and unpredictable behaviour.',
+    rec: 'Give every published agent well-defined instructions: purpose, boundaries, allowed actions. Review them regularly.',
+    detail: r => 'Published, Instructions empty',
+    kql: _POSTURE_IDUPN + String.raw`
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| where LifecycleStatus != "Deleted"
+| where PublishedStatus == "Published"
+| where isempty(Instructions) or Instructions == "N/A"
+| extend OwnerId = tostring(Owners[0])
+| join kind=leftouter IdentityIdtoUPN on $left.OwnerId == $right.AccountObjectId
+| project-rename OwnerUpn = AccountUpn
+| project CreatedDateTime, AgentId, Name, Platform, OwnerUpn`,
+  },
+];
+// Hunting results serialise dynamic arrays as JSON strings — normalise to string[].
+function _postureList(v) {
+  if (Array.isArray(v)) return v.map(String);
+  if (typeof v === 'string' && v.trim().startsWith('[')) { try { return (JSON.parse(v) || []).map(String); } catch { } }
+  return v ? [String(v)] : [];
+}
+async function fetchAgentPosture() {
+  if (STATE.data.agentPosture !== undefined) return STATE.data.agentPosture;
+  const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
+  if (!token) {
+    STATE.data.agentPosture = { ok: false, code: 'forbidden', checks: [], flaggedAgents: 0, flaggedChecks: 0 };
+    return STATE.data.agentPosture;
+  }
+  const isUnsupportedErr = msg => /failed to resolve table|could not be resolved|unknown table|does not refer to any known table|semantic error/i.test(msg || '');
+  const checks = [];
+  // Sequential on purpose: 6 parallel runHuntingQuery calls risk 429 throttling
+  // on top of the inventory / local-agents / DLP queries this page already runs.
+  for (const c of AGENT_POSTURE_CHECKS) {
+    try {
+      const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+        method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ Query: c.kql, Timespan: 'P30D' }),
+      });
+      if (!r.ok) {
+        const text = (await r.text()).slice(0, 300);
+        checks.push({ ...c, rows: null, error: text, unsupported: isUnsupportedErr(text), forbidden: r.status === 403 });
+        continue;
+      }
+      const data = await r.json();
+      const rows = Array.isArray(data.results) ? data.results : (Array.isArray(data.Results) ? data.Results : []);
+      checks.push({ ...c, rows, error: null, unsupported: false, forbidden: false });
+    } catch (e) {
+      checks.push({ ...c, rows: null, error: e.message || String(e), unsupported: isUnsupportedErr(e.message), forbidden: false });
+    }
+  }
+  const okChecks = checks.filter(c => c.rows !== null);
+  const flaggedChecks = okChecks.filter(c => c.rows.length > 0).length;
+  const flaggedAgents = new Set(okChecks.flatMap(c => c.rows.map(r => String(r.AgentId || r.Name || '')))).size;
+  STATE.data.agentPosture = {
+    ok: okChecks.length > 0,
+    code: okChecks.length ? null : (checks.every(c => c.forbidden) ? 'forbidden' : checks.every(c => c.unsupported) ? 'unsupported' : 'error'),
+    checks, flaggedAgents, flaggedChecks, ranChecks: okChecks.length,
+  };
+  return STATE.data.agentPosture;
+}
+
 // Local AI agents & runtimes (Ollama, LM Studio, desktop assistants, IDE agents)
 // automatically discovered on onboarded devices by Defender for Endpoint (preview).
 // Read from the exposure graph via Advanced Hunting — same ThreatHunting.Read.All
@@ -2832,12 +3001,12 @@ async function loadDashboard() {
       </div>
       <div class="card dash-rise" style="animation-delay:210ms;margin-top:0">
         <div class="card-body no-pad">
-          ${dashAlerts.allAlerts.length ? dashAlerts.allAlerts.map((a, i) => {
+          ${dashAlerts.allAlerts.length ? `<div class="dash-alerts-scroll">${dashAlerts.allAlerts.map(a => {
             const sev = (a.sev || 'medium').toLowerCase();
             const col = { critical:'var(--risk-critical)', high:'var(--risk-high)', medium:'var(--risk-medium)', low:'var(--risk-low)', informational:'var(--accent-blue)' }[sev] || 'var(--accent-blue)';
             const lbl = { critical:'Critical', high:'High', medium:'Medium', low:'Low', informational:'Info' }[sev] || sev;
             const nav = a.page ? `navigate('${a.page}', document.querySelector('[onclick*=${a.page}]'))` : a.url ? `window.open('${esc(a.url)}','_blank')` : '';
-            return `<div class="risk-row${i >= 6 ? ' dash-alert-more' : ''}"${i >= 6 ? ' style="display:none"' : ''}${nav ? ` onclick="${nav}"` : ''}>
+            return `<div class="risk-row"${nav ? ` onclick="${nav}"` : ''}>
               <div class="risk-rail" style="background:${col}"></div>
               <span style="font-size:18px;flex-shrink:0">${a.icon || '⚠️'}</span>
               <div style="flex:1;min-width:0">
@@ -2847,14 +3016,12 @@ async function loadDashboard() {
               <span class="risk-chip" style="color:${col};background:${col}1a;border:1px solid ${col}44">${lbl}</span>
               ${a.url ? '<span style="font-size:11px;color:var(--accent-blue);white-space:nowrap">View →</span>' : a.page ? '<span style="font-size:12px;color:var(--accent-blue);white-space:nowrap">→</span>' : ''}
             </div>`;
-          }).join('') : `<div style="display:flex;align-items:center;gap:12px;padding:18px 16px">
+          }).join('')}</div>` : `<div style="display:flex;align-items:center;gap:12px;padding:18px 16px">
               <span style="font-size:22px">✅</span>
               <div><div style="font-size:13px;font-weight:600">No AI security alerts</div>
               <div style="font-size:11px;color:var(--text-muted)">No high-risk AI scopes, risky users, tenant-wide consent, or AI-scoped Defender alerts detected.</div></div>
             </div>`}
-          ${dashAlerts.allAlerts.length > 6 ? `<div style="text-align:center;padding:10px;border-top:1px solid var(--border)">
-            <button class="btn btn-ghost" style="font-size:12px" onclick="document.querySelectorAll('.dash-alert-more').forEach(r=>r.style.display=r.style.display==='none'?'flex':'none');this.textContent=this.textContent.startsWith('Show')?'↑ Collapse':'Show ${dashAlerts.allAlerts.length - 6} more alert${dashAlerts.allAlerts.length - 6 !== 1 ? 's' : ''}'">Show ${dashAlerts.allAlerts.length - 6} more alert${dashAlerts.allAlerts.length - 6 !== 1 ? 's' : ''}</button>
-          </div>` : ''}
+          ${dashAlerts.allAlerts.length > 4 ? `<div style="text-align:center;padding:6px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim)">↕ ${dashAlerts.allAlerts.length} alerts — scroll for more</div>` : ''}
         </div>
       </div>
 
@@ -4763,7 +4930,7 @@ function sortClassicTable(key) {
 
 function showAgentSection(name, scroll = false) {
   STATE.agentSection = name;
-  const sections = ['defender', 'blueprints', 'identities', 'classic', 'risky', 'stale', 'localagents', 'mcp'];
+  const sections = ['defender', 'posture', 'blueprints', 'identities', 'classic', 'risky', 'stale', 'localagents', 'mcp'];
   sections.forEach(s => {
     const sec = document.getElementById('section-' + s);
     const kpi = document.getElementById('kpi-agent-' + s);
@@ -4795,6 +4962,76 @@ function showAgentSection(name, scroll = false) {
 
 // ── DEFENDER AI ASSETS ────────────────────────────────────────────────────
 // Renders the per-agent table from the Defender AI Assets page.
+
+async function renderAgentPostureSection() {
+  const el = document.getElementById('posture-content');
+  if (!el) return;
+  const p = await fetchAgentPosture().catch(() => ({ ok: false, code: 'error', checks: [] }));
+  if (!document.getElementById('posture-content')) return;
+  const kpiVal = document.getElementById('kpi-posture-val');
+  const kpiSub = document.getElementById('kpi-posture-sub');
+  if (!p.ok) {
+    if (kpiVal) kpiVal.textContent = '—';
+    el.innerHTML = `<div class="card"><div class="card-body" style="font-size:12px;color:var(--text-muted)">${
+      p.code === 'forbidden' ? '🔒 Needs <code>ThreatHunting.Read.All</code> — re-run admin consent, then sign out &amp; back in.'
+      : p.code === 'unsupported' ? 'ℹ️ The <code>AgentsInfo</code> / <code>IdentityInfo</code> hunting tables aren&#39;t available in this tenant yet.'
+      : 'ℹ️ Posture checks unavailable — ' + esc(String(p.checks?.[0]?.error || 'unknown error').slice(0, 160))}</div></div>`;
+    return;
+  }
+  if (kpiVal) {
+    kpiVal.textContent = p.flaggedAgents;
+    kpiVal.className = 'kpi-value ' + (p.flaggedAgents > 0 ? 'text-high' : 'text-low');
+  }
+  if (kpiSub) kpiSub.textContent = `${p.flaggedChecks} of ${p.ranChecks} checks flagged`;
+  const sevCol = { critical: 'var(--risk-critical)', high: 'var(--risk-high)', medium: 'var(--risk-medium)' };
+  const cards = p.checks.map(c => {
+    const col = sevCol[c.sev] || 'var(--text-muted)';
+    const n = c.rows ? c.rows.length : null;
+    const status = c.rows === null
+      ? `<span class="badge" style="font-size:10px;background:var(--bg-hover);color:var(--text-dim)" title="${esc(String(c.error || '').slice(0, 200))}">${c.unsupported ? 'table n/a' : 'error'}</span>`
+      : n === 0
+        ? '<span class="badge badge-low" style="font-size:10px">✅ 0</span>'
+        : `<span class="badge" style="font-size:10px;background:${col};color:#fff">${n} agent${n !== 1 ? 's' : ''}</span>`;
+    const rowsHtml = (c.rows || []).slice(0, 20).map(r => `<tr>
+        <td style="font-size:12px"><strong>${esc(String(r.Name || '—'))}</strong><br><span class="mono text-muted" style="font-size:10px">${esc(String(r.AgentId || '').slice(0, 24))}${String(r.AgentId || '').length > 24 ? '…' : ''}</span></td>
+        <td style="font-size:12px;color:var(--text-muted)">${esc(String(r.Platform || '—'))}</td>
+        <td style="font-size:12px">${esc(String(r[c.ownerKey || 'OwnerUpn'] || '—'))}</td>
+        <td style="font-size:11px;color:var(--text-muted)">${esc(String(c.detail(r) || '—'))}</td>
+        <td class="mono text-muted" style="font-size:11px;white-space:nowrap">${r.CreatedDateTime ? new Date(r.CreatedDateTime).toLocaleDateString() : '—'}</td>
+      </tr>`).join('');
+    return `<details class="card" style="margin-bottom:10px"${n > 0 ? ' open' : ''}>
+      <summary style="display:flex;align-items:center;gap:10px;padding:11px 16px;cursor:pointer;list-style:none">
+        <span style="width:3px;align-self:stretch;border-radius:2px;background:${col};flex-shrink:0"></span>
+        <span style="font-size:16px">${c.icon}</span>
+        <span style="flex:1;min-width:0">
+          <span style="font-size:13px;font-weight:600;display:block">${esc(c.title)}</span>
+          <span style="font-size:11px;color:var(--text-muted)">${esc(c.desc)}</span>
+        </span>
+        ${status}
+      </summary>
+      <div style="padding:0 16px 12px">
+        <div style="font-size:11px;color:var(--text-dim);padding:6px 0 8px">💡 ${esc(c.rec)}</div>
+        ${n > 0 ? `<div class="table-wrap" style="max-height:280px;overflow-y:auto"><table>
+          <thead><tr><th>Agent</th><th>Platform</th><th>Owner</th><th>Detail</th><th>Created</th></tr></thead>
+          <tbody>${rowsHtml}</tbody></table></div>${n > 20 ? `<div style="font-size:11px;color:var(--text-dim);padding-top:6px">Showing 20 of ${n} — run the full query in Advanced Hunting.</div>` : ''}`
+        : n === 0 ? '<div style="font-size:11px;color:var(--risk-low)">✅ No agents flagged by this check.</div>'
+        : `<div style="font-size:11px;color:var(--text-dim)">Query failed: ${esc(String(c.error || '').slice(0, 200))}</div>`}
+      </div>
+    </details>`;
+  }).join('');
+  el.innerHTML = `
+    <div class="card-header" style="border:none;padding:0 0 10px">
+      <div>
+        <div class="card-title">🛡️ AI Agent Security Posture</div>
+        <span style="font-size:11px;color:var(--text-muted)">Six <code>AgentsInfo</code> hunting checks — <strong style="color:${p.flaggedAgents ? 'var(--risk-high)' : 'var(--risk-low)'}">${p.flaggedAgents} agent${p.flaggedAgents !== 1 ? 's' : ''} flagged</strong> across ${p.flaggedChecks} of ${p.ranChecks} checks · last 30 days</span>
+      </div>
+      <span class="data-source source-live" style="font-size:10px">● AgentsInfo + IdentityInfo · Advanced Hunting</span>
+    </div>
+    ${cards}
+    <div style="font-size:11px;color:var(--text-dim);padding:4px 2px">
+      ℹ️ Checks adapted from the <a href="https://github.com/Azure/Azure-Sentinel/tree/master/Hunting%20Queries/AI%20Agents" target="_blank" rel="noopener" style="color:var(--accent-blue)">Azure-Sentinel AI Agents hunting queries</a> · run them interactively in <a href="https://security.microsoft.com/v2/advanced-hunting" target="_blank" rel="noopener" style="color:var(--accent-blue)">Advanced Hunting ↗</a>
+    </div>`;
+}
 
 async function renderDefenderAssetsSection() {
   const bodyEl   = document.getElementById('def-assets-body');
@@ -5345,7 +5582,7 @@ async function loadAgents() {
           </div>
           <span class="data-source source-derived">⚡ Derived from service principals</span>
         </div>
-        <div class="kpi-row" style="grid-template-columns:repeat(8,1fr);margin-bottom:0">
+        <div class="kpi-row" style="grid-template-columns:repeat(9,1fr);margin-bottom:0">
           <div class="kpi-card info" id="kpi-agent-defender" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('defender', true)">
             <div class="kpi-label">Defender AI Assets</div>
             <div class="kpi-value text-blue" id="kpi-defender-val">…</div>
@@ -5393,6 +5630,12 @@ async function loadAgents() {
             <div class="kpi-delta">Agent tools &amp; connectors</div>
             <div class="kpi-icon">🔌</div>
           </div>
+          <div class="kpi-card high" id="kpi-agent-posture" style="cursor:pointer;transition:outline .15s,opacity .15s" onclick="showAgentSection('posture', true)">
+            <div class="kpi-label">Agent Posture</div>
+            <div class="kpi-value text-high" id="kpi-posture-val">…</div>
+            <div class="kpi-delta" id="kpi-posture-sub">6 hunting checks</div>
+            <div class="kpi-icon">🩺</div>
+          </div>
         </div>
       </div>
 
@@ -5409,6 +5652,11 @@ async function loadAgents() {
             <div class="section-loading" style="padding:20px"><span class="spinner"></span>Loading Defender AI Assets…</div>
           </div>
         </div>
+      </div>
+
+      <!-- AI Agent Security Posture (AgentsInfo hunting checks) -->
+      <div id="section-posture">
+        <div id="posture-content"><div class="section-loading"><span class="spinner"></span>Running the six AgentsInfo posture checks…</div></div>
       </div>
 
       <!-- Agent Blueprints -->
@@ -5562,13 +5810,15 @@ async function loadAgents() {
     `;
     renderAllAgentTables();
     // Guard against a stale persisted selection (e.g. removed 'audit'/'cred-hygiene')
-    const validSections = ['defender', 'blueprints', 'identities', 'classic', 'risky', 'stale', 'localagents', 'mcp'];
+    const validSections = ['defender', 'posture', 'blueprints', 'identities', 'classic', 'risky', 'stale', 'localagents', 'mcp'];
     showAgentSection(validSections.includes(STATE.agentSection) ? STATE.agentSection : 'defender');
     renderStaleAgentsSection(agentSps, grants);
     // Owners/sponsors load in background — re-render tables when done
     fetchAgentOwnersSponsors(agentSps).then(() => { renderAllAgentTables(); renderStaleAgentsSection(agentSps, grants); });
     // Defender AI Assets card — loads async after the main render
     renderDefenderAssetsSection();
+    // AI Agent Security Posture — six AgentsInfo hunting checks, async
+    renderAgentPostureSection().catch(() => {});
     // Local agents load in background
     renderLocalAgentsSection().catch(() => {});
   } catch (e) {
@@ -9548,16 +9798,22 @@ function _normaliseMcasUsers(raw) {
   });
 }
 
-// Fallback: match users from Azure AD sign-in logs by app name
+// Fallback: match users from Azure AD sign-in logs by app name. Generic vendor
+// words must never count as a match on their own — the old first-word rule made
+// "Microsoft 365 Copilot Chat" claim every sign-in containing "microsoft" (Azure
+// CLI, Office portal, Intune …), listing users who never touched Copilot.
+const _NAME_STOPWORDS = new Set(['microsoft','m365','365','office','azure','windows','cloud','app','apps','online','portal','client','web','service','services','platform','the','for','and']);
+const _sigTokens = n => String(n || '').toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length >= 3 && !_NAME_STOPWORDS.has(t));
 function _appNameMatches(mcasName, signInAppName) {
-  const m = mcasName.toLowerCase();
-  const s = (signInAppName || '').toLowerCase();
+  const m = String(mcasName || '').toLowerCase();
+  const s = String(signInAppName || '').toLowerCase();
   if (!s) return false;
   if (m === s) return true;
-  if (s.length > 4 && m.includes(s)) return true;
-  const firstWord = m.split(/[\s(]/)[0];
-  if (firstWord.length >= 5 && s.includes(firstWord)) return true;
-  return false;
+  const mt = _sigTokens(m), st = _sigTokens(s);
+  if (!mt.length || !st.length) return false;
+  // Every distinctive token of one name must appear in the other:
+  // "Anthropic Claude" ↔ "Claude", "Microsoft 365 Copilot Chat" ↔ "M365 Copilot".
+  return mt.every(t => s.includes(t)) || st.every(t => m.includes(t));
 }
 
 function _usersFromSignIns(appName) {
@@ -9570,7 +9826,7 @@ function _usersFromSignIns(appName) {
     const date = s.createdDateTime ? new Date(s.createdDateTime) : null;
     const existing = userMap.get(upn);
     if (!existing || (date && (!existing.lastSeen || date > existing.lastSeen))) {
-      userMap.set(upn, { upn, displayName: s.userDisplayName || upn.split('@')[0], lastSeen: date, _source: 'signin' });
+      userMap.set(upn, { upn, displayName: s.userDisplayName || upn.split('@')[0], lastSeen: date, via: s.appDisplayName || '', _source: 'signin' });
     }
   }
   return [...userMap.values()].sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
@@ -9593,7 +9849,7 @@ function _renderPopoverUsers(users, sourceName) {
     const sub      = isMcas && (u.tx || u.download)
       ? `${u.tx ? u.tx + ' tx' : ''}${u.tx && u.download ? ' · ' : ''}${u.download ? fmtBytes(u.download) + ' ↓' : ''}`
       : esc(u.upn);
-    return `<div class="pop-row">
+    return `<div class="pop-row"${u.via ? ` title="${esc('Matched sign-in app: ' + u.via)}"` : ''}>
       <div class="pop-avatar">${esc(initials)}</div>
       <div style="flex:1;min-width:0">
         <div class="pop-name">${esc(u.displayName)}</div>
@@ -9649,7 +9905,31 @@ async function showAppUsers(idx, anchorEl) {
     return;
   }
 
-  // 3. No per-user identities available via API — explain why and link to the
+  // 3. Fallback: endpoint DLP / Purview events — browser uploads to claude.ai etc.
+  //    carry the device UPN even though the app never authenticates through Entra,
+  //    so this is often the ONLY identity source for network-discovered AI apps.
+  const dlpApp = _aiEgressApp(appName);
+  if (dlpApp !== 'AI app') {
+    const dlp = await fetchDlpAiBlocks().catch(() => null);
+    if (pop.style.display === 'none') return; // closed while the fetch ran
+    const map = new Map();
+    (dlp?.ok ? dlp.events : []).forEach(e => {
+      if (e.app !== dlpApp || !e.user || e.user === '—') return;
+      const d = e.time ? new Date(e.time) : null;
+      const ex = map.get(e.user);
+      if (!ex || (d && (!ex.lastSeen || d > ex.lastSeen))) {
+        map.set(e.user, { upn: e.user, displayName: e.user.split('@')[0], lastSeen: d, via: 'DLP: ' + (e.file !== '—' && e.file ? e.file : e.action || 'upload event'), _source: 'dlp' });
+      }
+    });
+    if (map.size) {
+      const users = [...map.values()].sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+      _renderPopoverUsers(users, 'endpoint DLP events');
+      _positionPopover(anchorEl, users.length);
+      return;
+    }
+  }
+
+  // 4. No per-user identities available via API — explain why and link to the
   //    Defender portal, where network-discovered app users ARE listed.
   _renderPopoverNoUsers(a);
   _positionPopover(anchorEl, 3);
