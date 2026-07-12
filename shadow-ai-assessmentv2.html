@@ -6359,6 +6359,23 @@ async function loadDataRisk() {
         </div>
       </div>
 
+      <!-- Labelled-content evidence — accessed (cloud-side) & blocked (endpoint DLP).
+           Moved here from the labels page: this is the page's headline evidence. -->
+      <div class="card" id="label-evidence-card" style="margin-bottom:16px">
+        <div class="card-header">
+          <div class="card-title">🔎 Labelled Content — Accessed &amp; Blocked by AI (30d)</div>
+          <span id="label-evidence-src" class="data-source source-derived" style="font-size:10px">⚡ CloudAppEvents · DeviceEvents · Advanced Hunting</span>
+        </div>
+        <div style="padding:8px 16px 2px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em">✅ Accessed — cloud-side (CloudAppEvents)</div>
+        <div id="label-evidence-body">
+          <div class="section-loading"><span class="spinner"></span>Querying labelled-file evidence…</div>
+        </div>
+        <div style="padding:8px 16px 2px;border-top:1px solid var(--border);font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em">🚫 Blocked by DLP — endpoint (DeviceEvents / DataSecurityEvents)</div>
+        <div id="label-dlp-body">
+          <div class="section-loading"><span class="spinner"></span>Checking for DLP-blocked uploads to AI…</div>
+        </div>
+      </div>
+
       <div class="kpi-row" style="grid-template-columns:repeat(4,1fr)">
         <div class="kpi-card ${aiDataApps.length ? 'high' : 'low'}">
           <div class="kpi-label">AI Apps with Data Access</div>
@@ -6378,7 +6395,7 @@ async function loadDataRisk() {
           <div class="kpi-delta">${mailboxAiApps.length > 0 ? mailboxAiApps.slice(0,2).map(sp=>esc(sp.displayName)).join(', ')+(mailboxAiApps.length>2?'…':'') : '✅ No mailbox grants to AI apps'}</div>
           <div class="kpi-icon">📧</div>
         </div>
-        <div class="kpi-card ${dlpBlocks?.blocked ? 'critical' : 'low'}"${dlpBlocks?.ok ? ` style="cursor:pointer" onclick="navigate('labels', document.querySelector('[onclick*=labels]'))"` : ''}>
+        <div class="kpi-card ${dlpBlocks?.blocked ? 'critical' : 'low'}"${dlpBlocks?.ok ? ` style="cursor:pointer" onclick="document.getElementById('label-evidence-card')?.scrollIntoView({behavior:'smooth'})"` : ''}>
           <div class="kpi-label">Blocked from AI by DLP</div>
           <div class="kpi-value ${dlpBlocks?.blocked ? 'text-critical' : 'text-low'}">${dlpBlocks?.ok ? dlpBlocks.blocked : '—'}</div>
           <div class="kpi-delta">${dlpBlocks?.ok ? (dlpBlocks.blocked ? `files stopped en route to AI (30d)${dlpBlocks.incidentCount ? ` · 🔺 ${dlpBlocks.incidentCount} incident${dlpBlocks.incidentCount!==1?'s':''}` : ''}` : '✅ none blocked (30d)') : 'needs ThreatHunting.Read.All'}</div>
@@ -6430,6 +6447,32 @@ async function loadDataRisk() {
     fetchAiActivityEvidence(agentSps.map(sp => sp.appId)).then(ev => {
       const card = document.getElementById('data-reach-card');
       if (card) card.innerHTML = renderDataReachabilityHtml(agentSps, grants, agentAppPerms, ev);
+    }).catch(() => {});
+
+    // Labelled-content evidence card (moved from the labels page). The DLP half
+    // is already fetched; the accessed half needs label context, recomputed here
+    // from the cached label list with the same rules the labels page uses.
+    fillLabelDlpCard(dlpBlocks);
+    fetchSensitivityLabels().then(labels => {
+      const appsWithLabeledAccess = [...new Map([...aiApps, ...agentSps].map(s => [s.id, s])).values()]
+        .filter(sp => getScopesForSp(sp.id, grants).some(s => LABELED_READ_SCOPES.includes(s)));
+      const sensitivity = l => l.sensitivity ?? l.priority ?? 0;
+      const maxSens = (labels || []).reduce((m, l) => Math.max(m, sensitivity(l)), 0);
+      const highSensLabels = (labels || []).filter(l => sensitivity(l) > 0 && sensitivity(l) >= maxSens * 0.6);
+      const reachable = label => {
+        const formats = label.contentFormats || [];
+        return appsWithLabeledAccess.some(sp => {
+          const scopes = getScopesForSp(sp.id, grants);
+          if (formats.includes('file') && scopes.some(s => ['Files.Read.All','Files.ReadWrite.All','Sites.Read.All','Sites.ReadWrite.All'].includes(s))) return true;
+          if (formats.includes('email') && scopes.some(s => ['Mail.Read','Mail.ReadWrite','Mail.Read.Shared'].includes(s))) return true;
+          if (formats.includes('teamwork') && scopes.some(s => ['Chat.Read.All','ChannelMessage.Read.All'].includes(s))) return true;
+          return false;
+        });
+      };
+      const reachableHighSens = highSensLabels.filter(reachable);
+      const protectionKnown = (labels || []).some(l => l.hasProtection !== undefined);
+      const criticalExposure = protectionKnown ? reachableHighSens.filter(l => l.hasProtection !== true) : reachableHighSens;
+      return renderLabelledAccessEvidence(labels, highSensLabels, criticalExposure, [...appsWithLabeledAccess, ...aiApps]);
     }).catch(() => {});
   } catch (e) {
     el.innerHTML = permWarn('Multiple permissions', e.message);
@@ -7966,8 +8009,9 @@ async function fetchAiFileAccessEvidence(appIds) {
 // Sharing page. Candidates = every detected AI app/agent (not only those with
 // visible grants — evidence can reveal access the grant scan missed).
 async function renderAiFileEvidence(fileApps, aiApps) {
+  // The evidence card itself moved to the Data Risk page; body is usually null
+  // here and this function then only feeds the "Files Accessed by AI" KPI.
   const body = document.getElementById('share-evidence-body');
-  if (!body) return;
   const candidates = [...new Map([...fileApps, ...aiApps].map(s => [s.id, s])).values()].filter(sp => sp.appId);
   const ev = await fetchAiFileAccessEvidence(candidates.map(sp => sp.appId));
   const kpiVal = document.getElementById('kpi-share-files');
@@ -7994,6 +8038,7 @@ async function renderAiFileEvidence(fileApps, aiApps) {
   if (kpiSub) kpiSub.textContent = rows.length
     ? `by ${rows.length} AI app${rows.length !== 1 ? 's' : ''}${totWrites ? ` · ${totWrites} write${totWrites !== 1 ? 's' : ''}` : ''}`
     : 'no access observed';
+  if (!body) return; // KPI-only mode — no card on this page anymore
   // "How much" from Cloud Discovery, when the Shadow AI page has loaded it
   const mcasApps = STATE.data.mcasApps || [];
   const uploadFor = sp => {
@@ -8089,46 +8134,6 @@ function dlpIncidentStrip(bl) {
     </div>
     ${rows}
   </div>`;
-}
-
-async function renderShareDlpBlocks() {
-  const body = document.getElementById('share-dlp-body');
-  if (!body) return;
-  const bl = await fetchDlpAiBlocks().catch(() => ({ ok: false, code: 'error' }));
-  const badge = document.getElementById('share-dlp-src');
-  if (bl?.ok && badge) { badge.textContent = '● DeviceEvents / DataSecurityEvents · Advanced Hunting'; badge.className = 'data-source source-live'; }
-  if (!document.getElementById('share-dlp-body')) return;
-  if (!bl?.ok) {
-    body.innerHTML = `<div class="card-body" style="font-size:12px;color:var(--text-muted)">${
-      bl?.code === 'forbidden'
-        ? '🔒 Needs <code>ThreatHunting.Read.All</code> — re-run admin consent, then sign out &amp; back in, to read DLP block events for AI uploads.'
-        : bl?.code === 'unsupported'
-          ? 'ℹ️ The DLP event tables (DeviceEvents / DataSecurityEvents) aren&#39;t queryable in this tenant — endpoint DLP or the Purview event preview may not be onboarded. Verify in <a href="https://purview.microsoft.com/datalossprevention/activityexplorer" target="_blank" style="color:var(--accent-blue)">Purview → Activity Explorer</a>.'
-          : 'ℹ️ DLP block events unavailable — ' + esc(String(bl?.error || 'unknown error').slice(0, 160))}</div>`;
-    return;
-  }
-  if (!bl.events.length) {
-    body.innerHTML = `<div class="card-body"><div class="empty-state text-muted">${bl.note ? esc(bl.note) : '✅ No DLP-blocked file uploads to external AI in the last 30 days.'}<br><span style="font-size:11px">A block <em>here</em> means DLP stopped a file before it reached an AI app — the enforcement proof section 1 can&#39;t show.</span></div></div>`;
-    return;
-  }
-  const appChips = Object.entries(bl.byApp).sort((a, b) => b[1].total - a[1].total)
-    .map(([app, c]) => `<span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 10px;border-radius:20px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-muted)"><span style="color:var(--risk-critical)">🚫</span>${esc(app)} <strong style="color:var(--text-primary)">${c.blocked}</strong>${c.total > c.blocked ? `<span style="color:var(--text-dim)"> / ${c.total}</span>` : ''}</span>`).join('');
-  body.innerHTML = `
-    <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;flex-wrap:wrap">
-      <div><span style="font-size:22px;font-weight:800;color:var(--risk-critical);line-height:1">${bl.blocked}</span> <span style="font-size:11px;color:var(--text-muted)">blocked</span></div>
-      ${bl.total > bl.blocked ? `<div><span style="font-size:22px;font-weight:800;color:var(--risk-medium);line-height:1">${bl.total - bl.blocked}</span> <span style="font-size:11px;color:var(--text-muted)">audited</span></div>` : ''}
-      <div style="display:flex;gap:6px;flex-wrap:wrap">${appChips}</div>
-    </div>
-    ${dlpIncidentStrip(bl)}
-    <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Files DLP stopped (or audited) on their way to an external AI app — the enforcement counterpart to section 1's cloud-side access evidence.</div>
-    <div class="table-wrap dlp-blocks-scroll">
-      <table class="dlp-blocks-table">
-        <thead><tr><th>When</th><th>User</th><th>File</th><th>AI App</th><th>Action</th><th>Policy</th></tr></thead>
-        <tbody>${bl.events.slice(0, 50).map(dlpEventRow).join('')}
-        </tbody>
-      </table>
-    </div>
-    ${dlpTableFooter()}`;
 }
 
 async function loadExternalSharing() {
@@ -8281,31 +8286,11 @@ async function loadExternalSharing() {
           'No detected AI app or agent has Files/Sites permissions, so AI cannot read shared file content via Graph today.');
       })()}
 
-      <!-- 1 · Evidence — what AI apps actually read/wrote (fills in async) -->
+      <!-- Access/blocked evidence lives on the Data Risk page (labelled-content
+           evidence card); this page keeps the settings & grant reachability view. -->
       <div class="card" style="margin-bottom:16px">
         <div class="card-header">
-          <div class="card-title">🔎 1 · What AI Actually Accessed (30d)</div>
-          <span id="share-evidence-src" class="data-source source-derived" style="font-size:10px">⚡ CloudAppEvents · Advanced Hunting</span>
-        </div>
-        <div id="share-evidence-body">
-          <div class="section-loading"><span class="spinner"></span>Querying file-access evidence…</div>
-        </div>
-      </div>
-
-      <!-- 1b · DLP blocks — sensitive files STOPPED on the way to an external AI -->
-      <div class="card" style="margin-bottom:16px">
-        <div class="card-header">
-          <div class="card-title">🚫 1b · Files Blocked From AI by DLP (30d)</div>
-          <span id="share-dlp-src" class="data-source source-derived" style="font-size:10px">⚡ DeviceEvents / DataSecurityEvents · Advanced Hunting</span>
-        </div>
-        <div id="share-dlp-body">
-          <div class="section-loading"><span class="spinner"></span>Checking for DLP-blocked uploads to AI…</div>
-        </div>
-      </div>
-
-      <div class="card" style="margin-bottom:16px">
-        <div class="card-header">
-          <div class="card-title">📂 2 · What AI Could Reach — Apps &amp; Agents with File Grants (${allFileApps.length})</div>
+          <div class="card-title">📂 1 · What AI Could Reach — Apps &amp; Agents with File Grants (${allFileApps.length})</div>
           <span class="data-source source-derived">⚡ Derived from OAuth2 grants</span>
         </div>
         ${allFileApps.length ? `
@@ -8344,7 +8329,7 @@ async function loadExternalSharing() {
       <!-- 3 · Root cause — the tenant settings that widen what delegated AI access reaches -->
       <div class="card" style="margin-bottom:16px">
         <div class="card-header">
-          <div class="card-title">🌐 3 · Settings That Amplify Exposure${spSettings ? ` (${amplifiers.length} of ${settingRows.length} active)` : ''}</div>
+          <div class="card-title">🌐 2 · Settings That Amplify Exposure${spSettings ? ` (${amplifiers.length} of ${settingRows.length} active)` : ''}</div>
           <span class="data-source ${spSettings ? 'source-live' : 'source-derived'}" style="font-size:10px">
             ${spSettings ? '● admin/sharepoint/settings' : '⚡ needs SharePointTenantSettings.Read.All'}
           </span>
@@ -8409,8 +8394,9 @@ async function loadExternalSharing() {
     `;
 
     // Evidence loads async (Advanced Hunting) — fills the card + evidence KPI
+    // Card moved to the Data Risk page — this call now only fills the
+    // "Files Accessed by AI" KPI (renderAiFileEvidence is KPI-safe without it).
     renderAiFileEvidence(allFileApps, aiApps).catch(() => {});
-    renderShareDlpBlocks().catch(() => {});
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
   }
@@ -8493,9 +8479,6 @@ async function loadSensitivityLabels() {
       // Enforcement counterpart — labels classify, DLP enforces what flows to AI
       fetchDlpProtectionScope().catch(() => null),
     ]);
-    // DLP *events* — actual blocks of labelled/sensitive items to external AI (30d).
-    // Loads in the background and fills its card when ready (Advanced Hunting).
-    const dlpBlocksP = fetchDlpAiBlocks().catch(() => ({ ok: false, code: 'error' }));
     const aiApps   = sps.filter(isAiApp);
     const agentSps = STATE.data.agentSps || sps.filter(sp => AGENT_KEYWORDS.some(k=>(sp.displayName||'').toLowerCase().includes(k)) || sp.servicePrincipalType==='ServiceIdentity');
 
@@ -8733,21 +8716,6 @@ async function loadSensitivityLabels() {
           `}
         </div>
 
-      <!-- Evidence: labelled content AI accessed (cloud-side) AND was blocked from (endpoint DLP) -->
-      <div class="card" style="margin-bottom:16px">
-        <div class="card-header">
-          <div class="card-title">🔎 Labelled Content — Accessed &amp; Blocked by AI (30d)</div>
-          <span id="label-evidence-src" class="data-source source-derived" style="font-size:10px">⚡ CloudAppEvents · DeviceEvents · Advanced Hunting</span>
-        </div>
-        <div style="padding:8px 16px 2px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em">✅ Accessed — cloud-side (CloudAppEvents)</div>
-        <div id="label-evidence-body">
-          <div class="section-loading"><span class="spinner"></span>Querying labelled-file evidence…</div>
-        </div>
-        <div style="padding:8px 16px 2px;border-top:1px solid var(--border);font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em">🚫 Blocked by DLP — endpoint (DeviceEvents / DataSecurityEvents)</div>
-        <div id="label-dlp-body">
-          <div class="section-loading"><span class="spinner"></span>Checking for DLP-blocked uploads to AI…</div>
-        </div>
-      </div>
 
       ${policies.length ? `
       <div class="card" style="margin-bottom:16px">
@@ -8947,50 +8915,47 @@ async function loadSensitivityLabels() {
       </div>
     `;
 
-    // Labelled-content evidence loads async (Advanced Hunting) — fills the card above
-    renderLabelledAccessEvidence(labels, highSensLabels, criticalExposure, [...appsWithLabeledAccess, ...aiApps]).catch(() => {});
-
-    // DLP-blocks-to-AI evidence loads async — the "did DLP actually stop an upload
-    // to Claude/ChatGPT" card. Cloud-side CloudAppEvents can't see endpoint blocks;
-    // this reads DeviceEvents / DataSecurityEvents where the policy actually fired.
-    dlpBlocksP.then(bl => {
-      const body = document.getElementById('label-dlp-body');
-      if (!body) return;
-      if (!bl?.ok) {
-        body.innerHTML = `<div class="card-body" style="font-size:12px;color:var(--text-muted)">${
-          bl?.code === 'forbidden'
-            ? '🔒 Needs <code>ThreatHunting.Read.All</code> — re-run admin consent, then sign out &amp; back in, to read DLP block events for AI uploads.'
-            : bl?.code === 'unsupported'
-              ? 'ℹ️ The DLP event tables (DeviceEvents / DataSecurityEvents) aren&#39;t queryable in this tenant — endpoint DLP or the Purview event preview may not be onboarded. Verify blocks directly in <a href="https://purview.microsoft.com/datalossprevention/activityexplorer" target="_blank" style="color:var(--accent-blue)">Purview → Activity Explorer</a>.'
-              : 'ℹ️ DLP block events unavailable — ' + esc(String(bl?.error || 'unknown error').slice(0, 160))}</div>`;
-        return;
-      }
-      if (!bl.events.length) {
-        body.innerHTML = `<div class="card-body"><div class="empty-state text-muted">${bl.note ? esc(bl.note) : '✅ No DLP-blocked uploads of sensitive content to external AI in the last 30 days.'}<br><span style="font-size:11px">A block <em>here</em> means DLP did its job — this is the enforcement proof the cloud-side card can&#39;t show.</span></div></div>`;
-        return;
-      }
-      const appChips = Object.entries(bl.byApp).sort((a, b) => b[1].total - a[1].total)
-        .map(([app, c]) => `<span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 10px;border-radius:20px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-muted)"><span style="color:var(--risk-critical)">🚫</span>${esc(app)} <strong style="color:var(--text-primary)">${c.blocked}</strong>${c.total > c.blocked ? `<span style="color:var(--text-dim)"> / ${c.total}</span>` : ''}</span>`).join('');
-      body.innerHTML = `
-        <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;flex-wrap:wrap">
-          <div><span style="font-size:22px;font-weight:800;color:var(--risk-critical);line-height:1">${bl.blocked}</span> <span style="font-size:11px;color:var(--text-muted)">blocked</span></div>
-          ${bl.total > bl.blocked ? `<div><span style="font-size:22px;font-weight:800;color:var(--risk-medium);line-height:1">${bl.total - bl.blocked}</span> <span style="font-size:11px;color:var(--text-muted)">audited</span></div>` : ''}
-          <div style="display:flex;gap:6px;flex-wrap:wrap">${appChips}</div>
-        </div>
-        ${dlpIncidentStrip(bl)}
-        <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Sensitive-content uploads that Purview DLP stopped (or audited) on their way to an external AI app — the enforcement proof the cloud-side evidence card can&#39;t see.</div>
-        <div class="table-wrap dlp-blocks-scroll">
-          <table class="dlp-blocks-table">
-            <thead><tr><th>When</th><th>User</th><th>File</th><th>AI App</th><th>Action</th><th>Policy</th></tr></thead>
-            <tbody>${bl.events.slice(0, 50).map(dlpEventRow).join('')}
-            </tbody>
-          </table>
-        </div>
-        ${dlpTableFooter()}`;
-    }).catch(() => {});
   } catch (e) {
     el.innerHTML = permWarn('InformationProtectionPolicy.Read', e.message);
   }
+}
+
+// Fills the "🚫 Blocked by DLP" half of the labelled-content evidence card
+// (id label-dlp-body, on the Data Risk page) from a resolved fetchDlpAiBlocks().
+function fillLabelDlpCard(bl) {
+  const body = document.getElementById('label-dlp-body');
+  if (!body) return;
+  if (!bl?.ok) {
+    body.innerHTML = `<div class="card-body" style="font-size:12px;color:var(--text-muted)">${
+      bl?.code === 'forbidden'
+        ? '🔒 Needs <code>ThreatHunting.Read.All</code> — re-run admin consent, then sign out &amp; back in, to read DLP block events for AI uploads.'
+        : bl?.code === 'unsupported'
+          ? 'ℹ️ The DLP event tables (DeviceEvents / DataSecurityEvents) aren&#39;t queryable in this tenant — endpoint DLP or the Purview event preview may not be onboarded. Verify blocks directly in <a href="https://purview.microsoft.com/datalossprevention/activityexplorer" target="_blank" style="color:var(--accent-blue)">Purview → Activity Explorer</a>.'
+          : 'ℹ️ DLP block events unavailable — ' + esc(String(bl?.error || 'unknown error').slice(0, 160))}</div>`;
+    return;
+  }
+  if (!bl.events.length) {
+    body.innerHTML = `<div class="card-body"><div class="empty-state text-muted">${bl.note ? esc(bl.note) : '✅ No DLP-blocked uploads of sensitive content to external AI in the last 30 days.'}<br><span style="font-size:11px">A block <em>here</em> means DLP did its job — this is the enforcement proof the cloud-side card can&#39;t show.</span></div></div>`;
+    return;
+  }
+  const appChips = Object.entries(bl.byApp).sort((a, b) => b[1].total - a[1].total)
+    .map(([app, c]) => `<span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 10px;border-radius:20px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-muted)"><span style="color:var(--risk-critical)">🚫</span>${esc(app)} <strong style="color:var(--text-primary)">${c.blocked}</strong>${c.total > c.blocked ? `<span style="color:var(--text-dim)"> / ${c.total}</span>` : ''}</span>`).join('');
+  body.innerHTML = `
+    <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+      <div><span style="font-size:22px;font-weight:800;color:var(--risk-critical);line-height:1">${bl.blocked}</span> <span style="font-size:11px;color:var(--text-muted)">blocked</span></div>
+      ${bl.total > bl.blocked ? `<div><span style="font-size:22px;font-weight:800;color:var(--risk-medium);line-height:1">${bl.total - bl.blocked}</span> <span style="font-size:11px;color:var(--text-muted)">audited</span></div>` : ''}
+      <div style="display:flex;gap:6px;flex-wrap:wrap">${appChips}</div>
+    </div>
+    ${dlpIncidentStrip(bl)}
+    <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Sensitive-content uploads that Purview DLP stopped (or audited) on their way to an external AI app — the enforcement proof the cloud-side evidence card can&#39;t see.</div>
+    <div class="table-wrap dlp-blocks-scroll">
+      <table class="dlp-blocks-table">
+        <thead><tr><th>When</th><th>User</th><th>File</th><th>AI App</th><th>Action</th><th>Policy</th></tr></thead>
+        <tbody>${bl.events.slice(0, 50).map(dlpEventRow).join('')}
+        </tbody>
+      </table>
+    </div>
+    ${dlpTableFooter()}`;
 }
 
 // ── MCP SERVER INVENTORY ──────────────────────────────────────────────────
