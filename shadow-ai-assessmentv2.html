@@ -3417,6 +3417,10 @@ async function loadShadowApps() {
     STATE.data.mcasUrl = 'Microsoft Graph (CloudApp-Discovery.Read.All)';
     updateDashShadowKpi();
     renderMcasApps(el, STATE.data.mcasApps, STATE.data.mcasUrl);
+    // Enrichment cards (async): OAuth governance for detected AI apps (Entra side)
+    // + endpoint-level AI traffic — the two lenses MDCA discovery can't see.
+    renderOAuthGovCard('shadow-content', 'shadow-gov-slot', null).catch(() => {});
+    renderEndpointAiTraffic('shadow-content', 'shadow-endpoint-slot').catch(() => {});
   } catch (graphErr) {
     // MCAS unavailable — fall back to SP / OAuth grant-based detection
     el.innerHTML = '<div class="section-loading"><span class="spinner"></span>MCAS unavailable — loading SP-based AI app detection…</div>';
@@ -4431,6 +4435,10 @@ async function loadModels() {
     // World map — tenant region + model-residency egress arcs; the residency
     // counts render as a static legend baked into the card body above.
     renderModelResidencyMap(models, tenantRegion);
+
+    // Azure-hosted AI (Sentinel AzureDiagnostics/AzureActivity) — closes the gap
+    // between tenant M365 AI and Azure-side models; async, degrades gracefully.
+    renderAzureAiCard('models-content', 'models-azure-slot').catch(() => {});
   } catch (e) {
     el.innerHTML = permWarn('Application.Read.All', e.message);
   }
@@ -8813,6 +8821,169 @@ function fillLabelDlpCard(bl) {
 
 // ── MCP SERVER INVENTORY ──────────────────────────────────────────────────
 
+// ═══ ADVANCED-HUNTING ENRICHMENT CARDS ═══════════════════════════════════════
+// OAuthAppInfo (app governance) · GraphApiAuditEvents (observed Graph activity)
+// · DeviceNetworkEvents (endpoint AI traffic) · Azure tables (Azure-hosted AI).
+// Each renders a self-contained card into a slot div appended to its page and
+// degrades to an explanatory card when the table/licence isn't available.
+async function _runHunt(kql) {
+  const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
+  if (!token) return { error: 'ThreatHunting.Read.All not consented', forbidden: true };
+  try {
+    const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ Query: kql, Timespan: 'P30D' }),
+    });
+    if (!r.ok) return { error: (await r.text()).slice(0, 250), status: r.status };
+    const d = await r.json();
+    return { rows: Array.isArray(d.results) ? d.results : (Array.isArray(d.Results) ? d.Results : []) };
+  } catch (e) { return { error: e.message || String(e) }; }
+}
+const _huntArr = v => { let d = v; if (typeof d === 'string') { try { d = JSON.parse(d); } catch { d = [d]; } } return Array.isArray(d) ? d.map(String).filter(Boolean) : []; };
+const _huntNA = msg => /failed to resolve table|could not be resolved|unknown table|semantic error/i.test(msg || '');
+function _ensureSlot(containerId, slotId) {
+  const c = document.getElementById(containerId);
+  if (!c) return null;
+  let s = document.getElementById(slotId);
+  if (!s) { s = document.createElement('div'); s.id = slotId; c.appendChild(s); }
+  return s;
+}
+function _huntErrCard(title, src, r) {
+  return `<div class="card" style="margin:16px 0"><div class="card-header"><div class="card-title">${title}</div><span class="data-source source-derived" style="font-size:10px">${src}</span></div>
+    <div class="card-body" style="font-size:12px;color:var(--text-muted)">${
+      (r.forbidden || r.status === 403) ? '🔒 Needs <code>ThreatHunting.Read.All</code>.'
+      : _huntNA(r.error) ? 'ℹ️ Table not available in this tenant — check licensing/onboarding for this source.'
+      : 'ℹ️ Unavailable — ' + esc(String(r.error || '').slice(0, 160))}</div></div>`;
+}
+
+// OAuthAppInfo snapshot (Defender for Cloud Apps app governance) — cached.
+async function fetchOAuthAppInfo() {
+  if (STATE.data.oauthGov !== undefined) return STATE.data.oauthGov;
+  const r = await _runHunt('OAuthAppInfo | summarize arg_max(Timestamp, *) by OAuthAppId | project OAuthAppId, AppName, AppStatus, PrivilegeLevel, Permissions, ConsentedUsersCount, IsAdminConsented, AppOrigin, LastUsedTime | take 1000');
+  if (!r.rows) { STATE.data.oauthGov = { ok: false, ...r, byAppId: {} }; return STATE.data.oauthGov; }
+  const byAppId = {};
+  r.rows.forEach(row => {
+    let perms = row.Permissions; if (typeof perms === 'string') { try { perms = JSON.parse(perms); } catch { perms = []; } } if (!Array.isArray(perms)) perms = [];
+    const highUnused = perms.filter(p => String(p?.PrivilegeLevel || '') === 'High' && String(p?.UsageStatus || '') === 'NotInUse').length;
+    byAppId[String(row.OAuthAppId || '').toLowerCase()] = {
+      name: String(row.AppName || ''), status: String(row.AppStatus || ''), privilege: String(row.PrivilegeLevel || ''),
+      permCount: perms.length, highUnused, users: Number(row.ConsentedUsersCount) || 0,
+      adminConsented: row.IsAdminConsented === true || String(row.IsAdminConsented).toLowerCase() === 'true',
+      origin: String(row.AppOrigin || ''), lastUsed: row.LastUsedTime || null,
+    };
+  });
+  STATE.data.oauthGov = { ok: true, byAppId };
+  return STATE.data.oauthGov;
+}
+
+// 🛂 App-governance card. apps = SPs with appId; null → detected AI apps.
+async function renderOAuthGovCard(containerId, slotId, apps) {
+  const gov = await fetchOAuthAppInfo();
+  const slot = _ensureSlot(containerId, slotId);
+  if (!slot) return;
+  const title = '🛂 App Governance — OAuth Posture', src = '● OAuthAppInfo · app governance (hourly)';
+  if (!gov.ok) { slot.innerHTML = _huntErrCard(title, src, gov); return; }
+  if (!apps) apps = (await fetchServicePrincipals().catch(() => [])).filter(isAiApp);
+  const rows = [...new Map(apps.map(s => [s.appId, s])).values()]
+    .map(sp => ({ sp, g: gov.byAppId[(sp.appId || '').toLowerCase()] })).filter(x => x.g);
+  if (!rows.length) { slot.innerHTML = `<div class="card" style="margin:16px 0"><div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div><div class="card-body" style="font-size:12px;color:var(--text-muted)">ℹ️ None of these apps appear in app governance yet (M365-connected OAuth apps only).</div></div>`; return; }
+  rows.sort((a, b) => (b.g.highUnused - a.g.highUnused) || (b.g.adminConsented - a.g.adminConsented));
+  slot.innerHTML = `<div class="card" style="margin:16px 0">
+    <div class="card-header"><div class="card-title">${title} (${rows.length})</div><span class="data-source source-live" style="font-size:10px">${src}</span></div>
+    <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Governance facts from Defender for Cloud Apps app governance — <strong>High privileged &amp; unused</strong> permissions are the cleanest revoke candidates.</div>
+    <div class="table-wrap tbl-scroll" style="max-height:330px"><table>
+      <thead><tr><th>App</th><th>Privilege</th><th>High &amp; Unused</th><th>Consent</th><th>Origin</th><th>Last Used</th><th>Status</th></tr></thead>
+      <tbody>${rows.map(({ sp, g }) => `<tr${g.highUnused ? ' style="background:rgba(248,81,73,.04)"' : ''}>
+        <td><strong style="font-size:13px">${esc(sp.displayName || g.name || '—')}</strong></td>
+        <td>${g.privilege === 'High' ? '<span class="badge badge-high" style="font-size:10px">High</span>' : esc(g.privilege || '—')}</td>
+        <td style="font-weight:700;color:${g.highUnused ? 'var(--risk-critical)' : 'var(--risk-low)'}" title="High-privilege permissions granted but not used — revoke candidates">${g.highUnused}<span class="text-muted" style="font-weight:400;font-size:10px"> / ${g.permCount}</span></td>
+        <td>${g.adminConsented ? '<span class="badge badge-critical" style="font-size:10px">Admin (tenant-wide)</span>' : `<span style="font-size:11px;color:var(--text-muted)">${g.users} user${g.users !== 1 ? 's' : ''}</span>`}</td>
+        <td style="font-size:11px;color:${/external/i.test(g.origin) ? 'var(--risk-high)' : 'var(--text-muted)'}">${esc(g.origin || '—')}</td>
+        <td class="mono text-muted" style="font-size:11px">${g.lastUsed ? new Date(g.lastUsed).toLocaleDateString() : '—'}</td>
+        <td style="font-size:11px;color:${/^Enabled$/i.test(g.status) ? 'var(--risk-low)' : 'var(--risk-high)'}">${esc(g.status || '—')}</td>
+      </tr>`).join('')}</tbody>
+    </table></div></div>`;
+}
+
+// 📡 Observed Graph activity per app identity (GraphApiAuditEvents).
+async function renderGraphActivityCard(containerId, slotId, apps) {
+  const ids = [...new Set((apps || []).map(s => (s.appId || '').toLowerCase()).filter(Boolean))].slice(0, 40);
+  const title = '📡 Observed Microsoft Graph Activity (30d)', src = '● GraphApiAuditEvents · Advanced Hunting';
+  const slot = _ensureSlot(containerId, slotId);
+  if (!slot || !ids.length) return;
+  const r = await _runHunt(`GraphApiAuditEvents | where Timestamp > ago(30d) | extend AppId = tolower(tostring(ApplicationId)) | where AppId in (${ids.map(i => `"${i}"`).join(',')}) | summarize Requests = count(), Workloads = make_set(TargetWorkload, 10), Endpoints = make_set(RequestUri, 8), IPs = dcount(IPAddress), LastCall = max(Timestamp) by AppId | order by Requests desc`);
+  if (!r.rows) { slot.innerHTML = _huntErrCard(title, src, r); return; }
+  const nameById = new Map((apps || []).map(s => [(s.appId || '').toLowerCase(), s.displayName]));
+  if (!r.rows.length) { slot.innerHTML = `<div class="card" style="margin:16px 0"><div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div><div class="card-body" style="font-size:12px;color:var(--text-muted)">✅ No Microsoft Graph API calls observed from these app identities in 30 days — permissions exist but are unexercised.</div></div>`; return; }
+  slot.innerHTML = `<div class="card" style="margin:16px 0">
+    <div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div>
+    <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">What each identity <strong>actually called</strong> — the runtime counterpart to granted permissions. Hover Endpoints for the sampled request URIs.</div>
+    <div class="table-wrap tbl-scroll" style="max-height:330px"><table>
+      <thead><tr><th>App / Server</th><th>Requests</th><th>Workloads</th><th>Endpoints</th><th>IPs</th><th>Last Call</th></tr></thead>
+      <tbody>${r.rows.map(row => { const eps = _huntArr(row.Endpoints), wls = _huntArr(row.Workloads); return `<tr>
+        <td><strong style="font-size:13px">${esc(nameById.get(String(row.AppId)) || String(row.AppId).slice(0, 12) + '…')}</strong></td>
+        <td style="font-weight:700">${Number(row.Requests) || 0}</td>
+        <td style="font-size:11px;color:var(--text-muted)">${wls.map(esc).join(', ') || '—'}</td>
+        <td style="font-size:11px;color:var(--text-muted)" title="${esc(eps.join('\n'))}">${eps.length} sampled</td>
+        <td>${Number(row.IPs) || 0}</td>
+        <td class="mono text-muted" style="font-size:11px">${row.LastCall ? new Date(row.LastCall).toLocaleDateString() : '—'}</td>
+      </tr>`; }).join('')}</tbody>
+    </table></div></div>`;
+}
+
+// 💻 Endpoint-side shadow AI: device connections to AI services (DeviceNetworkEvents).
+async function renderEndpointAiTraffic(containerId, slotId) {
+  const title = '💻 Endpoint AI Traffic — Shadow AI from Devices (30d)', src = '● DeviceNetworkEvents · Advanced Hunting';
+  const slot = _ensureSlot(containerId, slotId);
+  if (!slot) return;
+  const domains = ['claude.ai','anthropic.com','chatgpt.com','chat.openai.com','openai.com','gemini.google.com','perplexity.ai','deepseek.com','mistral.ai','huggingface.co','openrouter.ai','poe.com','grok.com','x.ai','character.ai'];
+  const r = await _runHunt(`DeviceNetworkEvents | where Timestamp > ago(30d) | where RemoteUrl has_any (${domains.map(d => `"${d}"`).join(',')}) | extend Domain = tolower(tostring(split(replace_regex(RemoteUrl, @"^\\w+://", ""), "/")[0])) | summarize Connections = count(), Devices = dcount(DeviceId), Users = make_set(InitiatingProcessAccountUpn, 5), Processes = make_set(InitiatingProcessFileName, 6), LastSeen = max(Timestamp) by Domain | order by Connections desc | take 30`);
+  if (!r.rows) { slot.innerHTML = _huntErrCard(title, src, r); return; }
+  if (!r.rows.length) { slot.innerHTML = `<div class="card" style="margin:16px 0"><div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div><div class="card-body" style="font-size:12px;color:var(--text-muted)">✅ No endpoint connections to known AI services in 30 days.</div></div>`; return; }
+  slot.innerHTML = `<div class="card" style="margin:16px 0">
+    <div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div>
+    <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Direct from Defender for Endpoint network telemetry — catches browser, desktop-app and CLI usage with no Cloud Discovery log collector. The Processes column separates browser use from scripted/API use.</div>
+    <div class="table-wrap tbl-scroll" style="max-height:330px"><table>
+      <thead><tr><th>AI Service</th><th>Domain</th><th>Connections</th><th>Devices</th><th>Users</th><th>Processes</th><th>Last Seen</th></tr></thead>
+      <tbody>${r.rows.map(row => { const us = _huntArr(row.Users).filter(Boolean), ps = _huntArr(row.Processes).filter(Boolean); return `<tr>
+        <td><strong style="font-size:13px">${esc(_aiEgressApp(String(row.Domain || '')))}</strong></td>
+        <td class="mono" style="font-size:11px;color:var(--text-muted)">${esc(String(row.Domain || '—'))}</td>
+        <td style="font-weight:700">${Number(row.Connections) || 0}</td>
+        <td>${Number(row.Devices) || 0}</td>
+        <td style="font-size:11px;color:var(--text-muted)" title="${esc(us.join(', '))}">${us.slice(0, 2).map(esc).join(', ') || '—'}${us.length > 2 ? ` +${us.length - 2}` : ''}</td>
+        <td style="font-size:11px;color:var(--text-muted)" title="${esc(ps.join(', '))}">${ps.slice(0, 3).map(esc).join(', ') || '—'}</td>
+        <td class="mono text-muted" style="font-size:11px">${row.LastSeen ? new Date(row.LastSeen).toLocaleDateString() : '—'}</td>
+      </tr>`; }).join('')}</tbody>
+    </table></div></div>`;
+}
+
+// ☁️ Azure-hosted AI — Azure OpenAI/Cognitive Services usage + deployments via the
+// connected Sentinel workspace tables (unified Advanced Hunting).
+async function renderAzureAiCard(containerId, slotId) {
+  const title = '☁️ Azure-hosted AI — Usage &amp; Deployments', src = '● AzureDiagnostics · AzureActivity (Sentinel workspace)';
+  const slot = _ensureSlot(containerId, slotId);
+  if (!slot) return;
+  const usage = await _runHunt('AzureDiagnostics | where TimeGenerated > ago(30d) | where ResourceProvider == "MICROSOFT.COGNITIVESERVICES" | summarize Requests = count(), Ops = make_set(OperationName, 8), LastSeen = max(TimeGenerated) by Resource | order by Requests desc | take 20');
+  const deploys = await _runHunt('AzureActivity | where TimeGenerated > ago(90d) | where ResourceProviderValue in ("MICROSOFT.COGNITIVESERVICES","MICROSOFT.MACHINELEARNINGSERVICES") | where ActivityStatusValue == "Success" | summarize Actions = count(), Callers = make_set(Caller, 5), Ops = make_set(OperationNameValue, 6), LastAction = max(TimeGenerated) by ResourceGroup | order by Actions desc | take 20');
+  if (!usage.rows && !deploys.rows) { slot.innerHTML = _huntErrCard(title, src, usage); return; }
+  const half = (label, res, cols, rowFn, empty) => !res.rows
+    ? `<div style="padding:8px 16px;font-size:11px;color:var(--text-muted)">${label}: ${_huntNA(res.error) ? 'table not reachable — connect the workspace/diagnostic settings' : esc(String(res.error || '').slice(0, 120))}</div>`
+    : !res.rows.length
+      ? `<div style="padding:8px 16px;font-size:11px;color:var(--text-muted)">${label}: ${empty}</div>`
+      : `<div style="padding:8px 16px 2px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em">${label}</div>
+         <div class="table-wrap tbl-scroll" style="max-height:230px"><table><thead><tr>${cols.map(c => `<th>${c}</th>`).join('')}</tr></thead><tbody>${res.rows.map(rowFn).join('')}</tbody></table></div>`;
+  slot.innerHTML = `<div class="card" style="margin:16px 0">
+    <div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div>
+    ${half('🧠 Azure OpenAI / Cognitive Services usage (30d)', usage, ['Resource', 'Requests', 'Operations', 'Last Seen'],
+      row => `<tr><td><strong style="font-size:12px">${esc(String(row.Resource || '—'))}</strong></td><td style="font-weight:700">${Number(row.Requests) || 0}</td><td style="font-size:11px;color:var(--text-muted)">${_huntArr(row.Ops).slice(0, 4).map(esc).join(', ')}</td><td class="mono text-muted" style="font-size:11px">${row.LastSeen ? new Date(row.LastSeen).toLocaleDateString() : '—'}</td></tr>`,
+      'no data-plane activity logged — enable diagnostic settings on the Azure OpenAI resource')}
+    ${half('🏗️ AI resource deployments (90d, AzureActivity)', deploys, ['Resource Group', 'Actions', 'Callers', 'Operations', 'Last'],
+      row => `<tr><td><strong style="font-size:12px">${esc(String(row.ResourceGroup || '—'))}</strong></td><td style="font-weight:700">${Number(row.Actions) || 0}</td><td style="font-size:11px;color:var(--text-muted)">${_huntArr(row.Callers).slice(0, 3).map(esc).join(', ')}</td><td style="font-size:11px;color:var(--text-muted)" title="${esc(_huntArr(row.Ops).join(', '))}">${_huntArr(row.Ops).length} type${_huntArr(row.Ops).length !== 1 ? 's' : ''}</td><td class="mono text-muted" style="font-size:11px">${row.LastAction ? new Date(row.LastAction).toLocaleDateString() : '—'}</td></tr>`,
+      'no Cognitive Services / ML deployments in 90 days')}
+    <div style="padding:8px 14px;font-size:11px;color:var(--text-dim);border-top:1px solid var(--border)">ℹ️ Requires the Microsoft Sentinel workspace to be connected to the unified Defender portal; Azure OpenAI data-plane logging needs diagnostic settings on each resource.</div>
+  </div>`;
+}
+
 const MCP_RE = /\bMCP\b|Model[\s-]?Context[\s-]?Protocol/i;
 const MCP_KNOWN_APPIDS = new Set([
   // Well-known Microsoft MCP hosts (add more as they become known)
@@ -9148,6 +9319,11 @@ async function loadMcpServers() {
 
     // Initial render of the table (with default sort: risk desc)
     renderMcpTable();
+
+    // Enrichment cards (async): app-governance posture + observed Graph activity
+    // for the registry's identities — appended below the static cards.
+    renderOAuthGovCard('mcp-content', 'mcp-gov-slot', uniqueMcp).catch(() => {});
+    renderGraphActivityCard('mcp-content', 'mcp-graphapi-slot', uniqueMcp).catch(() => {});
 
     // Malicious-MCP indicator checks — async, fills #mcp-mal-slot
     renderMcpMaliciousIndicators(uniqueMcp, grants).catch(() => {});
