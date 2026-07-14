@@ -480,7 +480,7 @@
           <button class="btn btn-primary" onclick="doAdminConsent('full')">Grant full consent</button>
         </div>
       </div>
-      <div class="ca-note">Dataverse (Copilot Studio) &amp; Azure AI (Foundry) permissions are separate resources — they consent on first use in those tabs.</div>
+      <div class="ca-note">Three non-Graph resources consent separately (on first use of their tab): <b>Dynamics CRM</b> (Copilot Studio · Dataverse), <b>Microsoft Cognitive Services</b> (Foundry agent reads), and <b>Windows Azure Service Management API</b> (Foundry project discovery). Foundry also needs Azure RBAC — a <b>Foundry User</b> role on the project and <b>Reader</b> on the subscription. See the requirements below for exact app IDs.</div>
     </div>
 
     <div class="reg-guide">
@@ -496,9 +496,12 @@
             <li><code class="perm-read">Application.Read.All</code> — enumerate classic agent service principals &amp; app registrations</li>
             <li><code class="perm-read">Directory.Read.All</code> — owners, resolve sponsor/owner user IDs</li>
             <li><code class="perm-read">AuditLog.Read.All</code> — sign-in activity (optional, for last-used data)</li>
-            <li><code class="perm-read">Dynamics CRM · user_impersonation</code> — read Copilot Studio agents from Dataverse (Copilot Studio inventory mode)</li>
-            <li><code class="perm-read">Azure AI Services / Cognitive Services · user_impersonation</code> — read Foundry agents (audience <code>https://ai.azure.com</code>, Foundry agents mode)</li>
-            <li><code class="perm-read">Azure Service Management · user_impersonation</code> — auto-discover Foundry projects via ARM (audience <code>https://management.azure.com</code>, Foundry "Discover" button)</li>
+          </ul>
+          <div style="font-size:.72rem;color:var(--text3);margin:8px 0 4px">Plus these per-resource delegated permissions (added under <b>API permissions → Add a permission → APIs my organization uses</b>, then <b>Grant admin consent</b>). They consent on first use of their tab:</div>
+          <ul>
+            <li><code class="perm-read">Dynamics CRM · user_impersonation</code> — Copilot Studio inventory (Dataverse). API: <b>Dynamics CRM</b> · <code>00000007-0000-0000-c000-000000000000</code></li>
+            <li><code class="perm-read">Microsoft Cognitive Services · user_impersonation</code> — Foundry agent reads (audience <code>https://ai.azure.com</code> / <code>https://cognitiveservices.azure.com</code>). API: <b>Microsoft Cognitive Services</b> · <code>7d312290-28c8-473c-a0ed-8e53749b6d6d</code></li>
+            <li><code class="perm-read">Azure Service Management · user_impersonation</code> — Foundry project auto-discovery via ARM (audience <code>https://management.azure.com</code>). API: <b>Windows Azure Service Management API</b> · <code>797f4846-ba00-4fd7-ba43-dac1f8f63013</code></li>
           </ul>
         </dd>
         <dt>Create scopes</dt>
@@ -879,6 +882,8 @@
                   <th onclick="csSortBy('_toolCount')">Tools</th>
                   <th onclick="csSortBy('_topicCount')">Topics</th>
                   <th onclick="csSortBy('published')">Published</th>
+                  <th onclick="csSortBy('_lastUsed')">Last used</th>
+                  <th onclick="csSortBy('_adviceRank')">Advice</th>
                 </tr>
               </thead>
               <tbody id="cs-tbody"></tbody>
@@ -2064,8 +2069,45 @@ async function csClassifyAgents(){
     const id = (a.appId || '').toLowerCase();
     if (id) withAppId++;
     a._agentClass = !res.ok ? 'unknown' : (!id ? 'unknown' : (res.set.has(id) ? 'modern' : 'classic'));
+    csAdvise(a);
   }
   return { withAppId, modernSet: res.set.size, ok: res.ok };
+}
+
+// Lifecycle-based recommendation. "Last used" is proxied by the most recent
+// authoring event (published/modified) since end-user usage isn't in the bot table.
+// A short-lived, long-dormant agent is a candidate to simply DISABLE rather than recreate.
+const CS_ADVICE_RANK = { disable: 0, review: 1, recreate: 2, active: 2 };
+function csAdvise(a){
+  const now = Date.now();
+  const t = d => d ? new Date(d).getTime() : 0;
+  const createdT = t(a.created);
+  const lastUsedT = Math.max(t(a.publishedOn), t(a.modified), createdT) || 0;
+  a._lastUsed = lastUsedT || null;
+  a._idleDays = lastUsedT ? Math.floor((now - lastUsedT) / 86400e3) : null;
+  a._activeDays = (createdT && lastUsedT) ? Math.max(0, Math.floor((lastUsedT - createdT) / 86400e3)) : null;
+
+  const idle = a._idleDays, active = a._activeDays;
+  if (idle != null && idle >= 90 && (active == null || active <= 14)){
+    a._advice = { level: 'disable', label: '🗑️ Disable',
+      reason: `Short-lived (~${active != null ? active : '?'}d active) and dormant for ${idle}d — looks abandoned. Disable/decommission instead of recreating.` };
+  } else if (idle != null && idle >= 90){
+    a._advice = { level: 'review', label: '⚠️ Review',
+      reason: `Dormant for ${idle}d — confirm it's still used before recreating.` };
+  } else if (a.published){
+    a._advice = { level: 'recreate', label: '⬆️ Recreate',
+      reason: 'Active & published — recreate in Copilot Studio to modernise (gets a modern Agent ID).' };
+  } else {
+    a._advice = { level: 'review', label: '🔍 Review',
+      reason: 'Never published — review whether to keep before investing in migration.' };
+  }
+  a._adviceRank = CS_ADVICE_RANK[a._advice.level] ?? 9;
+}
+function csAdviceBadge(a){
+  if (!a._advice) return '<span class="text-muted">—</span>';
+  const lv = a._advice.level;
+  const cls = lv === 'disable' ? 'st-error' : (lv === 'recreate' || lv === 'active') ? 'st-copied' : 'st-notcopied';
+  return `<span class="status-pill ${cls}" title="${esc(a._advice.reason)}">${a._advice.label}</span>`;
 }
 
 // Robustly pull the Entra app/identity ID out of a bot record. The documented
@@ -2462,6 +2504,8 @@ function csRender(){
       <td>${a._toolCount || '<span class="text-muted">0</span>'}</td>
       <td>${a._topicCount || '<span class="text-muted">0</span>'}</td>
       <td>${a.published ? '<span class="status-pill st-copied">🚀 Yes</span>' : '<span class="text-muted">No</span>'}</td>
+      <td>${a._lastUsed ? fmtDate(a._lastUsed) : '<span class="text-muted">—</span>'}</td>
+      <td>${csAdviceBadge(a)}</td>
     </tr>`).join('');
 
   if (csExpanded && csFiltered.find(a => a.botid === csExpanded)){
@@ -2484,7 +2528,9 @@ function csInsertDetail(tr, a){
   const list = arr => arr && arr.length ? arr.map(x => `<span class="tag">${esc(x)}</span>`).join('') : '<span class="text-muted">None</span>';
   const detail = document.createElement('tr');
   detail.className = 'expanded-row'; detail.dataset.csDetail = a.botid;
-  detail.innerHTML = `<td colspan="8"><div class="detail-panel">
+  const adviceColor = a._advice && a._advice.level === 'disable' ? 'var(--danger)'
+    : a._advice && (a._advice.level === 'recreate' || a._advice.level === 'active') ? 'var(--modern)' : 'var(--warning)';
+  detail.innerHTML = `<td colspan="10"><div class="detail-panel">
     <div class="detail-grid">
       <div class="detail-section">
         <h4>Agent</h4>
@@ -2495,8 +2541,18 @@ function csInsertDetail(tr, a){
         <div class="detail-row"><span class="dk">Owner</span><span class="dv">${esc(a.owner || '—')}</span></div>
         <div class="detail-row"><span class="dk">Model</span><span class="dv">${esc(a.model || '—')}</span></div>
         <div class="detail-row"><span class="dk">Orchestration</span><span class="dv">${esc(a.orchestration)}</span></div>
+      </div>
+      <div class="detail-section">
+        <h4>Lifecycle</h4>
+        <div class="detail-row"><span class="dk">Created</span><span class="dv">${a.created ? new Date(a.created).toLocaleDateString() : '—'}</span></div>
+        <div class="detail-row"><span class="dk">Last used</span><span class="dv">${a._lastUsed ? new Date(a._lastUsed).toLocaleDateString() : '—'}${a._idleDays != null ? ` <span class="text-muted">(${a._idleDays}d idle)</span>` : ''}</span></div>
+        <div class="detail-row"><span class="dk">Active span</span><span class="dv">${a._activeDays != null ? a._activeDays + 'd' : '—'}</span></div>
         <div class="detail-row"><span class="dk">Published</span><span class="dv">${a.published ? '🚀 ' + (a.publishedOn ? new Date(a.publishedOn).toLocaleDateString() : 'Yes') : 'No'}</span></div>
         <div class="detail-row"><span class="dk">Modified</span><span class="dv">${a.modified ? new Date(a.modified).toLocaleDateString() : '—'}</span></div>
+        <div style="margin-top:8px;padding:8px 10px;border-radius:6px;background:var(--surface3);border-left:3px solid ${adviceColor}">
+          <div style="font-weight:700;font-size:.78rem;color:var(--text)">${a._advice ? a._advice.label : '—'}</div>
+          <div style="font-size:.72rem;color:var(--text2);margin-top:3px;line-height:1.4">${a._advice ? esc(a._advice.reason) : ''}</div>
+        </div>
       </div>
       <div class="detail-section">
         <h4>Knowledge (${a._knowledgeCount})</h4>${list(a.knowledge)}
@@ -2528,15 +2584,21 @@ function csExport(kind){
       description: a.description, model: a.model, orchestration: a.orchestration,
       instructions: a.instructions, knowledge: a.knowledge, tools: a.tools, topics: a.topics,
       triggers: a.triggers, connections: a.connections, published: a.published,
+      created: a.created, lastUsed: a._lastUsed ? new Date(a._lastUsed).toISOString() : null,
+      idleDays: a._idleDays, activeDays: a._activeDays,
+      advice: a._advice ? a._advice.level : null, adviceReason: a._advice ? a._advice.reason : null,
     }));
     const blob = new Blob([JSON.stringify({ generated: new Date().toISOString(), agents: pkg }, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob); const el = document.createElement('a');
     el.href = url; el.download = `copilot-studio-agents-${stamp}.json`; el.click(); URL.revokeObjectURL(url);
     return;
   }
-  const headers = ['Name','Class','Environment','Model','Orchestration','Published','KnowledgeCount','ToolCount','TopicCount','Tools','Knowledge','Description','Instructions'];
+  const headers = ['Name','Class','Environment','Model','Orchestration','Published','Created','LastUsed','IdleDays','ActiveDays','Advice','AdviceReason','KnowledgeCount','ToolCount','TopicCount','Tools','Knowledge','Description','Instructions'];
   const rows = csAgents.map(a => [
-    a.name || '', a._agentClass || 'unknown', a.environment, a.model || '', a.orchestration, a.published, a._knowledgeCount, a._toolCount, a._topicCount,
+    a.name || '', a._agentClass || 'unknown', a.environment, a.model || '', a.orchestration, a.published,
+    a.created || '', a._lastUsed ? new Date(a._lastUsed).toISOString().slice(0, 10) : '', a._idleDays ?? '', a._activeDays ?? '',
+    a._advice ? a._advice.level : '', a._advice ? a._advice.reason : '',
+    a._knowledgeCount, a._toolCount, a._topicCount,
     (a.tools || []).join('; '), (a.knowledge || []).join('; '),
     (a.description || '').replace(/\s+/g, ' ').slice(0, 500), (a.instructions || '').replace(/\s+/g, ' ').slice(0, 1000),
   ]);
@@ -2590,10 +2652,14 @@ function fdryAuthHint(msg){
 // Data-plane token (audience https://ai.azure.com), acquired via the signed-in account.
 async function fdryGetToken(){
   const scopeSets = [['https://ai.azure.com/.default'], ['https://cognitiveservices.azure.com/.default']];
+  // Try SILENT for every audience first — if any is consented, no popup is needed.
+  for (const scopes of scopeSets){
+    try { return (await msalApp.acquireTokenSilent({ scopes, account: currentAccount })).accessToken; } catch {}
+  }
+  // Only then fall back to interactive, once per audience.
   let lastErr = null;
   for (const scopes of scopeSets){
-    try { return (await msalApp.acquireTokenSilent({ scopes, account: currentAccount })).accessToken; }
-    catch { try { return (await msalApp.acquireTokenPopup({ scopes, account: currentAccount })).accessToken; } catch(e){ lastErr = e; } }
+    try { return (await msalApp.acquireTokenPopup({ scopes, account: currentAccount })).accessToken; } catch(e){ lastErr = e; }
   }
   throw lastErr || new Error('token acquisition failed');
 }
