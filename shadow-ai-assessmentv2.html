@@ -3550,10 +3550,9 @@ function mcasSortBy(key) {
 // paths — the cached path (dashboard already populated mcasApps) previously
 // returned early and skipped these, which is why they'd "disappear".
 function renderShadowEndpointCards() {
-  // Endpoint-level AI traffic — the lens MDCA Cloud Discovery can't see.
+  // Endpoint shadow AI NOT in Cloud Discovery — the lens MDCA can't see (merged
+  // traffic + gaps view: registrable domains, processes, confidence).
   renderEndpointAiTraffic('shadow-content', 'shadow-endpoint-slot').catch(() => {});
-  // Endpoint AI domains NOT in Cloud Discovery — the shadow-AI long tail.
-  renderEndpointAiGaps('shadow-content', 'shadow-endpoint-gaps-slot').catch(() => {});
   // Alerts your Shadow IT / app-discovery policies raise for GenAI apps.
   renderShadowAiPolicyAlerts('shadow-content', 'shadow-policy-alerts-slot').catch(() => {});
 }
@@ -3839,7 +3838,7 @@ function renderMcasApps(el, apps, mcasUrl) {
       </div>
     </div>
 
-    <div class="kpi-row" style="grid-template-columns:repeat(5,1fr)">
+    <div class="kpi-row" style="grid-template-columns:repeat(4,1fr)">
       <div class="kpi-card info" style="cursor:pointer;transition:outline .15s" onclick="mcasFilterBy('all')" title="Show all discovered AI apps">
         <div class="kpi-label">AI Apps</div>
         <div class="kpi-value text-blue">${apps.length}</div>
@@ -3851,17 +3850,11 @@ function renderMcasApps(el, apps, mcasUrl) {
           ].filter(Boolean).join(' · ') || `of ${STATE.data.mcasTotal||'?'} total discovered`}</div>
         <div class="kpi-icon">🤖</div>
       </div>
-      <div class="kpi-card info" style="cursor:pointer;transition:outline .15s" onclick="document.getElementById('shadow-endpoint-slot')?.scrollIntoView({behavior:'smooth',block:'start'})" title="AI services seen in Defender for Endpoint network telemetry (7d) — jump to the Endpoint AI Traffic card">
-        <div class="kpi-label">Endpoint AI Traffic</div>
-        <div class="kpi-value text-blue" id="kpi-endpoint-traffic">${STATE.data.endpointTrafficKpi?.val ?? '…'}</div>
-        <div class="kpi-delta" id="kpi-endpoint-traffic-sub">${STATE.data.endpointTrafficKpi?.sub ?? 'AI services on devices · 7d'}</div>
+      <div class="kpi-card ${STATE.data.endpointShadowKpi?.danger ? 'high' : 'low'}" style="cursor:pointer;transition:outline .15s" onclick="document.getElementById('shadow-endpoint-slot')?.scrollIntoView({behavior:'smooth',block:'start'})" title="AI services seen in Defender for Endpoint network telemetry (7d) that are NOT in Cloud Discovery — jump to the card">
+        <div class="kpi-label">Endpoint Shadow AI</div>
+        <div class="kpi-value" id="kpi-endpoint" style="color:${STATE.data.endpointShadowKpi?.danger ? 'var(--risk-medium)' : 'var(--accent-blue)'}">${STATE.data.endpointShadowKpi?.val ?? '…'}</div>
+        <div class="kpi-delta" id="kpi-endpoint-sub">${STATE.data.endpointShadowKpi?.sub ?? 'not in Cloud Discovery · 7d'}</div>
         <div class="kpi-icon">💻</div>
-      </div>
-      <div class="kpi-card ${STATE.data.endpointGapsKpi?.danger ? 'high' : 'low'}" style="cursor:pointer;transition:outline .15s" onclick="document.getElementById('shadow-endpoint-gaps-slot')?.scrollIntoView({behavior:'smooth',block:'start'})" title="AI domains on endpoints that Cloud Discovery didn't surface — jump to the Cloud Discovery Gaps card">
-        <div class="kpi-label">Endpoint AI Domains</div>
-        <div class="kpi-value" id="kpi-endpoint-gaps" style="color:${STATE.data.endpointGapsKpi?.danger ? 'var(--risk-medium)' : 'var(--accent-blue)'}">${STATE.data.endpointGapsKpi?.val ?? '…'}</div>
-        <div class="kpi-delta" id="kpi-endpoint-gaps-sub">${STATE.data.endpointGapsKpi?.sub ?? 'not in Cloud Discovery'}</div>
-        <div class="kpi-icon">🕳️</div>
       </div>
       <div class="kpi-card ${unsUpload > 0 ? 'critical' : 'high'}">
         <div class="kpi-label">Uploaded to AI (${mcasPeriodLabel()})</div>
@@ -9377,53 +9370,40 @@ async function renderGraphActivityCard(containerId, slotId, apps) {
     </table></div></div>`;
 }
 
-// 💻 Endpoint-side shadow AI: device connections to AI services (DeviceNetworkEvents).
+// Shared Cloud Discovery cross-reference: is this endpoint domain already a
+// discovered MDCA app? Matches by full domain, first/registrable-domain brand,
+// and (for a recognised provider) the provider label's tokens — so both a.claude.ai
+// and cdn.openai.com resolve to the discovered "Anthropic Claude" / "ChatGPT" apps.
+function _mcasDiscoveryTokens() {
+  const s = new Set();
+  (STATE.data.mcasApps || []).forEach(a => { _appDomainTokens(a.name).forEach(t => s.add(t)); _sigTokens(a.name).forEach(t => s.add(t)); });
+  return s;
+}
+function _domainDiscovered(domain, provider, tokens) {
+  const dl = String(domain || '').toLowerCase();
+  if (!dl) return false;
+  if (tokens.has(dl)) return true;
+  const parts = dl.split('.');
+  const first = parts[0], reg = parts.length >= 2 ? parts[parts.length - 2] : first;
+  if (first.length >= 3 && tokens.has(first)) return true;
+  if (reg.length >= 3 && tokens.has(reg)) return true;
+  if (provider && provider !== 'AI app') { for (const t of _sigTokens(provider)) if (tokens.has(t)) return true; }
+  return false;
+}
+
+// 💻 Endpoint shadow AI — device connections to AI services (DeviceNetworkEvents),
+// collapsed to registrable domains and filtered to AI NOT already discovered by
+// Cloud Apps. Broad detection (.ai TLD + provider brands) catches the long tail;
+// the Processes column separates browser use from scripted/desktop/CLI use.
+// (Merged from the former Endpoint AI Traffic + Cloud Discovery Gaps cards.)
 async function renderEndpointAiTraffic(containerId, slotId) {
-  const title = '💻 Endpoint AI Traffic — Shadow AI from Devices (7d)', src = '● DeviceNetworkEvents · Advanced Hunting';
+  const title = '💻 Endpoint Shadow AI — Not in Cloud Discovery (7d)', src = '● DeviceNetworkEvents · Advanced Hunting';
   const slot = _ensureSlot(containerId, slotId);
   if (!slot) return;
   _slotLoading(slot, title, src, 'Scanning device network telemetry for AI services…');
-  // Update the Shadow-page KPI card (cached in STATE so it survives table re-renders).
-  const kpi = (val, sub) => { STATE.data.endpointTrafficKpi = { val, sub }; const v = document.getElementById('kpi-endpoint-traffic'); if (v) v.textContent = val; const s = document.getElementById('kpi-endpoint-traffic-sub'); if (s) s.textContent = sub; };
-  const domains = ['claude.ai','anthropic.com','chatgpt.com','chat.openai.com','openai.com','gemini.google.com','perplexity.ai','deepseek.com','mistral.ai','huggingface.co','openrouter.ai','poe.com','grok.com','x.ai','character.ai'];
-  const r = await _runHunt(`DeviceNetworkEvents | where Timestamp > ago(7d) | where RemoteUrl has_any (${domains.map(d => `"${d}"`).join(',')}) | extend Domain = tolower(tostring(split(replace_regex(RemoteUrl, @"^\\w+://", ""), "/")[0])) | summarize Connections = count(), Devices = dcount(DeviceId), Users = make_set(InitiatingProcessAccountUpn, 5), Processes = make_set(InitiatingProcessFileName, 6), LastSeen = max(Timestamp) by Domain | order by Connections desc | take 30`, 'P7D');
-  if (!r.rows) { kpi('—', 'endpoint hunting unavailable'); slot.innerHTML = _huntErrCard(title, src, r); return; }
-  if (!r.rows.length) { kpi(0, 'none seen on devices · 7d'); slot.innerHTML = `<div class="card" style="margin:16px 0"><div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div><div class="card-body" style="font-size:12px;color:var(--text-muted)">✅ No endpoint connections to known AI services in 7 days.</div></div>`; return; }
-  kpi(r.rows.length, `AI service${r.rows.length!==1?'s':''} on devices · 7d`);
-  slot.innerHTML = `<div class="card" style="margin:16px 0">
-    <div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div>
-    <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Direct from Defender for Endpoint network telemetry — catches browser, desktop-app and CLI usage with no Cloud Discovery log collector. The Processes column separates browser use from scripted/API use.</div>
-    <div class="table-wrap tbl-scroll" style="max-height:330px"><table>
-      <thead><tr><th>AI Service</th><th>Domain</th><th>Connections</th><th>Devices</th><th>Users</th><th>Processes</th><th>Last Seen</th></tr></thead>
-      <tbody>${r.rows.map(row => { const us = _huntArr(row.Users).filter(Boolean), ps = _huntArr(row.Processes).filter(Boolean); return `<tr>
-        <td><strong style="font-size:13px">${esc(_aiEgressApp(String(row.Domain || '')))}</strong></td>
-        <td class="mono" style="font-size:11px;color:var(--text-muted)">${esc(String(row.Domain || '—'))}</td>
-        <td style="font-weight:700">${Number(row.Connections) || 0}</td>
-        <td>${Number(row.Devices) || 0}</td>
-        <td style="font-size:11px;color:var(--text-muted)" title="${esc(us.join(', '))}">${us.slice(0, 2).map(esc).join(', ') || '—'}${us.length > 2 ? ` +${us.length - 2}` : ''}</td>
-        <td style="font-size:11px;color:var(--text-muted)" title="${esc(ps.join(', '))}">${ps.slice(0, 3).map(esc).join(', ') || '—'}</td>
-        <td class="mono text-muted" style="font-size:11px">${row.LastSeen ? new Date(row.LastSeen).toLocaleDateString() : '—'}</td>
-      </tr>`; }).join('')}</tbody>
-    </table></div></div>`;
-}
-
-// 🕳️ Endpoint AI domains that Cloud Discovery didn't surface — the "unknown
-// unknowns". DeviceNetworkEvents sees every AI-ish domain a managed device
-// touches, including apps too new/niche for the MDCA catalog or not categorized
-// as GenAI. Deliberately BROAD (.ai TLD + provider brands) — the noise is the
-// point; each domain is tagged by confidence and cross-referenced against the
-// MDCA discovered-app list so the endpoint-only GAPS stand out.
-async function renderEndpointAiGaps(containerId, slotId) {
-  const slot = _ensureSlot(containerId, slotId);
-  if (!slot) return;
-  const title = '🕳️ Endpoint AI Domains — Cloud Discovery Gaps (7d)', src = '● DeviceNetworkEvents · Advanced Hunting';
-  _slotLoading(slot, title, src, 'Scanning device network telemetry for AI domains not in Cloud Discovery…');
-  // Update the Shadow-page KPI card (cached in STATE so it survives table re-renders).
-  const kpi = (val, sub, danger) => { STATE.data.endpointGapsKpi = { val, sub, danger: !!danger }; const v = document.getElementById('kpi-endpoint-gaps'); if (v) { v.textContent = val; v.style.color = danger ? 'var(--risk-medium)' : 'var(--accent-blue)'; } const s = document.getElementById('kpi-endpoint-gaps-sub'); if (s) s.textContent = sub; };
-  // AI signal: .ai TLD OR a provider brand in the host. First-party Microsoft/Google
-  // and auth/CDN infrastructure are excluded so registrable domains don't collapse to
-  // google.com etc. Registrable domain = last two labels (good enough for .ai/.com).
-  const brands = ['openai','anthropic','claude','perplexity','deepseek','huggingface','ollama','openrouter','together.ai','mistral','cohere','midjourney','elevenlabs','character.ai','poe.com','stability'];
+  // Shadow-page KPI (cached in STATE so it survives table re-renders).
+  const kpi = (val, sub, danger) => { STATE.data.endpointShadowKpi = { val, sub, danger: !!danger }; const v = document.getElementById('kpi-endpoint'); if (v) { v.textContent = val; v.style.color = danger ? 'var(--risk-medium)' : 'var(--accent-blue)'; } const s = document.getElementById('kpi-endpoint-sub'); if (s) s.textContent = sub; };
+  const brands = ['openai','anthropic','claude','perplexity','deepseek','huggingface','ollama','openrouter','together.ai','mistral','cohere','midjourney','elevenlabs','character.ai','poe.com','stability','chatgpt','gemini','grok'];
   const excl = ['microsoft','azure','windows','office','msn','bing','msauth','msftauth','skype','sharepoint','onmicrosoft','officeapps','live.com','office.net','google','gstatic','googleapis','apple','icloud','mozilla','cloudflare'];
   const kql = [
     'DeviceNetworkEvents',
@@ -9435,55 +9415,55 @@ async function renderEndpointAiGaps(containerId, slotId) {
     `| where not(Host has_any (${excl.map(b => `"${b}"`).join(',')}))`,
     String.raw`| extend Domain = extract(@"([a-z0-9-]+\.[a-z0-9-]+)$", 1, Host)`,
     '| where isnotempty(Domain)',
-    '| summarize Connections=count(), Devices=dcount(DeviceId), Users=make_set(InitiatingProcessAccountUpn,5), LastSeen=max(Timestamp) by Domain',
+    '| summarize Connections=count(), Devices=dcount(DeviceId), Users=make_set(InitiatingProcessAccountUpn,5), Processes=make_set(InitiatingProcessFileName,6), LastSeen=max(Timestamp) by Domain',
     '| order by Connections desc | take 80',
   ].join(' ');
   const r = await _runHunt(kql, 'P7D');
   if (!r.rows) { kpi('—', 'endpoint hunting unavailable', false); slot.innerHTML = _huntErrCard(title, src, r); return; }
 
-  // Cross-reference each domain against the MDCA discovered-app inventory (name
-  // tokens ∪ derived domain tokens). A domain already in Cloud Discovery isn't a gap.
-  const mcasTokens = new Set();
-  (STATE.data.mcasApps || []).forEach(a => { _appDomainTokens(a.name).forEach(t => mcasTokens.add(t)); _sigTokens(a.name).forEach(t => mcasTokens.add(t)); });
-  const inMcas = d => { const dl = d.toLowerCase(); if (mcasTokens.has(dl)) return true; const brand = dl.split('.')[0]; return brand.length >= 3 && mcasTokens.has(brand); };
-
-  const rows = r.rows.map(row => {
+  const tokens = _mcasDiscoveryTokens();
+  const brandRoots = brands.map(b => b.split('.')[0]).filter(b => b.length >= 3);
+  const all = r.rows.map(row => {
     const domain = String(row.Domain || '').trim();
-    const known = _aiEgressApp(domain) !== 'AI app';
+    const provider = _aiEgressApp(domain);
+    const known = provider !== 'AI app';
     return {
-      domain,
-      provider: known ? _aiEgressApp(domain) : null,
+      domain, provider: known ? provider : null, known,
       connections: Number(row.Connections) || 0,
       devices: Number(row.Devices) || 0,
       users: _huntArr(row.Users).filter(Boolean),
+      processes: _huntArr(row.Processes).filter(Boolean),
       lastSeen: row.LastSeen ? new Date(row.LastSeen) : null,
-      known, gap: !inMcas(domain),
     };
   }).filter(x => x.domain);
-  const gaps = rows.filter(x => x.gap);
-  const covered = rows.length - gaps.length;
+  // Real AI only (drop .ai marketing noise), then only the ones NOT in Cloud Discovery.
+  const aiRows = all.filter(x => x.known || brandRoots.some(b => x.domain.includes(b)));
+  const gaps = aiRows.filter(x => !_domainDiscovered(x.domain, x.known ? x.provider : null, tokens));
+  const covered = aiRows.length - gaps.length;
 
   if (!gaps.length) {
     kpi(0, covered > 0 ? 'all covered by Cloud Discovery' : 'none seen · 7d', false);
     slot.innerHTML = `<div class="card" style="margin:16px 0"><div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div>
-      <div class="card-body" style="font-size:12px;color:var(--text-muted)">✅ No endpoint AI domains outside Cloud Discovery${rows.length ? ` — all ${rows.length} AI-ish domain${rows.length !== 1 ? 's' : ''} seen on devices are already in the discovered-app inventory` : ' in 7 days'}.</div></div>`;
+      <div class="card-body" style="font-size:12px;color:var(--text-muted)">✅ No endpoint AI services outside Cloud Discovery${aiRows.length ? ` — all ${aiRows.length} AI domain${aiRows.length !== 1 ? 's' : ''} seen on devices are already discovered` : ' in 7 days'}.</div></div>`;
     return;
   }
   kpi(gaps.length, `not in Cloud Discovery${covered ? ` · ${covered} covered` : ''}`, true);
   const conf = x => x.known
     ? '<span class="badge badge-high" style="font-size:9px">Known AI</span>'
-    : (/\.ai$/.test(x.domain) ? '<span style="font-size:10px;color:var(--risk-medium)">Possible AI · .ai TLD</span>' : '<span style="font-size:10px;color:var(--text-muted)">Provider-brand match</span>');
+    : '<span style="font-size:10px;color:var(--risk-medium)">AI provider (brand match)</span>';
   slot.innerHTML = `<div class="card" style="margin:16px 0">
     <div class="card-header"><div class="card-title">${title} (${gaps.length})</div><span class="data-source source-live" style="font-size:10px">${src}</span></div>
-    <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">AI-ish domains seen on managed devices that are <strong>not</strong> in Cloud Discovery — the shadow-AI long tail MDCA's catalog missed.${covered ? ` ${covered} other AI domain${covered !== 1 ? 's are' : ' is'} already covered (see Endpoint AI Traffic).` : ''} <em>.ai is a noisy TLD — treat unconfirmed rows as candidates to review.</em></div>
+    <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">AI services seen on managed devices that are <strong>not</strong> in Cloud Discovery — endpoint-only shadow AI (browser, desktop-app, CLI).${covered ? ` ${covered} other AI domain${covered !== 1 ? 's are' : ' is'} already covered.` : ''} The Processes column separates browser from scripted/API use.</div>
     <div class="table-wrap tbl-scroll" style="max-height:330px"><table>
-      <thead><tr><th>Domain</th><th>Confidence</th><th>Connections</th><th>Devices</th><th>Users</th><th>Last Seen</th></tr></thead>
+      <thead><tr><th>AI Service</th><th>Domain</th><th>Confidence</th><th>Connections</th><th>Devices</th><th>Users</th><th>Processes</th><th>Last Seen</th></tr></thead>
       <tbody>${gaps.map(x => `<tr>
-        <td><strong style="font-size:12px">${esc(x.domain)}</strong>${x.provider ? ` <span style="font-size:10px;color:var(--text-muted)">${esc(x.provider)}</span>` : ''}</td>
+        <td><strong style="font-size:13px">${x.provider ? esc(x.provider) : '—'}</strong></td>
+        <td class="mono" style="font-size:11px;color:var(--text-muted)">${esc(x.domain)}</td>
         <td>${conf(x)}</td>
         <td style="font-weight:700">${x.connections}</td>
         <td>${x.devices}</td>
         <td style="font-size:11px;color:var(--text-muted)" title="${esc(x.users.join(', '))}">${x.users.slice(0, 2).map(esc).join(', ') || '—'}${x.users.length > 2 ? ` +${x.users.length - 2}` : ''}</td>
+        <td style="font-size:11px;color:var(--text-muted)" title="${esc(x.processes.join(', '))}">${x.processes.slice(0, 3).map(esc).join(', ') || '—'}</td>
         <td class="mono text-muted" style="font-size:11px">${x.lastSeen ? x.lastSeen.toLocaleDateString() : '—'}</td>
       </tr>`).join('')}</tbody>
     </table></div></div>`;
