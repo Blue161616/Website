@@ -959,9 +959,21 @@ async function gget(url, consistency = false, extraHeaders = null) {
   const headers = { Authorization: 'Bearer ' + token };
   if (consistency) headers['ConsistencyLevel'] = 'eventual';
   if (extraHeaders) Object.assign(headers, extraHeaders);
-  const r = await fetch(url, { headers });
-  if (!r.ok) { const t = await r.text(); throw new Error(r.status + ' ' + r.statusText + ': ' + t.slice(0, 300)); }
-  return r.json();
+  // Retry throttling (429) and transient service errors (503) with Retry-After
+  // backoff — the Cloud Discovery aggregatedAppsDetails endpoint throttles
+  // aggressively, especially on the heavier 30d/90d windows.
+  for (let attempt = 0; ; attempt++) {
+    const r = await fetch(url, { headers });
+    if (r.ok) return r.json();
+    if ((r.status === 429 || r.status === 503) && attempt < 4) {
+      const ra = parseFloat(r.headers.get('Retry-After'));
+      const waitMs = Number.isFinite(ra) ? Math.min(ra * 1000, 10000) : Math.min(1000 * 2 ** attempt, 8000);
+      await new Promise(res => setTimeout(res, waitMs + Math.random() * 250));
+      continue;
+    }
+    const t = await r.text();
+    throw new Error(r.status + ' ' + r.statusText + ': ' + t.slice(0, 300));
+  }
 }
 
 async function ggetAll(url, maxPages = 5, consistency = false, extraHeaders = null) {
@@ -3294,13 +3306,17 @@ function fmtBytes(b) {
 // ── SHADOW APPS ────────────────────────────────────────────────────────────
 
 // Cloud Discovery aggregation window — selectable on the Shadow AI Apps page.
-// Defaults to 7d: in practice the shorter window surfaces MORE discovered apps
-// (per-app traffic/user detail and enrichment are richest in the recent window;
-// longer windows can aggregate rows away). 30d/90d remain selectable for a
-// wider historical sweep.
-const MCAS_PERIODS = { P7D: '7d', P30D: '30d', P90D: '90d' };
-const MCAS_DEFAULT_PERIOD = 'P7D';
-function mcasPeriodLabel() { return MCAS_PERIODS[STATE.mcasPeriod || MCAS_DEFAULT_PERIOD] || '7d'; }
+// Defaults to 'ALL': each of the 7/30/90-day windows is an INDEPENDENT server-side
+// aggregation (not a superset), and the 1 GB continuous-report cap can drop apps
+// from longer windows — so a single window never guarantees the full inventory.
+// 'ALL' unions all three (dedupe by appId, richest per-app numbers) for the most
+// complete view; the individual windows remain selectable for a single-window lens.
+const MCAS_PERIODS = { ALL: 'All', P7D: '7d', P30D: '30d', P90D: '90d' };
+const MCAS_DEFAULT_PERIOD = 'ALL';
+function mcasPeriodLabel() { const k = STATE.mcasPeriod || MCAS_DEFAULT_PERIOD; return k === 'ALL' ? 'all windows' : (MCAS_PERIODS[k] || '7d'); }
+// Concrete API period for calls that can't take the union (e.g. the per-app user
+// drilldown URL): 'ALL' → the widest single window.
+function mcasApiPeriod() { const k = STATE.mcasPeriod || MCAS_DEFAULT_PERIOD; return (k === 'ALL' || !MCAS_PERIODS[k]) ? 'P90D' : k; }
 function setMcasPeriod(p) {
   if (!MCAS_PERIODS[p] || STATE.mcasPeriod === p) return;
   STATE.mcasPeriod = p;
@@ -3343,16 +3359,40 @@ function updateDashShadowKpi() {
 }
 
 async function fetchMcasAppsFromGraph(period) {
-  // Default 7d (MCAS_DEFAULT_PERIOD): the short window surfaces more discovered
-  // apps with richer per-app detail than the longer aggregations. The Shadow AI
-  // page has a period selector for a wider 30d/90d historical sweep.
   const p = period || STATE.mcasPeriod || MCAS_DEFAULT_PERIOD;
   const streamsResp = await gget(`${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams`);
   const streams = streamsResp.value || [];
   if (!streams.length) throw new Error('No cloud discovery streams found. Ensure Defender for Cloud Apps is connected and receiving data.');
 
+  let all;
+  if (p === 'ALL') {
+    // Union the 7/30/90-day windows for the most complete inventory. Across
+    // periods take the MAX of each metric (the longer window already encompasses
+    // the shorter — summing would multi-count the same traffic); WITHIN a period,
+    // traffic is summed across streams (distinct data sources). Each window is
+    // fetched independently so one throttled/failed window still leaves the rest.
+    const merged = {};
+    for (const per of ['P7D', 'P30D', 'P90D']) {
+      let periodApps;
+      try { periodApps = await _fetchMcasPeriod(streams, per); }
+      catch { periodApps = []; }
+      for (const a of periodApps) _mergeMcasAcrossPeriods(merged, a);
+    }
+    all = Object.values(merged);
+  } else {
+    all = await _fetchMcasPeriod(streams, p);
+  }
+  if (!all.length) throw new Error('Streams found but no discovered apps returned. Check that cloud discovery data is flowing.');
+  return all;
+}
+
+// Fetch + aggregate discovered apps for ONE window across all streams.
+async function _fetchMcasPeriod(streams, p) {
   const appMap = {};
-  await Promise.all(streams.map(async stream => {
+  // Sequential (not Promise.all): firing one aggregatedAppsDetails call per stream
+  // in parallel bursts straight into the Cloud Discovery rate limit (429). gget
+  // also retries with backoff, so a transient throttle no longer surfaces an error.
+  for (const stream of streams) {
     try {
       // Try with $expand=userActivity to capture per-user traffic data in one call.
       // If the endpoint doesn't support the expand, fall back to plain fetch.
@@ -3432,11 +3472,36 @@ async function fetchMcasAppsFromGraph(period) {
         }
       });
     } catch { /* skip streams that error */ }
-  }));
+  }
+  return Object.values(appMap);
+}
 
-  const all = Object.values(appMap);
-  if (!all.length) throw new Error('Streams found but no discovered apps returned. Check that cloud discovery data is flowing.');
-  return all;
+// Merge one app (from a single window) into the cross-window union map, keeping
+// the richest per-app numbers. Across windows metrics are MAX-ed (see
+// fetchMcasAppsFromGraph for the max-vs-sum rationale); the deduped user set and
+// stream IDs are unioned, and a definitive review tag wins over "Unreviewed".
+function _mergeMcasAcrossPeriods(map, a) {
+  const key = a.appId ?? a.name;
+  if (!key) return;
+  const ex = map[key];
+  if (!ex) {
+    map[key] = { ...a, _mcasUsers: [...(a._mcasUsers || [])], _streamIds: [...(a._streamIds || [])], tags: [...(a.tags || [])] };
+    return;
+  }
+  ex.trafficUploadedBytes = Math.max(ex.trafficUploadedBytes || 0, a.trafficUploadedBytes || 0);
+  ex.trafficTotalBytes    = Math.max(ex.trafficTotalBytes    || 0, a.trafficTotalBytes    || 0);
+  ex.trafficTotalEvents   = Math.max(ex.trafficTotalEvents   || 0, a.trafficTotalEvents   || 0);
+  ex.machineNamesCount    = Math.max(ex.machineNamesCount    || 0, a.machineNamesCount    || 0);
+  ex.ipAddressesCount     = Math.max(ex.ipAddressesCount     || 0, a.ipAddressesCount     || 0);
+  if (a.lastSeen && (!ex.lastSeen || new Date(a.lastSeen) > new Date(ex.lastSeen))) ex.lastSeen = a.lastSeen;
+  if (ex.revised_score_total == null && a.revised_score_total != null) ex.revised_score_total = a.revised_score_total;
+  // Prefer a definitive review tag (Sanctioned/Unsanctioned/Monitored) over Unreviewed (3).
+  if ((ex.type === 3 || ex.type == null) && a.type != null && a.type !== 3) { ex.type = a.type; ex.tags = [...(a.tags || [])]; }
+  for (const sid of a._streamIds || []) if (!ex._streamIds.includes(sid)) ex._streamIds.push(sid);
+  const um = new Map((ex._mcasUsers || []).map(u => [u.userPrincipalName || u.id, u]));
+  for (const u of a._mcasUsers || []) { const k = u.userPrincipalName || u.id; if (k && !um.has(k)) um.set(k, u); }
+  ex._mcasUsers = [...um.values()];
+  ex.usersCount = Math.max(ex.usersCount || 0, a.usersCount || 0, ex._mcasUsers.length);
 }
 
 function mcasSortBy(key) {
@@ -3704,14 +3769,14 @@ function renderMcasApps(el, apps, mcasUrl) {
           Source: Defender for Cloud Apps · <span class="mono">${esc(mcasUrl)}</span>
           ${STATE.data.mcasFilteredToGenAi
             ? ` · Generative AI + Model Provider + MCP Server categories (${STATE.data.mcasTotal} total apps scanned)`
-            : ` · all categories (${STATE.data.mcasTotal} total apps — AI category filter returned nothing)`} · ${mcasPeriodLabel()} window
+            : ` · all categories (${STATE.data.mcasTotal} total apps — AI category filter returned nothing)`} · ${mcasPeriodLabel() === 'all windows' ? 'all windows (7/30/90d union)' : mcasPeriodLabel() + ' window'}
         </div>
       </div>
       <div style="display:flex;gap:6px;align-items:center">
         <span class="data-source source-live">● Live from MDCA</span>
         <span style="font-size:10px;color:var(--text-dim);margin-left:4px">Window</span>
         ${Object.entries(MCAS_PERIODS).map(([p, l]) =>
-          `<button class="btn ${(STATE.mcasPeriod || MCAS_DEFAULT_PERIOD) === p ? 'btn-primary' : 'btn-ghost'}" style="font-size:10px;padding:3px 8px" onclick="setMcasPeriod('${p}')" title="Cloud Discovery aggregation period — 7d surfaces the most discovered apps; 30d/90d widen the historical sweep">${l}</button>`).join('')}
+          `<button class="btn ${(STATE.mcasPeriod || MCAS_DEFAULT_PERIOD) === p ? 'btn-primary' : 'btn-ghost'}" style="font-size:10px;padding:3px 8px" onclick="setMcasPeriod('${p}')" title="${p === 'ALL' ? 'Union of the 7/30/90-day windows — the most complete inventory (each window is an independent aggregation, so no single one is guaranteed complete)' : 'Single ' + l + ' aggregation window'}">${l}</button>`).join('')}
         <button class="btn btn-ghost" style="font-size:11px"
           onclick="STATE.data.mcasApps=undefined;STATE.loaded.delete('shadow-apps');loadShadowApps()">
           🔄 Re-fetch
@@ -10235,7 +10300,7 @@ async function fetchMcasAppUsers(app) {
   for (const streamId of streamIds) {
     // ── Strategy 1: proper navigation endpoint (user-recommended) ──────────
     try {
-      const url = `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${streamId}/aggregatedAppsDetails(period=duration'${STATE.mcasPeriod || MCAS_DEFAULT_PERIOD}')/${app.appId}/users`;
+      const url = `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${streamId}/aggregatedAppsDetails(period=duration'${mcasApiPeriod()}')/${app.appId}/users`;
       const resp = await gget(url);
       const users = resp.value || (Array.isArray(resp) ? resp : []);
       if (users.length) {
@@ -10246,7 +10311,7 @@ async function fetchMcasAppUsers(app) {
 
     // ── Strategy 2: $expand=userActivity, filter client-side ───────────────
     try {
-      const url = `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${streamId}/microsoft.graph.security.aggregatedAppsDetails(period=duration'${STATE.mcasPeriod || MCAS_DEFAULT_PERIOD}')?$top=500&$expand=userActivity`;
+      const url = `${GRAPH_BETA}/security/dataDiscovery/cloudAppDiscovery/uploadedStreams/${streamId}/microsoft.graph.security.aggregatedAppsDetails(period=duration'${mcasApiPeriod()}')?$top=500&$expand=userActivity`;
       const resp = await gget(url);
       const detail = (resp.value || []).find(a => String(a.id) === String(app.appId) || a.displayName === app.name);
       if (detail?.userActivity?.length) {
@@ -10387,7 +10452,7 @@ function _renderPopoverUsers(users, sourceName, windowLabel) {
   const body = document.getElementById('pop-body');
   if (!users || users.length === 0) {
     body.innerHTML = `<div style="font-size:11px;color:var(--text-dim);font-style:italic;padding:4px 0">
-      No user data found for this app in the last ${mcasPeriodLabel()}.<br>
+      No user data found for this app ${mcasPeriodLabel() === 'all windows' ? 'in any window' : 'in the last ' + mcasPeriodLabel()}.<br>
       Requires <code style="font-size:10px;background:var(--bg-hover);padding:1px 4px;border-radius:3px">AuditLog.Read.All</code> and active MDCA discovery.
     </div>`;
     return;
@@ -10412,7 +10477,11 @@ function _renderPopoverUsers(users, sourceName, windowLabel) {
       </div>
       <div class="pop-date">${lastStr}</div>
     </div>`;
-  }).join('') + `<div class="pop-hint">${users.length} user${users.length !== 1 ? 's' : ''} · ${sourceName} · last ${windowLabel || mcasPeriodLabel()}</div>`;
+  }).join('') + (() => {
+    const wl = windowLabel || mcasPeriodLabel();
+    const wtxt = wl === 'all windows' ? 'across all windows' : 'last ' + wl;
+    return `<div class="pop-hint">${users.length} user${users.length !== 1 ? 's' : ''} · ${sourceName} · ${wtxt}</div>`;
+  })();
 }
 
 function _positionPopover(anchorEl, estRows) {
