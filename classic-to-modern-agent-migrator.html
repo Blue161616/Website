@@ -495,7 +495,7 @@
           <button class="btn btn-primary" onclick="doAdminConsent('full')">Grant full consent</button>
         </div>
       </div>
-      <div class="ca-note">Non-Graph resources consent separately (on first use of their tab): <b>Dynamics CRM</b> (Copilot Studio · Dataverse) and <b>Windows Azure Service Management API</b> (Foundry project discovery). Foundry <b>agent reads</b> require an <code>https://ai.azure.com</code>-audience token (a Cognitive Services token is rejected) — add that API to the app registration or paste a CLI token in the Foundry tab. Foundry also needs Azure RBAC — a <b>Foundry User</b> role on the project and <b>Reader</b> on the subscription.</div>
+      <div class="ca-note">Non-Graph resources consent separately (on first use of their tab): <b>Dynamics CRM</b> (Copilot Studio · Dataverse) and <b>Windows Azure Service Management API</b> (Foundry project discovery). Foundry <b>agent reads</b> use a <b>pasted CLI token</b> (<code>az account get-access-token --scope https://ai.azure.com/.default</code>) in the Foundry tab — no app-registration permission (a Cognitive Services token is 401-rejected). Foundry also needs Azure RBAC — a <b>Foundry User</b> role on the project and <b>Reader</b> on the subscription.</div>
     </div>
 
     <div class="reg-guide">
@@ -515,7 +515,7 @@
           <div style="font-size:.72rem;color:var(--text3);margin:8px 0 4px">Plus these per-resource delegated permissions (added under <b>API permissions → Add a permission → APIs my organization uses</b>, then <b>Grant admin consent</b>). They consent on first use of their tab:</div>
           <ul>
             <li><code class="perm-read">Dynamics CRM · user_impersonation</code> — Copilot Studio inventory (Dataverse). API: <b>Dynamics CRM</b> · <code>00000007-0000-0000-c000-000000000000</code></li>
-            <li><code class="perm-read">Foundry data plane · audience https://ai.azure.com</code> — Foundry agent reads. The Agents endpoint accepts <b>only</b> the <code>https://ai.azure.com</code> audience — a <b>Microsoft Cognitive Services</b> (<code>cognitiveservices.azure.com</code>) token is rejected with <code>401</code>. Either add the <code>https://ai.azure.com</code> API to the app registration, or paste a CLI <code>ai.azure.com</code> token in the Foundry tab. Also needs Azure RBAC <b>Foundry User</b> on the project.</li>
+            <li><code class="perm-read">Foundry data plane · audience https://ai.azure.com</code> — Foundry agent reads. <b>No app-registration permission is used here — paste a CLI token instead:</b> <code>az account get-access-token --scope https://ai.azure.com/.default</code> → paste into the Foundry tab’s <b>Access token</b> box. The Agents endpoint accepts <b>only</b> the <code>https://ai.azure.com</code> audience (a <b>Microsoft Cognitive Services</b> / <code>cognitiveservices.azure.com</code> token is <code>401</code>-rejected, and <code>https://ai.azure.com</code> has no consentable SP in most tenants). Also needs Azure RBAC <b>Foundry User</b> on the project.</li>
             <li><code class="perm-read">Azure Service Management · user_impersonation</code> — Foundry project auto-discovery via ARM (audience <code>https://management.azure.com</code>). API: <b>Windows Azure Service Management API</b> · <code>797f4846-ba00-4fd7-ba43-dac1f8f63013</code></li>
           </ul>
         </dd>
@@ -2736,11 +2736,22 @@ async function armGetAll(url, token){
 }
 // Derive the services.ai.azure.com base for a Foundry account.
 function fdryAccountBase(acc){
-  const eps = (acc.properties && acc.properties.endpoints) || {};
-  for (const k in eps){ const v = eps[k]; if (typeof v === 'string' && /services\.ai\.azure\.com/i.test(v)) return v.replace(/\/+$/, ''); }
-  const ep = acc.properties && acc.properties.endpoint;
-  if (ep && /services\.ai\.azure\.com/i.test(ep)) return ep.replace(/\/+$/, '');
-  return 'https://' + acc.name + '.services.ai.azure.com';
+  const pick = () => {
+    const eps = (acc.properties && acc.properties.endpoints) || {};
+    for (const k in eps){ const v = eps[k]; if (typeof v === 'string' && /services\.ai\.azure\.com/i.test(v)) return v; }
+    const ep = acc.properties && acc.properties.endpoint;
+    if (ep && /services\.ai\.azure\.com/i.test(ep)) return ep;
+    return 'https://' + acc.name + '.services.ai.azure.com';
+  };
+  try { return new URL(pick()).origin; } catch { return 'https://' + acc.name + '.services.ai.azure.com'; }
+}
+// Repair an endpoint whose project path got nested: /api/projects/{account}/{project} → /api/projects/{project}.
+function fdryNormalizeEndpoint(s){
+  let ep = String(s || '').trim().replace(/\/+$/, '');
+  if (!ep) return '';
+  const m = ep.match(/^(https?:\/\/[^/]+\/api\/projects)\/(.+)$/i);
+  if (m){ const parts = m[2].split('/').filter(Boolean); ep = m[1] + '/' + parts[parts.length - 1]; }
+  return ep;
 }
 function fdryArmHint(msg){
   msg = String(msg || '');
@@ -2778,8 +2789,9 @@ async function fdryDiscover(){
         try { projs = await armGetAll(`https://management.azure.com${acc.id}/projects?api-version=2025-06-01`, token); }
         catch(e){ continue; } // account without the projects sub-resource
         for (const p of projs){
-          const ep = `${base}/api/projects/${p.name}`;
-          if (!seen.has(ep)){ seen.add(ep); endpoints.push(ep); found.push({ name: p.name, account: acc.name, endpoint: ep }); }
+          const projName = String(p.name || '').split('/').pop(); // ARM returns "{account}/{project}"
+          const ep = `${base}/api/projects/${projName}`;
+          if (!seen.has(ep)){ seen.add(ep); endpoints.push(ep); found.push({ name: projName, account: acc.name, endpoint: ep }); }
         }
       }
     }
@@ -2881,7 +2893,7 @@ async function fdryListAgents(endpoint, token, log){
 }
 
 async function fdryScan(){
-  const endpoints = document.getElementById('fdry-endpoints').value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  const endpoints = document.getElementById('fdry-endpoints').value.split(/\r?\n/).map(s => fdryNormalizeEndpoint(s)).filter(Boolean);
   if (!endpoints.length){ fdryStatus('Enter at least one Foundry project endpoint.'); return; }
   const btn = document.getElementById('fdry-scan-btn'); btn.disabled = true;
   document.getElementById('fdry-progress-log').innerHTML = '';
