@@ -3477,9 +3477,10 @@ async function loadShadowApps() {
     STATE.data.mcasUrl = 'Microsoft Graph (CloudApp-Discovery.Read.All)';
     updateDashShadowKpi();
     renderMcasApps(el, STATE.data.mcasApps, STATE.data.mcasUrl);
-    // Enrichment cards (async): OAuth governance for detected AI apps (Entra side)
-    // + endpoint-level AI traffic — the two lenses MDCA discovery can't see.
-    renderOAuthGovCard('shadow-content', 'shadow-gov-slot', null).catch(() => {});
+    // Enrichment card (async): endpoint-level AI traffic — the lens MDCA discovery can't see.
+    // (App Governance — OAuth Posture card removed by request — OAuthAppInfo rarely covers
+    // these network-discovered apps and mostly added noise; renderOAuthGovCard /
+    // fetchOAuthAppInfo remain available for reuse.)
     renderEndpointAiTraffic('shadow-content', 'shadow-endpoint-slot').catch(() => {});
   } catch (graphErr) {
     // MCAS unavailable — fall back to SP / OAuth grant-based detection
@@ -10331,7 +10332,58 @@ function _usersFromSignIns(appName) {
   return [...userMap.values()].sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
 }
 
-function _renderPopoverUsers(users, sourceName) {
+// Approach (b): derive host/domain tokens from the app's display name so its
+// endpoint connections can be located in DeviceNetworkEvents.RemoteUrl. Explicit
+// domains embedded in the name (e.g. "Candy.ai", "openrouter.ai") are used
+// verbatim; otherwise the distinctive brand tokens are matched as broad host
+// substrings — higher recall, with some false-positive risk on generic tokens
+// (e.g. "github" also matches non-Copilot github.com traffic).
+const _DOMAIN_TOKEN_STOP = new Set(['consumer','enterprise','personal','business','free','pro','plus','team','teams','api','client','server','chat','bot','assistant','www','com','net','org','inc','ltd','labs','studio','desktop','mobile','beta']);
+function _appDomainTokens(name) {
+  const n = String(name || '').toLowerCase();
+  const out = [], seen = new Set();
+  const add = t => { t = String(t || '').replace(/[^a-z0-9.-]/g, ''); if (t.length >= 3 && !seen.has(t)) { seen.add(t); out.push(t); } };
+  // 1. Explicit domain(s) in the name — most precise (e.g. "candy.ai").
+  const dre = /[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:ai|com|io|co|org|net|app|dev|chat|cloud|xyz|me)\b/g;
+  let m; while ((m = dre.exec(n))) add(m[0]);
+  // 2. No explicit domain — fall back to distinctive brand tokens.
+  if (!out.length) _sigTokens(n).filter(t => !_DOMAIN_TOKEN_STOP.has(t)).forEach(add);
+  return out.slice(0, 6);
+}
+
+// Attribute a network-discovered app to real users via Defender for Endpoint
+// network telemetry: match the app's derived domain/host tokens against
+// DeviceNetworkEvents.RemoteUrl and group by the signed-in UPN + device. This is
+// often the ONLY identity source for apps that never authenticate through Entra.
+// Requires devices onboarded to MDE; degrades to null (→ portal-link message).
+async function _usersFromEndpointNetwork(app) {
+  const tokens = _appDomainTokens(app?.name);
+  if (!tokens.length) return null;
+  const list = tokens.map(t => `"${t}"`).join(',');
+  const r = await _runHunt(
+    `DeviceNetworkEvents | where Timestamp > ago(30d) | where RemoteUrl has_any (${list}) ` +
+    `| where isnotempty(InitiatingProcessAccountUpn) ` +
+    `| summarize Connections=count(), Devices=make_set(DeviceName,6), ` +
+    `Hosts=make_set(tolower(tostring(split(replace_regex(RemoteUrl,@"^\\w+://",""),"/")[0])),4), ` +
+    `LastSeen=max(Timestamp) by User=InitiatingProcessAccountUpn ` +
+    `| order by Connections desc | take 60`
+  );
+  if (!r.rows?.length) return null;
+  return r.rows.map(row => {
+    const devices = _huntArr(row.Devices).filter(Boolean);
+    const hosts = _huntArr(row.Hosts).filter(Boolean);
+    return {
+      upn: String(row.User || '—'),
+      displayName: String(row.User || '—').split('@')[0],
+      lastSeen: row.LastSeen ? new Date(row.LastSeen) : null,
+      devices, hosts, connections: Number(row.Connections) || 0,
+      via: hosts.length ? 'Endpoint host: ' + hosts.join(', ') : '',
+      _source: 'mde',
+    };
+  });
+}
+
+function _renderPopoverUsers(users, sourceName, windowLabel) {
   const body = document.getElementById('pop-body');
   if (!users || users.length === 0) {
     body.innerHTML = `<div style="font-size:11px;color:var(--text-dim);font-style:italic;padding:4px 0">
@@ -10340,15 +10392,19 @@ function _renderPopoverUsers(users, sourceName) {
     </div>`;
     return;
   }
-  const isMcas = users[0]?._source === 'mcas';
   body.innerHTML = users.map(u => {
     const parts   = (u.displayName || '').split(/[\s.@]/);
     const initials = ((parts[0]||'').slice(0,1) + (parts[1]||'').slice(0,1)).toUpperCase() || '?';
     const lastStr  = u.lastSeen ? u.lastSeen.toLocaleDateString('en', {month:'short', day:'numeric'}) : '—';
-    const sub      = isMcas && (u.tx || u.download)
-      ? `${u.tx ? u.tx + ' tx' : ''}${u.tx && u.download ? ' · ' : ''}${u.download ? fmtBytes(u.download) + ' ↓' : ''}`
-      : esc(u.upn);
-    return `<div class="pop-row"${u.via ? ` title="${esc('Matched sign-in app: ' + u.via)}"` : ''}>
+    let sub;
+    if (u._source === 'mcas' && (u.tx || u.download))
+      sub = `${u.tx ? u.tx + ' tx' : ''}${u.tx && u.download ? ' · ' : ''}${u.download ? fmtBytes(u.download) + ' ↓' : ''}`;
+    else if (u._source === 'mde')
+      sub = `${u.connections} conn${u.devices?.length ? ' · ' + esc(u.devices.slice(0,2).join(', ')) + (u.devices.length > 2 ? ` +${u.devices.length - 2}` : '') : ''}`;
+    else
+      sub = esc(u.upn);
+    const titleText = u._source === 'mde' ? (u.via || '') : (u.via ? 'Matched sign-in app: ' + u.via : '');
+    return `<div class="pop-row"${titleText ? ` title="${esc(titleText)}"` : ''}>
       <div class="pop-avatar">${esc(initials)}</div>
       <div style="flex:1;min-width:0">
         <div class="pop-name">${esc(u.displayName)}</div>
@@ -10356,7 +10412,7 @@ function _renderPopoverUsers(users, sourceName) {
       </div>
       <div class="pop-date">${lastStr}</div>
     </div>`;
-  }).join('') + `<div class="pop-hint">${users.length} user${users.length !== 1 ? 's' : ''} · ${sourceName} · last ${mcasPeriodLabel()}</div>`;
+  }).join('') + `<div class="pop-hint">${users.length} user${users.length !== 1 ? 's' : ''} · ${sourceName} · last ${windowLabel || mcasPeriodLabel()}</div>`;
 }
 
 function _positionPopover(anchorEl, estRows) {
@@ -10428,8 +10484,21 @@ async function showAppUsers(idx, anchorEl) {
     }
   }
 
-  // 4. No per-user identities available via API — explain why and link to the
-  //    Defender portal, where network-discovered app users ARE listed.
+  // 4. Fallback: Defender for Endpoint network telemetry. Match the app's derived
+  //    domain/host tokens in DeviceNetworkEvents to surface the real UPNs + devices
+  //    behind a network-discovered app — the identity source the Cloud Discovery
+  //    API can't provide. Uses the silent ThreatHunting.Read.All token.
+  const mdeUsers = await _usersFromEndpointNetwork(a).catch(() => null);
+  if (pop.style.display === 'none') return; // popover closed while the query ran
+  if (mdeUsers?.length) {
+    mdeUsers.sort((x, y) => (y.lastSeen || 0) - (x.lastSeen || 0));
+    _renderPopoverUsers(mdeUsers, 'Defender for Endpoint · network telemetry', '30d');
+    _positionPopover(anchorEl, mdeUsers.length);
+    return;
+  }
+
+  // 5. No per-user identities available via any source — explain why and link to
+  //    the Defender portal, where network-discovered app users ARE listed.
   _renderPopoverNoUsers(a);
   _positionPopover(anchorEl, 3);
 }
