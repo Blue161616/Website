@@ -3547,6 +3547,9 @@ async function loadShadowApps() {
     // these network-discovered apps and mostly added noise; renderOAuthGovCard /
     // fetchOAuthAppInfo remain available for reuse.)
     renderEndpointAiTraffic('shadow-content', 'shadow-endpoint-slot').catch(() => {});
+    // Enrichment card (async): the alerts your Shadow IT / app-discovery policies
+    // raise for GenAI apps (the policy definitions themselves aren't API-readable).
+    renderShadowAiPolicyAlerts('shadow-content', 'shadow-policy-alerts-slot').catch(() => {});
   } catch (graphErr) {
     // MCAS unavailable — fall back to SP / OAuth grant-based detection
     el.innerHTML = '<div class="section-loading"><span class="spinner"></span>MCAS unavailable — loading SP-based AI app detection…</div>';
@@ -9302,6 +9305,62 @@ async function renderEndpointAiTraffic(containerId, slotId) {
         <td class="mono text-muted" style="font-size:11px">${row.LastSeen ? new Date(row.LastSeen).toLocaleDateString() : '—'}</td>
       </tr>`; }).join('')}</tbody>
     </table></div></div>`;
+}
+
+// 🛡️ Shadow AI policy alerts — Defender for Cloud Apps alerts about GenAI apps (30d).
+// The MDCA app-discovery / Shadow IT POLICY definitions aren't exposed by any API,
+// but the ALERTS those policies raise flow into the Defender XDR unified queue and
+// ARE queryable via AlertInfo (ServiceSource = "Microsoft Defender for Cloud Apps").
+// We pull the MDCA alerts and scope to GenAI by matching the title against the
+// tenant's discovered GenAI app names + AI keywords. Uses the silent hunting token.
+async function fetchShadowAiPolicyAlerts() {
+  if (STATE.data.shadowAiPolicyAlerts !== undefined) return STATE.data.shadowAiPolicyAlerts;
+  const kql = [
+    'AlertInfo',
+    '| where Timestamp > ago(30d)',
+    '| where ServiceSource contains "Cloud App"',   // Microsoft Defender for Cloud Apps
+    '| project Timestamp, Title, Severity, Category, ServiceSource, DetectionSource, AlertId',
+    '| order by Timestamp desc | take 200',
+  ].join(' ');
+  const res = await runAgentHuntingQuery(kql);
+  if (!res.ok) { STATE.data.shadowAiPolicyAlerts = { ok: false, code: res.code, error: res.error }; return STATE.data.shadowAiPolicyAlerts; }
+  // Scope to GenAI: alert title mentions a discovered GenAI app OR an AI keyword.
+  const aiNames = [...new Set((STATE.data.mcasApps || []).map(a => String(a.name || '').toLowerCase()).filter(n => n.length >= 3))];
+  const isGenAi = t => { const s = String(t || '').toLowerCase(); return /\bgenai\b|generative ai/.test(s) || AI_KEYWORDS.some(k => s.includes(k)) || aiNames.some(n => s.includes(n)); };
+  const alerts = res.rows.filter(r => isGenAi(r.Title));
+  const sev = { high: 0, medium: 0, low: 0, informational: 0 };
+  alerts.forEach(r => { const s = String(r.Severity || '').toLowerCase(); if (s in sev) sev[s]++; else sev.informational++; });
+  STATE.data.shadowAiPolicyAlerts = { ok: true, total: alerts.length, alerts: alerts.slice(0, 15), sev, scanned: res.rows.length, code: null };
+  return STATE.data.shadowAiPolicyAlerts;
+}
+
+async function renderShadowAiPolicyAlerts(containerId, slotId) {
+  const slot = _ensureSlot(containerId, slotId);
+  if (!slot) return;
+  const title = '🛡️ Shadow AI Policy Alerts — Defender for Cloud Apps (30d)', src = '● AlertInfo · Defender for Cloud Apps';
+  const res = await fetchShadowAiPolicyAlerts();
+  if (!res.ok) { slot.innerHTML = _huntErrCard(title, src, { forbidden: res.code === 'forbidden', error: res.error }); return; }
+  if (!res.total) {
+    slot.innerHTML = `<div class="card" style="margin:16px 0"><div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div>
+      <div class="card-body" style="font-size:12px;color:var(--text-muted)">✅ No Defender for Cloud Apps alerts about GenAI apps in the last 30 days${res.scanned ? ` (scanned ${res.scanned} Cloud App alert${res.scanned !== 1 ? 's' : ''})` : ''}.</div></div>`;
+    return;
+  }
+  const sevBadge = s => { const k = String(s || '').toLowerCase(); const c = k === 'high' ? 'var(--risk-high)' : k === 'medium' ? 'var(--risk-medium)' : k === 'low' ? 'var(--risk-low)' : 'var(--text-muted)'; return `<span style="color:${c};font-weight:600">${esc(s || '—')}</span>`; };
+  const counts = ['high', 'medium', 'low', 'informational'].filter(k => res.sev[k]).map(k => `${res.sev[k]} ${k}`).join(' · ');
+  slot.innerHTML = `<div class="card" style="margin:16px 0">
+    <div class="card-header"><div class="card-title">${title} (${res.total})</div><span class="data-source source-live" style="font-size:10px">${src}</span></div>
+    <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Alerts raised by your Shadow IT / app-discovery policies (and other MDCA detections) for GenAI apps. The policy <em>definitions</em> aren't API-readable — these are the incidents they generate.${counts ? ` <strong>${esc(counts)}</strong>.` : ''}</div>
+    <div class="table-wrap tbl-scroll" style="max-height:330px"><table>
+      <thead><tr><th>Alert</th><th>Severity</th><th>Category</th><th>When</th></tr></thead>
+      <tbody>${res.alerts.map(a => `<tr>
+        <td><strong style="font-size:12px">${esc(a.Title || '—')}</strong></td>
+        <td style="font-size:11px">${sevBadge(a.Severity)}</td>
+        <td style="font-size:11px;color:var(--text-muted)">${esc(a.Category || '—')}</td>
+        <td class="mono text-muted" style="font-size:11px">${a.Timestamp ? new Date(a.Timestamp).toLocaleDateString() : '—'}</td>
+      </tr>`).join('')}</tbody>
+    </table>
+    <div style="padding:6px 16px 10px;font-size:10px;color:var(--text-dim)">Manage the policies in <a href="https://security.microsoft.com/cloudapps/policies/management" target="_blank" rel="noopener" style="color:var(--accent-blue);text-decoration:none">Defender → Cloud Apps → Policies → Shadow IT ↗</a></div>
+    </div></div>`;
 }
 
 // ☁️ Azure-hosted AI (Sentinel AzureDiagnostics/AzureActivity) — cached data
