@@ -9227,13 +9227,15 @@ function generateAssessmentReport() {
 // · DeviceNetworkEvents (endpoint AI traffic) · Azure tables (Azure-hosted AI).
 // Each renders a self-contained card into a slot div appended to its page and
 // degrades to an explanatory card when the table/licence isn't available.
-async function _runHunt(kql) {
+async function _runHunt(kql, timespan = 'P30D') {
   const token = await getTokenFor(['https://graph.microsoft.com/ThreatHunting.Read.All']);
   if (!token) return { error: 'ThreatHunting.Read.All not consented', forbidden: true };
   try {
+    // Timespan bounds the server-side scan window — keep it in step with the KQL's
+    // ago() filter so a 7d query doesn't needlessly scan 30 days of endpoint data.
     const r = await fetch(`${GRAPH}/security/runHuntingQuery`, {
       method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ Query: kql, Timespan: 'P30D' }),
+      body: JSON.stringify({ Query: kql, Timespan: timespan }),
     });
     if (!r.ok) return { error: (await r.text()).slice(0, 250), status: r.status };
     const d = await r.json();
@@ -9248,6 +9250,13 @@ function _ensureSlot(containerId, slotId) {
   let s = document.getElementById(slotId);
   if (!s) { s = document.createElement('div'); s.id = slotId; c.appendChild(s); }
   return s;
+}
+// Immediate loading card so a slow Advanced-Hunting card isn't a blank gap for
+// minutes (DeviceNetworkEvents / AlertInfo queries can take a while to return).
+function _slotLoading(slot, title, src, note) {
+  if (!slot) return;
+  slot.innerHTML = `<div class="card" style="margin:16px 0"><div class="card-header"><div class="card-title">${title}</div><span class="data-source source-derived" style="font-size:10px">${src}</span></div>
+    <div class="card-body" style="font-size:12px;color:var(--text-muted)"><span class="spinner"></span> ${esc(note || 'Querying Advanced Hunting — endpoint tables can take up to a minute…')}</div></div>`;
 }
 function _huntErrCard(title, src, r) {
   // Table simply not present in the tenant (licensing/onboarding) → render
@@ -9336,13 +9345,14 @@ async function renderGraphActivityCard(containerId, slotId, apps) {
 
 // 💻 Endpoint-side shadow AI: device connections to AI services (DeviceNetworkEvents).
 async function renderEndpointAiTraffic(containerId, slotId) {
-  const title = '💻 Endpoint AI Traffic — Shadow AI from Devices (30d)', src = '● DeviceNetworkEvents · Advanced Hunting';
+  const title = '💻 Endpoint AI Traffic — Shadow AI from Devices (7d)', src = '● DeviceNetworkEvents · Advanced Hunting';
   const slot = _ensureSlot(containerId, slotId);
   if (!slot) return;
+  _slotLoading(slot, title, src, 'Scanning device network telemetry for AI services…');
   const domains = ['claude.ai','anthropic.com','chatgpt.com','chat.openai.com','openai.com','gemini.google.com','perplexity.ai','deepseek.com','mistral.ai','huggingface.co','openrouter.ai','poe.com','grok.com','x.ai','character.ai'];
-  const r = await _runHunt(`DeviceNetworkEvents | where Timestamp > ago(30d) | where RemoteUrl has_any (${domains.map(d => `"${d}"`).join(',')}) | extend Domain = tolower(tostring(split(replace_regex(RemoteUrl, @"^\\w+://", ""), "/")[0])) | summarize Connections = count(), Devices = dcount(DeviceId), Users = make_set(InitiatingProcessAccountUpn, 5), Processes = make_set(InitiatingProcessFileName, 6), LastSeen = max(Timestamp) by Domain | order by Connections desc | take 30`);
+  const r = await _runHunt(`DeviceNetworkEvents | where Timestamp > ago(7d) | where RemoteUrl has_any (${domains.map(d => `"${d}"`).join(',')}) | extend Domain = tolower(tostring(split(replace_regex(RemoteUrl, @"^\\w+://", ""), "/")[0])) | summarize Connections = count(), Devices = dcount(DeviceId), Users = make_set(InitiatingProcessAccountUpn, 5), Processes = make_set(InitiatingProcessFileName, 6), LastSeen = max(Timestamp) by Domain | order by Connections desc | take 30`, 'P7D');
   if (!r.rows) { slot.innerHTML = _huntErrCard(title, src, r); return; }
-  if (!r.rows.length) { slot.innerHTML = `<div class="card" style="margin:16px 0"><div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div><div class="card-body" style="font-size:12px;color:var(--text-muted)">✅ No endpoint connections to known AI services in 30 days.</div></div>`; return; }
+  if (!r.rows.length) { slot.innerHTML = `<div class="card" style="margin:16px 0"><div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div><div class="card-body" style="font-size:12px;color:var(--text-muted)">✅ No endpoint connections to known AI services in 7 days.</div></div>`; return; }
   slot.innerHTML = `<div class="card" style="margin:16px 0">
     <div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div>
     <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">Direct from Defender for Endpoint network telemetry — catches browser, desktop-app and CLI usage with no Cloud Discovery log collector. The Processes column separates browser use from scripted/API use.</div>
@@ -9369,7 +9379,8 @@ async function renderEndpointAiTraffic(containerId, slotId) {
 async function renderEndpointAiGaps(containerId, slotId) {
   const slot = _ensureSlot(containerId, slotId);
   if (!slot) return;
-  const title = '🕳️ Endpoint AI Domains — Cloud Discovery Gaps (30d)', src = '● DeviceNetworkEvents · Advanced Hunting';
+  const title = '🕳️ Endpoint AI Domains — Cloud Discovery Gaps (7d)', src = '● DeviceNetworkEvents · Advanced Hunting';
+  _slotLoading(slot, title, src, 'Scanning device network telemetry for AI domains not in Cloud Discovery…');
   // AI signal: .ai TLD OR a provider brand in the host. First-party Microsoft/Google
   // and auth/CDN infrastructure are excluded so registrable domains don't collapse to
   // google.com etc. Registrable domain = last two labels (good enough for .ai/.com).
@@ -9377,7 +9388,7 @@ async function renderEndpointAiGaps(containerId, slotId) {
   const excl = ['microsoft','azure','windows','office','msn','bing','msauth','msftauth','skype','sharepoint','onmicrosoft','officeapps','live.com','office.net','google','gstatic','googleapis','apple','icloud','mozilla','cloudflare'];
   const kql = [
     'DeviceNetworkEvents',
-    '| where Timestamp > ago(30d)',
+    '| where Timestamp > ago(7d)',
     '| where isnotempty(RemoteUrl)',
     String.raw`| extend Host = tolower(extract(@"^(?:[a-z]+://)?([^/:?#]+)", 1, RemoteUrl))`,
     '| where isnotempty(Host)',
@@ -9388,7 +9399,7 @@ async function renderEndpointAiGaps(containerId, slotId) {
     '| summarize Connections=count(), Devices=dcount(DeviceId), Users=make_set(InitiatingProcessAccountUpn,5), LastSeen=max(Timestamp) by Domain',
     '| order by Connections desc | take 80',
   ].join(' ');
-  const r = await _runHunt(kql);
+  const r = await _runHunt(kql, 'P7D');
   if (!r.rows) { slot.innerHTML = _huntErrCard(title, src, r); return; }
 
   // Cross-reference each domain against the MDCA discovered-app inventory (name
@@ -9415,7 +9426,7 @@ async function renderEndpointAiGaps(containerId, slotId) {
 
   if (!gaps.length) {
     slot.innerHTML = `<div class="card" style="margin:16px 0"><div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div>
-      <div class="card-body" style="font-size:12px;color:var(--text-muted)">✅ No endpoint AI domains outside Cloud Discovery${rows.length ? ` — all ${rows.length} AI-ish domain${rows.length !== 1 ? 's' : ''} seen on devices are already in the discovered-app inventory` : ' in 30 days'}.</div></div>`;
+      <div class="card-body" style="font-size:12px;color:var(--text-muted)">✅ No endpoint AI domains outside Cloud Discovery${rows.length ? ` — all ${rows.length} AI-ish domain${rows.length !== 1 ? 's' : ''} seen on devices are already in the discovered-app inventory` : ' in 7 days'}.</div></div>`;
     return;
   }
   const conf = x => x.known
@@ -9468,6 +9479,7 @@ async function renderShadowAiPolicyAlerts(containerId, slotId) {
   const slot = _ensureSlot(containerId, slotId);
   if (!slot) return;
   const title = '🛡️ Shadow AI Policy Alerts — Defender for Cloud Apps (30d)', src = '● AlertInfo · Defender for Cloud Apps';
+  _slotLoading(slot, title, src, 'Querying Defender for Cloud Apps alerts (AlertInfo)…');
   const res = await fetchShadowAiPolicyAlerts();
   if (!res.ok) { slot.innerHTML = _huntErrCard(title, src, { forbidden: res.code === 'forbidden', error: res.error }); return; }
   if (!res.total) {
