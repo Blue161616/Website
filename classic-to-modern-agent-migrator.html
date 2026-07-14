@@ -1722,10 +1722,36 @@ async function csGetModernAppIds(){
 // by testing its appId against the modern agent-identity set.
 async function csClassifyAgents(){
   let res; try { res = await csGetModernAppIds(); } catch { res = { set: new Set(), ok: false }; }
+  let withAppId = 0;
   for (const a of csAgents){
     const id = (a.appId || '').toLowerCase();
+    if (id) withAppId++;
     a._agentClass = !res.ok ? 'unknown' : (!id ? 'unknown' : (res.set.has(id) ? 'modern' : 'classic'));
   }
+  return { withAppId, modernSet: res.set.size, ok: res.ok };
+}
+
+// Robustly pull the Entra app/identity ID out of a bot record. The documented
+// source is bot.synchronizationstatus JSON → applicationId, but it can be nested,
+// so deep-search the parsed JSON and fall back to a regex over the raw string.
+function csDeepFindKey(obj, keyLc){
+  if (!obj || typeof obj !== 'object') return null;
+  for (const k of Object.keys(obj)){
+    if (k.toLowerCase() === keyLc && typeof obj[k] === 'string' &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(obj[k])) return obj[k];
+  }
+  for (const k of Object.keys(obj)){
+    const v = obj[k];
+    if (v && typeof v === 'object'){ const r = csDeepFindKey(v, keyLc); if (r) return r; }
+  }
+  return null;
+}
+function csExtractAppId(b){
+  const raw = b.synchronizationstatus || '';
+  if (!raw) return null;
+  try { const j = JSON.parse(raw); const r = csDeepFindKey(j, 'applicationid'); if (r) return r; } catch {}
+  const m = /"applicationId"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/i.exec(raw);
+  return m ? m[1] : null;
 }
 
 function csStatus(msg){ const el = document.getElementById('cs-status'); if (el) el.textContent = msg; }
@@ -1795,7 +1821,7 @@ async function csBuildAppIdMap(envs, log){
     const token = await csGetToken(org); const H = csDvHeaders(token);
     const bots = await csDvGetAll(api + "/bots?$select=name,botid,synchronizationstatus", H);
     for (const b of bots){
-      let appId = null; try { appId = JSON.parse(b.synchronizationstatus || '{}').applicationId || null; } catch {}
+      const appId = csExtractAppId(b);
       if (appId) map.set(String(appId).toLowerCase(), { name: b.name, environment: envName });
     }
   }
@@ -1856,10 +1882,19 @@ async function csRunScan(){
       done++;
     }
     csSetProgress(95, 'Classifying', 'Classifying agents as classic (app registration) vs modern (Entra Agent ID)…');
-    await csClassifyAgents();
+    const diag = await csClassifyAgents();
     const nClassic = csAgents.filter(a => a._agentClass === 'classic').length;
     const nModern  = csAgents.filter(a => a._agentClass === 'modern').length;
     csSetProgress(100, 'Done', `Inventoried ${csAgents.length} agent(s) across ${csEnvCount} environment(s): ${nClassic} classic, ${nModern} modern.`, 'log-ok');
+    if (nClassic === 0 && nModern === 0){
+      const syncPresent = csAgents.filter(a => a._syncPresent).length;
+      const syncAppId   = csAgents.filter(a => a._syncHasAppId).length;
+      csSetProgress(null, null,
+        `Diagnostics: Entra app ID resolved on ${diag.withAppId}/${csAgents.length}; ` +
+        `modern-identity set ${diag.ok ? '= ' + diag.modernSet : 'unavailable (Graph lookup failed)'}; ` +
+        `synchronizationstatus present on ${syncPresent}, contains "applicationId" on ${syncAppId}.`,
+        'log-warn');
+    }
     csRenderKpis();
     csRender();
     document.getElementById('cs-kpi').style.display = 'flex';
@@ -1887,7 +1922,9 @@ async function csScanEnvironment(orgUrl){
       name: b.name, botid: b.botid, schemaName: b.schemaname || '',
       environment: envName, environmentUrl: org,
       owner: b['_ownerid_value@OData.Community.Display.V1.FormattedValue'] || b['_createdby_value@OData.Community.Display.V1.FormattedValue'] || '',
-      appId: (() => { try { return JSON.parse(b.synchronizationstatus || '{}').applicationId || null; } catch { return null; } })(),
+      appId: csExtractAppId(b),
+      _syncPresent: !!b.synchronizationstatus,
+      _syncHasAppId: /applicationId/i.test(b.synchronizationstatus || ''),
       created: b.createdon || null, modified: b.modifiedon || null, publishedOn: b.publishedon || null,
       published: !!b.publishedon,
       orchestration: /"GenerativeActionsEnabled"\s*:\s*true/i.test(b.configuration || '') ? 'Generative' : 'Classic',
