@@ -185,6 +185,9 @@
   .filter-btn.f-copied.active { background: var(--modern); color: #111; }
   .filter-btn.f-copilot.active { background: var(--copilot); }
   .filter-btn.f-foundry.active { background: var(--foundry); }
+  .filter-btn.cs-f-all.active { background: var(--accent); }
+  .filter-btn.cs-f-classic.active { background: var(--classic); color: #111; }
+  .filter-btn.cs-f-modern.active { background: var(--modern); color: #111; }
   .action-bar { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
   .sel-count { font-size: 0.8rem; color: var(--text2); align-self: center; }
 
@@ -717,6 +720,11 @@
       <div id="cs-table-section" style="display:none">
         <div class="toolbar">
           <input type="text" class="search-box" id="cs-search" placeholder="Search agents, models, instructions…" oninput="csRender()">
+          <div class="filter-group">
+            <button class="filter-btn cs-f-all active" onclick="csSetFilter('all',this)">All</button>
+            <button class="filter-btn cs-f-classic" onclick="csSetFilter('classic',this)">🧩 Classic</button>
+            <button class="filter-btn cs-f-modern" onclick="csSetFilter('modern',this)">🤖 Modern</button>
+          </div>
           <div class="action-bar">
             <button class="btn btn-secondary btn-sm" onclick="csExport('csv')">Export CSV</button>
             <button class="btn btn-secondary btn-sm" onclick="csExport('json')">Export JSON package</button>
@@ -1676,6 +1684,50 @@ function csExtractInstructions(yaml){
   return '';
 }
 
+// Turn common Dataverse auth failures into an actionable instruction.
+function csAuthHint(msg){
+  msg = String(msg || '');
+  if (/650057|invalid resource|invalid_client/i.test(msg))
+    return ' → Your app registration is missing the Dataverse permission. In Entra: App registrations → this app → API permissions → Add a permission → Dynamics CRM → Delegated → user_impersonation → Add, then Grant admin consent, and retry.';
+  if (/AADSTS65001|consent_required|AADSTS65004|interaction_required/i.test(msg))
+    return ' → Consent required: an admin must grant consent for the Dynamics CRM (Dataverse) permission, then retry.';
+  return '';
+}
+
+let csFilter = 'all';
+function csSetFilter(f, btn){
+  csFilter = f;
+  document.querySelectorAll('#mode-cs .filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  csRender();
+}
+
+// Get the set of modern agent-identity appIds from Entra (reuse pro-code data if
+// already loaded, else query Graph). Returns { set, ok } — ok=false if unresolved.
+async function csGetModernAppIds(){
+  let set = new Set(modernAgents.map(m => (m.appId || '').toLowerCase()).filter(Boolean));
+  if (set.size) return { set, ok: true };
+  const attempts = [
+    `${GRAPH}/servicePrincipals/microsoft.graph.agentIdentity?$select=appId&$top=999`,
+    `${GRAPH_BETA}/servicePrincipals/microsoft.graph.agentIdentity?$select=appId&$top=999`,
+  ];
+  for (const url of attempts){
+    try { const items = await ggetAll(url, 20, true); items.forEach(i => { if (i.appId) set.add(String(i.appId).toLowerCase()); }); return { set, ok: true }; }
+    catch (e){ /* try next */ }
+  }
+  return { set, ok: false };
+}
+
+// Classify each scanned agent as classic (app registration) or modern (Entra Agent ID),
+// by testing its appId against the modern agent-identity set.
+async function csClassifyAgents(){
+  let res; try { res = await csGetModernAppIds(); } catch { res = { set: new Set(), ok: false }; }
+  for (const a of csAgents){
+    const id = (a.appId || '').toLowerCase();
+    a._agentClass = !res.ok ? 'unknown' : (!id ? 'unknown' : (res.set.has(id) ? 'modern' : 'classic'));
+  }
+}
+
 function csStatus(msg){ const el = document.getElementById('cs-status'); if (el) el.textContent = msg; }
 function csSetProgress(pct, phase, msg, cls){
   document.getElementById('cs-progress').style.display = 'block';
@@ -1727,7 +1779,7 @@ async function csDiscoverEnvs(){
     if (!urls.length){ csStatus('No environments returned for your account.'); return; }
     document.getElementById('cs-envs').value = urls.join('\n');
     csStatus('Found ' + urls.length + ' environment(s): ' + names.join(', ') + '. Review, then Scan agents.');
-  } catch (e){ csStatus('Discovery failed: ' + e.message + ' — you can still enter URLs manually.'); }
+  } catch (e){ csStatus('Discovery failed: ' + e.message + csAuthHint(e.message) + ' (You can still enter URLs manually.)'); }
   finally { btn.disabled = false; }
 }
 
@@ -1773,7 +1825,7 @@ async function matchCopilotNames(){
     applyFilters();
     setTimeout(hideProgress, 2000);
   } catch (e){
-    setProgress(100, 'Match Copilot Studio names', 'Failed: ' + e.message, 'log-err');
+    setProgress(100, 'Match Copilot Studio names', 'Failed: ' + e.message + csAuthHint(e.message), 'log-err');
   } finally {
     if (btn){ btn.disabled = false; btn.textContent = '🔗 Match Copilot Studio names'; }
   }
@@ -1799,16 +1851,20 @@ async function csRunScan(){
         csEnvCount++;
         csSetProgress(null, null, `  ${env}: ${list.length} agent(s).`, 'log-ok');
       } catch (e){
-        csSetProgress(null, null, `  ${env} failed: ${e.message}`, 'log-err');
+        csSetProgress(null, null, `  ${env} failed: ${e.message}${csAuthHint(e.message)}`, 'log-err');
       }
       done++;
     }
-    csSetProgress(100, 'Done', `Inventoried ${csAgents.length} agent(s) across ${csEnvCount} environment(s).`, 'log-ok');
+    csSetProgress(95, 'Classifying', 'Classifying agents as classic (app registration) vs modern (Entra Agent ID)…');
+    await csClassifyAgents();
+    const nClassic = csAgents.filter(a => a._agentClass === 'classic').length;
+    const nModern  = csAgents.filter(a => a._agentClass === 'modern').length;
+    csSetProgress(100, 'Done', `Inventoried ${csAgents.length} agent(s) across ${csEnvCount} environment(s): ${nClassic} classic, ${nModern} modern.`, 'log-ok');
     csRenderKpis();
     csRender();
     document.getElementById('cs-kpi').style.display = 'flex';
     document.getElementById('cs-table-section').style.display = 'block';
-    csStatus(`Done — ${csAgents.length} agent(s).`);
+    csStatus(`Done — ${csAgents.length} agent(s) (${nClassic} classic, ${nModern} modern).`);
     setTimeout(() => { document.getElementById('cs-progress').style.display = 'none'; }, 1800);
   } catch (e){
     const el = document.getElementById('cs-error'); el.textContent = 'Scan failed: ' + e.message; el.style.display = 'block';
@@ -1892,6 +1948,7 @@ function csSortBy(key){
 function csRender(){
   const q = (document.getElementById('cs-search').value || '').toLowerCase();
   csFiltered = csAgents.filter(a => {
+    if (csFilter !== 'all' && a._agentClass !== csFilter) return false;
     if (!q) return true;
     return [a.name, a.environment, a.model, a.orchestration, a.description, a.instructions, (a.tools||[]).join(' '), (a.knowledge||[]).join(' ')]
       .join(' ').toLowerCase().includes(q);
@@ -1914,9 +1971,12 @@ function csRender(){
   if (!csFiltered.length){ tbody.innerHTML = ''; empty.style.display = 'block'; document.getElementById('cs-empty-msg').textContent = csAgents.length ? 'No agents match your search.' : 'No Copilot Studio agents found.'; return; }
   empty.style.display = 'none';
 
+  const clsBadge = c => c === 'classic' ? `<span class="tag" style="color:#fbbf24;border:1px solid #f59e0b55">Classic</span>`
+    : c === 'modern' ? `<span class="tag" style="color:#4ade80;border:1px solid #22c55e55">Modern</span>`
+    : `<span class="tag" title="No linked Entra app ID resolved">Unknown</span>`;
   tbody.innerHTML = csFiltered.map(a => `
     <tr onclick="csToggleRow('${esc(a.botid)}')" data-cs-id="${esc(a.botid)}" style="cursor:pointer">
-      <td><div class="agent-name">${esc(a.name || '—')}</div><div class="agent-id">${esc(a.schemaName || a.botid)}</div></td>
+      <td><div class="agent-name">${esc(a.name || '—')} ${clsBadge(a._agentClass)}</div><div class="agent-id">${esc(a.schemaName || a.botid)}</div></td>
       <td>${esc(a.environment)}</td>
       <td>${a.model && a.model !== '—' ? `<span class="tag">${esc(a.model)}</span>` : '<span class="text-muted">—</span>'}</td>
       <td>${a.orchestration === 'Generative' ? '<span class="status-pill st-pending">✨ Generative</span>' : '<span class="text-muted">Classic</span>'}</td>
@@ -1986,6 +2046,7 @@ function csExport(kind){
   if (kind === 'json'){
     const pkg = csAgents.map(a => ({
       name: a.name, schemaName: a.schemaName, environment: a.environment, botId: a.botid, entraAppId: a.appId || null,
+      agentClass: a._agentClass || 'unknown',
       description: a.description, model: a.model, orchestration: a.orchestration,
       instructions: a.instructions, knowledge: a.knowledge, tools: a.tools, topics: a.topics,
       triggers: a.triggers, connections: a.connections, published: a.published,
@@ -1995,9 +2056,9 @@ function csExport(kind){
     el.href = url; el.download = `copilot-studio-agents-${stamp}.json`; el.click(); URL.revokeObjectURL(url);
     return;
   }
-  const headers = ['Name','Environment','Model','Orchestration','Published','KnowledgeCount','ToolCount','TopicCount','Tools','Knowledge','Description','Instructions'];
+  const headers = ['Name','Class','Environment','Model','Orchestration','Published','KnowledgeCount','ToolCount','TopicCount','Tools','Knowledge','Description','Instructions'];
   const rows = csAgents.map(a => [
-    a.name || '', a.environment, a.model || '', a.orchestration, a.published, a._knowledgeCount, a._toolCount, a._topicCount,
+    a.name || '', a._agentClass || 'unknown', a.environment, a.model || '', a.orchestration, a.published, a._knowledgeCount, a._toolCount, a._topicCount,
     (a.tools || []).join('; '), (a.knowledge || []).join('; '),
     (a.description || '').replace(/\s+/g, ' ').slice(0, 500), (a.instructions || '').replace(/\s+/g, ' ').slice(0, 1000),
   ]);
