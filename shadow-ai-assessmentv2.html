@@ -3559,6 +3559,9 @@ async function loadShadowApps() {
     // these network-discovered apps and mostly added noise; renderOAuthGovCard /
     // fetchOAuthAppInfo remain available for reuse.)
     renderEndpointAiTraffic('shadow-content', 'shadow-endpoint-slot').catch(() => {});
+    // Enrichment card (async): endpoint AI domains NOT in Cloud Discovery — the
+    // shadow-AI long tail the MDCA catalog missed (broad .ai/brand heuristic).
+    renderEndpointAiGaps('shadow-content', 'shadow-endpoint-gaps-slot').catch(() => {});
     // Enrichment card (async): the alerts your Shadow IT / app-discovery policies
     // raise for GenAI apps (the policy definitions themselves aren't API-readable).
     renderShadowAiPolicyAlerts('shadow-content', 'shadow-policy-alerts-slot').catch(() => {});
@@ -9316,6 +9319,83 @@ async function renderEndpointAiTraffic(containerId, slotId) {
         <td style="font-size:11px;color:var(--text-muted)" title="${esc(ps.join(', '))}">${ps.slice(0, 3).map(esc).join(', ') || '—'}</td>
         <td class="mono text-muted" style="font-size:11px">${row.LastSeen ? new Date(row.LastSeen).toLocaleDateString() : '—'}</td>
       </tr>`; }).join('')}</tbody>
+    </table></div></div>`;
+}
+
+// 🕳️ Endpoint AI domains that Cloud Discovery didn't surface — the "unknown
+// unknowns". DeviceNetworkEvents sees every AI-ish domain a managed device
+// touches, including apps too new/niche for the MDCA catalog or not categorized
+// as GenAI. Deliberately BROAD (.ai TLD + provider brands) — the noise is the
+// point; each domain is tagged by confidence and cross-referenced against the
+// MDCA discovered-app list so the endpoint-only GAPS stand out.
+async function renderEndpointAiGaps(containerId, slotId) {
+  const slot = _ensureSlot(containerId, slotId);
+  if (!slot) return;
+  const title = '🕳️ Endpoint AI Domains — Cloud Discovery Gaps (30d)', src = '● DeviceNetworkEvents · Advanced Hunting';
+  // AI signal: .ai TLD OR a provider brand in the host. First-party Microsoft/Google
+  // and auth/CDN infrastructure are excluded so registrable domains don't collapse to
+  // google.com etc. Registrable domain = last two labels (good enough for .ai/.com).
+  const brands = ['openai','anthropic','claude','perplexity','deepseek','huggingface','ollama','openrouter','together.ai','mistral','cohere','midjourney','elevenlabs','character.ai','poe.com','stability'];
+  const excl = ['microsoft','azure','windows','office','msn','bing','msauth','msftauth','skype','sharepoint','onmicrosoft','officeapps','live.com','office.net','google','gstatic','googleapis','apple','icloud','mozilla','cloudflare'];
+  const kql = [
+    'DeviceNetworkEvents',
+    '| where Timestamp > ago(30d)',
+    '| where isnotempty(RemoteUrl)',
+    String.raw`| extend Host = tolower(extract(@"^(?:[a-z]+://)?([^/:?#]+)", 1, RemoteUrl))`,
+    '| where isnotempty(Host)',
+    `| where Host matches regex @"\\.ai$" or Host has_any (${brands.map(b => `"${b}"`).join(',')})`,
+    `| where not(Host has_any (${excl.map(b => `"${b}"`).join(',')}))`,
+    String.raw`| extend Domain = extract(@"([a-z0-9-]+\.[a-z0-9-]+)$", 1, Host)`,
+    '| where isnotempty(Domain)',
+    '| summarize Connections=count(), Devices=dcount(DeviceId), Users=make_set(InitiatingProcessAccountUpn,5), LastSeen=max(Timestamp) by Domain',
+    '| order by Connections desc | take 80',
+  ].join(' ');
+  const r = await _runHunt(kql);
+  if (!r.rows) { slot.innerHTML = _huntErrCard(title, src, r); return; }
+
+  // Cross-reference each domain against the MDCA discovered-app inventory (name
+  // tokens ∪ derived domain tokens). A domain already in Cloud Discovery isn't a gap.
+  const mcasTokens = new Set();
+  (STATE.data.mcasApps || []).forEach(a => { _appDomainTokens(a.name).forEach(t => mcasTokens.add(t)); _sigTokens(a.name).forEach(t => mcasTokens.add(t)); });
+  const inMcas = d => { const dl = d.toLowerCase(); if (mcasTokens.has(dl)) return true; const brand = dl.split('.')[0]; return brand.length >= 3 && mcasTokens.has(brand); };
+
+  const rows = r.rows.map(row => {
+    const domain = String(row.Domain || '').trim();
+    const known = _aiEgressApp(domain) !== 'AI app';
+    return {
+      domain,
+      provider: known ? _aiEgressApp(domain) : null,
+      connections: Number(row.Connections) || 0,
+      devices: Number(row.Devices) || 0,
+      users: _huntArr(row.Users).filter(Boolean),
+      lastSeen: row.LastSeen ? new Date(row.LastSeen) : null,
+      known, gap: !inMcas(domain),
+    };
+  }).filter(x => x.domain);
+  const gaps = rows.filter(x => x.gap);
+  const covered = rows.length - gaps.length;
+
+  if (!gaps.length) {
+    slot.innerHTML = `<div class="card" style="margin:16px 0"><div class="card-header"><div class="card-title">${title}</div><span class="data-source source-live" style="font-size:10px">${src}</span></div>
+      <div class="card-body" style="font-size:12px;color:var(--text-muted)">✅ No endpoint AI domains outside Cloud Discovery${rows.length ? ` — all ${rows.length} AI-ish domain${rows.length !== 1 ? 's' : ''} seen on devices are already in the discovered-app inventory` : ' in 30 days'}.</div></div>`;
+    return;
+  }
+  const conf = x => x.known
+    ? '<span class="badge badge-high" style="font-size:9px">Known AI</span>'
+    : (/\.ai$/.test(x.domain) ? '<span style="font-size:10px;color:var(--risk-medium)">Possible AI · .ai TLD</span>' : '<span style="font-size:10px;color:var(--text-muted)">Provider-brand match</span>');
+  slot.innerHTML = `<div class="card" style="margin:16px 0">
+    <div class="card-header"><div class="card-title">${title} (${gaps.length})</div><span class="data-source source-live" style="font-size:10px">${src}</span></div>
+    <div style="padding:6px 16px 4px;font-size:11px;color:var(--text-dim)">AI-ish domains seen on managed devices that are <strong>not</strong> in Cloud Discovery — the shadow-AI long tail MDCA's catalog missed.${covered ? ` ${covered} other AI domain${covered !== 1 ? 's are' : ' is'} already covered (see Endpoint AI Traffic).` : ''} <em>.ai is a noisy TLD — treat unconfirmed rows as candidates to review.</em></div>
+    <div class="table-wrap tbl-scroll" style="max-height:330px"><table>
+      <thead><tr><th>Domain</th><th>Confidence</th><th>Connections</th><th>Devices</th><th>Users</th><th>Last Seen</th></tr></thead>
+      <tbody>${gaps.map(x => `<tr>
+        <td><strong style="font-size:12px">${esc(x.domain)}</strong>${x.provider ? ` <span style="font-size:10px;color:var(--text-muted)">${esc(x.provider)}</span>` : ''}</td>
+        <td>${conf(x)}</td>
+        <td style="font-weight:700">${x.connections}</td>
+        <td>${x.devices}</td>
+        <td style="font-size:11px;color:var(--text-muted)" title="${esc(x.users.join(', '))}">${x.users.slice(0, 2).map(esc).join(', ') || '—'}${x.users.length > 2 ? ` +${x.users.length - 2}` : ''}</td>
+        <td class="mono text-muted" style="font-size:11px">${x.lastSeen ? x.lastSeen.toLocaleDateString() : '—'}</td>
+      </tr>`).join('')}</tbody>
     </table></div></div>`;
 }
 
