@@ -454,6 +454,7 @@
             <li><code class="perm-read">AuditLog.Read.All</code> — sign-in activity (optional, for last-used data)</li>
             <li><code class="perm-read">Dynamics CRM · user_impersonation</code> — read Copilot Studio agents from Dataverse (Copilot Studio inventory mode)</li>
             <li><code class="perm-read">Azure AI Services / Cognitive Services · user_impersonation</code> — read Foundry agents (audience <code>https://ai.azure.com</code>, Foundry agents mode)</li>
+            <li><code class="perm-read">Azure Service Management · user_impersonation</code> — auto-discover Foundry projects via ARM (audience <code>https://management.azure.com</code>, Foundry "Discover" button)</li>
           </ul>
         </dd>
         <dt>Create scopes</dt>
@@ -710,6 +711,11 @@
               <label>Environment URL(s) — one per line (or use “Discover my environments”)</label>
               <textarea id="cs-envs" placeholder="https://org.crm.dynamics.com&#10;https://org2.crm4.dynamics.com"></textarea>
             </div>
+            <div class="mig-field">
+              <label>Dataverse app registration — client ID (optional)</label>
+              <input type="text" id="cs-dv-clientid" placeholder="reuse an already-consented app (e.g. your Copilot Studio Auditor) — leave blank to use this app">
+              <div class="mig-hint">To avoid granting <b>Dynamics CRM</b> to this app, enter a client ID that <b>already</b> has that permission consented — its consent is reused for the Dataverse read. That app must list this page’s URL as a <b>SPA redirect URI</b>. Auto-filled from a same-origin auditor if found.</div>
+            </div>
           </div>
           <div class="mig-actions">
             <button class="btn btn-primary" id="cs-scan-btn" onclick="csRunScan()">🔍 Scan agents</button>
@@ -830,10 +836,11 @@
           </div>
           <div class="mig-actions">
             <button class="btn btn-primary" id="fdry-scan-btn" onclick="fdryScan()">🔍 Scan agents</button>
-            <span class="mig-summary" id="fdry-status">Paste a project endpoint (Foundry portal → project → Overview) to begin.</span>
+            <button class="btn btn-secondary" id="fdry-discover-btn" onclick="fdryDiscover()">🧭 Discover my Foundry projects</button>
+            <span class="mig-summary" id="fdry-status">Paste a project endpoint, or discover them automatically, to begin.</span>
           </div>
           <div class="bp-note">
-            Uses a data-plane token with audience <code>https://ai.azure.com</code> (acquired via your sign-in). Your app registration needs an <b>Azure AI / Cognitive Services</b> delegated permission, and you need a Foundry role (e.g. <b>Foundry User</b> / <b>Foundry Agent Consumer</b>) on the project. Tries the classic <code>/assistants</code> API, then the new <code>/agents</code> API.
+            <b>Scan</b> uses a data-plane token (audience <code>https://ai.azure.com</code>) — needs an <b>Azure AI / Cognitive Services</b> delegated permission and a Foundry role (e.g. <b>Foundry User</b> / <b>Foundry Agent Consumer</b>) on each project. <b>Discover</b> enumerates every project via Azure Resource Manager — needs the <b>Azure Service Management · user_impersonation</b> permission and Azure RBAC <b>Reader</b> on your subscriptions. Listing tries the classic <code>/assistants</code> API, then the new <code>/agents</code> API.
           </div>
         </div>
       </div>
@@ -1050,6 +1057,10 @@ function showLoginErr(msg) {
 window.addEventListener('DOMContentLoaded', () => {
   const saved = localStorage.getItem('c2m_clientId');
   document.getElementById('clientId-input').value = saved || DEFAULT_CLIENT_ID;
+  // Reuse a same-origin auditor's already-consented Dataverse app registration, if present.
+  const dvReuse = localStorage.getItem('cs_clientId');
+  const dvInput = document.getElementById('cs-dv-clientid');
+  if (dvReuse && dvInput && dvReuse !== (saved || DEFAULT_CLIENT_ID)) dvInput.value = dvReuse;
   const ru = document.getElementById('redir-uri');
   if (ru && (location.protocol === 'https:' || location.protocol === 'http:')) ru.textContent = APP_REDIRECT_URI;
 
@@ -1937,6 +1948,8 @@ function csAuthHint(msg){
     return ' → Your app registration is missing the Dataverse permission. In Entra: App registrations → this app → API permissions → Add a permission → Dynamics CRM → Delegated → user_impersonation → Add, then Grant admin consent, and retry.';
   if (/AADSTS65001|consent_required|AADSTS65004|interaction_required/i.test(msg))
     return ' → Consent required: an admin must grant consent for the Dynamics CRM (Dataverse) permission, then retry.';
+  if (/AADSTS50011|redirect|reply url/i.test(msg))
+    return ' → The reused Dataverse app registration (' + (csGetDvClientId() || '?') + ') must list this page’s URL (' + APP_REDIRECT_URI + ') as a SPA redirect URI. Add it there, or clear the Dataverse client ID field to use this app instead.';
   return '';
 }
 
@@ -2027,10 +2040,44 @@ function csSetProgress(pct, phase, msg, cls){
 }
 
 // Dataverse is per-resource: acquire a token scoped to each environment's URL.
+// Optional: read Dataverse under a DIFFERENT app registration that already has the
+// Dynamics CRM consent (e.g. the Copilot Studio Auditor), so this app never needs it.
+let csDvMsal = null, csDvAccount = null, csDvClientId = null;
+function csGetDvClientId(){ return (document.getElementById('cs-dv-clientid')?.value || '').trim() || null; }
+
+// Return the MSAL app + account to use for Dataverse tokens. If an override client
+// ID is set (and differs from this app), lazily build a second MSAL client and SSO
+// into it with the current user, reusing that app's existing Dataverse consent.
+async function csEnsureDvAuth(){
+  const cid = csGetDvClientId();
+  if (!cid || cid === getClientId()) return { app: msalApp, account: currentAccount };
+  if (!csDvMsal || csDvClientId !== cid){
+    csDvClientId = cid;
+    csDvMsal = new msal.PublicClientApplication({
+      auth: { clientId: cid, authority: 'https://login.microsoftonline.com/organizations', redirectUri: APP_REDIRECT_URI },
+      cache: { cacheLocation: 'localStorage' },
+    });
+    await csDvMsal.initialize();
+    csDvAccount = null;
+  }
+  if (!csDvAccount){
+    const hint = (currentAccount && currentAccount.username) || null;
+    const accts = csDvMsal.getAllAccounts();
+    csDvAccount = (hint && accts.find(a => (a.username || '').toLowerCase() === hint.toLowerCase())) || accts[0] || null;
+    if (!csDvAccount){
+      try { csDvAccount = (await csDvMsal.ssoSilent({ scopes: ['https://graph.microsoft.com/User.Read'], loginHint: hint })).account; }
+      catch { csDvAccount = (await csDvMsal.loginPopup({ scopes: ['https://graph.microsoft.com/User.Read'], ...(hint ? { loginHint: hint } : {}) })).account; }
+    }
+    csDvMsal.setActiveAccount(csDvAccount);
+  }
+  return { app: csDvMsal, account: csDvAccount };
+}
+
 async function csGetToken(resource){
-  const scopes = [resource.replace(/\/$/, '') + '/.default'];
-  try { return (await msalApp.acquireTokenSilent({ scopes, account: currentAccount })).accessToken; }
-  catch { return (await msalApp.acquireTokenPopup({ scopes, account: currentAccount })).accessToken; }
+  const { app, account } = await csEnsureDvAuth();
+  const req = { scopes: [resource.replace(/\/$/, '') + '/.default'], account };
+  try { return (await app.acquireTokenSilent(req)).accessToken; }
+  catch { return (await app.acquireTokenPopup(req)).accessToken; }
 }
 function csDvHeaders(token){
   return { Authorization: 'Bearer ' + token, Accept: 'application/json',
@@ -2421,6 +2468,88 @@ async function fdryGetToken(){
     catch { try { return (await msalApp.acquireTokenPopup({ scopes, account: currentAccount })).accessToken; } catch(e){ lastErr = e; } }
   }
   throw lastErr || new Error('token acquisition failed');
+}
+
+// ── ARM auto-discovery of Foundry projects ───────────────────────────────────
+// Enumerates subscriptions → Microsoft.CognitiveServices AIServices accounts →
+// projects, and builds each project's data-plane endpoint. Control-plane token
+// (audience https://management.azure.com) + Azure RBAC Reader required.
+async function fdryGetArmToken(){
+  const scopes = ['https://management.azure.com/.default'];
+  try { return (await msalApp.acquireTokenSilent({ scopes, account: currentAccount })).accessToken; }
+  catch { return (await msalApp.acquireTokenPopup({ scopes, account: currentAccount })).accessToken; }
+}
+async function armGetAll(url, token){
+  const items = []; let next = url, pages = 0;
+  while (next && pages < 50){
+    const r = await fetch(next, { headers: { Authorization: 'Bearer ' + token } });
+    if (!r.ok) throw new Error(r.status + ' ' + (await r.text()).slice(0, 200));
+    const j = await r.json();
+    if (Array.isArray(j.value)) items.push(...j.value);
+    next = j.nextLink || null; pages++;
+  }
+  return items;
+}
+// Derive the services.ai.azure.com base for a Foundry account.
+function fdryAccountBase(acc){
+  const eps = (acc.properties && acc.properties.endpoints) || {};
+  for (const k in eps){ const v = eps[k]; if (typeof v === 'string' && /services\.ai\.azure\.com/i.test(v)) return v.replace(/\/+$/, ''); }
+  const ep = acc.properties && acc.properties.endpoint;
+  if (ep && /services\.ai\.azure\.com/i.test(ep)) return ep.replace(/\/+$/, '');
+  return 'https://' + acc.name + '.services.ai.azure.com';
+}
+function fdryArmHint(msg){
+  msg = String(msg || '');
+  if (/650057|invalid resource|invalid_client/i.test(msg))
+    return ' → App registration is missing the "Azure Service Management · user_impersonation" permission. Add it + grant admin consent, then retry.';
+  if (/consent|AADSTS65001/i.test(msg))
+    return ' → Consent required for the Azure Service Management scope; grant admin consent and retry.';
+  if (/\b403\b|Authorization(Failed)?/i.test(msg))
+    return ' → You need Azure RBAC Reader on the subscription(s) / Foundry account(s).';
+  return '';
+}
+async function fdryDiscover(){
+  const btn = document.getElementById('fdry-discover-btn'); btn.disabled = true;
+  try {
+    if (!msalApp || !currentAccount) throw new Error('Sign in first (use the Pro-code tab), then return here.');
+    fdryStatus('Acquiring Azure Resource Manager token…');
+    const token = await fdryGetArmToken().catch(e => { throw new Error('__ARM__' + (e.errorMessage || e.message || e)); });
+
+    fdryStatus('Listing subscriptions…');
+    const subs = await armGetAll('https://management.azure.com/subscriptions?api-version=2020-01-01', token);
+    if (!subs.length){ fdryStatus('No subscriptions visible to your account.'); return; }
+
+    const endpoints = []; const seen = new Set(); let accCount = 0;
+    for (const s of subs){
+      const sid = s.subscriptionId;
+      fdryStatus(`Scanning subscription ${s.displayName || sid} …`);
+      let accts = [];
+      try { accts = await armGetAll(`https://management.azure.com/subscriptions/${sid}/providers/Microsoft.CognitiveServices/accounts?api-version=2024-10-01`, token); }
+      catch(e){ continue; } // no access to this subscription's Cognitive Services
+      for (const acc of accts){
+        if ((acc.kind || '').toLowerCase() !== 'aiservices') continue; // Foundry accounts only
+        accCount++;
+        const base = fdryAccountBase(acc);
+        let projs = [];
+        try { projs = await armGetAll(`https://management.azure.com${acc.id}/projects?api-version=2025-06-01`, token); }
+        catch(e){ continue; } // account without the projects sub-resource
+        for (const p of projs){
+          const ep = `${base}/api/projects/${p.name}`;
+          if (!seen.has(ep)){ seen.add(ep); endpoints.push(ep); }
+        }
+      }
+    }
+
+    if (!endpoints.length){ fdryStatus(`No Foundry projects found across ${subs.length} subscription(s). You may need Azure RBAC Reader on the accounts.`); return; }
+    const existing = document.getElementById('fdry-endpoints').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+    const merged = [...new Set([...existing, ...endpoints])];
+    document.getElementById('fdry-endpoints').value = merged.join('\n');
+    fdryStatus(`Found ${endpoints.length} project(s) across ${accCount} Foundry account(s) in ${subs.length} subscription(s). Review, then Scan agents.`);
+  } catch(e){
+    const msg = String(e.message || e);
+    if (msg.startsWith('__ARM__')) fdryStatus('Could not get an ARM token: ' + msg.slice(7) + fdryArmHint(msg.slice(7)));
+    else fdryStatus('Discovery failed: ' + msg + fdryArmHint(msg));
+  } finally { btn.disabled = false; }
 }
 
 function fdryToolLabel(t){
