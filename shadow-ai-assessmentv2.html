@@ -1107,7 +1107,10 @@ async function fetchSharePointSettings() {
 
 async function fetchSensitivityLabels() {
   if (STATE.data.sensitivityLabels !== undefined) return STATE.data.sensitivityLabels;
-  const sort = arr => (arr||[]).sort((a,b) => (b.sensitivity||b.priority||0) - (a.sensitivity||a.priority||0));
+  // Use ?? not ||: sensitivity 0 (Public / lowest) is a valid rank and must not
+  // fall through to priority, which is a different ordinal scale.
+  const rank = l => l.sensitivity ?? l.priority ?? 0;
+  const sort = arr => (arr||[]).sort((a,b) => rank(b) - rank(a));
   // 1. Org-level endpoint — richest data, the only one that exposes isDefault (the
   //    default-label flag). Lives under /beta ONLY (the v1.0 path 404s). Requires
   //    InformationProtectionPolicy.Read + a reader role (Security/Global Reader).
@@ -2478,7 +2481,7 @@ function refreshAll() {
   Object.values(STATE.charts).forEach(c => c.destroy());
   STATE.charts = {};
   // reset all page content
-  ['shadow','models','agents','copilot','risk','users','licenses','protection','sharing','labels'].forEach(k => {
+  ['shadow','models','agents','copilot','risk','users','licenses','protection','sharing','labels','mcp'].forEach(k => {
     const el = document.getElementById(k + '-content');
     if (el) el.innerHTML = '<div class="section-loading"><span class="spinner"></span>Reloading…</div>';
   });
@@ -2599,8 +2602,8 @@ function buildAiAlerts({ aiApps, grants, signIns, riskyUsers, secAlerts, agentSp
   if (highRiskApps.length) derived.push({ sev:'critical', title:`${highRiskApps.length} AI app(s) with high-risk OAuth scopes`, desc:`Apps: ${highRiskApps.slice(0,3).map(a=>a.displayName).join(', ')}${highRiskApps.length>3?'…':''}. High-risk scopes: Mail, Files, Calendar access granted.`, icon:'🔑', page:'shadow-apps' });
   const chinaApps = (aiApps || []).filter(sp => detectModel(sp.displayName||'').residency === 'China');
   if (chinaApps.length) derived.push({ sev:'critical', title:`${chinaApps.length} AI app(s) routing data to China`, desc:`${chinaApps.map(a=>a.displayName).join(', ')} — data residency in China, no GDPR compliance. Prompts may be used for training.`, icon:'🇨🇳', page:'models' });
-  const trainApps = (aiApps || []).filter(sp => detectModel(sp.displayName||'').training === 'Yes');
-  if (trainApps.length) derived.push({ sev:'high', title:`${trainApps.length} AI app(s) train on your data`, desc:`Training on prompts: ${trainApps.slice(0,4).map(a=>a.displayName).join(', ')}. Confidential data may enter public models.`, icon:'🧠', page:'models' });
+  const trainApps = (aiApps || []).filter(sp => trainsOnPrompts(detectModel(sp.displayName||'')));
+  if (trainApps.length) derived.push({ sev:'high', title:`${trainApps.length} AI app(s) may train on your data`, desc:`Train on prompts (or only opt-out): ${trainApps.slice(0,4).map(a=>a.displayName).join(', ')}. Confidential data may enter public models.`, icon:'🧠', page:'models' });
   if (riskyAiSignIns.length) derived.push({ sev:'high', title:`${riskyAiSignIns.length} risky sign-in(s) to AI apps`, desc:`Elevated-risk users accessing AI apps. Latest: ${riskyAiSignIns[0]?.userDisplayName} → ${riskyAiSignIns[0]?.appDisplayName}.`, icon:'⚠️', page:'users' });
   const riskyActive = (riskyUsers || []).filter(u => u.riskLevel && u.riskLevel !== 'none');
   if (riskyActive.length) derived.push({ sev:'high', title:`${riskyActive.length} risky user(s) in tenant`, desc:`Identity Protection flagged: ${riskyActive.slice(0,3).map(u=>u.userDisplayName).join(', ')}. Possible compromised credentials using AI apps.`, icon:'👤', page:'users' });
@@ -3396,17 +3399,34 @@ async function fetchMcasAppsFromGraph(period) {
             _source:              'graph',
           };
         } else {
-          // Accumulate stream IDs and merge user activity from additional streams
-          if (!appMap[key]._streamIds) appMap[key]._streamIds = [];
-          if (!appMap[key]._streamIds.includes(stream.id)) appMap[key]._streamIds.push(stream.id);
+          // Accumulate stream IDs and merge user activity from additional streams.
+          // aggregatedAppsDetails is aggregated PER stream, so the same app seen via
+          // two streams (e.g. two firewalls/proxies) carries independent counts —
+          // sum the traffic/event bytes so multi-stream tenants aren't undercounted.
+          const ex = appMap[key];
+          if (!ex._streamIds) ex._streamIds = [];
+          if (!ex._streamIds.includes(stream.id)) {
+            ex._streamIds.push(stream.id);
+            const upload = a.uploadNetworkTrafficInBytes ?? 0;
+            const download = a.downloadNetworkTrafficInBytes ?? 0;
+            ex.trafficUploadedBytes += upload;
+            ex.trafficTotalBytes    += upload + download;
+            ex.trafficTotalEvents   += a.transactionCount ?? 0;
+          }
           if (a.userActivity?.length) {
-            const existing = new Map((appMap[key]._mcasUsers || []).map(u => [u.userPrincipalName || u.id, u]));
+            const existing = new Map((ex._mcasUsers || []).map(u => [u.userPrincipalName || u.id, u]));
             for (const u of a.userActivity) {
               const k = u.userPrincipalName || u.id;
               if (!existing.has(k)) existing.set(k, u);
             }
-            appMap[key]._mcasUsers = [...existing.values()];
+            ex._mcasUsers = [...existing.values()];
           }
+          // Reconcile the headline user count with the deduped cross-stream set so
+          // tiles/KPIs agree with the per-app drilldown. Fall back to the summed
+          // userCount when no per-user activity is available.
+          ex.usersCount = ex._mcasUsers.length
+            ? ex._mcasUsers.length
+            : ex.usersCount + (a.userCount ?? 0);
         }
       });
     } catch { /* skip streams that error */ }
@@ -4248,7 +4268,7 @@ async function loadModels() {
     });
     STATE.data.modelList = models;
 
-    const fmtBytes = b => b >= 1e9 ? (b/1e9).toFixed(1)+' GB' : b >= 1e6 ? (b/1e6).toFixed(1)+' MB' : b >= 1e3 ? (b/1e3).toFixed(0)+' KB' : b+' B';
+    // fmtBytes: shared global helper (shows "—" for zero traffic) — no local shadow.
     const srcBadge = sources => [...sources].map(s => ({
       sp:     `<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:rgba(56,139,253,.15);color:var(--accent-blue);border:1px solid rgba(56,139,253,.3)">SP</span>`,
       signin: `<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:rgba(163,113,247,.15);color:var(--accent-purple);border:1px solid rgba(163,113,247,.3)">Sign-in</span>`,
