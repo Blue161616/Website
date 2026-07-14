@@ -421,6 +421,16 @@
   }
   @media (max-width: 760px){ .cs-anim{ flex-direction: column; } .cs-arrow{ transform: rotate(90deg); align-self: center; } }
   @media (prefers-reduced-motion: reduce){ .cs-stage, .cs-arrow .cs-flow { animation: none; } }
+
+  /* Foundry variant of the process animation (auto-provisioned, blue theme) */
+  .fdry-anim { background: linear-gradient(90deg, rgba(14,165,233,.07) 0%, rgba(14,165,233,.03) 55%, rgba(34,197,94,.07) 100%); }
+  .fdry-anim .cs-stage { --glow: 14,165,233; }
+  .fdry-anim .cs-stage[data-step="3"]{ --glow: 34,197,94; }
+  .fdry-anim .cs-arrow path, .fdry-anim .cs-arrow .cs-flow { stroke: #38bdf8; }
+  .cs-auto-badge {
+    position: absolute; bottom: -6px; right: -6px; background: var(--modern); color: #06210f;
+    font-size: .5rem; font-weight: 800; padding: 1px 4px; border-radius: 5px; border: 1.5px solid var(--bg); letter-spacing: .03em;
+  }
 </style>
 </head>
 <body>
@@ -922,6 +932,36 @@
           <div id="fdry-discovered" style="margin-top:10px"></div>
           <div class="bp-note">
             <b>Scan</b> uses a data-plane token (audience <code>https://ai.azure.com</code>) — needs an <b>Azure AI / Cognitive Services</b> delegated permission and a Foundry role (e.g. <b>Foundry User</b> / <b>Foundry Agent Consumer</b>) on each project. <b>Discover</b> enumerates every project via Azure Resource Manager — needs the <b>Azure Service Management · user_impersonation</b> permission and Azure RBAC <b>Reader</b> on your subscriptions. Listing tries the classic <code>/assistants</code> API, then the new <code>/agents</code> API.
+          </div>
+        </div>
+      </div>
+
+      <!-- Foundry process animation: Build → Foundry auto-provisions identity → Modern Agent ID -->
+      <div class="cs-anim fdry-anim" aria-hidden="true">
+        <div class="cs-stage" data-step="1">
+          <span class="cs-step-num">1</span>
+          <div class="cs-stage-icon">⚗️</div>
+          <div class="cs-stage-text">
+            <div class="cs-stage-title">Build the agent</div>
+            <div class="cs-stage-sub">model · instructions · tools · knowledge in Azure AI Foundry</div>
+          </div>
+        </div>
+        <div class="cs-arrow"><svg viewBox="0 0 30 14" preserveAspectRatio="none"><line class="cs-flow" x1="1" y1="7" x2="23" y2="7"/><path d="M22 2 l6 5 l-6 5"/></svg></div>
+        <div class="cs-stage" data-step="2">
+          <span class="cs-step-num">2</span>
+          <div class="cs-stage-icon">⚙️<span class="cs-auto-badge">auto</span></div>
+          <div class="cs-stage-text">
+            <div class="cs-stage-title">Foundry provisions the identity</div>
+            <div class="cs-stage-sub">automatic on publish — no manual migration</div>
+          </div>
+        </div>
+        <div class="cs-arrow"><svg viewBox="0 0 30 14" preserveAspectRatio="none"><line class="cs-flow" x1="1" y1="7" x2="23" y2="7"/><path d="M22 2 l6 5 l-6 5"/></svg></div>
+        <div class="cs-stage" data-step="3">
+          <span class="cs-step-num">3</span>
+          <div class="cs-stage-icon">🤖</div>
+          <div class="cs-stage-text">
+            <div class="cs-stage-title">Modern Entra Agent ID</div>
+            <div class="cs-stage-sub">governed · sponsored · Conditional-Access ready</div>
           </div>
         </div>
       </div>
@@ -2795,33 +2835,39 @@ async function fdryListAgents(endpoint, token, log){
   const base = endpoint.replace(/\/+$/, '');
   const projName = decodeURIComponent((base.match(/\/projects\/([^\/?]+)/) || [])[1] || base);
   const agents = [];
-  let usedApi = null;
+  let usedApi = null; const tried = [];
+  const seen = new Set();
+  const addAll = list => (list || []).forEach(a => { const n = fdryNormalize(a, projName, base); if (n.id && !seen.has(n.id)){ seen.add(n.id); agents.push(n); } });
 
-  // Classic Assistants API (OpenAI-shaped, cursor-paginated)
-  try {
-    let after = null, pages = 0;
-    do {
-      const url = base + '/assistants?api-version=2025-05-01&limit=100' + (after ? '&after=' + encodeURIComponent(after) : '');
-      const r = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
-      if (!r.ok){ if (pages === 0) throw new Error('assistants HTTP ' + r.status); break; }
-      const j = await r.json();
-      const list = j.data || j.value || [];
-      list.forEach(a => agents.push(fdryNormalize(a, projName, base)));
-      after = j.has_more ? j.last_id : null;
-      pages++;
-      usedApi = 'assistants';
-    } while (after && pages < 20);
-  } catch(e){ if (log) log('  /assistants: ' + e.message, 'dim'); }
-
-  // New /agents API (fallback if classic returned nothing)
-  if (!agents.length){
-    try {
-      const r = await fetch(base + '/agents?api-version=v1', { headers: { Authorization: 'Bearer ' + token } });
-      if (r.ok){ const j = await r.json(); (j.value || j.data || []).forEach(a => agents.push(fdryNormalize(a, projName, base))); usedApi = 'agents'; }
-      else if (log) log('  /agents: HTTP ' + r.status, 'dim');
-    } catch(e){ if (log) log('  /agents: ' + e.message, 'dim'); }
+  // 1) Assistants / Agent Service (asst_* ids). Try several paths & api-versions.
+  const paths = [ p => `${base}/assistants?api-version=${p}`, p => `${base}/openai/assistants?api-version=${p}` ];
+  const versions = ['2025-05-01', '2025-05-15-preview', '2024-12-01-preview', '2025-04-01-preview'];
+  outer:
+  for (const mk of paths){
+    for (const ver of versions){
+      try {
+        let after = null, pages = 0, ok2xx = false;
+        do {
+          const url = mk(ver) + '&limit=100' + (after ? '&after=' + encodeURIComponent(after) : '');
+          const r = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
+          if (!r.ok){ if (pages === 0) tried.push(mk(ver).replace(base, '').split('&')[0] + ' → ' + r.status); break; }
+          ok2xx = true;
+          const j = await r.json(); addAll(j.data || j.value || []);
+          after = j.has_more ? j.last_id : null; pages++;
+        } while (after && pages < 20);
+        if (ok2xx){ usedApi = mk(ver).replace(base, '').split('?')[0] + ' @' + ver; break outer; }
+      } catch(e){ tried.push('assistants@' + ver + ' → ' + (e.message || e)); }
+    }
   }
-  return { agents, usedApi };
+
+  // 2) New Foundry /agents API (kind-based). Merge any additional.
+  try {
+    const r = await fetch(`${base}/agents?api-version=v1`, { headers: { Authorization: 'Bearer ' + token } });
+    if (r.ok){ const j = await r.json(); addAll(j.value || j.data || []); if (!usedApi) usedApi = '/agents @v1'; }
+    else tried.push('/agents@v1 → ' + r.status);
+  } catch(e){ tried.push('/agents@v1 → ' + (e.message || e)); }
+
+  return { agents, usedApi, tried };
 }
 
 async function fdryScan(){
@@ -2843,22 +2889,28 @@ async function fdryScan(){
     for (const ep of endpoints){
       fdrySetProgress(Math.round((done / endpoints.length) * 90) + 5, 'Scanning projects', 'Reading ' + ep + ' …');
       try {
-        const { agents, usedApi } = await fdryListAgents(ep, token, (m, c) => fdrySetProgress(null, null, m, c));
+        const { agents, usedApi, tried } = await fdryListAgents(ep, token, (m, c) => fdrySetProgress(null, null, m, c));
         fdryAgents.push(...agents); fdryEpCount++;
-        fdrySetProgress(null, null, `  ${ep}: ${agents.length} agent(s)${usedApi ? ' via /' + usedApi : ''}.`, agents.length ? 'log-ok' : 'log-warn');
+        fdrySetProgress(null, null, `  ${ep}: ${agents.length} agent(s)${usedApi ? ' via ' + usedApi : ''}.`, agents.length ? 'log-ok' : 'log-warn');
+        if (!agents.length && tried.length) fdrySetProgress(null, null, `     tried: ${tried.join('  ·  ')}`, 'log-warn');
       } catch(e){
         fdrySetProgress(null, null, `  ${ep} failed: ${e.message}${fdryAuthHint(e.message)}`, 'log-err');
       }
       done++;
     }
-    fdrySetProgress(100, 'Done', `Inventoried ${fdryAgents.length} agent(s) across ${fdryEpCount} endpoint(s).`, 'log-ok');
+    fdrySetProgress(100, 'Done', `Inventoried ${fdryAgents.length} agent(s) across ${fdryEpCount} endpoint(s).`, fdryAgents.length ? 'log-ok' : 'log-warn');
+    if (!fdryAgents.length){
+      const el = document.getElementById('fdry-error');
+      el.innerHTML = '0 agents returned. Common causes: (1) the scanned project isn’t the one holding your agents — <b>paste the exact endpoint</b> from Foundry portal → your project → Overview, e.g. <code>https://{resource}.services.ai.azure.com/api/projects/{project}</code>; (2) missing <b>Foundry User / Foundry Agent Consumer</b> RBAC on that project; (3) the token audience was rejected (see the “tried” HTTP codes in the log — 401/403 = auth, 404 = wrong path/version).';
+      el.style.display = 'block';
+    }
     fdryRenderKpis();
     fdryRender();
     document.getElementById('fdry-kpi').style.display = 'flex';
     document.getElementById('fdry-table-section').style.display = 'block';
     fdryStatus(`Done — ${fdryAgents.length} agent(s).`);
     fdrySetConfigCollapsed(true, `${fdryEpCount} endpoint${fdryEpCount === 1 ? '' : 's'} · ${fdryAgents.length} agents — click to change`);
-    setTimeout(() => { document.getElementById('fdry-progress').style.display = 'none'; }, 1800);
+    if (fdryAgents.length) setTimeout(() => { document.getElementById('fdry-progress').style.display = 'none'; }, 1800);
   } catch(e){
     const msg = String(e.message || e);
     const el = document.getElementById('fdry-error');
