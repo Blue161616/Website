@@ -1020,6 +1020,11 @@
       <div id="fdry-table-section" style="display:none">
         <div class="toolbar">
           <input type="text" class="search-box" id="fdry-search" placeholder="Search agents, models, instructions, tools…" oninput="fdryRender()">
+          <div class="filter-group">
+            <button class="filter-btn cs-f-all active" onclick="fdrySetFilter('all',this)">All</button>
+            <button class="filter-btn cs-f-classic" onclick="fdrySetFilter('classic',this)">🧩 Classic</button>
+            <button class="filter-btn cs-f-modern" onclick="fdrySetFilter('modern',this)">🤖 Modern</button>
+          </div>
           <div class="action-bar">
             <button class="btn btn-secondary btn-sm" onclick="fdryExport('csv')">Export CSV</button>
             <button class="btn btn-secondary btn-sm" onclick="fdryExport('json')">Export JSON package</button>
@@ -2826,7 +2831,7 @@ function fdryToolLabel(t){
 }
 
 // Normalise both the classic (Assistants) and new (/agents) shapes into one record.
-function fdryNormalize(a, project, endpoint){
+function fdryNormalize(a, project, endpoint, source){
   const def = a.definition || {};
   const rawTools = a.tools || def.tools || [];
   const tools = rawTools.map(fdryToolLabel);
@@ -2836,18 +2841,23 @@ function fdryNormalize(a, project, endpoint){
   let created = null;
   if (a.created_at) created = new Date(a.created_at * 1000).toISOString();
   else if (a.createdAt || a.created) created = a.createdAt || a.created;
+  const id = a.id || a.name;
+  const instanceId = (a.instance_identity && a.instance_identity.principal_id) || null;
+  // classic = Assistants API (asst_* ids, no Entra Agent ID); modern = new /agents API (blueprint-provisioned Agent ID).
+  const cls = instanceId ? 'modern' : (source || (/^asst_/i.test(id || '') ? 'classic' : 'modern'));
   return {
-    id: a.id || a.name, name: a.name || a.id || '(unnamed)',
+    id, name: a.name || a.id || '(unnamed)',
     project, endpoint,
     model: a.model || def.model || '—',
     description: a.description || def.description || '',
     instructions: a.instructions || def.instructions || '',
     tools, vectorStores, ciFiles,
     metadata: a.metadata || def.metadata || {},
-    instanceIdentity: (a.instance_identity && a.instance_identity.principal_id) || null,
+    instanceIdentity: instanceId,
     created,
     _toolCount: tools.length,
     _knowledgeCount: vectorStores.length + ciFiles.length,
+    _agentClass: cls,
   };
 }
 
@@ -2859,7 +2869,7 @@ async function fdryListAgents(endpoint, token, log){
   const agents = [];
   let usedApi = null; const tried = [];
   const seen = new Set();
-  const addAll = list => (list || []).forEach(a => { const n = fdryNormalize(a, projName, base); if (n.id && !seen.has(n.id)){ seen.add(n.id); agents.push(n); } });
+  const addAll = (list, source) => (list || []).forEach(a => { const n = fdryNormalize(a, projName, base, source); if (n.id && !seen.has(n.id)){ seen.add(n.id); agents.push(n); } });
 
   // 1) Assistants / Agent Service (asst_* ids). Try several paths & api-versions.
   const paths = [ p => `${base}/assistants?api-version=${p}`, p => `${base}/openai/assistants?api-version=${p}` ];
@@ -2874,7 +2884,7 @@ async function fdryListAgents(endpoint, token, log){
           const r = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
           if (!r.ok){ if (pages === 0) tried.push(mk(ver).replace(base, '').split('&')[0] + ' → ' + r.status); break; }
           ok2xx = true;
-          const j = await r.json(); addAll(j.data || j.value || []);
+          const j = await r.json(); addAll(j.data || j.value || [], 'classic');
           after = j.has_more ? j.last_id : null; pages++;
         } while (after && pages < 20);
         if (ok2xx){ usedApi = mk(ver).replace(base, '').split('?')[0] + ' @' + ver; break outer; }
@@ -2885,7 +2895,7 @@ async function fdryListAgents(endpoint, token, log){
   // 2) New Foundry /agents API (kind-based). Merge any additional.
   try {
     const r = await fetch(`${base}/agents?api-version=v1`, { headers: { Authorization: 'Bearer ' + token } });
-    if (r.ok){ const j = await r.json(); addAll(j.value || j.data || []); if (!usedApi) usedApi = '/agents @v1'; }
+    if (r.ok){ const j = await r.json(); addAll(j.value || j.data || [], 'modern'); if (!usedApi) usedApi = '/agents @v1'; }
     else tried.push('/agents@v1 → ' + r.status);
   } catch(e){ tried.push('/agents@v1 → ' + (e.message || e)); }
 
@@ -2962,9 +2972,24 @@ function fdryRenderKpis(){
 
 function fdrySortBy(k){ if (fdrySortKey === k) fdrySortDir *= -1; else { fdrySortKey = k; fdrySortDir = 1; } fdryRender(); }
 
+let fdryFilter = 'all';
+function fdrySetFilter(f, btn){
+  fdryFilter = f;
+  document.querySelectorAll('#mode-foundry .filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  fdryRender();
+}
+function fdryClsBadge(c){
+  return c === 'classic' ? `<span class="tag" style="color:#fbbf24;border:1px solid #f59e0b55">Classic</span>`
+    : c === 'modern' ? `<span class="tag" style="color:#4ade80;border:1px solid #22c55e55">Modern</span>`
+    : `<span class="tag">—</span>`;
+}
 function fdryRender(){
   const q = (document.getElementById('fdry-search').value || '').toLowerCase();
-  fdryFiltered = fdryAgents.filter(a => !q || [a.name, a.project, a.model, a.instructions, a.description, (a.tools||[]).join(' ')].join(' ').toLowerCase().includes(q));
+  fdryFiltered = fdryAgents.filter(a => {
+    if (fdryFilter !== 'all' && a._agentClass !== fdryFilter) return false;
+    return !q || [a.name, a.project, a.model, a.instructions, a.description, (a.tools||[]).join(' ')].join(' ').toLowerCase().includes(q);
+  });
   fdryFiltered.sort((a, b) => {
     let av = a[fdrySortKey], bv = b[fdrySortKey];
     if (fdrySortKey === 'created'){ av = av ? new Date(av).getTime() : 0; bv = bv ? new Date(bv).getTime() : 0; }
@@ -2985,7 +3010,7 @@ function fdryRender(){
 
   tbody.innerHTML = fdryFiltered.map(a => `
     <tr onclick="fdryToggleRow('${esc(a.id)}')" data-fdry-id="${esc(a.id)}" style="cursor:pointer">
-      <td><div class="agent-name">${esc(a.name)}</div><div class="agent-id">${esc(a.id)}</div></td>
+      <td><div class="agent-name">${esc(a.name)} ${fdryClsBadge(a._agentClass)}</div><div class="agent-id">${esc(a.id)}</div></td>
       <td>${esc(a.project)}</td>
       <td>${a.model && a.model !== '—' ? `<span class="tag">${esc(a.model)}</span>` : '<span class="text-muted">—</span>'}</td>
       <td>${a._toolCount || '<span class="text-muted">0</span>'}</td>
@@ -3023,6 +3048,7 @@ function fdryInsertDetail(tr, a){
         <div class="detail-row"><span class="dk">Project</span><span class="dv">${esc(a.project)}</span></div>
         <div class="detail-row"><span class="dk">Model</span><span class="dv">${esc(a.model)}</span></div>
         <div class="detail-row"><span class="dk">Created</span><span class="dv">${a.created ? new Date(a.created).toLocaleString() : '—'}</span></div>
+        <div class="detail-row"><span class="dk">Type</span><span class="dv">${a._agentClass === 'classic' ? '🧩 Classic (Assistants API — no Agent ID)' : '🤖 Modern (blueprint Agent ID)'}</span></div>
         <div class="detail-row"><span class="dk">Agent identity</span><span class="dv">${a.instanceIdentity ? `<code>${esc(a.instanceIdentity)}</code>` : '<span class="text-muted">—</span>'}</span></div>
       </div>
       <div class="detail-section">
@@ -3050,7 +3076,7 @@ function fdryExport(kind){
   const stamp = new Date().toISOString().slice(0, 10);
   if (kind === 'json'){
     const pkg = fdryAgents.map(a => ({
-      name: a.name, id: a.id, project: a.project, endpoint: a.endpoint, model: a.model,
+      name: a.name, id: a.id, class: a._agentClass, project: a.project, endpoint: a.endpoint, model: a.model,
       description: a.description, instructions: a.instructions, tools: a.tools,
       vectorStores: a.vectorStores, codeInterpreterFiles: a.ciFiles.length,
       metadata: a.metadata, agentIdentity: a.instanceIdentity, created: a.created,
@@ -3060,9 +3086,9 @@ function fdryExport(kind){
     el.href = url; el.download = `foundry-agents-${stamp}.json`; el.click(); URL.revokeObjectURL(url);
     return;
   }
-  const headers = ['Name','ID','Project','Model','ToolCount','KnowledgeCount','Tools','VectorStores','Description','Instructions','Created'];
+  const headers = ['Name','ID','Class','Project','Model','ToolCount','KnowledgeCount','Tools','VectorStores','Description','Instructions','Created'];
   const rows = fdryAgents.map(a => [
-    a.name, a.id, a.project, a.model, a._toolCount, a._knowledgeCount,
+    a.name, a.id, a._agentClass, a.project, a.model, a._toolCount, a._knowledgeCount,
     (a.tools || []).join('; '), (a.vectorStores || []).join('; '),
     (a.description || '').replace(/\s+/g, ' ').slice(0, 500), (a.instructions || '').replace(/\s+/g, ' ').slice(0, 1000), a.created || '',
   ]);
