@@ -3980,6 +3980,8 @@ function modelRiskLevel(m) {
   if (/opt-?out|varies/.test(train)) { soft++; reasons.push('may train on prompts'); }
   if (m.gdprOk === false)            { soft++; reasons.push('no EU adequacy'); }
   if (!res || res === 'unknown')     { soft++; reasons.push('unknown data residency'); }
+  const jb = modelJailbreakRisk(m);
+  if (jb) { reasons.push(jb.why); if (jb.level === 'high') score += 1; else soft++; }
   if (soft >= 2) score += 1;   // multiple compounding risks → one level up
   if (soft >= 4) score += 1;   // many compounding risks → another level
 
@@ -3995,13 +3997,38 @@ function trainsOnPrompts(m)  { return /^(yes|opt-?out|varies)/i.test(m.training 
 // prompts OR unmanaged (Cloud-Discovery-only, no Entra app / sign-in).
 function isPolicyViolationModel(m) { return !m.gdprOk || trainsOnPrompts(m) || isUnmanagedModel(m); }
 
+// Heuristic prompt-injection / jailbreak exposure. Older model generations and
+// models with weaker safety alignment are materially easier to jailbreak or
+// hijack via prompt injection than current hardened flagships. This is a
+// generation / known-weakness heuristic (a flag to prioritise review), NOT a live
+// benchmark — first match wins, ordered most-specific first.
+const _JAILBREAK_RULES = [
+  { re: /deepseek/i,                                   level: 'high',   why: 'DeepSeek shows very high jailbreak success in published red-team testing' },
+  { re: /character\.?ai|char\.ai|custom llm|companion|\bcandy\b|\bgrok\b/i, level: 'high', why: 'uncensored / companion / weak-filter model — minimal jailbreak & prompt-injection guardrails' },
+  { re: /gpt-?3|gpt3|davinci|curie|babbage|turbo-0301|gpt-4-0314|gpt-4-0613|gpt-4-32k/i, level: 'high', why: 'older GPT generation — far weaker jailbreak resistance than GPT-4o/4.1/5' },
+  { re: /claude\s*(instant|1|2)\b|claude-?2/i,          level: 'high',   why: 'legacy Claude (1/2) — pre-modern safety training' },
+  { re: /llama\s*2|llama2|mixtral-8x7b|mistral-7b|vicuna|wizardlm|dolphin|openhermes|uncensored/i, level: 'high', why: 'older / community-tuned open model — frequently unaligned' },
+  { re: /\bgpt-?4\b(?![.\-]?[0-9]|o)/i,                 level: 'medium', why: 'original GPT-4 — superseded by the hardened GPT-4o/4.1' },
+  { re: /claude\s*3(\.|\b)/i,                           level: 'medium', why: 'Claude 3.x — older generation than the current Claude 4.x' },
+  { re: /palm|bard|gemini\s*1/i,                        level: 'medium', why: 'older Google generation (PaLM / Gemini 1.x)' },
+];
+function modelJailbreakRisk(m) {
+  const hay = ((m?.model || '') + ' ' + (m?.provider || '')).toLowerCase();
+  for (const r of _JAILBREAK_RULES) if (r.re.test(hay)) return { level: r.level, why: r.why };
+  // Self-hosted / local runtimes often run unverified, unaligned open weights.
+  if (/local|self-?hosted|on-?device/.test((m?.residency || '').toLowerCase()) && /various|unknown|local|self/i.test(m?.model || ''))
+    return { level: 'medium', why: 'self-hosted open weights — jailbreak resistance depends on the unverified local model' };
+  return null;
+}
+
 const MODEL_FILTER_FNS = {
   all:        () => true,
   violations: isPolicyViolationModel,
   external:   m => !isManagedModel(m),
   mcas:       m => m.sources?.has('mcas'),
+  jailbreak:  m => !!modelJailbreakRisk(m),
 };
-const MODEL_FILTER_LABELS = { violations: 'policy violations', external: 'external models', mcas: 'Cloud Discovery' };
+const MODEL_FILTER_LABELS = { violations: 'policy violations', external: 'external models', mcas: 'Cloud Discovery', jailbreak: 'prompt-injection / jailbreak exposure' };
 
 function filterModelTable(key) {
   STATE.modelFilter = (key === 'all' || STATE.modelFilter === key) ? 'all' : key;
@@ -4077,8 +4104,12 @@ function renderModelTable() {
     const riskCell = rk.reasons.length
       ? `<span title="Risk drivers: ${esc(rk.reasons.join(' · '))}" style="cursor:help">${riskBadge(rk.level)}</span>`
       : riskBadge(rk.level);
+    const jb = modelJailbreakRisk(m);
+    const jbChip = jb
+      ? ` <span class="badge" style="font-size:9px;background:${jb.level === 'high' ? 'rgba(248,81,73,.15)' : 'rgba(240,136,62,.15)'};color:${jb.level === 'high' ? 'var(--risk-high)' : 'var(--risk-medium)'};cursor:help" title="Prompt injection / jailbreak — ${esc(jb.why)}">💉 ${jb.level === 'high' ? 'Jailbreak-prone' : 'Older gen'}</span>`
+      : '';
     return '<tr>'
-      + '<td><strong>' + esc(m.model) + '</strong></td>'
+      + '<td><strong>' + esc(m.model) + '</strong>' + jbChip + '</td>'
       + '<td class="text-muted">' + esc(m.provider) + '</td>'
       + '<td class="mono">' + esc(m.residency) + '</td>'
       + '<td>' + (m.training==='Yes' ? '<span class="text-critical">⚠️ Yes</span>' : m.training==='No' ? '<span class="text-low">✅ No</span>' : '<span class="text-medium">⚡ ' + esc(m.training) + '</span>') + '</td>'
@@ -4102,7 +4133,13 @@ function renderModelTable() {
 
   // Filter feedback: header sub-label + active-KPI highlight
   const subEl = document.getElementById('model-table-sub');
-  if (subEl) subEl.textContent = `${filtered.length} of ${models.length}${filter !== 'all' ? ' · ' + (MODEL_FILTER_LABELS[filter] || filter) : ''} · click headers to sort`;
+  if (subEl) {
+    const jbCount = models.filter(m => modelJailbreakRisk(m)).length;
+    const jbPill = jbCount
+      ? ` · <span onclick="filterModelTable('jailbreak')" style="cursor:pointer;color:${filter === 'jailbreak' ? 'var(--risk-high)' : 'var(--risk-medium)'}" title="Older-generation or weak-safety models are materially easier to jailbreak / prompt-inject — click to filter">💉 ${jbCount} jailbreak-prone</span>`
+      : '';
+    subEl.innerHTML = `${filtered.length} of ${models.length}${filter !== 'all' ? ' · ' + esc(MODEL_FILTER_LABELS[filter] || filter) : ''} · click headers to sort${jbPill}`;
+  }
   ['kpi-model-all','kpi-model-violations','kpi-model-external','kpi-model-mcas'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.style.outline = '';
