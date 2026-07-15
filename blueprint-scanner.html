@@ -132,6 +132,7 @@
   .b-ext  { background: var(--cert-bg); color: var(--accent-dark); }
   .b-home { background: var(--green-bg); color: var(--green); }
   .b-ms   { background: var(--cert-bg); color: var(--accent-dark); }
+  .b-blocked { background: var(--red-bg); color: var(--red); text-decoration: line-through; }
   .badge[title] { cursor: help; }
   .picon { vertical-align: -2px; margin-right: 4px; color: var(--muted); }
   html[data-theme="dark"] .picon { color: var(--accent-dark); }   /* light blue in dark mode */
@@ -265,10 +266,10 @@
               <th class="sortable" data-key="name">Blueprint <span class="arrow"></span></th>
               <th class="sortable" data-key="tenancy">Tenancy <span class="arrow"></span></th>
               <th class="sortable" data-key="cred">Client credentials <span class="arrow"></span></th>
-              <th class="sortable" data-key="perms">Permissions <span class="arrow"></span></th>
+              <th class="sortable" data-key="perms">Declared&nbsp;perms <span class="arrow"></span></th>
               <th class="sortable" data-key="risk">Risk <span class="arrow"></span></th>
               <th class="sortable" data-key="roles" style="text-align:center">App&nbsp;roles <span class="arrow"></span></th>
-              <th class="sortable" data-key="consent" style="text-align:center">Consent <span class="arrow"></span></th>
+              <th class="sortable" data-key="consent" style="text-align:center">Granted <span class="arrow"></span></th>
               <th class="sortable" data-key="agents" style="text-align:center">Agent&nbsp;identities <span class="arrow"></span></th>
             </tr>
           </thead>
@@ -452,7 +453,7 @@ async function graphGetAll(url, accessToken) {
 function tenancy(signInAudience) {
   return signInAudience === "AzureADMyOrg"
     ? { label: "Single-tenant", cls: "b-single", single: true }
-    : { label: "Multi-tenant", cls: "b-multi", single: false };
+    : { label: "Multi-tenant", cls: "b-risk-med", single: false };   // multi-tenant = consent-phishing surface
 }
 
 function fmtDate(iso) { return iso ? String(iso).slice(0, 10) : ""; }
@@ -588,12 +589,50 @@ function mergePrincipals(blueprints, principals, myTenant) {
 
 const WELL_KNOWN_APIS = { "00000003-0000-0000-c000-000000000000": "Microsoft Graph" };
 
-let roleIdToName = {};   // appRole GUID -> permission value, across all resolved resource SPs
+// Microsoft's agent-identity permission blocklist. High-risk Graph permissions that can NEVER be
+// granted to (or be effective for) an agent — even an admin can't consent. A declared perm on this
+// list is inert. Blocked-as-application and blocked-as-delegated are tracked separately because the
+// block differs by grant type. Source: Microsoft Entra Agent ID — "permissions blocked for agents".
+const BLOCKED_APP = new Set([
+  "agentidentity.create","agentidentity.create.all","agentidentity.createasmanager",
+  "agentidentityblueprint.create","agentidentityblueprint.createasmanager","agentidentityblueprint.readwrite.all",
+  "agentidentityblueprintprincipal.create","application.readwrite.all","application.readwrite.ownedby",
+  "approleassignment.readwrite.all","bitlockerkey.read.all","calendars.read","channelmessage.read.all",
+  "channelmessage.read.group","chat.read.all","chat.readwrite.all","consentrequest.readwrite.all",
+  "customsecattributeassignment.readwrite.all","customsecattributedefinition.readwrite.all",
+  "delegatedpermissiongrant.readwrite.all","device.readwrite.all","devicemanagementconfiguration.read.all",
+  "directory.readwrite.all","directory.write.restricted","domain.readwrite.all","eduroster.readwrite.all",
+  "entitlementmanagement.readwrite.all","files.read.all","files.readwrite.all","group.create",
+  "group.readwrite.all","groupmember.readwrite.all","identityprovider.readwrite.all",
+  "lifecyclemanagement.readwrite.all","organization.readwrite.all","policy.readwrite.authenticationmethod",
+  "policy.readwrite.crosstenantaccess","policy.readwrite.permissiongrant","policy.readwrite.securitydefaults",
+  "printjob.readwrite.all","privilegedaccess.readwrite.azuread","privilegedaccess.readwrite.azureresources",
+  "rolemanagement.readwrite.directory","sites.fullcontrol.all","sites.manage.all","sites.read.all",
+  "sites.readwrite.all","tasks.readwrite.all","user-passwordprofile.readwrite.all","user.deleterestore.all",
+  "user.enabledisableaccount.all","user.invite.all","user.readwrite.all","userauthenticationmethod.readwrite.all"
+]);
+const BLOCKED_DELEG = new Set([
+  "customsecattributeassignment.readwrite.all","customsecattributedefinition.readwrite.all",
+  "delegatedpermissiongrant.readwrite.all","device.write.restricted","directory.accessasuser.all",
+  "directory.readwrite.all","directory.write.restricted","domain.readwrite.all","group.readwrite.all",
+  "group.write.restricted","groupmember.readwrite.all","rolemanagement.readwrite.all",
+  "rolemanagement.readwrite.directory","user-passwordprofile.readwrite.all","user.deleterestore.all",
+  "user.enabledisableaccount.all","user.readwrite.all","userauthenticationmethod.read.all",
+  "userauthenticationmethod.readwrite.all"
+]);
+function isBlockedPerm(name, type) {
+  const n = (name || "").toLowerCase();
+  return type === "application" ? BLOCKED_APP.has(n) : BLOCKED_DELEG.has(n);
+}
+
+let roleIdToName = {};    // appRole GUID -> permission value, across all resolved resource SPs
+let resourceNames = {};   // resource appId -> display name, across all resolved resource SPs
 
 // Resolve each blueprint's requiredResourceAccess (permission GUIDs) to readable names by
 // reading the resource service principals. Falls back to GUIDs if the SP can't be read.
 async function resolvePermissions(blueprints, base, at) {
   roleIdToName = {};
+  resourceNames = {};
   const ids = new Set();
   blueprints.forEach(bp => (bp.requiredResourceAccess || []).forEach(r => ids.add(r.resourceAppId)));
 
@@ -608,7 +647,9 @@ async function resolvePermissions(blueprints, base, at) {
       const scopes = {}, roles = {};
       (sp.oauth2PermissionScopes || []).forEach(s => scopes[s.id] = s.value);
       (sp.appRoles || []).forEach(r => { roles[r.id] = r.value; roleIdToName[r.id] = r.value; });
-      lookup[appId] = { name: sp.displayName || WELL_KNOWN_APIS[appId] || appId, scopes, roles };
+      const nm = sp.displayName || WELL_KNOWN_APIS[appId] || appId;
+      resourceNames[appId] = nm;
+      lookup[appId] = { name: nm, scopes, roles };
     } catch { /* leave unresolved */ }
   }));
 
@@ -620,12 +661,68 @@ async function resolvePermissions(blueprints, base, at) {
       (rra.resourceAccess || []).forEach(ra => {
         const deleg = ra.type === "Scope";
         const name = info ? (deleg ? info.scopes[ra.id] : info.roles[ra.id]) : null;
-        perms.push({ name: name || ra.id, type: deleg ? "delegated" : "application", resource: resName });
+        const type = deleg ? "delegated" : "application";
+        const pname = name || ra.id;
+        // Graph is the only resource the agent blocklist applies to; flag declared perms that can never be effective.
+        const blocked = rra.resourceAppId === "00000003-0000-0000-c000-000000000000" && isBlockedPerm(pname, type);
+        perms.push({ name: pname, type, resource: resName, blocked });
       });
     });
     perms.sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name));
     bp._perms = perms;
   });
+}
+
+// Inheritable permissions — the escalation lever. Configured per resource app on the blueprint,
+// they decide which grants automatically flow to EVERY agent identity. "allAllowed" means all
+// current & future perms on that resource inherit fleet-wide; "none" means grants stay inert.
+function inheritKind(obj) {
+  if (!obj) return null;
+  let k = (obj.kind || (obj["@odata.type"] || "").split(".").pop() || "").toLowerCase();
+  if (k.includes("allallowed")) return "all";
+  if (k.includes("enumerated")) return "enumerated";
+  if (k.includes("no")) return "none";
+  return k || null;
+}
+function inheritScopeList(obj) {
+  return (obj && (obj.scopes || obj.value || obj.enumeratedScopes)) || [];
+}
+async function loadInheritable(blueprints, base, at) {
+  await Promise.all(blueprints.map(async bp => {
+    bp._inherit = [];
+    if (bp._external || !bp.id) return;   // external blueprint's application lives in another tenant
+    try {
+      const entries = await graphGetAll(base + "/applications/" + bp.id
+        + "/microsoft.graph.agentIdentityBlueprint/inheritablePermissions", at);
+      bp._inherit = entries.map(e => ({
+        resourceAppId: e.resourceAppId,
+        resource: resourceNames[e.resourceAppId] || WELL_KNOWN_APIS[e.resourceAppId] || e.resourceAppId,
+        scopesKind: inheritKind(e.inheritableScopes),
+        scopesList: inheritScopeList(e.inheritableScopes),
+        rolesKind: inheritKind(e.inheritableRoles)
+      }));
+    } catch { /* best effort — betas/tenants may not expose it */ }
+  }));
+}
+function inheritOf(bp) { return bp._inherit || []; }
+function inheritHasAll(bp) { return inheritOf(bp).some(i => i.scopesKind === "all" || i.rolesKind === "all"); }
+
+function inheritChips(bp) {
+  if (bp._external) return "";
+  const list = inheritOf(bp);
+  if (!list.length) return `<div class="hint" style="margin-top:6px">Inheritable → agents: <span class="badge b-none">none configured</span></div>`;
+  const fmtScopes = i => i.scopesKind === "all" ? "all allowed"
+    : i.scopesKind === "enumerated" ? `${i.scopesList.length} enumerated`
+    : i.scopesKind === "none" ? "none" : (i.scopesKind || "—");
+  const fmtRoles = i => !i.rolesKind ? "" : (i.rolesKind === "all" ? "all allowed" : i.rolesKind);
+  const chips = list.map(i => {
+    const risky = i.scopesKind === "all" || i.rolesKind === "all";
+    const roles = fmtRoles(i);
+    const tip = `${i.resource}: scopes=${fmtScopes(i)}${roles ? ", roles=" + roles : ""}`
+      + (risky ? " — allAllowed inherits every current & future perm on this resource to all agents." : "");
+    return `<span class="badge ${risky ? "b-risk-med" : "b-deleg"}" title="${escapeHtml(tip)}">${escapeHtml(i.resource)}: scopes ${fmtScopes(i)}${roles ? " · roles " + roles : ""}</span>`;
+  });
+  return `<div class="hint" style="margin-top:6px">Inheritable → agents: ${chips.join(" ")}</div>`;
 }
 
 function appRolesOf(bp) {
@@ -716,49 +813,81 @@ function assignmentBadge(bp) {
   return "";
 }
 
+// Declared permissions (requiredResourceAccess) — a declaration, NOT an effective grant. Perms on
+// Microsoft's agent blocklist are struck through: they can never be granted, so they overstate risk.
 function permChips(bp) {
   if (bp._perms === null) return `<span class="badge b-none" title="The blueprint application is in another tenant; its permissions aren't visible here.">n/a · external</span>`;
   const perms = bp._perms || [];
-  if (!perms.length) return `<span class="badge b-none">None</span>`;
+  if (!perms.length) return `<span class="badge b-none">None declared</span>`;
   const max = 8;
   const chips = perms.slice(0, max).map(p => {
+    if (p.blocked)
+      return `<span class="badge b-blocked" title="${escapeHtml(p.resource + " · " + p.type)} — BLOCKED for agents: on Microsoft's agent permission blocklist, so it can never be granted or effective.">${escapeHtml(p.name)}</span>`;
     const cls = p.type === "delegated" ? "b-deleg" : "b-approle";
-    return `<span class="badge ${cls}" title="${escapeHtml(p.resource + " · " + p.type)}">${escapeHtml(p.name)}</span>`;
+    return `<span class="badge ${cls}" title="${escapeHtml(p.resource + " · " + p.type)} — declared (requiredResourceAccess), not necessarily granted.">${escapeHtml(p.name)}</span>`;
   });
   if (perms.length > max) {
     const rest = perms.slice(max).map(p => p.name).join(", ");
     chips.push(`<span class="badge b-none" title="${escapeHtml(rest)}">+${perms.length - max} more</span>`);
   }
-  return chips.join("");
+  const blockedN = perms.filter(p => p.blocked).length;
+  const note = blockedN
+    ? `<div class="hint" style="margin-top:4px;color:var(--red)">${blockedN} declared perm(s) blocked for agents — never effective.</div>`
+    : "";
+  return chips.join("") + note;
 }
 
-// Risk scoring: client secrets are the weakest credential; multi-tenant widens the blast radius.
+// Longest client-secret validity window, in days (0 if none / no dates).
+function secretMaxLifetimeDays(bp) {
+  let max = 0;
+  (bp.passwordCredentials || []).forEach(c => {
+    if (c.startDateTime && c.endDateTime) {
+      const d = Math.round((new Date(c.endDateTime) - new Date(c.startDateTime)) / 86400000);
+      if (d > max) max = d;
+    }
+  });
+  return max;
+}
+
+// Risk verdict that explains itself: each factor is a concrete, actionable reason. The heaviest
+// levers are allAllowed inheritance (fleet-wide) and secret+open/multi (weak cred + wide reach).
 function riskOf(bp) {
   if (bp._external) {
-    if (bp._ownerIsMicrosoft) return { rank: 0, label: "Low", cls: "b-risk-low",
+    if (bp._ownerIsMicrosoft) return { rank: 0, label: "Low", cls: "b-risk-low", factors: [],
       why: "Microsoft first-party blueprint (owner tenant: " + (bp._ownerName || "Microsoft") + "). Published by Microsoft." };
     return { rank: 1.5, label: "Review", cls: "b-risk-med",
-      why: "This blueprint is owned by another tenant (published multi-tenant) and operates in your tenant" + (bp._ownerName ? " — owner: " + bp._ownerName + (bp._ownerDomain ? " (" + bp._ownerDomain + ")" : "") : "") + ". Its credentials and permissions are managed by the publisher — confirm the publisher is trusted and that this blueprint is expected." };
+      factors: ["Owned by another tenant (published multi-tenant)" + (bp._ownerName ? " — owner: " + bp._ownerName + (bp._ownerDomain ? " (" + bp._ownerDomain + ")" : "") : "") + ". Credentials & permissions are managed by the publisher — confirm it's trusted and expected."],
+      why: "This blueprint is owned by another tenant and operates in your tenant. Its credentials and permissions are managed by the publisher — confirm the publisher is trusted and that this blueprint is expected." };
   }
-  const hasSecret = (bp.passwordCredentials || []).length > 0;
-  const multi = !tenancy(bp.signInAudience).single;
-  const open = bp._assignmentRequired === false;   // no app-role assignment required before tokens are issued
+  const hasSecret  = (bp.passwordCredentials || []).length > 0;
+  const secretDays = secretMaxLifetimeDays(bp);
+  const multi      = !tenancy(bp.signInAudience).single;
+  const open       = bp._assignmentRequired === false;   // no app-role assignment required before tokens are issued
+  const inheritAll = inheritHasAll(bp);
+  const grantedApp = (consentOf(bp).app || []);
+  const mailSend   = grantedApp.some(a => (a.role || "").toLowerCase() === "mail.send");
+  const agentN     = ((loaded && loaded.byBlueprint && loaded.byBlueprint[bp.appId]) || []).length;
 
   const factors = [];
-  if (hasSecret) factors.push("uses a client secret (weakest credential)");
-  if (multi) factors.push("multi-tenant (usable from other tenants)");
-  if (open) factors.push("open access — no app-role assignment required before tokens are issued");
+  if (hasSecret)        factors.push("Uses a client secret — the weakest credential. Prefer a managed-identity federated credential (FIC).");
+  if (secretDays > 180) factors.push("Long-lived secret (" + secretDays + "-day validity) — shorten the rotation window.");
+  if (multi)            factors.push("Multi-tenant (AzureADMultipleOrgs) — usable from other tenants; a consent-phishing surface.");
+  if (open)             factors.push("Open access — no app-role assignment required before Entra issues tokens.");
+  if (inheritAll)       factors.push("Inheritable permissions set to allAllowed — every agent inherits all of the resource's perms fleet-wide (the escalation lever).");
+  if (mailSend)         factors.push("Mail.Send granted (application) — can send mail as any user (send-as-anyone).");
+  if (grantedApp.length) factors.push(grantedApp.length + " application permission(s) actually granted (effective, not just declared).");
+  if (agentN)           factors.push(agentN + " agent identit" + (agentN === 1 ? "y" : "ies") + " inherit this blueprint (blast radius).");
 
-  let rank, label, cls;
-  if (hasSecret && (multi || open)) { rank = 2; label = "High"; cls = "b-risk-high"; }
-  else if (hasSecret) { rank = 1; label = "Medium"; cls = "b-risk-med"; }
-  else if (multi && open) { rank = 1; label = "Medium"; cls = "b-risk-med"; }
-  else { rank = 0; label = "Low"; cls = "b-risk-low"; }
+  let rank = 0;
+  if (hasSecret || multi || open) rank = 1;
+  if ((hasSecret && (multi || open)) || (multi && open) || inheritAll || (mailSend && (open || multi))) rank = 2;
 
+  const label = rank >= 2 ? "High" : rank >= 1 ? "Medium" : "Low";
+  const cls   = rank >= 2 ? "b-risk-high" : rank >= 1 ? "b-risk-med" : "b-risk-low";
   const why = factors.length
-    ? "Risk factors: " + factors.join("; ") + ". Prefer a certificate / FIC over secrets, least-privilege permissions, and require explicit app-role assignment."
-    : "No elevated risk factors (no client secret; single-tenant or assignment required).";
-  return { rank, label, cls, why };
+    ? "Risk factors: " + factors.join(" ")
+    : "No elevated risk factors (no client secret; single-tenant; assignment required; no allAllowed inheritance).";
+  return { rank, label, cls, factors, why };
 }
 
 async function loadBlueprints() {
@@ -788,6 +917,9 @@ async function loadBlueprints() {
 
     setStatus("Resolving permission scopes…", false, true);
     await resolvePermissions(blueprints, base, at);
+
+    setStatus("Reading inheritable permissions…", false, true);
+    await loadInheritable(blueprints, base, at);
 
     // Blueprint principals — the tenant-local instance of every blueprint present here, including
     // externally-owned (published multi-tenant) blueprints whose application lives in another tenant.
@@ -854,9 +986,9 @@ function renderSummary() {
     `<div class="stat clickable${activeScope === scope ? " active" : ""}" data-scope="${scope}" title="Click to scope the table to: ${label}">
        <div class="n"${color ? ` style="color:${color}"` : ""}>${n}</div><div class="l">${label}</div></div>`;
   $("summary").innerHTML =
-    tile(blueprints.length, "Blueprints", "", "all") +
-    tile(single, "Single-tenant", "var(--green)", "tenancy:single") +
-    tile(multi, "Multi-tenant", "var(--accent)", "tenancy:multi") +
+    tile(blueprints.length, "Blueprints", "var(--accent)", "all") +
+    tile(single, "Single-tenant", "var(--accent)", "tenancy:single") +
+    tile(multi, "Multi-tenant", "var(--red)", "tenancy:multi") +
     tile(ext, "External", "var(--accent)", "origin:external") +
     tile(totalAgents, "Agent identities", "var(--accent)", "sort:agents") +
     tile(high, "High risk", "var(--red)", "risk:2") +
@@ -973,6 +1105,7 @@ function exportRows() {
       sponsors: (bp._sponsors || []).map(p => p.name + (p.upn ? " <" + p.upn + ">" : "")),
       risk: riskOf(bp).label,
       riskWhy: riskOf(bp).why,
+      riskFactors: riskOf(bp).factors || [],
       assignmentRequired: bp._assignmentRequired === true ? "Yes"
         : bp._assignmentRequired === false ? "No (open access)" : "",
       secrets: (bp.passwordCredentials || []).length,
@@ -984,7 +1117,10 @@ function exportRows() {
         const withEnd = credList(bp).filter(c => c.end);
         return withEnd.length ? fmtDate(withEnd.reduce((a, c) => (!a || c.endDate < a.endDate) ? c : a, null).end) : "";
       })(),
-      permissions: bp._perms === null ? "n/a (external)" : (bp._perms || []).map(p => p.name + " (" + p.type + ")"),
+      declaredPermissions: bp._perms === null ? "n/a (external)" : (bp._perms || []).map(p => p.name + " (" + p.type + (p.blocked ? ", BLOCKED — never effective" : "") + ")"),
+      declaredBlocked: bp._perms === null ? "" : (bp._perms || []).filter(p => p.blocked).map(p => p.name + " (" + p.type + ")"),
+      inheritablePermissions: bp._external ? "n/a (external)" : inheritOf(bp).map(i =>
+        i.resource + ": scopes=" + (i.scopesKind || "—") + (i.scopesKind === "enumerated" ? "(" + i.scopesList.length + ")" : "") + (i.rolesKind ? ", roles=" + i.rolesKind : "")),
       appRoles: appRolesOf(bp).map(r => r.value),
       appRoleAssignees: assigneesOf(bp).map(a => a.name + " (" + a.type + ")"),
       consentDelegated: c.delegated.map(d => d.scope + " (" + (d.consentType === "AllPrincipals" ? "admin" : "user") + ")"),
@@ -1055,6 +1191,7 @@ function renderTable() {
     const rolesId = "roles_" + i;
     const consentId = "consent_" + i;
     const credsId = "creds_" + i;
+    const riskId = "risk_" + i;
 
     const tr = document.createElement("tr");
     tr.innerHTML = `
@@ -1077,8 +1214,9 @@ function renderTable() {
         ${expiryBadge(bp)}
         ${creds.length ? `<div style="margin-top:3px"><span class="expander" data-target="${credsId}">details ▾</span></div>` : ``}
       </td>
-      <td style="max-width:340px">${permChips(bp)}</td>
-      <td><span class="badge ${r.cls}" title="${escapeHtml(r.why)}">${r.label}</span></td>
+      <td style="max-width:360px">${permChips(bp)}${inheritChips(bp)}</td>
+      <td><span class="badge ${r.cls}" title="${escapeHtml(r.why)}">${r.label}</span>
+          ${r.factors && r.factors.length ? `<div style="margin-top:4px"><span class="expander" data-target="${riskId}">why ▾</span></div>` : ``}</td>
       <td style="text-align:center">
         ${(roles.length || assignees.length)
           ? `<span class="expander" data-target="${rolesId}">${roles.length} ▾</span>`
@@ -1092,10 +1230,20 @@ function renderTable() {
       </td>
       <td style="text-align:center">
         ${agents.length
-          ? `<span class="expander" data-target="${rowId}">${agents.length} ▾</span>`
-          : `<span style="color:var(--muted)">0</span>`}
+          ? `<span class="expander" data-target="${rowId}"><span style="${agents.length > 200 ? "color:var(--red);font-weight:600" : ""}">${agents.length}</span> / 250 ▾</span>`
+          : `<span style="color:var(--muted)">0 / 250</span>`}
       </td>`;
     tbody.appendChild(tr);
+
+    if (r.factors && r.factors.length) {
+      const rwdetail = document.createElement("tr");
+      rwdetail.id = riskId;
+      rwdetail.className = "hidden";
+      rwdetail.innerHTML = `<td colspan="8" style="background:var(--hover)">
+        <div class="hint" style="margin:2px 0 6px"><b>Risk rationale — ${escapeHtml(r.label)}.</b> Each factor maps to a hardening step:</div>
+        <ul class="agent-list">${r.factors.map(f => `<li>${escapeHtml(f)}</li>`).join("")}</ul></td>`;
+      tbody.appendChild(rwdetail);
+    }
 
     if (creds.length) {
       const cddetail = document.createElement("tr");
@@ -1188,7 +1336,11 @@ function renderTable() {
           <b>${escapeHtml(a.displayName || "(no name)")}</b>
           <span class="mono"> · ${a.appId}${a.accountEnabled ? "" : " · disabled"}</span>
         </li>`).join("");
+      const cap = `<div class="hint" style="margin:2px 0 6px">
+        <b><span style="${agents.length > 200 ? "color:var(--red)" : ""}">${agents.length} of 250</span></b> agent identities (per-blueprint cap for app-only permissions).
+        Note: <code>AgentIdentity.CreateAsManager</code> is auto-granted and non-revocable — it never appears in the grants list, so its absence doesn't mean the blueprint can't self-manage agents.</div>`;
       detail.innerHTML = `<td colspan="8" style="background:var(--hover)">
+        ${cap}
         <ul class="agent-list">${items}</ul></td>`;
       tbody.appendChild(detail);
     }
