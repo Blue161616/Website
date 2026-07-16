@@ -158,6 +158,19 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   .hidden { display: none; }
   a { color: var(--accent); }
+  /* ---- risk exposure chart ---- */
+  .rf { display: grid; grid-template-columns: 190px 1fr 42px; align-items: center; gap: 12px;
+        padding: 4px 6px; border-radius: 4px; cursor: pointer; }
+  .rf:hover { background: var(--hover); }
+  .rf.active { background: var(--hover); box-shadow: inset 0 0 0 1px var(--accent); }
+  .rf-label { font-size: 12px; color: var(--text); }
+  .rf-track { background: var(--code-bg); border-radius: 3px; height: 12px; overflow: hidden; }
+  .rf-bar { height: 100%; border-radius: 3px; min-width: 2px; background: var(--red);
+            width: 0; animation: rfgrow .55s cubic-bezier(.22,.61,.36,1) forwards; }
+  .rf-bar.sev-med { opacity: .45; }
+  .rf-count { font-size: 12px; font-weight: 600; text-align: right; color: var(--text); }
+  @keyframes rfgrow { to { width: var(--w); } }
+  @media (prefers-reduced-motion: reduce) { .rf-bar { animation: none; width: var(--w); } }
 </style>
 </head>
 <body>
@@ -224,6 +237,12 @@
     </div>
 
     <div class="summary" id="summary"></div>
+
+    <div class="card" id="riskChartCard">
+      <h2>Risk exposure</h2>
+      <div class="hint" style="margin:-8px 0 12px">How many blueprints carry each risk factor. Click a bar to scope the table.</div>
+      <div id="riskChart"></div>
+    </div>
 
     <div class="card">
       <h2>Agent identity blueprints</h2>
@@ -994,8 +1013,7 @@ function riskOf(bp) {
   const redir      = redirectInfo(bp);
   // Dormant fleet: sign-in loaded, has agents, none active in 30d, and still holds a live credential.
   const agents     = (loaded && loaded.byBlueprint && loaded.byBlueprint[bp.appId]) || [];
-  const signInLoaded = agents.length && agents.every(a => a.signInActivity !== undefined);
-  const allDormant = signInLoaded && hasLiveCredential(bp) && agents.every(a => agentDormant(a) === true);
+  const allDormant = allAgentsDormant(bp);
   const riskState   = ((bp._risk && bp._risk.state) || "").toLowerCase();
   const riskLevel   = ((bp._risk && bp._risk.level) || "").toLowerCase();
   const compromised = riskState === "confirmedcompromised";
@@ -1133,10 +1151,49 @@ async function loadBlueprints() {
 let loaded = null;              // { blueprints, byBlueprint, totalAgents }
 let sortKey = "risk", sortDir = -1;   // default: risk high → low
 let activeScope = null;         // which summary tile is currently scoping the table
+let activeFactor = null;        // which risk-chart bar is currently scoping the table
 
 function render(blueprints, byBlueprint, totalAgents) {
   loaded = { blueprints, byBlueprint, totalAgents };
   renderSummary();
+  renderRiskChart();
+  renderTable();
+}
+
+// Horizontal bar chart of risk-factor prevalence. Only non-zero factors are shown, worst first,
+// so it reads as "what's actually wrong" rather than a checklist of everything that could be.
+function renderRiskChart() {
+  const { blueprints } = loaded;
+  const total = blueprints.length || 1;
+  const rows = RISK_FACTORS
+    .map(f => ({ f, n: blueprints.filter(f.test).length }))
+    .filter(r => r.n > 0)
+    .sort((a, b) => b.n - a.n || (a.f.sev === b.f.sev ? 0 : a.f.sev === "high" ? -1 : 1));
+
+  if (!rows.length) {
+    $("riskChart").innerHTML = `<div class="hint">No risk factors detected across ${blueprints.length} blueprint(s).</div>`;
+    return;
+  }
+  $("riskChart").innerHTML = rows.map(r => {
+    const pct = Math.round((r.n / total) * 100);
+    return `<div class="rf${activeFactor === r.f.key ? " active" : ""}" data-factor="${r.f.key}"
+      title="${escapeHtml(r.f.tip + " — " + r.n + " of " + blueprints.length + " blueprint(s). Click to scope the table.")}">
+      <div class="rf-label">${escapeHtml(r.f.label)}</div>
+      <div class="rf-track"><div class="rf-bar ${r.f.sev === "med" ? "sev-med" : ""}" style="--w:${pct}%"></div></div>
+      <div class="rf-count">${r.n}</div>
+    </div>`;
+  }).join("");
+  $("riskChart").querySelectorAll(".rf").forEach(el =>
+    el.addEventListener("click", () => applyFactor(el.dataset.factor)));
+}
+
+// Scope the table to one risk factor; clicking the active bar again clears it.
+function applyFactor(key) {
+  activeFactor = (activeFactor === key) ? null : key;
+  activeScope = null;
+  ["fltSearch", "fltTenancy", "fltRisk", "fltCred", "fltPerm", "fltOrigin", "fltOwners"].forEach(id => { $(id).value = ""; });
+  renderSummary();
+  renderRiskChart();
   renderTable();
 }
 
@@ -1174,6 +1231,7 @@ function renderSummary() {
 function applyScope(scope) {
   if (scope === activeScope) scope = "all";
   activeScope = (scope === "all") ? null : scope;
+  activeFactor = null;   // tile scoping and factor scoping are mutually exclusive
   ["fltSearch", "fltTenancy", "fltRisk", "fltCred", "fltPerm", "fltOrigin", "fltOwners"].forEach(id => { $(id).value = ""; });
   if (scope.startsWith("tenancy:")) $("fltTenancy").value = scope.split(":")[1];
   else if (scope.startsWith("origin:")) $("fltOrigin").value = scope.split(":")[1];
@@ -1193,6 +1251,45 @@ function credCounts(bp) {
 }
 
 function agentCount(bp) { return ((loaded && loaded.byBlueprint && loaded.byBlueprint[bp.appId]) || []).length; }
+
+// The risk-exposure chart's factors. `sev` drives bar intensity (red = risk, per the house scheme);
+// `test` is reused to scope the table when a bar is clicked. riskOf() keeps its own richer sentences.
+const RISK_FACTORS = [
+  { key: "secret",      sev: "high", label: "Client secret",             test: bp => credCounts(bp).secret > 0,
+    tip: "Uses a client secret — the weakest credential. Prefer a federated credential (FIC)." },
+  { key: "secretfic",   sev: "high", label: "Secret + FIC",              test: bp => credFlags(bp).secretPlusFic,
+    tip: "A secret retained alongside a FIC is a live fallback credential path." },
+  { key: "multi",       sev: "high", label: "Multi-tenant",              test: bp => !tenancy(bp.signInAudience).single,
+    tip: "AzureADMultipleOrgs — usable from other tenants; a consent-phishing surface." },
+  { key: "open",        sev: "high", label: "Open access",               test: bp => bp._assignmentRequired === false,
+    tip: "No app-role assignment required before Entra issues tokens." },
+  { key: "inheritall",  sev: "high", label: "Inheritable allAllowed",    test: bp => inheritHasAll(bp),
+    tip: "Every agent inherits all of the resource's permissions fleet-wide — the escalation lever." },
+  { key: "mailsend",    sev: "high", label: "Mail.Send granted",         test: bp => (consentOf(bp).app || []).some(a => (a.role || "").toLowerCase() === "mail.send"),
+    tip: "Can send mail as any user (send-as-anyone)." },
+  { key: "dormant",     sev: "high", label: "All agents dormant",        test: bp => allAgentsDormant(bp),
+    tip: "No agent has signed in for 30+ days while the blueprint still holds a live credential." },
+  { key: "redirect",    sev: "high", label: "Risky redirect URI",        test: bp => { const r = redirectInfo(bp); return r.wildcard || r.http; },
+    tip: "Wildcard or plain-http (non-loopback) redirect URI." },
+  { key: "iprisk",      sev: "high", label: "Identity Protection risk",  test: bp => ["atrisk", "confirmedcompromised"].includes(((bp._risk && bp._risk.state) || "").toLowerCase()),
+    tip: "Flagged at risk or admin-confirmed compromised by Identity Protection." },
+  { key: "granted",     sev: "med",  label: "App perms granted",         test: bp => (consentOf(bp).app || []).length > 0,
+    tip: "Application permissions actually granted (effective, not just declared)." },
+  { key: "blocked",     sev: "med",  label: "Blocked declared perms",    test: bp => (bp._perms || []).some(p => p.blocked),
+    tip: "Declares Graph permissions on Microsoft's agent blocklist — inert, and they overstate risk." },
+  { key: "multisecret", sev: "med",  label: "Multiple secrets",          test: bp => credFlags(bp).multiSecret,
+    tip: "More than one client secret — accumulation from re-provisioning." },
+  { key: "longsecret",  sev: "med",  label: "Long-lived secret >180d",   test: bp => secretMaxLifetimeDays(bp) > 180,
+    tip: "Secret validity window longer than 180 days." },
+  { key: "expired",     sev: "med",  label: "Expired credential",        test: bp => credList(bp).some(c => c.status === "expired"),
+    tip: "Holds at least one expired secret or certificate." },
+  { key: "orphan",      sev: "med",  label: "Orphan (0 agents)",         test: bp => credFlags(bp).orphan,
+    tip: "No agent identities, but still holds a live credential — cleanup candidate." },
+  { key: "noowner",     sev: "med",  label: "No owner",                  test: bp => !(bp._owners || []).length,
+    tip: "No owner assigned — nobody is accountable for this blueprint." },
+  { key: "cauncov",     sev: "med",  label: "CA uncovered",              test: bp => !!(bp._ca && !bp._ca.covered),
+    tip: "No enforced Conditional Access policy targets this identity." }
+];
 
 // Does this blueprint hold at least one still-usable credential? FICs never expire; secrets/certs
 // count only if not expired. Used to spot dead-but-armed blueprints.
@@ -1227,6 +1324,14 @@ function agentDormant(a) {
   return !t || (Date.now() - t) > 30 * 86400000;     // never, or >30 days
 }
 function daysSince(ms) { return ms ? Math.floor((Date.now() - ms) / 86400000) : null; }
+
+// Whole fleet dormant while the blueprint still holds a live credential — the "act today" combo.
+// Returns false unless sign-in data actually loaded for every agent.
+function allAgentsDormant(bp) {
+  const agents = (loaded && loaded.byBlueprint && loaded.byBlueprint[bp.appId]) || [];
+  if (!agents.length || !agents.every(a => a.signInActivity !== undefined)) return false;
+  return hasLiveCredential(bp) && agents.every(a => agentDormant(a) === true);
+}
 
 // Redirect URIs across web / SPA / public-client, with hygiene classification.
 function redirectInfo(bp) {
@@ -1284,6 +1389,11 @@ function bpMatches(bp) {
 
   const owners = $("fltOwners").value;
   if (owners === "none" && (bp._owners || []).length) return false;
+
+  if (activeFactor) {
+    const f = RISK_FACTORS.find(x => x.key === activeFactor);
+    if (f && !f.test(bp)) return false;
+  }
   return true;
 }
 
@@ -1560,7 +1670,12 @@ function renderTable() {
               + (bp._ownerIsMicrosoft ? `<span class="badge b-ms" title="Owner tenant is a known Microsoft first-party tenant.">${ICON_MS}Microsoft</span>` : ``)
             : `<span class="badge b-home" title="Blueprint authored in your tenant.">Home</span>`}
           <div class="mono" style="margin-top:3px">${bp._external
-            ? `${bp._ownerName ? "<b>" + escapeHtml(bp._ownerName) + "</b>" : "unknown owner"}${bp._ownerDomain ? " · " + escapeHtml(bp._ownerDomain) : ""}<br>tenant: ${bp._ownerOrg || "?"}`
+            ? `${bp._ownerName ? "<b>" + escapeHtml(bp._ownerName) + "</b>" : "unknown owner"}${
+                // A Microsoft first-party tenant's defaultDomainName (e.g. sharepoint.com on the
+                // Microsoft Services tenant) is unrelated to the product and only misleads — the
+                // tenant name is authoritative. Still show it for third-party publishers.
+                (bp._ownerDomain && !bp._ownerIsMicrosoft) ? " · " + escapeHtml(bp._ownerDomain) : ""
+              }<br>tenant: ${bp._ownerOrg || "?"}`
             : (bp.signInAudience || "")}</div></td>
       <td>
         ${credBadges(bp)}
@@ -1732,6 +1847,7 @@ $("exportJson").addEventListener("click", () => doExport("json"));
   $(id).addEventListener("input", () => {
     if (!loaded) return;
     if (activeScope) { activeScope = null; renderSummary(); }   // manual filter change clears tile highlight
+    if (activeFactor) { activeFactor = null; renderRiskChart(); }
     renderTable();
   }));
 
