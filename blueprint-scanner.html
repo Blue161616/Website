@@ -135,6 +135,9 @@
   .b-blocked { background: var(--red-bg); color: var(--red); text-decoration: line-through; }
   .badge[title] { cursor: help; }
   .msicon { vertical-align: -1px; margin-right: 4px; }
+  .grp td { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px;
+            background: var(--bg); padding: 14px 12px 6px; border-bottom: 1px solid var(--border); }
+  tbody tr.grp:hover { background: var(--bg); }
   .chev { width: 26px; text-align: center; padding-left: 6px; padding-right: 0; }
   .chev .expander { font-size: 11px; }
   .dsec { margin: 0 0 14px; }
@@ -264,9 +267,9 @@
         </select>
         <select id="fltRisk">
           <option value="">All risk</option>
-          <option value="2">High risk</option>
-          <option value="1">Medium risk</option>
-          <option value="0">Low risk</option>
+          <option value="act">Act today</option>
+          <option value="sprint">This sprint</option>
+          <option value="healthy">Healthy</option>
         </select>
         <select id="fltCred">
           <option value="">All credentials</option>
@@ -1061,15 +1064,37 @@ function secretMaxLifetimeDays(bp) {
   return max;
 }
 
-// Risk verdict that explains itself: each factor is a concrete, actionable reason. The heaviest
-// levers are allAllowed inheritance (fleet-wide) and secret+open/multi (weak cred + wide reach).
+// Bands. A label that fires on half the estate ("High" on 21 of 46) stops discriminating, so the
+// verdict is a 0–100 score and the band is derived from it. The score orders WITHIN a band, which
+// is what a "High" label could never do.
+const RISK_BANDS = [
+  { key: "act",     label: "Act today",   min: 60, cls: "b-risk-high", color: "var(--red)" },
+  { key: "sprint",  label: "This sprint", min: 25, cls: "b-risk-med",  color: "var(--red)" },
+  { key: "healthy", label: "Healthy",     min: 0,  cls: "b-risk-low",  color: "var(--green)" }
+];
+function bandOf(score) { return RISK_BANDS.find(b => score >= b.min) || RISK_BANDS[RISK_BANDS.length - 1]; }
+
+function riskVerdict(factors, fallbackWhy) {
+  const score = Math.min(100, factors.reduce((n, f) => n + f.pts, 0));
+  const band = bandOf(score);
+  const why = factors.length
+    ? factors.map(f => f.text + " (+" + f.pts + ")").join(" ")
+    : (fallbackWhy || "No elevated risk factors.");
+  return { score, band: band.key, label: band.label, cls: band.cls, color: band.color, factors, why };
+}
+
+// Risk verdict that explains itself: every factor carries its own weight, so the score is always
+// traceable to the reasons behind it. The heaviest levers are an admin-confirmed compromise,
+// allAllowed inheritance (fleet-wide), and a wildcard redirect.
 function riskOf(bp) {
+  const f = [];
+  const add = (pts, text) => f.push({ pts, text });
+
   if (bp._external) {
-    if (bp._ownerIsMicrosoft) return { rank: 0, label: "Low", cls: "b-risk-low", factors: [],
-      why: "Microsoft first-party blueprint (owner tenant: " + (bp._ownerName || "Microsoft") + "). Published by Microsoft." };
-    return { rank: 1.5, label: "Review", cls: "b-risk-med",
-      factors: ["Owned by another tenant (published multi-tenant)" + (bp._ownerName ? " — owner: " + bp._ownerName + (bp._ownerDomain ? " (" + bp._ownerDomain + ")" : "") : "") + ". Credentials & permissions are managed by the publisher — confirm it's trusted and expected."],
-      why: "This blueprint is owned by another tenant and operates in your tenant. Its credentials and permissions are managed by the publisher — confirm the publisher is trusted and that this blueprint is expected." };
+    if (bp._ownerIsMicrosoft)
+      return riskVerdict([], "Microsoft first-party blueprint (owner tenant: " + (bp._ownerName || "Microsoft") + "). Published by Microsoft.");
+    add(20, "Owned by another tenant (published multi-tenant)" + (bp._ownerName ? " — owner: " + bp._ownerName + (bp._ownerDomain ? " (" + bp._ownerDomain + ")" : "") : "") + ". Credentials & permissions are managed by the publisher — confirm it's trusted and expected.");
+    return riskVerdict(f);
   }
   const hasSecret  = (bp.passwordCredentials || []).length > 0;
   const secretDays = secretMaxLifetimeDays(bp);
@@ -1094,40 +1119,33 @@ function riskOf(bp) {
   const riskyAgents = agents.filter(a => ((a._risk && a._risk.state) || "").toLowerCase() === "confirmedcompromised"
                                       || ((a._risk && a._risk.state) || "").toLowerCase() === "atrisk");
 
-  const factors = [];
-  if (hasSecret)        factors.push("Uses a client secret — the weakest credential. Prefer a managed-identity federated credential (FIC).");
-  if (cf.secretPlusFic) factors.push("Client secret retained alongside a FIC — a live fallback credential path that defeats the point of the FIC. Remove the secret.");
-  if (cf.multiSecret)   factors.push(credCounts(bp).secret + " client secrets configured — accumulation from re-provisioning; prune stale ones.");
-  if (secretDays > 180) factors.push("Long-lived secret (" + secretDays + "-day validity) — shorten the rotation window.");
-  if (multi)            factors.push("Multi-tenant (AzureADMultipleOrgs) — usable from other tenants; a consent-phishing surface.");
-  if (open)             factors.push("Open access — no app-role assignment required before Entra issues tokens.");
-  if (inheritAll)       factors.push("Inheritable permissions set to allAllowed — every agent inherits all of the resource's perms fleet-wide (the escalation lever).");
-  if (mailSend)         factors.push("Mail.Send granted (application) — can send mail as any user (send-as-anyone).");
-  if (grantedApp.length) factors.push(grantedApp.length + " application permission(s) actually granted (effective, not just declared).");
-  if (cf.orphan)        factors.push("Orphan: 0 agent identities but holds a live credential — dead blueprint, cleanup candidate.");
-  if (allDormant)       factors.push("All agent identities dormant (>30d) while holding a live credential — act on this today.");
-  if (redir.wildcard)   factors.push("Wildcard redirect URI — tokens can be redirected to attacker-controlled hosts.");
-  if (redir.http)       factors.push("Plain-http (non-loopback) redirect URI — tokens returned over cleartext.");
-  if (cf.disabled)      factors.push("Blueprint principal is disabled (accountEnabled = false).");
-  if (compromised)      factors.push("Admin-confirmed COMPROMISED in Identity Protection (confirmCompromised was raised) — investigate now.");
-  else if (atRisk)      factors.push("Identity Protection flags this identity at risk (level: " + (bp._risk.level || "?") + ").");
-  if (riskyAgents.length) factors.push(riskyAgents.length + " agent identit" + (riskyAgents.length === 1 ? "y is" : "ies are") + " flagged at risk / compromised by Identity Protection.");
-  if (caUncovered)      factors.push(caUncov + " of " + caAgents.length + " agent identit" + (caAgents.length === 1 ? "y is" : "ies are") + " not covered by an enforced Conditional Access policy.");
-  if (agentN)           factors.push(agentN + " agent identit" + (agentN === 1 ? "y" : "ies") + " inherit this blueprint (blast radius).");
+  // An admin-confirmed compromise alone pins the score to 100 — nothing outranks it.
+  if (compromised)      add(100, "Admin-confirmed COMPROMISED in Identity Protection (confirmCompromised was raised) — investigate now.");
+  else if (atRisk)      add(riskLevel === "high" ? 40 : 25, "Identity Protection flags this identity at risk (level: " + (bp._risk.level || "?") + ").");
+  if (riskyAgents.length) add(25, riskyAgents.length + " agent identit" + (riskyAgents.length === 1 ? "y is" : "ies are") + " flagged at risk / compromised by Identity Protection.");
+  if (allDormant)       add(30, "All agent identities dormant (>30d) while holding a live credential — act on this today.");
+  if (inheritAll)       add(30, "Inheritable permissions set to allAllowed — every agent inherits all of the resource's perms fleet-wide (the escalation lever).");
+  if (redir.wildcard)   add(30, "Wildcard redirect URI — tokens can be redirected to attacker-controlled hosts.");
+  if (multi)            add(20, "Multi-tenant (AzureADMultipleOrgs) — usable from other tenants; a consent-phishing surface.");
+  if (open)             add(20, "Open access — no app-role assignment required before Entra issues tokens.");
+  if (mailSend)         add(20, "Mail.Send granted (application) — can send mail as any user (send-as-anyone).");
+  if (hasSecret)        add(15, "Uses a client secret — the weakest credential. Prefer a managed-identity federated credential (FIC).");
+  if (cf.secretPlusFic) add(15, "Client secret retained alongside a FIC — a live fallback credential path that defeats the point of the FIC. Remove the secret.");
+  if (redir.http)       add(12, "Plain-http (non-loopback) redirect URI — tokens returned over cleartext.");
+  if (cf.orphan)        add(12, "Orphan: 0 agent identities but holds a live credential — dead blueprint, cleanup candidate.");
+  if (caUncovered)      add(10, caUncov + " of " + caAgents.length + " agent identit" + (caAgents.length === 1 ? "y is" : "ies are") + " not covered by an enforced Conditional Access policy.");
+  if (cf.multiSecret)   add(8,  credCounts(bp).secret + " client secrets configured — accumulation from re-provisioning; prune stale ones.");
+  if (secretDays > 180) add(8,  "Long-lived secret (" + secretDays + "-day validity) — shorten the rotation window.");
+  if (!(bp._owners || []).length) add(8, "No owner assigned — nobody is accountable for this blueprint.");
+  if (grantedApp.length) add(Math.min(10, grantedApp.length * 3), grantedApp.length + " application permission(s) actually granted (effective, not just declared).");
+  if (credList(bp).some(c => c.status === "expired")) add(5, "Holds an expired credential — prune it.");
+  // Blast radius scales the consequence of everything above, so it earns points but can't alone
+  // push a clean blueprint out of Healthy.
+  if (agentN)           add(Math.min(10, agentN), agentN + " agent identit" + (agentN === 1 ? "y" : "ies") + " inherit this blueprint (blast radius).");
+  // Disabled is recorded but scores 0 — a disabled principal can't get a token.
+  if (cf.disabled)      add(0,  "Blueprint principal is disabled (accountEnabled = false) — it can't be issued tokens.");
 
-  let rank = 0;
-  if (hasSecret || multi || open || cf.secretPlusFic || cf.multiSecret || cf.orphan || redir.http
-      || atRisk || caUncovered) rank = 1;
-  if ((hasSecret && (multi || open)) || (multi && open) || inheritAll || (mailSend && (open || multi))
-      || redir.wildcard || (cf.secretPlusFic && (open || multi)) || allDormant
-      || compromised || (atRisk && riskLevel === "high") || riskyAgents.length) rank = 2;
-
-  const label = rank >= 2 ? "High" : rank >= 1 ? "Medium" : "Low";
-  const cls   = rank >= 2 ? "b-risk-high" : rank >= 1 ? "b-risk-med" : "b-risk-low";
-  const why = factors.length
-    ? "Risk factors: " + factors.join(" ")
-    : "No elevated risk factors (no client secret; single-tenant; assignment required; no allAllowed inheritance).";
-  return { rank, label, cls, factors, why };
+  return riskVerdict(f, "No elevated risk factors (no client secret; single-tenant; assignment required; no allAllowed inheritance).");
 }
 
 async function loadBlueprints() {
@@ -1314,7 +1332,7 @@ function renderSummary() {
   blueprints.forEach(b => {
     if (!tenancy(b.signInAudience).single) multi++;
     if (!(b._owners || []).length) noOwner++;
-    if (riskOf(b).rank === 2) high++;
+    if (riskOf(b).band === "act") high++;
   });
   const fcount = key => blueprints.filter(RISK_FACTORS.find(f => f.key === key).test).length;
   const pct = n => blueprints.length ? " (" + Math.round((n / blueprints.length) * 100) + "% of the estate)" : "";
@@ -1333,8 +1351,8 @@ function renderSummary() {
   $("summary").innerHTML =
     tile(blueprints.length, "Blueprints", "var(--accent)", "all") +
     tile(totalAgents, "Agent identities", "var(--accent)", "sort:agents") +
-    tile(high, "High risk", "var(--red)", "risk:2",
-      high + " of " + blueprints.length + " blueprints score High" + pct(high) + ".") +
+    tile(high, "Act today", "var(--red)", "risk:act",
+      high + " of " + blueprints.length + " blueprints score 60+" + pct(high) + ".") +
     (riskAvailable === true
       ? tile(fcount("iprisk"), "Compromised / at risk", "var(--red)", "factor:iprisk",
           "Blueprints whose principal or agents are flagged at risk / admin-confirmed compromised by Identity Protection.")
@@ -1502,7 +1520,7 @@ function bpMatches(bp) {
   if (ten === "multi" && tenancy(bp.signInAudience).single) return false;
 
   const risk = $("fltRisk").value;
-  if (risk !== "" && String(riskOf(bp).rank) !== risk) return false;
+  if (risk && riskOf(bp).band !== risk) return false;
 
   const cred = $("fltCred").value;
   if (cred) {
@@ -1544,7 +1562,7 @@ function bpSortVal(bp, key) {
     case "perms": return (bp._perms || []).length;
     case "roles": return appRolesOf(bp).length;
     case "consent": { const c = consentOf(bp); return c.delegated.length + c.app.length; }
-    case "risk": return riskOf(bp).rank;
+    case "risk": return riskOf(bp).score;
     case "agents": return (loaded.byBlueprint[bp.appId] || []).length;
     default: return 0;
   }
@@ -1574,9 +1592,10 @@ function exportRows() {
       ownerIsMicrosoft: bp._external ? (bp._ownerIsMicrosoft ? "Yes" : "No") : "",
       owners: (bp._owners || []).map(p => p.name + (p.upn ? " <" + p.upn + ">" : "")),
       sponsors: (bp._sponsors || []).map(p => p.name + (p.upn ? " <" + p.upn + ">" : "")),
-      risk: riskOf(bp).label,
+      riskScore: riskOf(bp).score,
+      riskBand: riskOf(bp).label,
       riskWhy: riskOf(bp).why,
-      riskFactors: riskOf(bp).factors || [],
+      riskFactors: (riskOf(bp).factors || []).map(f => "+" + f.pts + " " + f.text),
       assignmentRequired: bp._assignmentRequired === true ? "Yes"
         : bp._assignmentRequired === false ? "No (open access)" : "",
       accountEnabled: bp._accountEnabled === false ? "No" : bp._accountEnabled === true ? "Yes" : "",
@@ -1773,8 +1792,11 @@ async function loadAgentGrants(row, ulEl, agents) {
 // Each returns "" when it has nothing to say, so the panel only contains what exists.
 function secRisk(r) {
   if (!r.factors || !r.factors.length) return "";
-  return `<div class="dsec"><div class="dhead">Risk rationale — ${escapeHtml(r.label)}</div>
-    <ul class="agent-list">${r.factors.map(f => `<li>${escapeHtml(f)}</li>`).join("")}</ul></div>`;
+  const items = r.factors.map(f =>
+    `<li><b style="color:${f.pts ? "var(--red)" : "var(--muted)"}">+${f.pts}</b> &nbsp;${escapeHtml(f.text)}</li>`).join("");
+  return `<div class="dsec"><div class="dhead">Why ${r.score} — ${escapeHtml(r.label)}
+    <span class="hint">(each factor's weight; capped at 100)</span></div>
+    <ul class="agent-list">${items}</ul></div>`;
 }
 
 function secCreds(creds) {
@@ -1901,7 +1923,33 @@ function renderTable() {
     return;
   }
 
-  rows.forEach((bp, i) => {
+  // Group into the triage queue. Bands are the primary axis; a column sort reorders within them.
+  let i = -1;
+  RISK_BANDS.forEach(band => {
+    const group = rows.filter(bp => riskOf(bp).band === band.key);
+    if (!group.length) return;
+    const gr = document.createElement("tr");
+    gr.className = "grp";
+    gr.innerHTML = `<td colspan="9"><span style="color:${band.color}">${band.label}</span> · ${group.length}</td>`;
+    tbody.appendChild(gr);
+    group.forEach(bp => { i++; renderRow(bp, i, tbody, byBlueprint); });
+  });
+
+  tbody.querySelectorAll(".chev .expander").forEach(el => {
+    el.addEventListener("click", () => {
+      const row = $(el.dataset.target);
+      if (!row) return;
+      const open = row.classList.toggle("hidden") === false;
+      el.textContent = open ? "▾" : "▸";
+      el.title = el.ariaLabel = open ? "Hide details" : "Show details";
+      if (open && row._agents && row._agents.length)
+        loadAgentGrants(row, row.querySelector(".agents-ul"), row._agents);
+    });
+  });
+}
+
+function renderRow(bp, i, tbody, byBlueprint) {
+  {
     const t = tenancy(bp.signInAudience);
     const r = riskOf(bp);
     const agents = byBlueprint[bp.appId] || [];
@@ -1921,10 +1969,10 @@ function renderTable() {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td class="chev">${detail ? `<span class="expander" data-target="${detailId}" title="Show details" aria-label="Show details">▸</span>` : ``}</td>
-      <td>
-        <div style="white-space:nowrap" title="${escapeHtml(principalsTip(bp))}">
+      <td style="max-width:440px">
+        <div title="${escapeHtml(principalsTip(bp))}">
           <b>${escapeHtml(bp.displayName || "(no name)")}</b>
-          <span class="mono" style="margin-left:8px">${bp.appId}</span>
+          <span class="mono" style="margin-left:8px; white-space:nowrap">${bp.appId}</span>
         </div>
         ${flags}
       </td>
@@ -1941,7 +1989,7 @@ function renderTable() {
           // Only allAllowed inheritance earns a place in the row; the rest is in the panel.
           inheritHasAll(bp) ? `<span class="badge b-risk-med" title="Every agent inherits all of this resource's permissions, including future ones.">Inherits: allAllowed</span>` : ``
         }</td>
-      <td><span class="badge ${r.cls}" title="${escapeHtml(r.why)}">${r.label}</span></td>
+      <td style="text-align:right"><b style="color:${r.color}" title="${escapeHtml(r.label + " · " + r.why)}">${r.score}</b></td>
       <td style="text-align:center">${roles.length || assignees.length ? roles.length : ``}${assignmentBadge(bp)}</td>
       <td style="text-align:center">${consentCount || ``}</td>
       <td style="text-align:center">${agents.length
@@ -1957,19 +2005,7 @@ function renderTable() {
       d._agents = agents;   // for lazy-loading each agent's direct grants on first expand
       tbody.appendChild(d);
     }
-  });
-
-  tbody.querySelectorAll(".chev .expander").forEach(el => {
-    el.addEventListener("click", () => {
-      const row = $(el.dataset.target);
-      if (!row) return;
-      const open = row.classList.toggle("hidden") === false;
-      el.textContent = open ? "▾" : "▸";
-      el.title = el.ariaLabel = open ? "Hide details" : "Show details";
-      if (open && row._agents && row._agents.length)
-        loadAgentGrants(row, row.querySelector(".agents-ul"), row._agents);
-    });
-  });
+  }
 }
 
 function escapeHtml(s) {
