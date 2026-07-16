@@ -462,6 +462,7 @@ let signInAvailable = null;   // null = not attempted, true = loaded, false = sc
 let riskAvailable   = null;
 let caAvailable     = null;
 let workloadIdPremium = null;   // inferred: risk data returned as "hidden" => no Workload ID Premium
+let pendingScopes   = [];       // optional scopes the "grant access" link should request
 
 async function elevatedToken(scopes) {
   try { return (await msalInstance.acquireTokenSilent({ scopes, account })).accessToken; }
@@ -529,24 +530,44 @@ async function loadRiskState(blueprints, agents) {
   blueprints.forEach(bp => { bp._risk = bp._principalId ? map(byId[bp._principalId.toLowerCase()]) : null; });
 }
 
-// Conditional Access coverage for workload identities. A policy targets a service principal when
-// clientApplications.includeServicePrincipals holds its id (or "ServicePrincipalsInMyTenant") and
-// it isn't in excludeServicePrincipals.
-function caEvaluate(policies, spId) {
-  if (!spId) return null;
-  const id = spId.toLowerCase();
+// Conditional Access coverage. Agent identities are targeted by their OWN fields —
+// clientApplications.includeAgentIdServicePrincipals (which accepts the literal "All"),
+// excludeAgentIdServicePrincipals, and agentIdServicePrincipalFilter — NOT by the workload-identity
+// includeServicePrincipals fields. These only exist on /beta, so this always queries beta.
+// kind: "agent" for agent identities, "sp" for a plain workload identity (blueprint principal).
+const lcArr = a => (a || []).map(s => String(s).toLowerCase());
+
+function caPolicyHit(p, id, kind) {
+  const ca = p.conditions && p.conditions.clientApplications;
+  if (!ca) return null;
+  const incAgent = lcArr(ca.includeAgentIdServicePrincipals);
+  const excAgent = lcArr(ca.excludeAgentIdServicePrincipals);
+  const incSp    = lcArr(ca.includeServicePrincipals);
+  const excSp    = lcArr(ca.excludeServicePrincipals);
+
+  let included, excluded, byFilter = false;
+  if (kind === "agent") {
+    included = incAgent.includes("all") || incAgent.includes(id) || incSp.includes(id);
+    excluded = excAgent.includes(id) || excSp.includes(id);
+    // A custom-security-attribute filter can't be evaluated without the agent's attributes.
+    byFilter = !!ca.agentIdServicePrincipalFilter && !included && !excluded;
+  } else {
+    included = incSp.includes(id) || incSp.includes("serviceprincipalsinmytenant");
+    excluded = excSp.includes(id);
+  }
+  if (!included && !excluded && !byFilter) return null;
+  return { name: p.displayName || p.id, state: p.state || "", excluded, byFilter };
+}
+
+function caEvaluate(policies, id, kind) {
+  if (!id) return null;
   const hits = [];
-  policies.forEach(p => {
-    const ca = p.conditions && p.conditions.clientApplications;
-    if (!ca) return;
-    const inc = (ca.includeServicePrincipals || []).map(s => s.toLowerCase());
-    const exc = (ca.excludeServicePrincipals || []).map(s => s.toLowerCase());
-    const included = inc.includes(id) || inc.includes("serviceprincipalsinmytenant");
-    if (!included && !exc.includes(id)) return;
-    hits.push({ name: p.displayName || p.id, state: p.state || "", excluded: exc.includes(id) });
-  });
-  const covered = hits.some(h => !h.excluded && h.state === "enabled");
-  return { policies: hits, covered };
+  policies.forEach(p => { const h = caPolicyHit(p, String(id).toLowerCase(), kind || "sp"); if (h) hits.push(h); });
+  return {
+    policies: hits,
+    covered: hits.some(h => !h.excluded && !h.byFilter && h.state === "enabled"),
+    indeterminate: hits.some(h => h.byFilter)   // attribute-filter policy we can't resolve here
+  };
 }
 
 async function loadCaCoverage(blueprints, agents) {
@@ -555,16 +576,22 @@ async function loadCaCoverage(blueprints, agents) {
   if (!at) { caAvailable = false; return; }
   let policies = [];
   try {
-    policies = await graphGetAll(graphBase()
+    policies = await graphGetAll("https://graph.microsoft.com/beta"
       + "/identity/conditionalAccess/policies?$select=id,displayName,state,conditions", at);
   } catch { caAvailable = false; return; }
   caAvailable = true;
-  // Only policies that scope to workload identities at all are relevant here.
-  const wl = policies.filter(p => p.conditions && p.conditions.clientApplications
-    && ((p.conditions.clientApplications.includeServicePrincipals || []).length
-      || (p.conditions.clientApplications.excludeServicePrincipals || []).length));
-  agents.forEach(a => { a._ca = caEvaluate(wl, a.id); });
-  blueprints.forEach(bp => { bp._ca = caEvaluate(wl, bp._principalId); });
+  // Keep only policies that scope to agents or workload identities at all.
+  const wl = policies.filter(p => {
+    const ca = p.conditions && p.conditions.clientApplications;
+    if (!ca) return false;
+    return (ca.includeServicePrincipals || []).length || (ca.excludeServicePrincipals || []).length
+      || (ca.includeAgentIdServicePrincipals || []).length || (ca.excludeAgentIdServicePrincipals || []).length
+      || !!ca.agentIdServicePrincipalFilter;
+  });
+  agents.forEach(a => { a._ca = caEvaluate(wl, a.id, "agent"); });
+  // The blueprint principal itself: CA never governs a blueprint acquiring a token to create agents,
+  // so this only reports an explicit workload-identity targeting, not "coverage" of the blueprint.
+  blueprints.forEach(bp => { bp._ca = caEvaluate(wl, bp._principalId, "sp"); });
 }
 
 // Follow @odata.nextLink and return the full collection.
@@ -597,6 +624,8 @@ function tenancy(signInAudience) {
 }
 
 function fmtDate(iso) { return iso ? String(iso).slice(0, 10) : ""; }
+
+function plural(n, one, many) { return n + " " + (n === 1 ? one : (many || one + "s")); }
 
 function b64ToHex(b64) {
   if (!b64) return "";
@@ -1018,7 +1047,9 @@ function riskOf(bp) {
   const riskLevel   = ((bp._risk && bp._risk.level) || "").toLowerCase();
   const compromised = riskState === "confirmedcompromised";
   const atRisk      = riskState === "atrisk";
-  const caUncovered = !!(bp._ca && !bp._ca.covered);
+  const caAgents    = agents.filter(a => a._ca);
+  const caUncov     = caAgents.filter(a => !a._ca.covered).length;
+  const caUncovered = caAvailable === true && caAgents.length > 0 && caUncov > 0;
   const riskyAgents = agents.filter(a => ((a._risk && a._risk.state) || "").toLowerCase() === "confirmedcompromised"
                                       || ((a._risk && a._risk.state) || "").toLowerCase() === "atrisk");
 
@@ -1040,7 +1071,7 @@ function riskOf(bp) {
   if (compromised)      factors.push("Admin-confirmed COMPROMISED in Identity Protection (confirmCompromised was raised) — investigate now.");
   else if (atRisk)      factors.push("Identity Protection flags this identity at risk (level: " + (bp._risk.level || "?") + ").");
   if (riskyAgents.length) factors.push(riskyAgents.length + " agent identit" + (riskyAgents.length === 1 ? "y is" : "ies are") + " flagged at risk / compromised by Identity Protection.");
-  if (caUncovered)      factors.push("No enforced Conditional Access policy targets this identity — uncovered workload identity.");
+  if (caUncovered)      factors.push(caUncov + " of " + caAgents.length + " agent identit" + (caAgents.length === 1 ? "y is" : "ies are") + " not covered by an enforced Conditional Access policy.");
   if (agentN)           factors.push(agentN + " agent identit" + (agentN === 1 ? "y" : "ies") + " inherit this blueprint (blast radius).");
 
   let rank = 0;
@@ -1134,17 +1165,40 @@ async function loadBlueprints() {
     await loadCaCoverage(blueprints, agents);
 
     render(blueprints, byBlueprint, agents.length);
-    const missing = [];
-    if (signInAvailable === false) missing.push("sign-in activity (AuditLog.Read.All)");
-    if (riskAvailable === false)   missing.push("risk state (IdentityRiskyAgent.Read.All or IdentityRiskyServicePrincipal.Read.All)");
-    if (caAvailable === false)     missing.push("CA coverage (Policy.Read.All)");
-    const gaps = missing.length ? " · unavailable — add to the app registration + admin consent: " + missing.join("; ") : "";
-    const lic = workloadIdPremium === false
-      ? " · risk data returned as 'hidden' — tenant appears to lack Workload ID Premium" : "";
-    setStatus("Loaded " + blueprints.length + " blueprint(s) and " + agents.length
-      + " agent identit(y/ies)." + principalWarn + gaps + lic);
+
+    // Which optional features didn't get a token, and the scopes that would unlock them.
+    const gaps = [];
+    if (signInAvailable === false) gaps.push({ label: "sign-in activity", scopes: ELEVATED_SCOPES });
+    if (riskAvailable === false)   gaps.push({ label: "risk state", scopes: RISK_AGENT_SCOPES.concat(RISK_SP_SCOPES) });
+    if (caAvailable === false)     gaps.push({ label: "CA coverage", scopes: CA_SCOPES });
+    pendingScopes = [...new Set(gaps.flatMap(g => g.scopes))];
+
+    let msg = "Loaded " + plural(blueprints.length, "blueprint")
+      + " and " + plural(agents.length, "agent identity", "agent identities") + "." + principalWarn;
+    if (workloadIdPremium === false)
+      msg += " Risk details are hidden — this tenant appears to lack Workload ID Premium.";
+    if (gaps.length)
+      msg += ` <span title="Needs consent for: ${escapeHtml(pendingScopes.join(", "))}">`
+        + gaps.map(g => g.label).join(", ") + " not loaded</span> — "
+        + `<a href="#" id="grantBtn">grant access</a>`;
+    setStatus(msg);
+    if (gaps.length) $("grantBtn").addEventListener("click", e => { e.preventDefault(); grantElevated(); });
   } catch (e) {
     setStatus("Load failed: " + (e.message || e), true);
+  }
+}
+
+// Ask for the optional scopes interactively. Silent acquisition can't surface a consent prompt, so
+// a tenant that has only just added (or not yet admin-consented) these permissions needs one click.
+async function grantElevated() {
+  if (!pendingScopes.length) return;
+  try {
+    setStatus("Requesting consent…", false, true);
+    await msalInstance.acquireTokenPopup({ scopes: pendingScopes, account });
+    await loadBlueprints();
+  } catch (e) {
+    setStatus("Consent failed: " + (e.message || e)
+      + " — check the permissions are on the app registration and admin-consented.", true);
   }
 }
 
@@ -1197,38 +1251,58 @@ function applyFactor(key) {
   renderTable();
 }
 
+// CISO-facing KPIs: scale, exposure, urgency, accountability. Every tile is a decision, not an
+// inventory fact — which is why the complement counts (single-tenant, home) aren't here.
 function renderSummary() {
   const { blueprints, totalAgents } = loaded;
-  let single = 0, multi = 0, high = 0, ext = 0, noOwner = 0, heavy = 0;
+  let multi = 0, high = 0, noOwner = 0;
   blueprints.forEach(b => {
-    tenancy(b.signInAudience).single ? single++ : multi++;
-    if (b._external) ext++;
+    if (!tenancy(b.signInAudience).single) multi++;
     if (!(b._owners || []).length) noOwner++;
     if (riskOf(b).rank === 2) high++;
-    if (agentCount(b) > 5) heavy++;   // identity-sprawl distribution
   });
-  const ratio = blueprints.length ? (totalAgents / blueprints.length) : 0;
-  const tile = (n, label, color, scope, tip) =>
-    `<div class="stat clickable${activeScope === scope ? " active" : ""}" data-scope="${scope}" title="${escapeHtml(tip || ("Click to scope the table to: " + label))}">
+  const fcount = key => blueprints.filter(RISK_FACTORS.find(f => f.key === key).test).length;
+  const pct = n => blueprints.length ? " (" + Math.round((n / blueprints.length) * 100) + "% of the estate)" : "";
+
+  const tile = (n, label, color, scope, tip) => {
+    const active = scope.startsWith("factor:") ? activeFactor === scope.slice(7) : activeScope === scope;
+    return `<div class="stat clickable${active ? " active" : ""}" data-scope="${scope}" title="${escapeHtml(tip || ("Click to scope the table to: " + label))}">
        <div class="n"${color ? ` style="color:${color}"` : ""}>${n}</div><div class="l">${label}</div></div>`;
+  };
+  // A scope-gated KPI with no data must not render "0" — that reads as "all clear" when it means
+  // "never checked". Show an em dash and say what would unlock it.
+  const tileNA = (label, needs) =>
+    `<div class="stat" title="${escapeHtml("Not loaded — needs consent for " + needs + ". Use “grant access” in the status line above.")}">
+       <div class="n" style="color:var(--muted)">—</div><div class="l">${label}</div></div>`;
+
   $("summary").innerHTML =
     tile(blueprints.length, "Blueprints", "var(--accent)", "all") +
-    tile(single, "Single-tenant", "var(--accent)", "tenancy:single") +
-    tile(multi, "Multi-tenant", "var(--red)", "tenancy:multi") +
-    tile(ext, "External", "var(--accent)", "origin:external") +
     tile(totalAgents, "Agent identities", "var(--accent)", "sort:agents") +
-    tile(ratio.toFixed(1) + "×", "Agents / blueprint", "var(--accent)", "sort:agents",
-      "Identity sprawl: " + totalAgents + " agent identities across " + blueprints.length + " blueprints.") +
-    tile(heavy, "Blueprints >5 agents", heavy ? "var(--red)" : "var(--accent)", "sort:agents",
-      heavy + " blueprint(s) each fan out to more than 5 agent identities.") +
-    tile(high, "High risk", "var(--red)", "risk:2") +
-    tile(noOwner, "Missing owners", "var(--red)", "owners:none");
-  $("summary").querySelectorAll(".stat").forEach(el =>
+    tile(high, "High risk", "var(--red)", "risk:2",
+      high + " of " + blueprints.length + " blueprints score High" + pct(high) + ".") +
+    (riskAvailable === true
+      ? tile(fcount("iprisk"), "Compromised / at risk", "var(--red)", "factor:iprisk",
+          "Blueprints whose principal or agents are flagged at risk / admin-confirmed compromised by Identity Protection.")
+      : tileNA("Compromised / at risk", "IdentityRiskyAgent.Read.All")) +
+    (signInAvailable === true
+      ? tile(fcount("dormant"), "Dormant + live cred", "var(--red)", "factor:dormant",
+          "Blueprints whose agents have all been dormant 30+ days while a live credential remains — the act-today list.")
+      : tileNA("Dormant + live cred", "AuditLog.Read.All")) +
+    tile(noOwner, "Missing owners", "var(--red)", "owners:none",
+      noOwner + " blueprint(s) with nobody accountable" + pct(noOwner) + ".") +
+    tile(multi, "Multi-tenant", "var(--red)", "tenancy:multi",
+      multi + " blueprint(s) usable from other tenants — the consent-phishing surface" + pct(multi) + ".") +
+    tile(fcount("secret"), "Secrets in use", "var(--red)", "factor:secret",
+      "Blueprints still using a client secret rather than a federated credential (FIC)" + pct(fcount("secret")) + ".");
+
+  $("summary").querySelectorAll(".stat[data-scope]").forEach(el =>
     el.addEventListener("click", () => applyScope(el.dataset.scope)));
 }
 
 // Scope the table from a summary tile: reset filters, apply the tile's dimension; click again clears.
 function applyScope(scope) {
+  if (!scope) return;
+  if (scope.startsWith("factor:")) { applyFactor(scope.slice(7)); return; }   // KPI backed by a risk factor
   if (scope === activeScope) scope = "all";
   activeScope = (scope === "all") ? null : scope;
   activeFactor = null;   // tile scoping and factor scoping are mutually exclusive
@@ -1271,8 +1345,13 @@ const RISK_FACTORS = [
     tip: "No agent has signed in for 30+ days while the blueprint still holds a live credential." },
   { key: "redirect",    sev: "high", label: "Risky redirect URI",        test: bp => { const r = redirectInfo(bp); return r.wildcard || r.http; },
     tip: "Wildcard or plain-http (non-loopback) redirect URI." },
-  { key: "iprisk",      sev: "high", label: "Identity Protection risk",  test: bp => ["atrisk", "confirmedcompromised"].includes(((bp._risk && bp._risk.state) || "").toLowerCase()),
-    tip: "Flagged at risk or admin-confirmed compromised by Identity Protection." },
+  { key: "iprisk",      sev: "high", label: "Identity Protection risk",  test: bp => {
+      const st = o => ((o && o._risk && o._risk.state) || "").toLowerCase();
+      const flagged = s => s === "atrisk" || s === "confirmedcompromised";
+      if (flagged(st(bp))) return true;
+      return ((loaded && loaded.byBlueprint && loaded.byBlueprint[bp.appId]) || []).some(a => flagged(st(a)));
+    },
+    tip: "The blueprint principal or one of its agents is flagged at risk / admin-confirmed compromised by Identity Protection." },
   { key: "granted",     sev: "med",  label: "App perms granted",         test: bp => (consentOf(bp).app || []).length > 0,
     tip: "Application permissions actually granted (effective, not just declared)." },
   { key: "blocked",     sev: "med",  label: "Blocked declared perms",    test: bp => (bp._perms || []).some(p => p.blocked),
@@ -1287,8 +1366,12 @@ const RISK_FACTORS = [
     tip: "No agent identities, but still holds a live credential — cleanup candidate." },
   { key: "noowner",     sev: "med",  label: "No owner",                  test: bp => !(bp._owners || []).length,
     tip: "No owner assigned — nobody is accountable for this blueprint." },
-  { key: "cauncov",     sev: "med",  label: "CA uncovered",              test: bp => !!(bp._ca && !bp._ca.covered),
-    tip: "No enforced Conditional Access policy targets this identity." }
+  { key: "cauncov",     sev: "med",  label: "CA uncovered",              test: bp => {
+      if (caAvailable !== true) return false;
+      const ags = ((loaded && loaded.byBlueprint && loaded.byBlueprint[bp.appId]) || []).filter(a => a._ca);
+      return ags.length > 0 && ags.some(a => !a._ca.covered);
+    },
+    tip: "Has agent identities that no enforced Conditional Access policy covers." }
 ];
 
 // Does this blueprint hold at least one still-usable credential? FICs never expire; secrets/certs
@@ -1559,19 +1642,34 @@ function riskStateBadge(o) {
   return `<span class="badge b-none" title="${escapeHtml(tip)}">Risk ${escapeHtml(r.state || r.level)}</span>`;
 }
 
-// Conditional Access coverage for this identity.
+// Conditional Access coverage for a single agent identity.
 function caBadge(o) {
   const ca = o && o._ca;
   if (!ca) return "";
   if (!ca.policies.length)
-    return `<span class="badge b-risk-med" title="No Conditional Access policy scoped to workload identities targets this identity. CA for workload identities requires Workload ID Premium.">CA: uncovered</span>`;
-  const tip = ca.policies.map(p => p.name + " (" + p.state + (p.excluded ? ", EXCLUDED" : "") + ")").join(" · ");
-  if (!ca.covered) {
-    const onlyExcluded = ca.policies.every(p => p.excluded);
-    return `<span class="badge b-risk-med" title="${escapeHtml(tip)}">CA: ${onlyExcluded ? "excluded" : "not enforced"}</span>`;
+    return `<span class="badge b-risk-med" title="No Conditional Access policy targets this agent identity (checked All-agent, per-agent and workload-identity targeting).">CA: uncovered</span>`;
+  const tip = ca.policies.map(p => p.name + " (" + p.state
+    + (p.excluded ? ", EXCLUDED" : p.byFilter ? ", attribute filter" : "") + ")").join(" · ");
+  if (ca.covered) {
+    const n = ca.policies.filter(p => !p.excluded && !p.byFilter && p.state === "enabled").length;
+    return `<span class="badge b-risk-low" title="${escapeHtml(tip)}">CA: ${n} enforced</span>`;
   }
-  const n = ca.policies.filter(p => !p.excluded && p.state === "enabled").length;
-  return `<span class="badge b-risk-low" title="${escapeHtml(tip)}">CA: ${n} enforced</span>`;
+  if (ca.indeterminate)
+    return `<span class="badge b-none" title="${escapeHtml(tip)} — targeted via a custom-security-attribute filter, which can't be resolved here.">CA: filter-based</span>`;
+  return `<span class="badge b-risk-med" title="${escapeHtml(tip)}">CA: ${ca.policies.every(p => p.excluded) ? "excluded" : "not enforced"}</span>`;
+}
+
+// Blueprint-level rollup. CA never governs a blueprint acquiring a token to create agents, so
+// coverage is only meaningful for the agent identities derived from it.
+function caAgentSummary(bp) {
+  if (caAvailable !== true) return "";
+  const agents = (loaded && loaded.byBlueprint && loaded.byBlueprint[bp.appId]) || [];
+  const withCa = agents.filter(a => a._ca);
+  if (!withCa.length) return "";
+  const covered = withCa.filter(a => a._ca.covered).length;
+  const tip = "Conditional Access governs agent identities, not the blueprint itself. "
+    + covered + " of " + withCa.length + " agent identities are covered by an enabled policy.";
+  return `<span class="badge ${covered === withCa.length ? "b-risk-low" : "b-risk-med"}" title="${escapeHtml(tip)}">CA: ${covered}/${withCa.length} agents</span>`;
 }
 
 // Governance / hygiene badges shown under the blueprint name.
@@ -1585,8 +1683,8 @@ function blueprintFlags(bp) {
     if (r.http)      out.push(`<span class="badge b-risk-med" title="Plain-http (non-loopback) redirect URI — tokens returned over cleartext.">http redirect</span>`);
     if (r.loopback)  out.push(`<span class="badge b-none" title="Loopback redirect URI (localhost / 127.0.0.1). Informational.">loopback redirect</span>`);
   }
-  const rb = riskStateBadge(bp); if (rb) out.push(rb);
-  const cb = caBadge(bp);        if (cb) out.push(cb);
+  const rb = riskStateBadge(bp);   if (rb) out.push(rb);
+  const cb = caAgentSummary(bp);   if (cb) out.push(cb);
   return out.length ? `<div style="margin-top:4px">${out.join("")}</div>` : "";
 }
 
