@@ -135,6 +135,12 @@
   .b-blocked { background: var(--red-bg); color: var(--red); text-decoration: line-through; }
   .badge[title] { cursor: help; }
   .msicon { vertical-align: -1px; margin-right: 4px; }
+  .chev { width: 26px; text-align: center; padding-left: 6px; padding-right: 0; }
+  .chev .expander { font-size: 11px; }
+  .dsec { margin: 0 0 14px; }
+  .dsec:last-child { margin-bottom: 0; }
+  .dhead { font-size: 12px; font-weight: 600; margin: 0 0 4px; }
+  .dhead .hint { display: inline; font-weight: 400; }
   .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
   .toolbar input, .toolbar select { width: auto; }
   .toolbar #fltSearch { flex: 1 1 220px; min-width: 200px; max-width: 340px; }
@@ -292,6 +298,7 @@
         <table id="table">
           <thead>
             <tr>
+              <th style="width:26px"></th>
               <th class="sortable" data-key="name">Blueprint <span class="arrow"></span></th>
               <th class="sortable" data-key="tenancy">Tenancy <span class="arrow"></span></th>
               <th class="sortable" data-key="cred">Client credentials <span class="arrow"></span></th>
@@ -1762,6 +1769,111 @@ async function loadAgentGrants(row, ulEl, agents) {
   ulEl.innerHTML = agents.map(agentLine).join("");
 }
 
+// ---- expanded-row detail sections ----
+// Each returns "" when it has nothing to say, so the panel only contains what exists.
+function secRisk(r) {
+  if (!r.factors || !r.factors.length) return "";
+  return `<div class="dsec"><div class="dhead">Risk rationale — ${escapeHtml(r.label)}</div>
+    <ul class="agent-list">${r.factors.map(f => `<li>${escapeHtml(f)}</li>`).join("")}</ul></div>`;
+}
+
+function secCreds(creds) {
+  if (!creds.length) return "";
+  const items = creds.map(c => {
+    const st = c.status === "expired"
+      ? `<span style="color:var(--red);font-weight:600"> · EXPIRED ${fmtDate(c.end)}</span>`
+      : c.status === "soon"
+        ? `<span style="color:var(--red);font-weight:600"> · expires ${fmtDate(c.end)} (in ${c.daysLeft} days)</span>`
+        : c.end ? ` · expires ${fmtDate(c.end)} (in ${c.daysLeft} days)` : " · no expiry set";
+    return `<li>
+      <span class="badge ${c.kind === "Secret" ? "b-secret" : "b-cert"}">${c.kind}</span>
+      <b>${escapeHtml(c.name || "(no name)")}</b>
+      <span class="mono">${c.start ? " · from " + fmtDate(c.start) : ""}${st}</span>
+      ${c.thumbprint ? `<div class="mono">thumbprint: ${escapeHtml(c.thumbprint)}</div>` : ""}</li>`;
+  }).join("");
+  return `<div class="dsec"><div class="dhead">Client credentials <span class="hint">(federated credentials / FIC don't expire)</span></div>
+    <ul class="agent-list">${items}</ul></div>`;
+}
+
+function secPerms(bp) {
+  const perms = bp._perms || [];
+  const inh = inheritOf(bp);
+  let out = "";
+  if (perms.length) {
+    const items = perms.map(p => `<li>
+      <span class="badge ${p.blocked ? "b-blocked" : p.type === "delegated" ? "b-deleg" : "b-approle"}">${escapeHtml(p.name)}</span>
+      <span class="mono"> · ${escapeHtml(p.type)} · ${escapeHtml(p.resource)}${p.blocked ? " · BLOCKED for agents — never effective" : ""}</span></li>`).join("");
+    out += `<div class="dsec"><div class="dhead">Declared permissions <span class="hint">(requiredResourceAccess — a declaration, not a grant)</span></div>
+      <ul class="agent-list">${items}</ul></div>`;
+  }
+  if (inh.length) {
+    const items = inh.map(i => `<li>
+      <b>${escapeHtml(i.resource)}</b>
+      <span class="mono"> · scopes ${escapeHtml(i.scopesKind || "—")}${i.rolesKind ? " · roles " + escapeHtml(i.rolesKind) : ""} · appId ${escapeHtml(i.resourceAppId || "")}</span>
+      ${i.scopesKind === "enumerated" && i.scopesList.length ? `<div class="hint">${escapeHtml(i.scopesList.join(", "))}</div>` : ""}
+      ${(i.scopesKind === "all" || i.rolesKind === "all") ? `<div class="hint" style="color:var(--red)">allAllowed — every agent inherits all of this resource's permissions, including future ones.</div>` : ""}</li>`).join("");
+    out += `<div class="dsec"><div class="dhead">Inheritable → every agent</div><ul class="agent-list">${items}</ul></div>`;
+  }
+  return out;
+}
+
+function secRoles(roles, assignees) {
+  if (!roles.length && !assignees.length) return "";
+  const ZERO = "00000000-0000-0000-0000-000000000000";
+  const byRole = {};
+  assignees.forEach(a => { (byRole[a.appRoleId] = byRole[a.appRoleId] || []).push(a); });
+  const holderChips = list => list.map(h =>
+    `<span class="badge b-deleg" title="${escapeHtml(h.type)}">${escapeHtml(h.name)}</span>`).join("");
+  const items = roles.map(role => {
+    const holders = byRole[role.id] || [];
+    return `<li>
+      <b>${escapeHtml(role.value || "(no value)")}</b>
+      <span class="mono"> · ${escapeHtml(role.displayName || "")} · [${escapeHtml((role.allowedMemberTypes || []).join(", ") || "—")}]${role.isEnabled === false ? " · disabled" : ""}</span>
+      <div style="margin-top:3px">Assigned to: ${holders.length ? holderChips(holders) : `<span class="mono">no explicit assignments</span>`}</div>
+      ${role.description ? `<div class="hint" style="margin-top:2px">${escapeHtml(role.description)}</div>` : ""}</li>`;
+  }).join("");
+  const defaults = byRole[ZERO] || [];
+  const defaultItem = defaults.length
+    ? `<li><b>(default access)</b> <span class="mono"> · no specific app role</span>
+       <div style="margin-top:3px">Assigned to: ${holderChips(defaults)}</div></li>` : "";
+  return `<div class="dsec"><div class="dhead">App roles exposed by this blueprint</div>
+    <ul class="agent-list">${items}${defaultItem}</ul></div>`;
+}
+
+function secConsent(consent) {
+  const n = consent.delegated.length + consent.app.length;
+  if (!n) return "";
+  const d = consent.delegated.map(x => `<li><span class="badge b-deleg">${escapeHtml(x.scope)}</span>
+    <span class="mono"> · delegated · ${x.consentType === "AllPrincipals" ? "admin consent (all users)" : "user consent"}</span></li>`).join("");
+  const a = consent.app.map(x => `<li><span class="badge b-approle">${escapeHtml(x.role)}</span>
+    <span class="mono"> · application · ${escapeHtml(x.resource)}</span></li>`).join("");
+  return `<div class="dsec"><div class="dhead">Consent granted <span class="hint">(what this principal actually holds in your tenant)</span></div>
+    <ul class="agent-list">${d}${a}</ul></div>`;
+}
+
+function secOwner(bp) {
+  const fmt = list => (list || []).map(p => escapeHtml(p.name + (p.upn ? " <" + p.upn + ">" : ""))).join(", ");
+  const o = fmt(bp._owners), s = fmt(bp._sponsors);
+  const ext = bp._external
+    ? `<li><b>Published by</b> <span class="mono">${bp._ownerName ? escapeHtml(bp._ownerName) : "unknown owner"}${
+        (bp._ownerDomain && !bp._ownerIsMicrosoft) ? " · " + escapeHtml(bp._ownerDomain) : ""} · tenant ${escapeHtml(bp._ownerOrg || "?")}</span></li>` : "";
+  if (!o && !s && !ext) return `<div class="dsec"><div class="dhead">Accountability</div>
+    <ul class="agent-list"><li style="color:var(--red)">No owner assigned — nobody is accountable for this blueprint.</li></ul></div>`;
+  return `<div class="dsec"><div class="dhead">Accountability</div><ul class="agent-list">
+    <li><b>Owners</b> <span class="mono">${o || "none — nobody is accountable"}</span></li>
+    ${s ? `<li><b>Sponsors</b> <span class="mono">${s}</span></li>` : ""}${ext}</ul></div>`;
+}
+
+function secAgents(agents) {
+  if (!agents.length) return "";
+  return `<div class="dsec"><div class="dhead">Agent identities</div>
+    <div class="hint" style="margin:0 0 6px">
+      <b><span style="${agents.length > 200 ? "color:var(--red)" : ""}">${agents.length} of 250</span></b> (per-blueprint cap for app-only permissions).
+      Each agent's own direct grants load on expand.
+      Note: <code>AgentIdentity.CreateAsManager</code> is auto-granted and non-revocable — it never appears in the grants list, so its absence doesn't mean the blueprint can't self-manage agents.</div>
+    <ul class="agent-list agents-ul">${agents.map(agentLine).join("")}</ul></div>`;
+}
+
 function renderTable() {
   const { blueprints, byBlueprint } = loaded;
   const tbody = $("table").querySelector("tbody");
@@ -1781,11 +1893,11 @@ function renderTable() {
     : `${rows.length} of ${blueprints.length} blueprint(s)`;
 
   if (!blueprints.length) {
-    tbody.innerHTML = `<tr><td colspan="8" style="color:var(--muted)">No agent identity blueprints found in this tenant.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" style="color:var(--muted)">No agent identity blueprints found in this tenant.</td></tr>`;
     return;
   }
   if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="8" style="color:var(--muted)">No blueprints match the current filters.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" style="color:var(--muted)">No blueprints match the current filters.</td></tr>`;
     return;
   }
 
@@ -1798,18 +1910,23 @@ function renderTable() {
     const consent = consentOf(bp);
     const consentCount = consent.delegated.length + consent.app.length;
     const creds = credList(bp);
-    const rowId = "ag_" + i;
-    const rolesId = "roles_" + i;
-    const consentId = "consent_" + i;
-    const credsId = "creds_" + i;
-    const riskId = "risk_" + i;
+    const detailId = "d_" + i;
+
+    // Everything secondary lives in one panel behind one chevron, so a healthy blueprint is a
+    // single line and only rows with something to say grow.
+    const detail = secRisk(r) + secCreds(creds) + secPerms(bp)
+      + secRoles(roles, assignees) + secConsent(consent) + secOwner(bp) + secAgents(agents);
+    const flags = blueprintFlags(bp);
 
     const tr = document.createElement("tr");
     tr.innerHTML = `
+      <td class="chev">${detail ? `<span class="expander" data-target="${detailId}" title="Show details" aria-label="Show details">▸</span>` : ``}</td>
       <td>
-        <div style="font-weight:600" title="${escapeHtml(principalsTip(bp))}">${escapeHtml(bp.displayName || "(no name)")}</div>
-        <div class="mono" style="white-space:nowrap">appId: ${bp.appId}</div>
-        ${blueprintFlags(bp)}
+        <div style="white-space:nowrap" title="${escapeHtml(principalsTip(bp))}">
+          <b>${escapeHtml(bp.displayName || "(no name)")}</b>
+          <span class="mono" style="margin-left:8px">${bp.appId}</span>
+        </div>
+        ${flags}
       </td>
       <td>${
           // Single-tenant + Home + AzureADMyOrg is the safe default and was on ~80% of rows —
@@ -1818,151 +1935,39 @@ function renderTable() {
         }${bp._external
             ? `<span class="badge b-ext" title="The blueprint application is registered in another tenant.">External</span>`
               + (bp._ownerIsMicrosoft ? `<span class="badge b-ms" title="Owner tenant is a known Microsoft first-party tenant.">${ICON_MS}Microsoft</span>` : ``)
-              + `<div class="mono" style="margin-top:3px">${bp._ownerName ? "<b>" + escapeHtml(bp._ownerName) + "</b>" : "unknown owner"}${
-                  // A Microsoft first-party tenant's defaultDomainName (e.g. sharepoint.com on the
-                  // Microsoft Services tenant) is unrelated to the product and only misleads — the
-                  // tenant name is authoritative. Still show it for third-party publishers.
-                  (bp._ownerDomain && !bp._ownerIsMicrosoft) ? " · " + escapeHtml(bp._ownerDomain) : ""
-                }<br>tenant: ${bp._ownerOrg || "?"}</div>`
             : ``}</td>
-      <td>
-        ${credBadges(bp)}
-        ${credFlagBadges(bp)}
-        ${expiryBadge(bp)}
-        ${creds.length ? `<div style="margin-top:3px"><span class="expander" data-target="${credsId}">details ▾</span></div>` : ``}
-      </td>
-      <td style="max-width:360px">${permChips(bp)}${inheritChips(bp)}</td>
-      <td><span class="badge ${r.cls}" title="${escapeHtml(r.why)}">${r.label}</span>
-          ${r.factors && r.factors.length ? `<div style="margin-top:4px"><span class="expander" data-target="${riskId}">why ▾</span></div>` : ``}</td>
-      <td style="text-align:center">
-        ${(roles.length || assignees.length)
-          ? `<span class="expander" data-target="${rolesId}">${roles.length} ▾</span>` : ``}
-        ${assignmentBadge(bp)}
-      </td>
-      <td style="text-align:center">
-        ${consentCount ? `<span class="expander" data-target="${consentId}">${consentCount} ▾</span>` : ``}
-      </td>
-      <td style="text-align:center">
-        ${agents.length
-          ? `<span class="expander" data-target="${rowId}" title="${agents.length} of the 250-per-blueprint cap"><span style="${agents.length > 200 ? "color:var(--red);font-weight:600" : ""}">${agents.length}${agents.length > 200 ? " / 250" : ""}</span> ▾</span>`
-          : ``}
-      </td>`;
+      <td>${credBadges(bp)}${credFlagBadges(bp)}${expiryBadge(bp)}</td>
+      <td style="max-width:340px">${permChips(bp)}${
+          // Only allAllowed inheritance earns a place in the row; the rest is in the panel.
+          inheritHasAll(bp) ? `<span class="badge b-risk-med" title="Every agent inherits all of this resource's permissions, including future ones.">Inherits: allAllowed</span>` : ``
+        }</td>
+      <td><span class="badge ${r.cls}" title="${escapeHtml(r.why)}">${r.label}</span></td>
+      <td style="text-align:center">${roles.length || assignees.length ? roles.length : ``}${assignmentBadge(bp)}</td>
+      <td style="text-align:center">${consentCount || ``}</td>
+      <td style="text-align:center">${agents.length
+          ? `<span title="${agents.length} of the 250-per-blueprint cap" style="${agents.length > 200 ? "color:var(--red);font-weight:600" : ""}">${agents.length}${agents.length > 200 ? " / 250" : ""}</span>`
+          : ``}</td>`;
     tbody.appendChild(tr);
 
-    if (r.factors && r.factors.length) {
-      const rwdetail = document.createElement("tr");
-      rwdetail.id = riskId;
-      rwdetail.className = "hidden";
-      rwdetail.innerHTML = `<td colspan="8" style="background:var(--hover)">
-        <div class="hint" style="margin:2px 0 6px"><b>Risk rationale — ${escapeHtml(r.label)}.</b> Each factor maps to a hardening step:</div>
-        <ul class="agent-list">${r.factors.map(f => `<li>${escapeHtml(f)}</li>`).join("")}</ul></td>`;
-      tbody.appendChild(rwdetail);
-    }
-
-    if (creds.length) {
-      const cddetail = document.createElement("tr");
-      cddetail.id = credsId;
-      cddetail.className = "hidden";
-      const items = creds.map(c => {
-        const badge = c.kind === "Secret" ? "b-secret" : "b-cert";
-        const st = c.status === "expired"
-          ? `<span style="color:var(--red);font-weight:600"> · EXPIRED ${fmtDate(c.end)}</span>`
-          : c.status === "soon"
-            ? `<span style="color:var(--red);font-weight:600"> · expires ${fmtDate(c.end)} (in ${c.daysLeft} days)</span>`
-            : c.end ? ` · expires ${fmtDate(c.end)} (in ${c.daysLeft} days)` : " · no expiry set";
-        return `
-        <li>
-          <span class="badge ${badge}">${c.kind}</span>
-          <b>${escapeHtml(c.name || "(no name)")}</b>
-          <span class="mono">${c.start ? " · from " + fmtDate(c.start) : ""}${st}</span>
-          ${c.thumbprint ? `<div class="mono">thumbprint: ${escapeHtml(c.thumbprint)}</div>` : ""}
-        </li>`;
-      }).join("");
-      cddetail.innerHTML = `<td colspan="8" style="background:var(--hover)">
-        <div class="hint" style="margin:2px 0 6px"><b>Client credentials</b> and expiry (federated credentials / FIC don't expire):</div>
-        <ul class="agent-list">${items}</ul></td>`;
-      tbody.appendChild(cddetail);
-    }
-
-    if (roles.length || assignees.length) {
-      const rdetail = document.createElement("tr");
-      rdetail.id = rolesId;
-      rdetail.className = "hidden";
-
-      const ZERO = "00000000-0000-0000-0000-000000000000";
-      const byRole = {};
-      assignees.forEach(a => { (byRole[a.appRoleId] = byRole[a.appRoleId] || []).push(a); });
-      const holderChips = list => list.map(h =>
-        `<span class="badge b-deleg" title="${escapeHtml(h.type)}">${escapeHtml(h.name)}</span>`).join("");
-
-      const items = roles.map(role => {
-        const members = (role.allowedMemberTypes || []).join(", ") || "—";
-        const holders = byRole[role.id] || [];
-        return `
-        <li>
-          <b>${escapeHtml(role.value || "(no value)")}</b>
-          <span class="mono"> · ${escapeHtml(role.displayName || "")} · [${escapeHtml(members)}]${role.isEnabled === false ? " · disabled" : ""}</span>
-          <div style="margin-top:3px">Assigned to: ${holders.length ? holderChips(holders) : `<span class="mono">no explicit assignments</span>`}</div>
-          ${role.description ? `<div class="hint" style="margin-top:2px">${escapeHtml(role.description)}</div>` : ""}
-        </li>`;
-      }).join("");
-
-      const defaults = byRole[ZERO] || [];
-      const defaultItem = defaults.length ? `
-        <li>
-          <b>(default access)</b> <span class="mono"> · no specific app role</span>
-          <div style="margin-top:3px">Assigned to: ${holderChips(defaults)}</div>
-        </li>` : "";
-
-      rdetail.innerHTML = `<td colspan="8" style="background:var(--hover)">
-        <div class="hint" style="margin:2px 0 6px"><b>App roles</b> exposed by this blueprint and the principals assigned to them:</div>
-        <ul class="agent-list">${items}${defaultItem}</ul></td>`;
-      tbody.appendChild(rdetail);
-    }
-
-    if (consentCount) {
-      const cdetail = document.createElement("tr");
-      cdetail.id = consentId;
-      cdetail.className = "hidden";
-      const delegatedItems = consent.delegated.map(d => `
-        <li>
-          <span class="badge b-deleg">${escapeHtml(d.scope)}</span>
-          <span class="mono"> · delegated · ${d.consentType === "AllPrincipals" ? "admin consent (all users)" : "user consent"}</span>
-        </li>`).join("");
-      const appItems = consent.app.map(a => `
-        <li>
-          <span class="badge b-approle">${escapeHtml(a.role)}</span>
-          <span class="mono"> · application · ${escapeHtml(a.resource)}</span>
-        </li>`).join("");
-      cdetail.innerHTML = `<td colspan="8" style="background:var(--hover)">
-        <div class="hint" style="margin:2px 0 6px"><b>Consent granted</b> to this blueprint's principal in your tenant:</div>
-        <ul class="agent-list">${delegatedItems}${appItems}</ul></td>`;
-      tbody.appendChild(cdetail);
-    }
-
-    if (agents.length) {
-      const detail = document.createElement("tr");
-      detail.id = rowId;
-      detail.className = "hidden";
-      const items = agents.map(agentLine).join("");
-      const cap = `<div class="hint" style="margin:2px 0 6px">
-        <b><span style="${agents.length > 200 ? "color:var(--red)" : ""}">${agents.length} of 250</span></b> agent identities (per-blueprint cap for app-only permissions).
-        Each agent's own direct grants load on expand.
-        Note: <code>AgentIdentity.CreateAsManager</code> is auto-granted and non-revocable — it never appears in the grants list, so its absence doesn't mean the blueprint can't self-manage agents.</div>`;
-      detail.innerHTML = `<td colspan="8" style="background:var(--hover)">
-        ${cap}
-        <ul class="agent-list">${items}</ul></td>`;
-      detail._agents = agents;   // for lazy-loading direct grants on first expand
-      tbody.appendChild(detail);
+    if (detail) {
+      const d = document.createElement("tr");
+      d.id = detailId;
+      d.className = "hidden";
+      d.innerHTML = `<td colspan="9" style="background:var(--hover)">${detail}</td>`;
+      d._agents = agents;   // for lazy-loading each agent's direct grants on first expand
+      tbody.appendChild(d);
     }
   });
 
-  tbody.querySelectorAll(".expander").forEach(el => {
+  tbody.querySelectorAll(".chev .expander").forEach(el => {
     el.addEventListener("click", () => {
       const row = $(el.dataset.target);
+      if (!row) return;
       const open = row.classList.toggle("hidden") === false;
-      el.innerHTML = el.innerHTML.replace(/[▾▴]/, open ? "▴" : "▾");   // innerHTML keeps the colored count span
-      if (open && row._agents) loadAgentGrants(row, row.querySelector(".agent-list"), row._agents);
+      el.textContent = open ? "▾" : "▸";
+      el.title = el.ariaLabel = open ? "Hide details" : "Show details";
+      if (open && row._agents && row._agents.length)
+        loadAgentGrants(row, row.querySelector(".agents-ul"), row._agents);
     });
   });
 }
