@@ -758,7 +758,30 @@ function mergePrincipals(blueprints, principals, myTenant) {
   });
 }
 
-const WELL_KNOWN_APIS = { "00000003-0000-0000-c000-000000000000": "Microsoft Graph" };
+// Offline fallback names, used only when the resource's service principal can't be read from the
+// tenant (the SP's own displayName always wins).
+const WELL_KNOWN_APIS = {
+  "00000003-0000-0000-c000-000000000000": "Microsoft Graph",
+  "ea9ffc3e-8a23-4a7d-836d-234d7c7565c1": "Agent 365 Tools",
+  "9b975845-388f-4429-889e-eab1ef63949c": "Agent 365 Observability",
+  "5a807f24-c9de-44ee-a3a7-329e88a00ffc": "Messaging Bot API"
+};
+
+// Name a resource app: tenant SP displayName > well-known fallback > raw appId.
+async function resolveResourceNames(appIds, base, at) {
+  await Promise.all([...appIds].map(async appId => {
+    if (!appId || resourceNames[appId]) return;
+    try {
+      const resp = await fetch(base + "/servicePrincipals(appId='" + appId + "')?$select=appId,displayName",
+        { headers: { Authorization: "Bearer " + at } });
+      if (resp.ok) {
+        const sp = await resp.json();
+        if (sp.displayName) { resourceNames[appId] = sp.displayName; return; }
+      }
+    } catch { /* fall through to the offline map */ }
+    if (WELL_KNOWN_APIS[appId]) resourceNames[appId] = WELL_KNOWN_APIS[appId];
+  }));
+}
 
 // Microsoft's agent-identity permission blocklist. High-risk Graph permissions that can NEVER be
 // granted to (or be effective for) an agent — even an admin can't consent. A declared perm on this
@@ -859,21 +882,32 @@ function inheritScopeList(obj) {
   return (obj && (obj.scopes || obj.value || obj.enumeratedScopes)) || [];
 }
 async function loadInheritable(blueprints, base, at) {
+  const raw = new Map();
   await Promise.all(blueprints.map(async bp => {
     bp._inherit = [];
     if (bp._external || !bp.id) return;   // external blueprint's application lives in another tenant
     try {
-      const entries = await graphGetAll(base + "/applications/" + bp.id
-        + "/microsoft.graph.agentIdentityBlueprint/inheritablePermissions", at);
-      bp._inherit = entries.map(e => ({
-        resourceAppId: e.resourceAppId,
-        resource: resourceNames[e.resourceAppId] || WELL_KNOWN_APIS[e.resourceAppId] || e.resourceAppId,
-        scopesKind: inheritKind(e.inheritableScopes),
-        scopesList: inheritScopeList(e.inheritableScopes),
-        rolesKind: inheritKind(e.inheritableRoles)
-      }));
+      raw.set(bp, await graphGetAll(base + "/applications/" + bp.id
+        + "/microsoft.graph.agentIdentityBlueprint/inheritablePermissions", at));
     } catch { /* best effort — betas/tenants may not expose it */ }
   }));
+
+  // A blueprint can inherit permissions for resources it never declares (Agent 365 Tools,
+  // Observability, …), so those appIds aren't in resourceNames yet — resolve them before rendering,
+  // otherwise the chips show raw GUIDs.
+  const need = new Set();
+  raw.forEach(entries => entries.forEach(e => { if (e.resourceAppId) need.add(e.resourceAppId); }));
+  await resolveResourceNames(need, base, at);
+
+  raw.forEach((entries, bp) => {
+    bp._inherit = entries.map(e => ({
+      resourceAppId: e.resourceAppId,
+      resource: resourceNames[e.resourceAppId] || WELL_KNOWN_APIS[e.resourceAppId] || e.resourceAppId,
+      scopesKind: inheritKind(e.inheritableScopes),
+      scopesList: inheritScopeList(e.inheritableScopes),
+      rolesKind: inheritKind(e.inheritableRoles)
+    }));
+  });
 }
 function inheritOf(bp) { return bp._inherit || []; }
 function inheritHasAll(bp) { return inheritOf(bp).some(i => i.scopesKind === "all" || i.rolesKind === "all"); }
@@ -889,8 +923,9 @@ function inheritChips(bp) {
   const chips = list.map(i => {
     const risky = i.scopesKind === "all" || i.rolesKind === "all";
     const roles = fmtRoles(i);
-    const tip = `${i.resource}: scopes=${fmtScopes(i)}${roles ? ", roles=" + roles : ""}`
-      + (risky ? " — allAllowed inherits every current & future perm on this resource to all agents." : "");
+    const tip = `${i.resource} · appId ${i.resourceAppId}\nscopes=${fmtScopes(i)}${roles ? ", roles=" + roles : ""}`
+      + (i.scopesKind === "enumerated" && i.scopesList.length ? "\n" + i.scopesList.join(", ") : "")
+      + (risky ? "\nallAllowed inherits every current & future perm on this resource to all agents." : "");
     return `<span class="badge ${risky ? "b-risk-med" : "b-deleg"}" title="${escapeHtml(tip)}">${escapeHtml(i.resource)}: scopes ${fmtScopes(i)}${roles ? " · roles " + roles : ""}</span>`;
   });
   return `<div class="hint" style="margin-top:6px">Inheritable → agents: ${chips.join(" ")}</div>`;
