@@ -611,8 +611,11 @@ const RISK_SP_SCOPES      = ["IdentityRiskyServicePrincipal.Read.All"];   // fal
 const CA_SCOPES           = ["Policy.Read.All"];                          // Conditional Access policies
 // The ONLY write scope. Deliberately never part of sign-in: the tool stays read-only until you
 // actually delete something, so an auditor can run it without holding delete rights.
-const WRITE_SCOPES        = ["Application.ReadWrite.All"];                // delete a blueprint (app + principal)
-const AGENT_DELETE_SCOPES = ["AgentIdentity.DeleteRestore.All"];          // delete a single agent identity
+// Agent-native delete scopes. Both are DeleteRestore (least privilege) and only need the Agent ID
+// Administrator role — NOT Cloud Application Administrator. Using the generic /applications delete
+// + Application.ReadWrite.All required Cloud App Admin, which most Agent ID admins don't hold → 403.
+const BLUEPRINT_DELETE_SCOPES = ["AgentIdentityBlueprint.DeleteRestore.All"];   // delete a blueprint (cascades)
+const AGENT_DELETE_SCOPES     = ["AgentIdentity.DeleteRestore.All"];            // delete a single agent identity
 
 let signInAvailable = null;   // null = not attempted, true = loaded, false = scope not consented
 let riskAvailable   = null;
@@ -2339,7 +2342,8 @@ $("manModal").addEventListener("click", e => { if (e.target === $("manModal")) $
 
 // One modal, driven by a "delete plan" so blueprint and agent deletion share the same confirm
 // flow. A plan is { title, confirmLabel, name (typed to confirm), scopes, url, consentErr,
-// successMsg, bodyHtml }.
+// roleHint, successMsg, bodyHtml }. roleHint is appended on a 403 (delegated perms are bounded by
+// the caller's directory role, so consent can succeed while the call is still denied).
 let delTarget = null;
 
 function blueprintDeletePlan(bp) {
@@ -2348,9 +2352,11 @@ function blueprintDeletePlan(bp) {
     title: "Delete blueprint",
     confirmLabel: "Type the blueprint name to confirm",
     name: bp.displayName || "",
-    scopes: WRITE_SCOPES,
-    url: graphBase() + "/applications/" + bp.id,
-    consentErr: "Write consent denied — needs Application.ReadWrite.All on the app registration.",
+    scopes: BLUEPRINT_DELETE_SCOPES,
+    // Agent-native cast endpoint: needs only the Agent ID Administrator role, not Cloud App Admin.
+    url: graphBase() + "/applications/" + bp.id + "/microsoft.graph.agentIdentityBlueprint",
+    consentErr: "Write consent denied — needs AgentIdentityBlueprint.DeleteRestore.All on the app registration.",
+    roleHint: "Deleting a blueprint needs the Agent ID Administrator role, or being an owner of this blueprint. Delegated permissions are bounded by your own directory roles, so consent can succeed while the delete is still denied.",
     successMsg: "Deleted “" + (bp.displayName || bp.appId) + "”. Its agent identities are being cascade soft-deleted; all are restorable from the recycle bin for 30 days. Reloading…",
     bodyHtml: `
       <div style="font-weight:600">${escapeHtml(bp.displayName || "(no name)")}</div>
@@ -2362,7 +2368,7 @@ function blueprintDeletePlan(bp) {
           : `This blueprint has no agent identities, so nothing cascades.`}</li>
         <li>Soft delete: recoverable from the recycle bin for <b>30 days</b>, then permanent.</li>
         <li><b>Restoring the blueprint does not undo the cascade</b> once it has run — each agent identity must then be restored individually.</li>
-        <li>Needs <code>Application.ReadWrite.All</code> and the <b>Cloud Application Administrator</b> role; you'll be asked to consent.</li>
+        <li>Needs <code>AgentIdentityBlueprint.DeleteRestore.All</code> and the <b>Agent ID Administrator</b> role (or blueprint ownership); you'll be asked to consent.</li>
       </ul>`
   };
 }
@@ -2375,6 +2381,7 @@ function agentDeletePlan(agent, bp) {
     scopes: AGENT_DELETE_SCOPES,
     url: graphBase() + "/servicePrincipals/" + agent.id + "/microsoft.graph.agentIdentity",
     consentErr: "Write consent denied — needs AgentIdentity.DeleteRestore.All on the app registration.",
+    roleHint: "Deleting an agent identity needs the Agent ID Administrator role, or being an owner of its blueprint. Delegated permissions are bounded by your own directory roles, so consent can succeed while the delete is still denied.",
     successMsg: "Deleted agent identity “" + (agent.displayName || agent.appId) + "”. It's restorable from the recycle bin for 30 days. Reloading…",
     bodyHtml: `
       <div style="font-weight:600">${escapeHtml(agent.displayName || "(no name)")}</div>
@@ -2425,7 +2432,9 @@ async function doDelete() {
     if (!resp.ok) {
       let detail = "";
       try { detail = (await resp.json()).error?.message || ""; } catch {}
-      throw new Error("HTTP " + resp.status + (detail ? " — " + detail : ""));
+      // A 403 after consent succeeded is a directory-role gap, not a scope gap — spell out the role.
+      const hint = (resp.status === 403 && plan.roleHint) ? " " + plan.roleHint : "";
+      throw new Error("HTTP " + resp.status + (detail ? " — " + detail : "") + hint);
     }
     closeDeleteModal();
     setStatus(plan.successMsg, false, true);
