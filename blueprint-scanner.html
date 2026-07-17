@@ -194,6 +194,9 @@
   button.danger:disabled { opacity: .45; cursor: not-allowed; filter: none; }
   .modal { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex;
            align-items: center; justify-content: center; z-index: 50; padding: 20px; }
+  /* .modal's display:flex outranks the earlier .hidden{display:none} (equal specificity, later
+     wins), so the dialog would show on load. This restores the hidden state with higher specificity. */
+  .modal.hidden { display: none; }
   .modal-box { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
                box-shadow: var(--shadow); padding: 22px 24px; max-width: 620px; width: 100%; }
   .modal-box h3 { margin: 0 0 12px; font-size: 16px; color: var(--red); }
@@ -293,6 +296,10 @@
         <option value="">Select a blueprint to delete…</option>
       </select>
       <button id="delBtn" class="danger" disabled>Delete…</button>
+      <select id="delAgentSelect" style="max-width:360px" aria-label="Agent identity to delete">
+        <option value="">Select an agent identity to delete…</option>
+      </select>
+      <button id="delAgentBtn" class="danger" disabled>Delete…</button>
     </div>
 
     <div class="summary" id="summary"></div>
@@ -375,9 +382,9 @@
      — deletion cascades to every agent identity, so a plain OK/Cancel would be too cheap. -->
 <div class="modal hidden" id="delModal" role="dialog" aria-modal="true" aria-labelledby="delTitle">
   <div class="modal-box">
-    <h3 id="delTitle">Delete blueprint</h3>
+    <h3 id="delTitle">Delete</h3>
     <div id="delBody"></div>
-    <label for="delConfirm">Type the blueprint name to confirm</label>
+    <label for="delConfirm" id="delConfirmLabel">Type the name to confirm</label>
     <input id="delConfirm" autocomplete="off" spellcheck="false" />
     <div class="row-actions">
       <button id="delGo" class="danger" disabled>Delete blueprint</button>
@@ -571,7 +578,8 @@ const RISK_SP_SCOPES      = ["IdentityRiskyServicePrincipal.Read.All"];   // fal
 const CA_SCOPES           = ["Policy.Read.All"];                          // Conditional Access policies
 // The ONLY write scope. Deliberately never part of sign-in: the tool stays read-only until you
 // actually delete something, so an auditor can run it without holding delete rights.
-const WRITE_SCOPES        = ["Application.ReadWrite.All"];                // delete a blueprint
+const WRITE_SCOPES        = ["Application.ReadWrite.All"];                // delete a blueprint (app + principal)
+const AGENT_DELETE_SCOPES = ["AgentIdentity.DeleteRestore.All"];          // delete a single agent identity
 
 let signInAvailable = null;   // null = not attempted, true = loaded, false = scope not consented
 let riskAvailable   = null;
@@ -587,10 +595,10 @@ async function elevatedToken(scopes) {
 // Write access is requested interactively, unlike the read-only optional scopes: the user has
 // explicitly asked to delete, so a consent prompt at that moment is expected rather than a
 // surprise. Returns null if consent is declined or the app registration lacks the permission.
-async function writeToken() {
-  try { return (await msalInstance.acquireTokenSilent({ scopes: WRITE_SCOPES, account })).accessToken; }
+async function writeToken(scopes) {
+  try { return (await msalInstance.acquireTokenSilent({ scopes, account })).accessToken; }
   catch {
-    try { return (await msalInstance.acquireTokenPopup({ scopes: WRITE_SCOPES, account })).accessToken; }
+    try { return (await msalInstance.acquireTokenPopup({ scopes, account })).accessToken; }
     catch { return null; }
   }
 }
@@ -1393,6 +1401,7 @@ function render(blueprints, byBlueprint, totalAgents) {
   loaded = { blueprints, byBlueprint, totalAgents };
   populateOwnerFilter();
   populateDeleteSelect();
+  populateAgentDeleteSelect();
   renderSummary();
   renderRiskChart();
   renderTable();
@@ -1416,6 +1425,26 @@ function populateDeleteSelect() {
   sel.value = cur;
   if (sel.selectedIndex < 0) sel.value = "";
   $("delBtn").disabled = !sel.value;
+}
+
+// Flat list of every agent identity across all blueprints (value = SP object id, needed for the
+// delete URL). Each option carries its parent blueprint so the same-named agents are tellable apart.
+function populateAgentDeleteSelect() {
+  const sel = $("delAgentSelect");
+  const cur = sel.value;
+  const rows = [];
+  Object.entries(loaded.byBlueprint).forEach(([appId, agents]) => {
+    const bp = loaded.blueprints.find(b => b.appId === appId);
+    (agents || []).forEach(a => { if (a.id) rows.push({ a, bpName: bp ? (bp.displayName || "") : "" }); });
+  });
+  rows.sort((x, y) => (x.a.displayName || "").localeCompare(y.a.displayName || ""));
+  sel.innerHTML = `<option value="">Select an agent identity to delete…</option>`
+    + rows.map(({ a, bpName }) =>
+        `<option value="${escapeHtml(a.id)}">${escapeHtml(a.displayName || "(no name)")}`
+        + (bpName ? ` · ${escapeHtml(bpName)}` : "") + `</option>`).join("");
+  sel.value = cur;
+  if (sel.selectedIndex < 0) sel.value = "";
+  $("delAgentBtn").disabled = !sel.value;
 }
 
 // Owners left the table, so the filter has to carry them: list every distinct owner alongside
@@ -2193,23 +2222,65 @@ function escapeHtml(s) {
 }
 
 // ---- delete a blueprint ----
+// One modal, driven by a "delete plan" so blueprint and agent deletion share the same confirm
+// flow. A plan is { title, confirmLabel, name (typed to confirm), scopes, url, consentErr,
+// successMsg, bodyHtml }.
 let delTarget = null;
 
-function openDeleteModal(bp) {
-  delTarget = bp;
+function blueprintDeletePlan(bp) {
   const n = agentCount(bp);
-  $("delBody").innerHTML = `
-    <div style="font-weight:600">${escapeHtml(bp.displayName || "(no name)")}</div>
-    <div class="mono" style="margin-bottom:10px">appId: ${escapeHtml(bp.appId)}</div>
-    <ul>
-      <li>Deletes the blueprint <b>application and its principal</b>.</li>
-      <li>${n
-        ? `Microsoft Entra will cascade soft-delete <b style="color:var(--red)">${plural(n, "agent identity", "agent identities")}</b> created from this blueprint, plus their agent user accounts. Anything those agents run will stop working.`
-        : `This blueprint has no agent identities, so nothing cascades.`}</li>
-      <li>Soft delete: recoverable from the recycle bin for <b>30 days</b>, then permanent.</li>
-      <li><b>Restoring the blueprint does not undo the cascade</b> once it has run — each agent identity must then be restored individually.</li>
-      <li>Needs <code>Application.ReadWrite.All</code> and the <b>Cloud Application Administrator</b> role; you'll be asked to consent.</li>
-    </ul>`;
+  return {
+    title: "Delete blueprint",
+    confirmLabel: "Type the blueprint name to confirm",
+    name: bp.displayName || "",
+    scopes: WRITE_SCOPES,
+    url: graphBase() + "/applications/" + bp.id,
+    consentErr: "Write consent denied — needs Application.ReadWrite.All on the app registration.",
+    successMsg: "Deleted “" + (bp.displayName || bp.appId) + "”. Its agent identities are being cascade soft-deleted; all are restorable from the recycle bin for 30 days. Reloading…",
+    bodyHtml: `
+      <div style="font-weight:600">${escapeHtml(bp.displayName || "(no name)")}</div>
+      <div class="mono" style="margin-bottom:10px">appId: ${escapeHtml(bp.appId)}</div>
+      <ul>
+        <li>Deletes the blueprint <b>application and its principal</b>.</li>
+        <li>${n
+          ? `Microsoft Entra will cascade soft-delete <b style="color:var(--red)">${plural(n, "agent identity", "agent identities")}</b> created from this blueprint, plus their agent user accounts. Anything those agents run will stop working.`
+          : `This blueprint has no agent identities, so nothing cascades.`}</li>
+        <li>Soft delete: recoverable from the recycle bin for <b>30 days</b>, then permanent.</li>
+        <li><b>Restoring the blueprint does not undo the cascade</b> once it has run — each agent identity must then be restored individually.</li>
+        <li>Needs <code>Application.ReadWrite.All</code> and the <b>Cloud Application Administrator</b> role; you'll be asked to consent.</li>
+      </ul>`
+  };
+}
+
+function agentDeletePlan(agent, bp) {
+  return {
+    title: "Delete agent identity",
+    confirmLabel: "Type the agent identity name to confirm",
+    name: agent.displayName || agent.appId || "",
+    scopes: AGENT_DELETE_SCOPES,
+    url: graphBase() + "/servicePrincipals/" + agent.id + "/microsoft.graph.agentIdentity",
+    consentErr: "Write consent denied — needs AgentIdentity.DeleteRestore.All on the app registration.",
+    successMsg: "Deleted agent identity “" + (agent.displayName || agent.appId) + "”. It's restorable from the recycle bin for 30 days. Reloading…",
+    bodyHtml: `
+      <div style="font-weight:600">${escapeHtml(agent.displayName || "(no name)")}</div>
+      <div class="mono" style="margin-bottom:10px">appId: ${escapeHtml(agent.appId || "")}</div>
+      <ul>
+        <li>Deletes this <b>single agent identity</b>${bp ? ` (created from <b>${escapeHtml(bp.displayName || "its blueprint")}</b>)` : ""}.</li>
+        <li><b>No cascade</b> — the blueprint and its other agent identities are untouched.</li>
+        <li>Anything this agent runs will stop working.</li>
+        <li>If it has a paired <b>agent user account</b>, that may need to be cleaned up separately.</li>
+        <li>Soft delete: recoverable from the recycle bin for <b>30 days</b>, then permanent.</li>
+        <li>Needs <code>AgentIdentity.DeleteRestore.All</code>; you'll be asked to consent.</li>
+      </ul>`
+  };
+}
+
+function openDeleteModal(plan) {
+  delTarget = plan;
+  $("delTitle").textContent = plan.title;
+  $("delConfirmLabel").textContent = plan.confirmLabel;
+  $("delGo").textContent = plan.title;
+  $("delBody").innerHTML = plan.bodyHtml;
   $("delConfirm").value = "";
   $("delGo").disabled = true;
   $("delStatus").textContent = "";
@@ -2222,29 +2293,27 @@ function closeDeleteModal() { $("delModal").classList.add("hidden"); delTarget =
 
 async function doDelete() {
   if (!delTarget) return;
-  const bp = delTarget;
+  const plan = delTarget;
   $("delGo").disabled = true;
   $("delStatus").className = "";
   $("delStatus").innerHTML = '<span class="spinner"></span>Requesting write consent…';
-  const at = await writeToken();
+  const at = await writeToken(plan.scopes);
   if (!at) {
     $("delStatus").className = "err";
-    $("delStatus").textContent = "Write consent denied — needs Application.ReadWrite.All on the app registration.";
+    $("delStatus").textContent = plan.consentErr;
     $("delGo").disabled = false;
     return;
   }
   try {
     $("delStatus").innerHTML = '<span class="spinner"></span>Deleting…';
-    const resp = await fetch(graphBase() + "/applications/" + bp.id, {
-      method: "DELETE", headers: { Authorization: "Bearer " + at }
-    });
+    const resp = await fetch(plan.url, { method: "DELETE", headers: { Authorization: "Bearer " + at } });
     if (!resp.ok) {
       let detail = "";
       try { detail = (await resp.json()).error?.message || ""; } catch {}
       throw new Error("HTTP " + resp.status + (detail ? " — " + detail : ""));
     }
     closeDeleteModal();
-    setStatus("Deleted “" + (bp.displayName || bp.appId) + "”. Its agent identities are being cascade soft-deleted; all are restorable from the recycle bin for 30 days. Reloading…", false, true);
+    setStatus(plan.successMsg, false, true);
     await loadBlueprints();
   } catch (e) {
     $("delStatus").className = "err";
@@ -2256,12 +2325,24 @@ async function doDelete() {
 $("delSelect").addEventListener("change", () => { $("delBtn").disabled = !$("delSelect").value; });
 $("delBtn").addEventListener("click", () => {
   const bp = loaded && loaded.blueprints.find(b => b.appId === $("delSelect").value);
-  if (bp) openDeleteModal(bp);
+  if (bp) openDeleteModal(blueprintDeletePlan(bp));
 });
 
-// Enable the button only on an exact name match — a typo shouldn't delete a fleet.
+$("delAgentSelect").addEventListener("change", () => { $("delAgentBtn").disabled = !$("delAgentSelect").value; });
+$("delAgentBtn").addEventListener("click", () => {
+  const id = $("delAgentSelect").value;
+  if (!loaded || !id) return;
+  let agent = null, parent = null;
+  Object.entries(loaded.byBlueprint).forEach(([appId, agents]) => {
+    const a = agents.find(x => x.id === id);
+    if (a) { agent = a; parent = loaded.blueprints.find(b => b.appId === appId); }
+  });
+  if (agent) openDeleteModal(agentDeletePlan(agent, parent));
+});
+
+// Enable the confirm button only on an exact name match — a typo shouldn't delete anything.
 $("delConfirm").addEventListener("input", () => {
-  $("delGo").disabled = !delTarget || $("delConfirm").value.trim() !== (delTarget.displayName || "").trim();
+  $("delGo").disabled = !delTarget || $("delConfirm").value.trim() !== (delTarget.name || "").trim();
 });
 $("delGo").addEventListener("click", doDelete);
 $("delCancel").addEventListener("click", closeDeleteModal);
