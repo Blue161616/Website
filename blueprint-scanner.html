@@ -150,6 +150,7 @@
   .badge[title] { cursor: help; }
   .msicon { vertical-align: -1px; margin-right: 4px; }
   .mi { width: 14px; height: 14px; vertical-align: -2px; margin-right: 6px; flex-shrink: 0; }
+  .stat .l .mi { width: 12px; height: 12px; vertical-align: -1.5px; margin-right: 5px; }
   .grp td { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px;
             background: var(--bg); padding: 14px 12px 6px; border-bottom: 1px solid var(--border); }
   tbody tr.grp:hover { background: var(--bg); }
@@ -1087,10 +1088,19 @@ function principalsTip(bp) {
   return [o ? "Owners: " + o : "No owner assigned", s ? "Sponsors: " + s : ""].filter(Boolean).join("\n");
 }
 
+// appRoleAssignmentRequired gates INBOUND access: whether a caller must hold one of this
+// blueprint's app roles before Entra will issue it a token for the blueprint. Two reasons that
+// only matters when the blueprint actually exposes app roles:
+//   - false is the Entra DEFAULT, so flagging it fires on essentially every blueprint;
+//   - with no app roles there is nothing to assign, and a blueprint isn't callable as a resource
+//     anyway (it only mints agent identities), so "open" gates a door into an empty room.
+function isOpenAccess(bp) {
+  return bp._assignmentRequired === false && appRolesOf(bp).length > 0;
+}
+
 function assignmentBadge(bp) {
-  // "Assignment required" is the locked-down default — say nothing. Only flag the exception.
-  if (bp._assignmentRequired === false)
-    return `<div style="margin-top:5px"><span class="badge b-risk-med" title="No explicit assignment required — any principal in the tenant can be issued tokens for this blueprint.">Open access</span></div>`;
+  if (isOpenAccess(bp))
+    return `<div style="margin-top:5px"><span class="badge b-risk-med" title="This blueprint exposes app roles, but appRoleAssignmentRequired is false — any principal in the tenant can be issued a token for them without being assigned a role first.">Open access</span></div>`;
   return "";
 }
 
@@ -1165,7 +1175,7 @@ function riskOf(bp) {
   const hasSecret  = (bp.passwordCredentials || []).length > 0;
   const secretDays = secretMaxLifetimeDays(bp);
   const multi      = !tenancy(bp.signInAudience).single;
-  const open       = bp._assignmentRequired === false;   // no app-role assignment required before tokens are issued
+  const open       = isOpenAccess(bp);   // only counts where the blueprint exposes app roles to gate
   const inheritAll = inheritHasAll(bp);
   const grantedApp = (consentOf(bp).app || []);
   const mailSend   = grantedApp.some(a => (a.role || "").toLowerCase() === "mail.send");
@@ -1193,7 +1203,7 @@ function riskOf(bp) {
   if (inheritAll)       add(30, "Inheritable permissions set to allAllowed — every agent inherits all of the resource's perms fleet-wide (the escalation lever).");
   if (redir.wildcard)   add(30, "Wildcard redirect URI — tokens can be redirected to attacker-controlled hosts.");
   if (multi)            add(20, "Multi-tenant (AzureADMultipleOrgs) — usable from other tenants; a consent-phishing surface.");
-  if (open)             add(20, "Open access — no app-role assignment required before Entra issues tokens.");
+  if (open)             add(20, "Exposes " + appRolesOf(bp).length + " app role(s) with no assignment required — any principal in the tenant can be issued a token for them.");
   if (mailSend)         add(20, "Mail.Send granted (application) — can send mail as any user (send-as-anyone).");
   if (hasSecret)        add(15, "Uses a client secret — the weakest credential. Prefer a managed-identity federated credential (FIC).");
   if (cf.secretPlusFic) add(15, "Client secret retained alongside a FIC — a live fallback credential path that defeats the point of the FIC. Remove the secret.");
@@ -1403,10 +1413,12 @@ function renderSummary() {
   const fcount = key => blueprints.filter(RISK_FACTORS.find(f => f.key === key).test).length;
   const pct = n => blueprints.length ? " (" + Math.round((n / blueprints.length) * 100) + "% of the estate)" : "";
 
-  const tile = (n, label, color, scope, tip) => {
+  // `icon` is a separate arg, not part of `label` — label also feeds the fallback tooltip, and raw
+  // SVG markup would leak into the hover text.
+  const tile = (n, label, color, scope, tip, icon) => {
     const active = scope.startsWith("factor:") ? activeFactor === scope.slice(7) : activeScope === scope;
     return `<div class="stat clickable${active ? " active" : ""}" data-scope="${scope}" title="${escapeHtml(tip || ("Click to scope the table to: " + label))}">
-       <div class="n"${color ? ` style="color:${color}"` : ""}>${n}</div><div class="l">${label}</div></div>`;
+       <div class="n"${color ? ` style="color:${color}"` : ""}>${n}</div><div class="l">${icon || ""}${label}</div></div>`;
   };
   // A scope-gated KPI with no data must not render "0" — that reads as "all clear" when it means
   // "never checked". Show an em dash and say what would unlock it.
@@ -1415,8 +1427,8 @@ function renderSummary() {
        <div class="n" style="color:var(--muted)">—</div><div class="l">${label}</div></div>`;
 
   $("summary").innerHTML =
-    tile(blueprints.length, "Blueprints", "var(--accent)", "all") +
-    tile(totalAgents, "Agent identities", "var(--accent)", "sort:agents") +
+    tile(blueprints.length, "Blueprints", "var(--accent)", "all", null, ICON_BLUEPRINT) +
+    tile(totalAgents, "Agent identities", "var(--accent)", "sort:agents", null, ICON_AGENTID) +
     tile(high, "Act today", "var(--red)", "risk:act",
       high + " of " + blueprints.length + " blueprints score 60+" + pct(high) + ".") +
     (riskAvailable === true
@@ -1474,8 +1486,8 @@ const RISK_FACTORS = [
     tip: "A secret retained alongside a FIC is a live fallback credential path." },
   { key: "multi",       sev: "high", label: "Multi-tenant",              test: bp => !tenancy(bp.signInAudience).single,
     tip: "AzureADMultipleOrgs — usable from other tenants; a consent-phishing surface." },
-  { key: "open",        sev: "high", label: "Open access",               test: bp => bp._assignmentRequired === false,
-    tip: "No app-role assignment required before Entra issues tokens." },
+  { key: "open",        sev: "high", label: "Open access",               test: bp => isOpenAccess(bp),
+    tip: "Exposes app roles with no assignment required — any principal in the tenant can be issued a token for them. (Not flagged when the blueprint exposes no roles: appRoleAssignmentRequired=false is the Entra default and gates nothing.)" },
   { key: "inheritall",  sev: "high", label: "Inheritable allAllowed",    test: bp => inheritHasAll(bp),
     tip: "Every agent inherits all of the resource's permissions fleet-wide — the escalation lever." },
   { key: "mailsend",    sev: "high", label: "Mail.Send granted",         test: bp => (consentOf(bp).app || []).some(a => (a.role || "").toLowerCase() === "mail.send"),
@@ -1663,7 +1675,8 @@ function exportRows() {
       riskWhy: riskOf(bp).why,
       riskFactors: (riskOf(bp).factors || []).map(f => "+" + f.pts + " " + f.text),
       assignmentRequired: bp._assignmentRequired === true ? "Yes"
-        : bp._assignmentRequired === false ? "No (open access)" : "",
+        : bp._assignmentRequired === false ? "No (the Entra default)" : "",
+      openAccess: isOpenAccess(bp) ? "Yes — exposes app roles with no assignment required" : "",
       accountEnabled: bp._accountEnabled === false ? "No" : bp._accountEnabled === true ? "Yes" : "",
       secrets: (bp.passwordCredentials || []).length,
       certificates: (bp.keyCredentials || []).length,
