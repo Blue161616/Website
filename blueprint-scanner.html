@@ -202,6 +202,19 @@
   .modal-box h3 { margin: 0 0 12px; font-size: 16px; color: var(--red); }
   .modal-box ul { margin: 8px 0 14px; padding-left: 18px; font-size: 13px; line-height: 1.65; }
   .modal-box li { margin: 3px 0; }
+  /* Manifest viewer: a wider box, a neutral (non-danger) title, a search toolbar and a scrollable code pane. */
+  .modal-box-lg { max-width: 940px; }
+  .modal-box-lg h3 { color: var(--text); }
+  .man-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .man-toolbar #manSearch { width: auto; flex: 1 1 220px; min-width: 150px; }
+  .man-toolbar input[type="checkbox"] { width: auto; }
+  .man-toolbar label { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .man-toolbar button { padding: 7px 12px; }
+  .man-pre { max-height: 60vh; overflow: auto; margin: 0; padding: 12px; background: var(--code-bg);
+             border: 1px solid var(--border); border-radius: 6px; font-family: "Cascadia Code", Consolas, monospace;
+             font-size: 12px; line-height: 1.5; white-space: pre; color: var(--text); }
+  .man-pre mark { background: #ffe08a; color: #000; border-radius: 2px; }
+  .man-pre mark.cur { background: #ff9800; box-shadow: 0 0 0 1px #b35c00; }
   /* ---- risk exposure chart ---- */
   .rf { display: grid; grid-template-columns: 190px 1fr 42px; align-items: center; gap: 12px;
         padding: 4px 6px; border-radius: 4px; cursor: pointer; }
@@ -292,9 +305,10 @@
       <span style="flex:1"></span>
       <!-- Deliberate, explicit target selection rather than a per-row button: deleting cascades to
            every agent identity, so picking the blueprint should be a conscious act. -->
-      <select id="delSelect" style="max-width:360px" aria-label="Blueprint to delete">
-        <option value="">Select a blueprint to delete…</option>
+      <select id="delSelect" style="max-width:360px" aria-label="Blueprint">
+        <option value="">Select a blueprint…</option>
       </select>
+      <button id="manBtn" class="secondary" disabled>View manifest</button>
       <button id="delBtn" class="danger" disabled>Delete…</button>
       <select id="delAgentSelect" style="max-width:360px" aria-label="Agent identity to delete">
         <option value="">Select an agent identity to delete…</option>
@@ -380,6 +394,25 @@
 
 <!-- Delete confirmation. Names the exact blast radius and requires the blueprint's name typed back
      — deletion cascades to every agent identity, so a plain OK/Cancel would be too cheap. -->
+<div class="modal hidden" id="manModal" role="dialog" aria-modal="true" aria-labelledby="manTitle">
+  <div class="modal-box modal-box-lg">
+    <h3 id="manTitle">Manifest</h3>
+    <div class="man-toolbar">
+      <input id="manSearch" type="text" placeholder="Search the manifest…" autocomplete="off" spellcheck="false" />
+      <button id="manPrev" class="secondary" title="Previous match" aria-label="Previous match">↑</button>
+      <button id="manNext" class="secondary" title="Next match" aria-label="Next match">↓</button>
+      <span id="manCount" class="hint" style="margin:0"></span>
+      <label><input id="manOnly" type="checkbox" /> matches only</label>
+      <span style="flex:1"></span>
+      <button id="manCopy" class="secondary">Copy</button>
+      <button id="manDownload" class="secondary">Download</button>
+      <button id="manClose" class="secondary">Close</button>
+    </div>
+    <pre id="manPre" class="man-pre" tabindex="0"></pre>
+    <div id="manStatus" style="margin-top:8px;font-size:13px"></div>
+  </div>
+</div>
+
 <div class="modal hidden" id="delModal" role="dialog" aria-modal="true" aria-labelledby="delTitle">
   <div class="modal-box">
     <h3 id="delTitle">Delete</h3>
@@ -1408,23 +1441,24 @@ function render(blueprints, byBlueprint, totalAgents) {
 }
 
 // Only home blueprints are listed: an external blueprint's application lives in the publisher's
-// tenant, so there's nothing here to delete. The agent count rides along in the option text —
-// that's the blast radius, and it should be visible before you even open the confirmation.
+// tenant, so there's nothing here to inspect or delete. The agent count rides along in the option
+// text — that's the blast radius, and it should be visible before you even open the confirmation.
+// This one dropdown drives both "View manifest" (read-only) and "Delete".
 function populateDeleteSelect() {
   const sel = $("delSelect");
   const cur = sel.value;
-  const deletable = loaded.blueprints
+  const listed = loaded.blueprints
     .filter(b => !b._external && b.id)
     .sort((a, b) => (a.displayName || "").localeCompare(b.displayName || ""));
-  sel.innerHTML = `<option value="">Select a blueprint to delete…</option>`
-    + deletable.map(b => {
+  sel.innerHTML = `<option value="">Select a blueprint…</option>`
+    + listed.map(b => {
         const n = agentCount(b);
         return `<option value="${escapeHtml(b.appId)}">${escapeHtml(b.displayName || "(no name)")}`
           + (n ? ` — ${plural(n, "agent", "agents")}` : "") + `</option>`;
       }).join("");
   sel.value = cur;
   if (sel.selectedIndex < 0) sel.value = "";
-  $("delBtn").disabled = !sel.value;
+  $("delBtn").disabled = $("manBtn").disabled = !sel.value;
 }
 
 // Flat list of every agent identity across all blueprints (value = SP object id, needed for the
@@ -2222,6 +2256,87 @@ function escapeHtml(s) {
 }
 
 // ---- delete a blueprint ----
+// ---- manifest viewer (read-only: the full application object with keyword search) ----
+let manifestRaw = "", manMatches = 0, manCur = -1;
+function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+async function openManifest(bp) {
+  $("manTitle").textContent = "Manifest — " + (bp.displayName || bp.appId);
+  $("manModal")._appId = bp.appId;
+  $("manSearch").value = ""; $("manOnly").checked = false;
+  manifestRaw = ""; manMatches = 0; manCur = -1;
+  $("manPre").textContent = ""; $("manCount").textContent = "";
+  $("manStatus").className = ""; $("manStatus").innerHTML = '<span class="spinner"></span>Loading manifest…';
+  $("manModal").classList.remove("hidden");
+  try {
+    const at = await token();   // full application object; Application.Read.All already covers it
+    const resp = await fetch(graphBase() + "/applications/" + bp.id, { headers: { Authorization: "Bearer " + at } });
+    if (!resp.ok) {
+      let d = ""; try { d = (await resp.json()).error?.message || ""; } catch {}
+      throw new Error("HTTP " + resp.status + (d ? " — " + d : ""));
+    }
+    manifestRaw = JSON.stringify(await resp.json(), null, 2);
+    $("manStatus").textContent = "";
+    renderManifest();
+    $("manSearch").focus();
+  } catch (e) {
+    $("manStatus").className = "err";
+    $("manStatus").textContent = "Couldn't load manifest: " + (e.message || e);
+  }
+}
+
+// Highlight matches by splitting on the query with a capture group — split() keeps the delimiters at
+// odd indices, so each segment is escaped independently and offsets never drift.
+function highlightManifest(text, q) {
+  if (!q) { manMatches = 0; return escapeHtml(text); }
+  const re = new RegExp("(" + escapeRegex(q) + ")", "gi");
+  let n = 0;
+  const html = text.split(re).map((part, i) =>
+    i % 2 === 1 ? `<mark data-m="${n++}">${escapeHtml(part)}</mark>` : escapeHtml(part)).join("");
+  manMatches = n;
+  return html;
+}
+
+function renderManifest() {
+  const q = $("manSearch").value;
+  let text = manifestRaw;
+  if ($("manOnly").checked && q) {
+    const lines = manifestRaw.split("\n").filter(l => l.toLowerCase().includes(q.toLowerCase()));
+    text = lines.length ? lines.join("\n") : "(no matching lines)";
+  }
+  $("manPre").innerHTML = highlightManifest(text, q);
+  manCur = manMatches ? 0 : -1;
+  updateManNav();
+}
+
+function updateManNav() {
+  $("manPre").querySelectorAll("mark.cur").forEach(m => m.classList.remove("cur"));
+  if (manCur >= 0) {
+    const el = $("manPre").querySelector(`mark[data-m="${manCur}"]`);
+    if (el) { el.classList.add("cur"); el.scrollIntoView({ block: "center" }); }
+  }
+  $("manCount").textContent = !$("manSearch").value ? "" : manMatches ? (manCur + 1) + " / " + manMatches : "no matches";
+}
+
+function manNav(dir) {
+  if (!manMatches) return;
+  manCur = (manCur + dir + manMatches) % manMatches;
+  updateManNav();
+}
+
+$("manSearch").addEventListener("input", renderManifest);
+$("manOnly").addEventListener("change", renderManifest);
+$("manNext").addEventListener("click", () => manNav(1));
+$("manPrev").addEventListener("click", () => manNav(-1));
+$("manSearch").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); manNav(e.shiftKey ? -1 : 1); } });
+$("manCopy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(manifestRaw); $("manStatus").className = ""; $("manStatus").textContent = "Copied to clipboard."; }
+  catch { $("manStatus").className = "err"; $("manStatus").textContent = "Copy failed — select the text and copy manually."; }
+});
+$("manDownload").addEventListener("click", () => download("manifest-" + ($("manModal")._appId || "blueprint") + ".json", manifestRaw, "application/json"));
+$("manClose").addEventListener("click", () => $("manModal").classList.add("hidden"));
+$("manModal").addEventListener("click", e => { if (e.target === $("manModal")) $("manModal").classList.add("hidden"); });
+
 // One modal, driven by a "delete plan" so blueprint and agent deletion share the same confirm
 // flow. A plan is { title, confirmLabel, name (typed to confirm), scopes, url, consentErr,
 // successMsg, bodyHtml }.
@@ -2322,7 +2437,11 @@ async function doDelete() {
   }
 }
 
-$("delSelect").addEventListener("change", () => { $("delBtn").disabled = !$("delSelect").value; });
+$("delSelect").addEventListener("change", () => { $("delBtn").disabled = $("manBtn").disabled = !$("delSelect").value; });
+$("manBtn").addEventListener("click", () => {
+  const bp = loaded && loaded.blueprints.find(b => b.appId === $("delSelect").value);
+  if (bp) openManifest(bp);
+});
 $("delBtn").addEventListener("click", () => {
   const bp = loaded && loaded.blueprints.find(b => b.appId === $("delSelect").value);
   if (bp) openDeleteModal(blueprintDeletePlan(bp));
@@ -2348,7 +2467,9 @@ $("delGo").addEventListener("click", doDelete);
 $("delCancel").addEventListener("click", closeDeleteModal);
 $("delModal").addEventListener("click", e => { if (e.target === $("delModal")) closeDeleteModal(); });
 document.addEventListener("keydown", e => {
-  if (e.key === "Escape" && !$("delModal").classList.contains("hidden")) closeDeleteModal();
+  if (e.key !== "Escape") return;
+  if (!$("delModal").classList.contains("hidden")) closeDeleteModal();
+  if (!$("manModal").classList.contains("hidden")) $("manModal").classList.add("hidden");
 });
 
 // Fill the static entity-icon placeholders from the single-source constants.
