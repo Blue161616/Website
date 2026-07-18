@@ -1081,6 +1081,24 @@ async function loadInheritable(blueprints, base, at) {
 function inheritOf(bp) { return bp._inherit || []; }
 function inheritHasAll(bp) { return inheritOf(bp).some(i => i.scopesKind === "all" || i.rolesKind === "all"); }
 
+// `inheritablePermissions` is the ONLY thing that makes a blueprint principal's grants matter. The
+// principal itself is a factory, not an app — the STS ignores its own oauth2PermissionGrants /
+// appRoleAssignments (verified). A granted permission becomes agent-effective only when an
+// inheritable conduit (allAllowed or enumerated) carries it to the agents. So grant risk is scored
+// through the conduit, never on the principal alone.
+function conduitCarries(bp) {
+  return inheritOf(bp).some(i => ["all", "enumerated"].includes(i.scopesKind) || ["all", "enumerated"].includes(i.rolesKind));
+}
+function grantsReachAgents(bp) { return (consentOf(bp).app || []).length > 0 && conduitCarries(bp); }
+// Displacement: the moment a blueprint principal holds any EXPLICIT app-role grant, the platform
+// drops its implicit CreateAsManager from enumeration (still functional). Signals that.
+function displacedCreateAsManager(bp) {
+  return (consentOf(bp).app || []).some(a => (a.role || "").toLowerCase() !== "agentidentity.createasmanager");
+}
+
+// inheritablePermissions is deprecated (announced only on the endpoint's response headers).
+const INHERIT_SUNSET = "This inheritance API (inheritablePermissions) is deprecated — Microsoft's published sunset is 28 Nov 2027; a successor is expected. Don't build lasting guidance on it.";
+
 function inheritChips(bp) {
   if (bp._external) return "";
   const list = inheritOf(bp);
@@ -1095,9 +1113,9 @@ function inheritChips(bp) {
     const tip = `${i.resource} · appId ${i.resourceAppId}\nscopes=${fmtScopes(i)}${roles ? ", roles=" + roles : ""}`
       + (i.scopesKind === "enumerated" && i.scopesList.length ? "\n" + i.scopesList.join(", ") : "")
       + (risky ? "\nallAllowed inherits every current & future perm on this resource to all agents." : "");
-    return `<span class="badge ${risky ? "b-risk-med" : "b-deleg"}" title="${escapeHtml(tip)}">${escapeHtml(i.resource)}: scopes ${fmtScopes(i)}${roles ? " · roles " + roles : ""}</span>`;
+    return `<span class="badge ${risky ? "b-risk-med" : "b-deleg"}" title="${escapeHtml(tip + "\n\n" + INHERIT_SUNSET)}">${escapeHtml(i.resource)}: scopes ${fmtScopes(i)}${roles ? " · roles " + roles : ""}</span>`;
   });
-  return `<div class="hint" style="margin-top:6px">Inheritable → agents: ${chips.join(" ")}</div>`;
+  return `<div class="hint" style="margin-top:6px" title="${escapeHtml(INHERIT_SUNSET)}">Inheritable → agents: ${chips.join(" ")} <span style="opacity:.7">· deprecated API (sunset 2027-11-28)</span></div>`;
 }
 
 function appRolesOf(bp) {
@@ -1269,6 +1287,9 @@ function riskOf(bp) {
   const open       = isOpenAccess(bp);   // only counts where the blueprint exposes app roles to gate
   const inheritAll = inheritHasAll(bp);
   const grantedApp = (consentOf(bp).app || []);
+  const carries    = conduitCarries(bp);                 // do inheritable perms actually flow to agents?
+  const grantsFlow = grantedApp.length > 0 && carries;   // grants matter only when the conduit carries them
+  const inertGrants = grantedApp.length > 0 && !carries; // granted on the principal but stuck there (factory)
   const mailSend   = grantedApp.some(a => (a.role || "").toLowerCase() === "mail.send");
   const agentN     = agentCount(bp);
   const cf         = credFlags(bp);
@@ -1291,11 +1312,12 @@ function riskOf(bp) {
   else if (atRisk)      add(riskLevel === "high" ? 40 : 25, "Identity Protection flags this identity at risk (level: " + (bp._risk.level || "?") + ").");
   if (riskyAgents.length) add(25, riskyAgents.length + " agent identit" + (riskyAgents.length === 1 ? "y is" : "ies are") + " flagged at risk / compromised by Identity Protection.");
   if (allDormant)       add(30, "All agent identities dormant (>30d) while holding a live credential — act on this today.");
-  if (inheritAll)       add(30, "Inheritable permissions set to allAllowed — every agent inherits all of the resource's perms fleet-wide (the escalation lever).");
+  if (inheritAll)       add(30, "Inheritable permissions set to allAllowed — every agent inherits ALL of the resource's perms fleet-wide, including ones granted later (the escalation lever).");
   if (redir.wildcard)   add(30, "Wildcard redirect URI — tokens can be redirected to attacker-controlled hosts.");
+  if (mailSend && carries) add(20, "Mail.Send is granted AND carried to agents by the inheritable conduit — those agents can send mail as any user (send-as-anyone).");
   if (multi)            add(20, "Multi-tenant (AzureADMultipleOrgs) — usable from other tenants; a consent-phishing surface.");
   if (open)             add(20, "Exposes " + appRolesOf(bp).length + " app role(s) with no assignment required — any principal in the tenant can be issued a token for them.");
-  if (mailSend)         add(20, "Mail.Send granted (application) — can send mail as any user (send-as-anyone).");
+  if (grantsFlow)       add(Math.min(12, grantedApp.length * 3), grantedApp.length + " application permission(s) granted AND carried to every agent by the inheritable conduit — this is what the agents can actually do.");
   if (hasSecret)        add(15, "Uses a client secret — the weakest credential. Prefer a managed-identity federated credential (FIC).");
   if (cf.secretPlusFic) add(15, "Client secret retained alongside a FIC — a live fallback credential path that defeats the point of the FIC. Remove the secret.");
   if (redir.http)       add(12, "Plain-http (non-loopback) redirect URI — tokens returned over cleartext.");
@@ -1304,8 +1326,10 @@ function riskOf(bp) {
   if (cf.multiSecret)   add(8,  credCounts(bp).secret + " client secrets configured — accumulation from re-provisioning; prune stale ones.");
   if (secretDays > 180) add(8,  "Long-lived secret (" + secretDays + "-day validity) — shorten the rotation window.");
   if (!(bp._owners || []).length) add(8, "No owner assigned — nobody is accountable for this blueprint.");
-  if (grantedApp.length) add(Math.min(10, grantedApp.length * 3), grantedApp.length + " application permission(s) actually granted (effective, not just declared).");
   if (credList(bp).some(c => c.status === "expired")) add(5, "Holds an expired credential — prune it.");
+  // Honest zero-point factors: recorded so the "why" panel explains the inert/displaced state.
+  if (inertGrants)      add(0, grantedApp.length + " application permission(s) sit on the blueprint principal, but no inheritable conduit carries them to agents — inert. A blueprint principal is a factory; the STS ignores its own grants.");
+  if (displacedCreateAsManager(bp)) add(0, "An explicit app-role grant is present, so the platform has dropped the implicit AgentIdentity.CreateAsManager from enumeration — it's no longer listed but remains functional.");
   // Blast radius scales the consequence of everything above, so it earns points but can't alone
   // push a clean blueprint out of Healthy.
   if (agentN)           add(Math.min(10, agentN), agentN + " agent identit" + (agentN === 1 ? "y" : "ies") + " inherit this blueprint (blast radius).");
@@ -1624,8 +1648,8 @@ const RISK_FACTORS = [
     tip: "Exposes app roles with no assignment required — any principal in the tenant can be issued a token for them. (Not flagged when the blueprint exposes no roles: appRoleAssignmentRequired=false is the Entra default and gates nothing.)" },
   { key: "inheritall",  sev: "high", label: "Inheritable allAllowed",    test: bp => inheritHasAll(bp),
     tip: "Every agent inherits all of the resource's permissions fleet-wide — the escalation lever." },
-  { key: "mailsend",    sev: "high", label: "Mail.Send granted",         test: bp => (consentOf(bp).app || []).some(a => (a.role || "").toLowerCase() === "mail.send"),
-    tip: "Can send mail as any user (send-as-anyone)." },
+  { key: "mailsend",    sev: "high", label: "Mail.Send → agents",         test: bp => conduitCarries(bp) && (consentOf(bp).app || []).some(a => (a.role || "").toLowerCase() === "mail.send"),
+    tip: "Mail.Send is granted AND carried to agents by the inheritable conduit — send-as-anyone. (Not flagged when no conduit carries it — it would be inert on the blueprint principal.)" },
   { key: "dormant",     sev: "high", label: "All agents dormant",        test: bp => allAgentsDormant(bp),
     tip: "No agent has signed in for 30+ days while the blueprint still holds a live credential." },
   { key: "redirect",    sev: "high", label: "Risky redirect URI",        test: bp => { const r = redirectInfo(bp); return r.wildcard || r.http; },
@@ -1637,8 +1661,8 @@ const RISK_FACTORS = [
       return ((loaded && loaded.byBlueprint && loaded.byBlueprint[bp.appId]) || []).some(a => flagged(st(a)));
     },
     tip: "The blueprint principal or one of its agents is flagged at risk / admin-confirmed compromised by Identity Protection." },
-  { key: "granted",     sev: "med",  label: "App perms granted",         test: bp => (consentOf(bp).app || []).length > 0,
-    tip: "Application permissions actually granted (effective, not just declared)." },
+  { key: "granted",     sev: "med",  label: "Granted → agents",          test: bp => grantsReachAgents(bp),
+    tip: "Application permissions granted AND carried to every agent by the inheritable conduit — what the agents can actually do. Grants without a conduit are inert on the principal and not flagged." },
   { key: "blocked",     sev: "med",  label: "Blocked declared perms",    test: bp => (bp._perms || []).some(p => p.blocked),
     tip: "Declares Graph permissions on Microsoft's agent blocklist — inert, and they overstate risk." },
   { key: "multisecret", sev: "med",  label: "Multiple secrets",          test: bp => credFlags(bp).multiSecret,
@@ -2047,7 +2071,10 @@ function secPerms(bp) {
       <span class="mono"> · scopes ${escapeHtml(i.scopesKind || "—")}${i.rolesKind ? " · roles " + escapeHtml(i.rolesKind) : ""} · appId ${escapeHtml(i.resourceAppId || "")}</span>
       ${i.scopesKind === "enumerated" && i.scopesList.length ? `<div class="hint">${escapeHtml(i.scopesList.join(", "))}</div>` : ""}
       ${(i.scopesKind === "all" || i.rolesKind === "all") ? `<div class="hint" style="color:var(--red)">allAllowed — every agent inherits all of this resource's permissions, including future ones.</div>` : ""}</li>`).join("");
-    out += `<div class="dsec" data-sec="inherit"><div class="dhead">Inheritable → every agent</div><ul class="agent-list">${items}</ul></div>`;
+    out += `<div class="dsec" data-sec="inherit"><div class="dhead">Inheritable → every agent</div>
+      <div class="hint" style="margin:0 0 6px">This is the conduit that makes granted permissions agent-effective. Grants with no conduit stay inert on the principal.</div>
+      <ul class="agent-list">${items}</ul>
+      <div class="hint" style="margin:6px 0 0">${escapeHtml(INHERIT_SUNSET)}</div></div>`;
   }
   return out;
 }
@@ -2075,15 +2102,25 @@ function secRoles(roles, assignees) {
     <ul class="agent-list">${items}${defaultItem}</ul></div>`;
 }
 
-function secConsent(consent) {
+function secConsent(bp) {
+  const consent = consentOf(bp);
   const n = consent.delegated.length + consent.app.length;
-  if (!n) return "";
+  if (!n) return "";   // no grants on the principal is the default — say nothing
+  const carries = conduitCarries(bp);
   const d = consent.delegated.map(x => `<li><span class="badge b-deleg">${escapeHtml(x.scope)}</span>
     <span class="mono"> · delegated · ${x.consentType === "AllPrincipals" ? "admin consent (all users)" : "user consent"}</span></li>`).join("");
   const a = consent.app.map(x => `<li><span class="badge b-approle">${escapeHtml(x.role)}</span>
     <span class="mono"> · application · ${escapeHtml(x.resource)}</span></li>`).join("");
-  return `<div class="dsec" data-sec="consent"><div class="dhead">Consent granted <span class="hint">(what this principal actually holds in your tenant)</span></div>
-    <ul class="agent-list">${d}${a}</ul></div>`;
+  // The blueprint principal is a factory, not an app: the STS ignores its own grants. What's below
+  // is directory state — it becomes AGENT-effective only where an inheritable conduit carries it.
+  const effect = bp._external ? ""
+    : carries
+      ? `<div class="hint" style="margin:0 0 6px;color:var(--red)">An inheritable conduit is open, so these flow to every agent — this is what the agents can actually do.</div>`
+      : `<div class="hint" style="margin:0 0 6px">Inert on the principal — no inheritable conduit carries these to agents. A blueprint principal is a factory; the STS ignores its own grants. Effective agent permissions live only in the token, not the directory.</div>`;
+  const disp = (!bp._external && displacedCreateAsManager(bp))
+    ? `<div class="hint" style="margin:6px 0 0">An explicit grant is present, so the platform dropped the implicit <code>AgentIdentity.CreateAsManager</code> from this list — it's no longer shown but remains functional.</div>` : "";
+  return `<div class="dsec" data-sec="consent"><div class="dhead">Grants on the principal <span class="hint">(directory state — effective for agents only via the conduit)</span></div>
+    ${effect}<ul class="agent-list">${a}${d}</ul>${disp}</div>`;
 }
 
 function secOwner(bp) {
@@ -2204,7 +2241,7 @@ function renderRow(bp, i, tbody, byBlueprint) {
     // Everything secondary lives in one panel behind one chevron, so a healthy blueprint is a
     // single line and only rows with something to say grow.
     const detail = secRisk(r) + secCreds(creds) + secPerms(bp)
-      + secRoles(roles, assignees) + secConsent(consent) + secOwner(bp) + secAgents(agents);
+      + secRoles(roles, assignees) + secConsent(bp) + secOwner(bp) + secAgents(agents);
     const flags = blueprintFlags(bp);
 
     const tr = document.createElement("tr");
