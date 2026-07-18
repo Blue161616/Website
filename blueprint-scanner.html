@@ -222,6 +222,14 @@
              font-size: 12px; line-height: 1.5; white-space: pre; color: var(--text); }
   .man-pre mark { background: #ffe08a; color: #000; border-radius: 2px; }
   .man-pre mark.cur { background: #ff9800; box-shadow: 0 0 0 1px #b35c00; }
+  .jwt-claims { width: 100%; border-collapse: collapse; margin: 4px 0 12px; }
+  .jwt-claims td { padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: top; font-size: 12.5px; }
+  .jwt-claims td.k { color: var(--muted); white-space: nowrap; width: 130px; font-family: "Cascadia Code", Consolas, monospace; font-size: 11px; }
+  .jwt-claims td.v { font-family: "Cascadia Code", Consolas, monospace; font-size: 11px; word-break: break-all; }
+  .jwt-diff { border: 1px solid var(--border); border-left-width: 3px; border-radius: 6px; padding: 10px 12px; margin: 0 0 12px; font-size: 12.5px; line-height: 1.55; }
+  .jwt-diff.lie { border-left-color: var(--red); background: var(--red-bg); }
+  .jwt-diff.ok  { border-left-color: var(--green); background: var(--green-bg); }
+  .jwt-diff.none { border-left-color: var(--accent); background: var(--hover); color: var(--muted); }
   /* ---- risk exposure chart ---- */
   .rf { display: grid; grid-template-columns: 190px 1fr 42px; align-items: center; gap: 12px;
         padding: 4px 6px; border-radius: 4px; cursor: pointer; }
@@ -375,6 +383,7 @@
         <span class="count" id="tableCount"></span>
         <button id="exportCsv" class="secondary" style="padding:6px 12px">Export CSV</button>
         <button id="exportJson" class="secondary" style="padding:6px 12px">Export JSON</button>
+        <button id="jwtBtn" class="secondary" style="padding:6px 12px">Decode token</button>
       </div>
       <div class="hint" style="margin:-4px 0 10px">Only exceptions are shown — a blank cell is the safe default
         (single-tenant, home-authored, nothing declared, assignment required, no expiry due).</div>
@@ -402,6 +411,21 @@
 
 <!-- Delete confirmation. Names the exact blast radius and requires the blueprint's name typed back
      — deletion cascades to every agent identity, so a plain OK/Cancel would be too cheap. -->
+<div class="modal hidden" id="jwtModal" role="dialog" aria-modal="true" aria-labelledby="jwtTitle">
+  <div class="modal-box modal-box-lg">
+    <h3 id="jwtTitle">Decode a token</h3>
+    <div class="hint" style="margin:-4px 0 8px">Paste a blueprint-principal or agent access token (JWT). It's decoded
+      <b>locally in your browser</b> — never sent anywhere. The point: diff what the token actually carries against what the directory claims.</div>
+    <textarea id="jwtInput" rows="3" placeholder="eyJ0eXAiOiJKV1QiLCJhbGc…" autocomplete="off" spellcheck="false"
+      style="width:100%;font-family:'Cascadia Code',Consolas,monospace;font-size:11px;resize:vertical"></textarea>
+    <div id="jwtStatus" style="margin:6px 0;font-size:13px"></div>
+    <div id="jwtOut"></div>
+    <div class="row-actions" style="margin-top:12px">
+      <button id="jwtClose" class="secondary">Close</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal hidden" id="manModal" role="dialog" aria-modal="true" aria-labelledby="manTitle">
   <div class="modal-box modal-box-lg">
     <h3 id="manTitle">Manifest</h3>
@@ -2404,6 +2428,94 @@ $("manDownload").addEventListener("click", () => download("manifest-" + ($("manM
 $("manClose").addEventListener("click", () => $("manModal").classList.add("hidden"));
 $("manModal").addEventListener("click", e => { if (e.target === $("manModal")) $("manModal").classList.add("hidden"); });
 
+// ---- token decoder (client-side JWT; the token is NEVER transmitted or used to call Graph) ----
+function decodeJwt(raw) {
+  const token = raw.trim().replace(/^Bearer\s+/i, "");
+  const parts = token.split(".");
+  if (parts.length < 2) throw new Error("That doesn't look like a JWT (expected header.payload.signature).");
+  const b64 = s => {
+    s = s.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = s.length % 4;
+    if (pad === 2) s += "=="; else if (pad === 3) s += "="; else if (pad === 1) throw new Error("Malformed token (bad base64url length).");
+    return new TextDecoder().decode(Uint8Array.from(atob(s), c => c.charCodeAt(0)));
+  };
+  return { header: JSON.parse(b64(parts[0])), payload: JSON.parse(b64(parts[1])) };
+}
+function fmtEpoch(s) { return s ? new Date(s * 1000).toISOString().replace("T", " ").slice(0, 19) + "Z" : ""; }
+const rolesOf = p => Array.isArray(p.roles) ? p.roles : (p.roles ? [p.roles] : []);
+
+// Match the token to a loaded blueprint principal or agent identity and diff token.roles against the
+// directory — the "directory lies" proof, per token. Purely local comparison, no network.
+function jwtDiff(p) {
+  if (!loaded) return { cls: "none", html: "Load blueprints first to diff this token against the directory." };
+  const roles = rolesOf(p), appid = (p.appid || "").toLowerCase(), oid = (p.oid || "").toLowerCase();
+  const chip = (arr, cls) => arr.length ? arr.map(r => `<span class="badge ${cls}">${escapeHtml(r)}</span>`).join(" ") : `<span class="mono">none</span>`;
+
+  const bp = loaded.blueprints.find(b => !b._external && (b.appId || "").toLowerCase() === appid);
+  let agent = null, agentBp = null;
+  Object.entries(loaded.byBlueprint).forEach(([app, ags]) => {
+    const a = (ags || []).find(x => [oid, appid].includes((x.id || "").toLowerCase()));
+    if (a) { agent = a; agentBp = loaded.blueprints.find(b => b.appId === app); }
+  });
+
+  if (bp) {
+    const dir = (consentOf(bp).app || []).map(a => a.role);
+    const inert = dir.filter(r => !roles.includes(r));
+    const tokenOnly = roles.filter(r => !dir.includes(r));
+    const disagree = inert.length || tokenOnly.length;
+    return { cls: disagree ? "lie" : "ok",
+      html: `<b>Blueprint principal token — ${escapeHtml(bp.displayName || bp.appId)}</b>
+        <div style="margin-top:6px">Token <code>roles</code> (what it can actually do): ${chip(roles, "b-approle")}</div>
+        <div style="margin-top:4px">Directory grants on the principal: ${chip(dir, "b-deleg")}</div>
+        ${inert.length ? `<div style="margin-top:6px;color:var(--red)"><b>${plural(inert.length, "directory grant")} the token does NOT carry — inert:</b> ${chip(inert, "b-blocked")} <span class="attrib">(per Blue16 research)</span></div>` : ""}
+        ${tokenOnly.length ? `<div style="margin-top:6px;color:var(--red)"><b>${plural(tokenOnly.length, "role")} the token carries that the directory does NOT list</b> (e.g. the implicit CreateAsManager): ${chip(tokenOnly, "b-approle")}</div>` : ""}
+        ${!disagree ? `<div style="margin-top:6px;color:var(--green)">Token and directory agree.</div>` : ""}` };
+  }
+  if (agent) {
+    const direct = (agent._grants || []).map(g => g.role);
+    return { cls: roles.length ? "lie" : "none",
+      html: `<b>Agent identity token — ${escapeHtml(agent.displayName || agent.appId)}${agentBp ? " (from " + escapeHtml(agentBp.displayName || "blueprint") + ")" : ""}</b>
+        <div style="margin-top:6px">Token <code>roles</code> (effective, via inheritance): ${chip(roles, "b-approle")}</div>
+        <div style="margin-top:4px">Directory <code>appRoleAssignments</code> on the agent: ${chip(direct, "b-deleg")}${agent._grants ? "" : " <span class='mono'>(expand its blueprint's agent list to load)</span>"}</div>
+        ${roles.length
+          ? `<div style="margin-top:6px;color:var(--red)"><b>The token carries ${plural(roles.length, "role")} the directory reports as ${direct.length} direct — inherited permissions are invisible in Graph. The directory under-reports.</b> <span class="attrib">(per Blue16 research)</span></div>`
+          : `<div style="margin-top:6px;color:var(--muted)">Token carries no app roles.</div>`}` };
+  }
+  return { cls: "none", html: `This token's <code>appid</code>/<code>oid</code> doesn't match a loaded blueprint principal or agent identity in this tenant — claims are shown above, but there's nothing loaded to diff it against.` };
+}
+
+function renderDecoded() {
+  const raw = $("jwtInput").value.trim();
+  $("jwtStatus").className = ""; $("jwtStatus").textContent = ""; $("jwtOut").innerHTML = "";
+  if (!raw) return;
+  let dec;
+  try { dec = decodeJwt(raw); }
+  catch (e) { $("jwtStatus").className = "err"; $("jwtStatus").textContent = e.message || String(e); return; }
+  const p = dec.payload, roles = rolesOf(p);
+  const row = (k, v) => (v || v === 0) ? `<tr><td class="k">${k}</td><td class="v">${escapeHtml(String(v))}</td></tr>` : "";
+  const expNote = p.exp ? (p.exp < Date.now() / 1000 ? " · EXPIRED" : " · valid") : "";
+  const claims = `<table class="jwt-claims">
+    ${row("aud", p.aud)}${row("appid", p.appid)}${row("oid", p.oid)}${row("sub", p.sub)}${row("tid", p.tid)}
+    ${row("idtyp", p.idtyp)}${row("app_displayname", p.app_displayname)}
+    <tr><td class="k">roles</td><td class="v">${roles.length ? roles.map(r => `<span class="badge b-approle">${escapeHtml(r)}</span>`).join(" ") : "<span class='mono'>none</span>"}</td></tr>
+    ${row("scp", p.scp)}${row("iat", fmtEpoch(p.iat))}${row("exp", fmtEpoch(p.exp) + expNote)}</table>`;
+  const diff = jwtDiff(p);
+  $("jwtOut").innerHTML = `<div class="dhead" style="border:none;margin:0 0 2px">Relevant claims</div>${claims}
+    <div class="jwt-diff ${diff.cls}">${diff.html}</div>
+    <details><summary style="cursor:pointer;font-size:12px;color:var(--accent)">Full payload</summary>
+      <pre class="man-pre" style="margin-top:6px">${escapeHtml(JSON.stringify(p, null, 2))}</pre></details>`;
+}
+
+function openDecoder() {
+  $("jwtInput").value = ""; $("jwtStatus").textContent = ""; $("jwtOut").innerHTML = "";
+  $("jwtModal").classList.remove("hidden");
+  $("jwtInput").focus();
+}
+$("jwtBtn").addEventListener("click", openDecoder);
+$("jwtInput").addEventListener("input", renderDecoded);
+$("jwtClose").addEventListener("click", () => $("jwtModal").classList.add("hidden"));
+$("jwtModal").addEventListener("click", e => { if (e.target === $("jwtModal")) $("jwtModal").classList.add("hidden"); });
+
 // One modal, driven by a "delete plan" so blueprint and agent deletion share the same confirm
 // flow. A plan is { title, confirmLabel, name (typed to confirm), scopes, url, consentErr,
 // roleHint, successMsg, bodyHtml }. roleHint is appended on a 403 (delegated perms are bounded by
@@ -2543,6 +2655,7 @@ document.addEventListener("keydown", e => {
   if (e.key !== "Escape") return;
   if (!$("delModal").classList.contains("hidden")) closeDeleteModal();
   if (!$("manModal").classList.contains("hidden")) $("manModal").classList.add("hidden");
+  if (!$("jwtModal").classList.contains("hidden")) $("jwtModal").classList.add("hidden");
 });
 
 // Fill the static entity-icon placeholders from the single-source constants.
