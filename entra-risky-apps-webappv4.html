@@ -248,6 +248,7 @@
       <button id="btn-signout" class="secondary hidden">Sign out</button>
       <span id="status" aria-live="polite"></span>
     </div>
+    <div class="hint" id="tenant-indicator" style="margin-top:10px"></div>
   </section>
 
   <div id="err-box"></div>
@@ -388,15 +389,42 @@
   function setStatus(msg, isErr, busy){ var s = el('status'); s.className = isErr ? 'err' : ''; s.innerHTML = (busy ? '<span class="spinner"></span>' : '') + (msg || ''); }
   function showError(err){ el('err-box').innerHTML = '<div class="notice notice-warn">' + escHtml((err && (err.message || err.errorMessage)) || String(err)) + '</div>'; console.error(err); }
   function clearError(){ el('err-box').innerHTML = ''; }
+  // Sign-in failures get a plain-language explanation for the two common tenant/consent traps, with the
+  // raw AADSTS text kept underneath for reference.
+  function showAuthError(e){
+    var msg = (e && (e.message || e.errorMessage)) || String(e);
+    var pinned = effectiveTenant(), friendly = null;
+    if(/AADSTS50020|does not exist in tenant|AADSTS90072/i.test(msg)){
+      friendly = '<b>Wrong directory for this account.</b> Sign-in is ' + (pinned ? 'pinned to tenant <code>' + escHtml(pinned) + '</code>' : 'targeting a specific tenant')
+        + ', but the account you picked belongs to a different tenant, so it can’t access this app there. '
+        + '<b>Fix:</b> open <b>Advanced &rsaquo; pin to a specific tenant</b> and ' + (pinned ? 'clear it (auto-detect) or set it to the tenant you want to scan' : 'set the tenant you want to scan')
+        + ', then <b>Sign out</b> and sign in with an account that belongs to that tenant. The account and the pinned tenant must match.';
+    } else if(/AADSTS650051|AADSTS65001|AADSTS700016|AADSTS900971|consent_required|interaction_required|not found in the directory|was not found in the tenant/i.test(msg)){
+      friendly = '<b>App not consented in this tenant yet.</b> This multi-tenant tool must be admin-consented once per tenant. '
+        + '<b>Fix:</b> click <b>Admin-consent this app</b> and approve as a <b>Global Administrator</b> of the tenant you want to scan, then sign in.';
+    }
+    el('err-box').innerHTML = '<div class="notice notice-warn">' + (friendly || escHtml(msg))
+      + (friendly ? '<div class="hint" style="margin-top:6px">Entra detail: <code>' + escHtml(msg.slice(0, 300)) + '</code></div>' : '') + '</div>';
+    console.error(e);
+  }
 
-  try { var saved = JSON.parse(localStorage.getItem('entraRiskyAppsCfg') || '{}'); if(saved.tenant) el('cfg-tenant').value = saved.tenant; } catch(e){}
-  function persistConfig(){ try { localStorage.setItem('entraRiskyAppsCfg', JSON.stringify({ tenant: el('cfg-tenant').value.trim() })); } catch(e){} }
+  // The sign-in tenant is intentionally NOT remembered across sessions. A stale pinned tenant silently
+  // forces the authority to the wrong directory, so an account from another tenant fails with AADSTS50020.
+  // Default is auto-detect (empty → 'organizations'); pinning is an explicit, per-session choice that the
+  // indicator below always shows.
+  function effectiveTenant(){ return el('cfg-tenant').value.trim(); }
+  function updateTenantIndicator(){
+    var t = effectiveTenant();
+    el('tenant-indicator').innerHTML = t
+      ? 'Sign-in directory: <b>' + escHtml(t) + '</b> (pinned) — the account you sign in with must belong to this tenant.'
+      : 'Sign-in directory: <b>auto-detect</b> — follows whichever organizational account you pick. Pin a tenant above only if you need to force one.';
+  }
 
   (function handleConsentReturn(){
     var params = new URLSearchParams(window.location.search);
     if(!params.has('admin_consent')) return;
     var ok = params.get('admin_consent') === 'True', tenant = params.get('tenant'), errDesc = params.get('error_description');
-    if(tenant){ el('cfg-tenant').value = tenant; try { localStorage.setItem('entraRiskyAppsCfg', JSON.stringify({ tenant: tenant })); } catch(e){} }
+    if(tenant){ el('cfg-tenant').value = tenant; }   // set for this session only — not persisted across sessions
     window.history.replaceState({}, document.title, window.location.origin + window.location.pathname);
     if(ok) el('err-box').innerHTML = '<div class="notice notice-ok">Admin consent granted for tenant <code>' + escHtml(tenant) + '</code>. Click <b>Sign in and scan</b> to continue.</div>';
     else if(errDesc) el('err-box').innerHTML = '<div class="notice notice-warn">Admin consent failed: ' + escHtml(errDesc) + '</div>';
@@ -411,12 +439,12 @@
     });
   }
   function startAdminConsent(){
-    clearError(); persistConfig();
+    clearError();
     var t = el('cfg-tenant').value.trim() || 'organizations';
     window.location.href = 'https://login.microsoftonline.com/' + encodeURIComponent(t) + '/adminconsent?client_id=' + encodeURIComponent(APP_CLIENT_ID) + '&redirect_uri=' + encodeURIComponent(REDIRECT_URI);
   }
   async function signIn(){
-    clearError(); persistConfig();
+    clearError();
     try {
       setStatus('Signing in…', false, true);
       msalInstance = buildMsal();
@@ -426,7 +454,7 @@
       el('who').innerHTML = 'Signed in as <strong>' + escHtml(account.username) + '</strong>';
       show('btn-signout'); hide('connectForm'); el('btn-signin').textContent = 'Re-run scan';
       await runAudit();
-    } catch(e){ setStatus(''); showError(e); }
+    } catch(e){ setStatus(''); showAuthError(e); }
   }
   function signOut(){
     if(msalInstance && account) msalInstance.logoutPopup({ account: account }).catch(function(){});
@@ -1175,6 +1203,8 @@
   el('btn-consent').addEventListener('click', startAdminConsent);
   el('btn-signin').addEventListener('click', signIn);
   el('btn-signout').addEventListener('click', signOut);
+  el('cfg-tenant').addEventListener('input', updateTenantIndicator);
+  updateTenantIndicator();
   el('btn-refresh').addEventListener('click', runAudit);
   el('btn-csv').addEventListener('click', exportCsv);
   el('q').addEventListener('input', renderTable);
