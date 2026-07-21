@@ -159,6 +159,16 @@
   .dlist li { margin-bottom: 4px; }
   .dlist code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; font-size: 11.5px; color: var(--amber); }
   .dmuted { font-size: 12.5px; color: var(--muted); line-height: 1.7; margin: 0; }
+  /* Risk content is coloured red so it stands out from remediation (neutral) and reference material.
+     Inline spans and code keep their own colour, so amber warnings / code tokens still read correctly. */
+  .dpanel .risk, .dpanel .risk li { color: var(--red); }
+  .dpanel .risk code { color: var(--amber); }
+  /* Connection between application permissions and the credential that lets the app wield them. */
+  .credlink { font-size: 12px; line-height: 1.5; border-radius: 6px; padding: 8px 10px; margin-top: 8px; border: 1px solid var(--border); }
+  .credlink b { font-weight: 700; }
+  .credlink-live { color: var(--red); border-color: var(--red); background: var(--red-bg); }
+  .credlink-dormant { color: var(--muted); background: var(--hover); }
+  .credlink-ext { color: var(--amber); border-color: var(--amber); background: var(--amber-bg); }
   .mitre-wrap { display: flex; flex-wrap: wrap; gap: 6px; }
   .mitre { font-size: 11px; background: var(--red-bg); border: 1px solid var(--red); color: var(--red); padding: 3px 8px; border-radius: 5px; text-decoration: none; }
   .mitre:hover { filter: brightness(1.05); }
@@ -968,8 +978,34 @@
       r.fic.forEach(function(c){ out += '<li><b>' + escHtml(c.name || '(unnamed)') + '</b><br>issuer <code>' + escHtml(c.issuer||'') + '</code><br>subject <code>' + escHtml(c.subject||'') + '</code>' + (c.audiences && c.audiences.length ? '<br>audiences <code>' + escHtml(c.audiences.join(', ')) + '</code>' : '') + '</li>'; });
       out += '</ul>';
     }
+    if(out && (r.appPermissions||[]).some(function(p){ return p.roleName !== 'Default access'; })) out += '<div class="credlink credlink-live">These credentials let the app authenticate as itself and use its <b>application permissions</b> (see that section) with no user — treat them as keys to those permissions.</div>';
     if(!out) out = '<p class="dmuted">' + (r.localApp ? 'No credentials registered on this application.' : 'Credential details are not readable for externally-registered (multi-tenant / Microsoft) apps.') + '</p>';
     return out;
+  }
+  function credInline(r){
+    var pw = credState(r.passwordCreds), kc = credState(r.keyCreds), parts = [];
+    if(r.passwordCreds && r.passwordCreds.length) parts.push(r.passwordCreds.length + ' secret' + (r.passwordCreds.length>1?'s':'') + (pw.expired?' ('+pw.expired+' expired)':pw.expiring?' (expiring)':''));
+    if(r.keyCreds && r.keyCreds.length) parts.push(r.keyCreds.length + ' certificate' + (r.keyCreds.length>1?'s':''));
+    if(r.fic && r.fic.length) parts.push(r.fic.length + ' federated credential' + (r.fic.length>1?'s':''));
+    return parts.join(', ');
+  }
+  function delegatedPermsHtml(r){
+    if(!r.delegatedDetail || !r.delegatedDetail.length) return '<p class="dmuted">No delegated permissions.</p>';
+    return '<div class="hint" style="margin:0 0 6px">Exercised on behalf of a <b>signed-in user</b> (OAuth consent).</div>' + r.delegatedDetail.map(function(d){
+      var tag = d.consentType === 'AllPrincipals' ? '<span class="ptag ptag-all">All users</span>' : '<span class="ptag ptag-usr">' + (d.principalCount||'?') + ' user' + (d.principalCount!==1?'s':'') + '</span>';
+      return '<div>' + tag + '<span class="res">' + escHtml(d.resourceName) + ':</span> ' + scopeHtml(d.scopes) + '</div>';
+    }).join('');
+  }
+  function appPermsHtml(r){
+    var perms = (r.appPermissions||[]).filter(function(p){ return p.roleName !== 'Default access'; });
+    if(!perms.length) return '<p class="dmuted">No application permissions (app roles).</p>';
+    var byRes = {}; perms.forEach(function(p){ (byRes[p.resourceName]=byRes[p.resourceName]||[]).push(p); });
+    var list = Object.keys(byRes).map(function(rn){ var vals = byRes[rn].map(function(p){ var v=p.roleValue||p.roleName, sc=scoreScope(p.roleValue||''), cls=sc>=4?'sc4':sc>=3?'sc3':sc>=2?'sc2':''; return cls?'<span class="'+cls+'">'+escHtml(v)+'</span>':escHtml(v); }).join(', '); return '<div><span class="ptag ptag-app">App role</span><span class="res">'+escHtml(rn)+':</span> '+vals+'</div>'; }).join('');
+    var inline = credInline(r), conn;
+    if(!r.localApp) conn = '<div class="credlink credlink-ext">Exercised by the app <b>authenticating as itself</b> — no user. This app is registered in another tenant, so its client credentials aren’t readable here; assume the <b>publisher can authenticate as it</b> and use every application permission above.</div>';
+    else if(inline) conn = '<div class="credlink credlink-live">Exercised by the app <b>authenticating as itself</b> — no signed-in user. Its registered client credentials make that possible: <b>' + inline + '</b>. Anyone holding one of those credentials wields <b>all</b> the application permissions above.</div>';
+    else conn = '<div class="credlink credlink-dormant">Exercised by the app authenticating as itself — but <b>no client credential (secret / certificate / federated credential) is registered</b>, so these application permissions are currently <b>dormant</b> (the app can’t authenticate as itself). Adding any credential activates them.</div>';
+    return list + conn;
   }
   function renderAssigned(principals){
     if(!principals.length) return '<p class="dmuted">No users or groups are assigned — the app requires assignment but has no assignees, so effectively no one can sign in to it.</p>';
@@ -1020,8 +1056,8 @@
     if(!rems.length) rems.push('No critical configuration issues detected — keep monitoring consent grants and rotate credentials on schedule.');
 
     var mitreHtml = mitreTechs.length ? '<div class="mitre-wrap">' + mitreTechs.map(function(t){ return '<a class="mitre" href="https://attack.mitre.org/techniques/' + t.id.replace('.','/') + '" target="_blank" rel="noopener" title="' + escHtml(t.tactic) + '"><b>' + escHtml(t.id) + '</b> ' + escHtml(t.name) + '</a>'; }).join('') + '</div>' : '<p class="dmuted">No MITRE techniques mapped for the granted scopes.</p>';
-    var blastHtml = blastCats.length ? '<ul class="dlist">' + blastCats.map(function(c){ return '<li><b>' + c.charAt(0).toUpperCase()+c.slice(1) + ':</b> ' + (BLAST_RADIUS[c]||c) + '</li>'; }).join('') + '</ul>' : '<p class="dmuted">No recognised capability categories.</p>';
-    var escHtml2 = escalations.length ? '<ul class="dlist">' + escalations.map(function(e){ return '<li><code>' + escHtml(e.scope) + '</code> — ' + escHtml(e.path) + '</li>'; }).join('') + '</ul>' : '<p class="dmuted">No specific escalation pivots for the granted scopes.</p>';
+    var blastHtml = blastCats.length ? '<ul class="dlist risk">' + blastCats.map(function(c){ return '<li><b>' + c.charAt(0).toUpperCase()+c.slice(1) + ':</b> ' + (BLAST_RADIUS[c]||c) + '</li>'; }).join('') + '</ul>' : '<p class="dmuted">No recognised capability categories.</p>';
+    var escHtml2 = escalations.length ? '<ul class="dlist risk">' + escalations.map(function(e){ return '<li><code>' + escHtml(e.scope) + '</code> — ' + escHtml(e.path) + '</li>'; }).join('') + '</ul>' : '<p class="dmuted">No specific escalation pivots for the granted scopes.</p>';
 
     var uris = r.redirectUris || [];
     var authHtml = '<ul class="dlist">'
@@ -1031,18 +1067,19 @@
       + (uris.length ? '<ul class="dlist">' + uris.map(function(u){ var rk = redirectRisk(u); return '<li><span class="mono" style="font-size:11px;word-break:break-all">' + escHtml(u) + '</span>' + (rk ? ' — <span style="color:' + (rk.level==='medium'?'var(--amber)':'var(--red)') + '">' + escHtml(rk.reason) + '</span>' : '') + '</li>'; }).join('') + '</ul>' : '<p class="dmuted">None' + (r.localApp ? '' : ' visible (external app)') + '</p>')
       + (r.localApp ? '<button class="secondary" style="margin-top:6px;padding:4px 10px;font-size:11px" data-manage-appid="' + escHtml(r.appId) + '">Manage redirect URIs</button>' : '');
     var tenHtml = '<ul class="dlist">'
-      + '<li><b>Tenancy:</b> ' + escHtml(r.audienceLabel) + (r.isFirstPartyMicrosoft ? ' · Microsoft first-party' : r.tenancy==='multi' ? ' · third-party (supply-chain blast radius)' : '') + '</li>'
+      + '<li><b>Tenancy:</b> ' + escHtml(r.audienceLabel) + (r.isFirstPartyMicrosoft ? ' · Microsoft first-party' : r.tenancy==='multi' ? ' · <span style="color:var(--red)">third-party (supply-chain blast radius)</span>' : '') + '</li>'
       + '<li><b>signInAudience:</b> <code>' + escHtml(r.signInAudience || '(inferred)') + '</code></li>'
       + '<li><b>Publisher:</b> ' + escHtml(r.publisherName || '—') + '</li>'
-      + '<li><b>Verified publisher:</b> ' + (r.isFirstPartyMicrosoft ? 'Microsoft first-party' : (r.isVerifiedPublisher ? escHtml(r.verifiedPublisherName||'verified') : '<span style="color:var(--amber)">not verified</span>')) + '</li>'
+      + '<li><b>Verified publisher:</b> ' + (r.isFirstPartyMicrosoft ? 'Microsoft first-party' : (r.isVerifiedPublisher ? escHtml(r.verifiedPublisherName||'verified') : '<span style="color:var(--red)">not verified</span>')) + '</li>'
       + '<li><b>Assignment required:</b> ' + (r.appRoleAssignmentRequired ? 'yes — only assigned users/groups can obtain a token' : '<span style="color:var(--red)">no — any tenant user can obtain a token</span>') + '</li>'
       + '<li><b>Account enabled:</b> ' + (r.accountEnabled === false ? '<span style="color:var(--red)">no (disabled)</span>' : 'yes') + '</li></ul>';
-    var ownersHtml = (r.owners && r.owners.length) ? '<ul class="dlist">' + r.owners.map(function(o){ return '<li>' + escHtml(o.displayName||'') + (o.upn ? ' <span class="mono" style="font-size:11px">' + escHtml(o.upn) + '</span>' : '') + '</li>'; }).join('') + '</ul>' : '<p class="dmuted">' + (r.localApp ? 'No owners assigned — orphaned registration.' : 'Owners not visible for external apps.') + '</p>';
+    var ownersHtml = (r.owners && r.owners.length) ? '<ul class="dlist">' + r.owners.map(function(o){ return '<li>' + escHtml(o.displayName||'') + (o.upn ? ' <span class="mono" style="font-size:11px">' + escHtml(o.upn) + '</span>' : '') + '</li>'; }).join('') + '</ul>' : (r.localApp ? '<p style="color:var(--red)">No owners assigned — orphaned registration, no accountable steward.</p>' : '<p class="dmuted">Owners not visible for external apps.</p>');
 
     return '<div class="dpanel">'
       + '<div class="dpanel-head">' + escHtml(r.displayName) + ' <span class="badge risk-' + r.riskScore + '">' + RISK_LABELS[r.riskScore] + '</span> <span class="xtag">' + escHtml(r.appId) + '</span></div>'
-      + '<div class="dsec dsec-wide"><div class="dhead">Why this risk level</div><ul class="dlist">' + (r.riskReasons&&r.riskReasons.length ? r.riskReasons.map(function(x){ return '<li>'+x+'</li>'; }).join('') : '<li>Baseline — low-impact permissions and clean posture.</li>') + '</ul></div>'
-      + '<div class="dsec"><div class="dhead">Permissions</div>' + permsCell(r) + '</div>'
+      + '<div class="dsec dsec-wide"><div class="dhead">Why this risk level</div><ul class="dlist' + ((r.riskReasons&&r.riskReasons.length) ? ' risk' : '') + '">' + (r.riskReasons&&r.riskReasons.length ? r.riskReasons.map(function(x){ return '<li>'+x+'</li>'; }).join('') : '<li>Baseline — low-impact permissions and clean posture.</li>') + '</ul></div>'
+      + '<div class="dsec"><div class="dhead">Delegated permissions</div>' + delegatedPermsHtml(r) + '</div>'
+      + '<div class="dsec"><div class="dhead">Application permissions</div>' + appPermsHtml(r) + '</div>'
       + '<div class="dsec"><div class="dhead">Credentials</div>' + credDetailHtml(r) + '</div>'
       + '<div class="dsec"><div class="dhead">Auth configuration</div>' + authHtml + '</div>'
       + '<div class="dsec"><div class="dhead">Tenancy &amp; publisher</div>' + tenHtml + '</div>'
