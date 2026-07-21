@@ -290,8 +290,8 @@
         </select>
         <span class="count" id="stat-count"></span>
       </div>
-      <div class="hint" style="margin:-4px 0 10px">Scope: enterprise apps with <b>assignment not required</b> and delegated consent
-        (tenant-wide or per-user). Sorted worst-first. Click <b>Attack path</b> on any row for blast radius, MITRE mapping, escalation pivots and remediation.</div>
+      <div class="hint" style="margin:-4px 0 10px">Scope: <b>all enterprise applications</b> in the tenant, sorted worst-first.
+        <b>Open to all users</b> = assignment not required, so any tenant user can obtain a token. Click <b>Attack path</b> on any row for blast radius, MITRE mapping, escalation pivots and remediation.</div>
       <div style="overflow-x:auto">
         <table id="tbl">
           <thead>
@@ -573,6 +573,7 @@
     f.noOwner = r.localApp && !(r.owners && r.owners.length);
     f.msDisabled = !!r.disabledByMicrosoft;
     f.disabled = r.accountEnabled === false;
+    f.assignmentNotRequired = r.appRoleAssignmentRequired === false;
     return f;
   }
   function computeRisk(r){
@@ -585,6 +586,7 @@
     if(f.riskyRedirect){ lvl = Math.max(lvl, 3); reasons.push('Risky redirect URI (wildcard / cleartext HTTP) — auth-code interception.'); }
     if(f.consumer && r.permScore >= 3){ lvl = 4; reasons.push('Accepts personal Microsoft accounts — broadest possible token audience.'); }
     if(f.multiThirdParty && r.permScore >= 3){ lvl = Math.max(lvl, 3); reasons.push('Multi-tenant third-party app with high permissions — supply-chain blast radius.'); }
+    if(f.assignmentNotRequired && (r.permScore >= 2 || (r.delegatedDetail||[]).length)){ if(r.permScore >= 3) lvl = Math.max(lvl, 3); reasons.push('Assignment not required — any user in the tenant can obtain a token for this app (no user/group assignment gate), so its permissions are exposed to the whole directory rather than an assigned subset.'); }
     if(f.credExpired){ reasons.push('Has an expired-but-present credential — hygiene gap and possible stale trust.'); }
     if(f.allPrincipals){ reasons.push('Tenant-wide (AllPrincipals) consent — every user inherits these permissions.'); }
     if(f.unverifiedPublisher){ reasons.push('Third-party publisher is not verified (no MPN verified publisher).'); }
@@ -607,8 +609,6 @@
         + '&$select=' + encodeURIComponent('id,appId,displayName,appRoleAssignmentRequired,appOwnerOrganizationId,signInAudience,publisherName,verifiedPublisher,accountEnabled,createdDateTime,passwordCredentials,keyCredentials,disabledByMicrosoftStatus')
         + '&$top=999&$count=true',
         token, function(n){ setStatus('Fetching service principals… ' + n, false, true); });
-      var candidates = sps.filter(function(sp){ return sp.appRoleAssignmentRequired === false; });
-
       setStatus('Fetching tenant-wide admin-consent grants…', false, true);
       var grants = await graphGetAllPages('https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$filter=' + encodeURIComponent("consentType eq 'AllPrincipals'") + '&$top=999', token, function(n){ setStatus('Fetching tenant-wide grants… ' + n, false, true); });
       setStatus('Fetching per-user delegated grants…', false, true);
@@ -637,9 +637,9 @@
       }
 
       var results = [];
-      candidates.forEach(function(sp){
+      sps.forEach(function(sp){
         var spGrants = grantsByClient[sp.id], princByRes = principalByClient[sp.id];
-        if((!spGrants || !spGrants.length) && !princByRes) return;   // population: apps with delegated consent
+        var hasGrant = !!(spGrants && spGrants.length) || !!princByRes;
         var allScopes = [], delegatedDetail = [];
         (spGrants||[]).forEach(function(g){ var scopes = (g.scope||'').split(/\s+/).filter(Boolean).sort(); allScopes = allScopes.concat(scopes); if(scopes.length) delegatedDetail.push({ resourceName: resourceNames[g.resourceId]||'(unknown)', scopes: scopes.join(', '), consentType: 'AllPrincipals' }); });
         if(princByRes) Object.keys(princByRes).forEach(function(resId){ var entry = princByRes[resId], scopes = Object.keys(entry.scopeSet).sort(); allScopes = allScopes.concat(scopes); delegatedDetail.push({ resourceName: resourceNames[resId]||'(unknown)', scopes: scopes.join(', '), consentType: 'Principal', principalCount: Object.keys(entry.principalIds).length }); });
@@ -648,6 +648,7 @@
           id: sp.id, appId: sp.appId, displayName: sp.displayName, publisherName: sp.publisherName,
           accountEnabled: sp.accountEnabled, appOwnerOrganizationId: sp.appOwnerOrganizationId,
           isFirstPartyMicrosoft: sp.appOwnerOrganizationId === MS_TENANT, createdDateTime: sp.createdDateTime,
+          appRoleAssignmentRequired: sp.appRoleAssignmentRequired, _hasGrant: hasGrant,
           delegatedDetail: delegatedDetail, allScopes: allScopes, caps: computeReconCaps(allScopes),
           passwordCreds: sp.passwordCredentials || [], keyCreds: sp.keyCredentials || [], fic: [],
           signInAudience: sp.signInAudience || null, verifiedPublisherName: vp, isVerifiedPublisher: !!vp,
@@ -657,14 +658,20 @@
         });
       });
 
-      // Application permissions (appRoleAssignments) per result
-      setStatus('Fetching application permissions…', false, true);
+      // Deep-enrichment set: apps that can actually act (consented or credentialed) or are open to all
+      // users and non-Microsoft. Every app still appears in the inventory with its cheap SP-level signals;
+      // only these get the extra per-app calls (app permissions, redirect URIs, owners, federated creds).
+      var enrichTargets = results.filter(function(r){ return r._hasGrant || r.passwordCreds.length || r.keyCreds.length || (r.appRoleAssignmentRequired === false && !r.isFirstPartyMicrosoft); });
+      var enrichCount = enrichTargets.length;
+
+      // Application permissions (appRoleAssignments) for the enrichment set
+      setStatus('Fetching application permissions for ' + enrichCount + ' app(s)…', false, true);
       var appRolesBySpId = {}, BATCH_MAX = 20;
-      for(var bi=0; bi<results.length; bi+=BATCH_MAX){
-        var bSlice = results.slice(bi, bi+BATCH_MAX);
+      for(var bi=0; bi<enrichTargets.length; bi+=BATCH_MAX){
+        var bSlice = enrichTargets.slice(bi, bi+BATCH_MAX);
         var bRequests = bSlice.map(function(r){ return { id: r.id, method:'GET', url:'/servicePrincipals/'+r.id+'/appRoleAssignments' }; });
         try { var bResponses = await graphBatch(bRequests, token); bResponses.forEach(function(resp){ appRolesBySpId[resp.id] = (resp.status===200 && resp.body && resp.body.value) ? resp.body.value : []; }); } catch(e){}
-        setStatus('Fetching application permissions… ' + Math.min(bi+BATCH_MAX, results.length) + ' / ' + results.length, false, true);
+        setStatus('Fetching application permissions… ' + Math.min(bi+BATCH_MAX, enrichCount) + ' / ' + enrichCount, false, true);
       }
       var missingResSet = {};
       results.forEach(function(r){ (appRolesBySpId[r.id]||[]).forEach(function(a){ if(!resourceSPCache[a.resourceId]) missingResSet[a.resourceId]=true; }); });
@@ -688,11 +695,11 @@
       // App registration details (redirect URIs, implicit, public client, verified publisher, owners, creds, objId)
       setStatus('Fetching app registration details…', false, true);
       var appRegByAppId = {};
-      for(var ai=0; ai<results.length; ai+=BATCH_MAX){
-        var aSlice = results.slice(ai, ai+BATCH_MAX);
+      for(var ai=0; ai<enrichTargets.length; ai+=BATCH_MAX){
+        var aSlice = enrichTargets.slice(ai, ai+BATCH_MAX);
         var aRequests = aSlice.map(function(r){ return { id: r.id, method:'GET', url:'/applications?$filter='+encodeURIComponent("appId eq '"+r.appId+"'")+'&$select=id,appId,allowPublicClient,isFallbackPublicClient,signInAudience,web,spa,publicClient,verifiedPublisher,passwordCredentials,keyCredentials&$expand=owners($select=id,displayName,userPrincipalName)' }; });
         try { var aResponses = await graphBatch(aRequests, token); aResponses.forEach(function(resp){ if(resp.status===200 && resp.body && resp.body.value && resp.body.value[0]) appRegByAppId[resp.body.value[0].appId] = resp.body.value[0]; }); } catch(e){}
-        setStatus('Fetching app registration details… ' + Math.min(ai+BATCH_MAX, results.length) + ' / ' + results.length, false, true);
+        setStatus('Fetching app registration details… ' + Math.min(ai+BATCH_MAX, enrichCount) + ' / ' + enrichCount, false, true);
       }
       results.forEach(function(r){
         var reg = appRegByAppId[r.appId];
@@ -738,7 +745,7 @@
       });
 
       cache.results = results;
-      setStatus('Scan complete — ' + results.length + ' consented app(s) analysed.');
+      setStatus('Scan complete — ' + results.length + ' enterprise app(s) inventoried, ' + enrichCount + ' deep-scanned.');
       show('results'); render();
     } catch(e){ setStatus(''); showError(e); }
     finally { el('btn-refresh').disabled = false; }
@@ -783,6 +790,7 @@
     { key:'msDisabled', label:'Microsoft-disabled app', sev:'high' },
     { key:'credExpired', label:'Expired credential present', sev:'high' },
     { key:'consumer', label:'Accepts consumer accounts', sev:'high' },
+    { key:'assignmentNotRequired', label:'Assignment not required (open to all users)', sev:'high' },
     { key:'allPrincipals', label:'Tenant-wide (AllPrincipals) consent', sev:'med' },
     { key:'implicitGrant', label:'Implicit grant', sev:'med' },
     { key:'riskyRedirect', label:'Risky redirect URI', sev:'med' },
@@ -794,32 +802,32 @@
   function statTile(id, n, label, crit){ return '<div class="stat clickable' + (activeStat === id ? ' active' : '') + '" data-stat="' + id + '"><div class="n' + (crit ? ' crit' : '') + '">' + n + '</div><div class="l">' + label + '</div></div>'; }
 
   function render(){
-    el('notices').innerHTML = '<div class="notice notice-info">Read-only scan of enterprise apps with delegated consent and <b>assignment not required</b>. Risk combines permission scope with posture (auth config, tenancy, credentials, publisher verification, Microsoft-disabled status). Click a tile, a bar, or a row’s <b>Attack path</b> to prioritise and investigate.</div>';
+    el('notices').innerHTML = '<div class="notice notice-info">Read-only posture scan of <b>all enterprise applications</b> in the tenant. Every app is inventoried with its tenancy, credentials, publisher verification, Microsoft-disabled status and assignment setting; apps that are consented, credentialed, or open to all users (non-Microsoft) are deep-scanned for permissions, redirect URIs and federated credentials. Risk combines permission scope with posture. Click a tile, a bar, or a row’s <b>Attack path</b> to prioritise.</div>';
     renderSummary(); renderExposure(); renderTable();
   }
   function renderSummary(){
     var b = baseSet();
     var crit = b.filter(function(r){ return r.riskScore === 4; }).length;
     var highp = b.filter(function(r){ return (r.riskScore||1) >= 3; }).length;
+    var openAll = b.filter(function(r){ return r.factors.assignmentNotRequired; }).length;
     var token = b.filter(function(r){ return r.factors.tokenTheft; }).length;
     var cred = b.filter(function(r){ return r.factors.credExpired || r.factors.credExpiring; }).length;
-    var multi3 = b.filter(function(r){ return r.factors.multiThirdParty; }).length;
     el('summary').innerHTML =
-        statTile('all', b.length, 'Apps in scope', false)
+        statTile('all', b.length, 'Enterprise apps', false)
       + statTile('critical', crit, 'Critical', crit > 0)
       + statTile('high', highp, 'High and above', false)
+      + statTile('openall', openAll, 'Open to all users', openAll > 0)
       + statTile('token', token, 'Token-theft vectors', token > 0)
-      + statTile('cred', cred, 'Credential issues', cred > 0)
-      + statTile('multi3', multi3, 'Multi-tenant · 3rd-party', false);
+      + statTile('cred', cred, 'Credential issues', cred > 0);
     el('summary').querySelectorAll('.stat').forEach(function(tile){
       tile.addEventListener('click', function(){
         var id = tile.getAttribute('data-stat'); activeFactor = null; el('f-risk').value = ''; el('f-tenancy').value = ''; el('f-auth').value = '';
         if(id === 'all'){ activeStat = null; }
         else if(id === 'critical'){ activeStat = id; el('f-risk').value = '4'; }
         else if(id === 'high'){ activeStat = id; el('f-risk').value = '3'; }
+        else if(id === 'openall'){ activeStat = id; activeFactor = 'assignmentNotRequired'; }
         else if(id === 'token'){ activeStat = id; el('f-auth').value = 'any'; }
         else if(id === 'cred'){ activeStat = id; activeFactor = 'credIssue'; }
-        else if(id === 'multi3'){ activeStat = id; activeFactor = 'multiThirdParty'; }
         render();
       });
     });
@@ -887,6 +895,8 @@
       var flags = '';
       if(r.factors.msDisabled) flags += '<span class="badge b-msdisabled" title="Microsoft disabled this app">MS-disabled</span>';
       if(r.factors.appPerms) flags += '<span class="badge b-app" title="Holds application permissions — acts with no signed-in user">App perms</span>';
+      if(r.appRoleAssignmentRequired === true) flags += '<span class="badge b-single" title="Only assigned users/groups can obtain a token — the safer setting">Assignment required</span>';
+      else if(r.factors.assignmentNotRequired && (r.permScore >= 2 || (r.delegatedDetail||[]).length || r.factors.appPerms)) flags += '<span class="badge b-noowner" title="Any user in the tenant can obtain a token — no assignment gate">Open to all users</span>';
       if(r.isFirstPartyMicrosoft) flags += '<span class="badge b-ms">Microsoft</span>';
       if(r.factors.noOwner) flags += '<span class="badge b-noowner">No owner</span>';
       if(r.factors.disabled) flags += '<span class="badge b-disabled">Disabled</span>';
@@ -929,6 +939,7 @@
 
     // Posture & credential section
     var posture = [];
+    posture.push('<b>Assignment:</b> ' + (r.appRoleAssignmentRequired ? 'required — only assigned users/groups can obtain a token (safer)' : 'not required — <span style="color:var(--red)">any tenant user can obtain a token</span>'));
     posture.push('<b>Tenancy:</b> ' + escHtml(r.audienceLabel) + (r.isFirstPartyMicrosoft ? ' (Microsoft first-party)' : r.tenancy==='multi' ? ' — supply-chain blast radius applies' : ''));
     posture.push('<b>Publisher:</b> ' + (r.isFirstPartyMicrosoft ? 'Microsoft' : (r.isVerifiedPublisher ? 'verified — ' + escHtml(r.verifiedPublisherName||'') : 'not verified (no MPN verified publisher)')));
     var pw = credState(r.passwordCreds), kc = credState(r.keyCreds);
@@ -985,7 +996,7 @@
   // -------------------- CSV --------------------
   function exportCsv(){
     var rows = filtered();
-    var cols = ['riskLevel','displayName','appId','tenancy','microsoftFirstParty','verifiedPublisher','publicClient','implicitGrant','riskyRedirect','delegatedPermissions','appPermissions','secrets','certs','fic','msDisabled','owners','riskReasons','portalUrl'];
+    var cols = ['riskLevel','displayName','appId','tenancy','microsoftFirstParty','assignmentRequired','verifiedPublisher','publicClient','implicitGrant','riskyRedirect','delegatedPermissions','appPermissions','secrets','certs','fic','msDisabled','owners','riskReasons','portalUrl'];
     var lines = [cols.join(',')];
     rows.forEach(function(r){
       var perms = (r.delegatedDetail||[]).map(function(d){ return d.consentType + ' ' + d.resourceName + ': ' + d.scopes; }).join(' | ');
@@ -994,7 +1005,7 @@
       var certs = (r.keyCreds||[]).map(function(c){ return (c.displayName||'cert') + (c.endDateTime?' exp:'+c.endDateTime.slice(0,10):''); }).join(' | ');
       var fic = (r.fic||[]).map(function(c){ return (c.name||'') + ' iss:' + (c.issuer||'') + ' sub:' + (c.subject||''); }).join(' | ');
       var owners = (r.owners||[]).map(function(o){ return o.displayName||o.upn||'?'; }).join(' | ');
-      var row = [RISK_LABELS[r.riskScore||1], r.displayName, r.appId, r.audienceLabel, r.isFirstPartyMicrosoft, r.isVerifiedPublisher, r.factors.publicClient, r.factors.implicitGrant, r.factors.riskyRedirect, perms, appPerms, secrets, certs, fic, r.factors.msDisabled, owners, (r.riskReasons||[]).join(' ; '), r.portalUrl];
+      var row = [RISK_LABELS[r.riskScore||1], r.displayName, r.appId, r.audienceLabel, r.isFirstPartyMicrosoft, (r.appRoleAssignmentRequired === true), r.isVerifiedPublisher, r.factors.publicClient, r.factors.implicitGrant, r.factors.riskyRedirect, perms, appPerms, secrets, certs, fic, r.factors.msDisabled, owners, (r.riskReasons||[]).join(' ; '), r.portalUrl];
       lines.push(row.map(function(v){ if(v==null) v=''; v=String(v).replace(/"/g,'""'); return /[,"\n]/.test(v)?'"'+v+'"':v; }).join(','));
     });
     var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([lines.join('\n')], {type:'text/csv'}));
