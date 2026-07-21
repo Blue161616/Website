@@ -115,6 +115,9 @@
   .samp td, .samp th { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
   .samp th { color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .3px; font-size: 11px; }
   .samp td { font-family: "Cascadia Code", Consolas, monospace; }
+  .secrow { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; font-size: 12.5px; flex-wrap: wrap; }
+  .secrow .secok { color: var(--green); font-weight: 700; }
+  .secrow .secbad { color: var(--red); font-weight: 700; }
 </style>
 </head>
 <body>
@@ -160,7 +163,7 @@
       <div>
         <label for="scopes">Delegated scopes to request</label>
         <input id="scopes" value="User.Read" autocomplete="off" spellcheck="false" />
-        <div class="hint">Space-separated. <code>User.Read</code> always works. Add e.g. <code>User.ReadBasic.All</code> or <code>Directory.Read.All</code> to try reading more of the other tenant — those may need admin consent <b>there</b> (that's the lesson).</div>
+        <div class="hint">Space-separated. <code>User.Read</code> always works. For the clearest <b>"capped by the user"</b> demo, add <b><code>Policy.Read.All</code></b> — admins can read Conditional Access policies, but ordinary users <b>can't, even with the scope</b>. Add <code>RoleManagement.Read.Directory</code> and <code>AuditLog.Read.All</code> for the same effect on role assignments and sign-in logs, and <code>Directory.Read.All</code> to read the directory. All the <code>*.Read.All</code> scopes need admin consent <b>in the signed-in user's tenant</b>.</div>
       </div>
     </div>
     <div class="row-actions">
@@ -314,6 +317,11 @@ async function harvestPreview(){
   const devices = await graphGet("/devices?$count=true&$top=1&$select=id", token);
   const sps     = await graphGet("/servicePrincipals?$count=true&$top=1&$select=id", token);
   const roles   = await graphGet("/directoryRoles?$expand=members($select=displayName,userPrincipalName)", token);
+  // Admin-gated security/governance reads — these need the scope AND a directory role, so they're the
+  // cleanest proof of the delegated cap: 200 as an admin, 403 as an ordinary user (same app + same scopes).
+  const ca   = await graphGet("/identity/conditionalAccess/policies?$select=id,displayName,state&$top=100", token);
+  const raps = await graphGet("/roleManagement/directory/roleAssignments?$top=5&$select=id", token);
+  const logs = await graphGet("/auditLogs/signIns?$top=1&$select=id", token);
 
   const cnt = (res)=> (res.ok && typeof res.body["@odata.count"] === "number") ? res.body["@odata.count"] : null;
   function tile(label, res){
@@ -338,11 +346,25 @@ async function harvestPreview(){
       + users.body.value.map(u=> '<tr><td>'+escHtml(u.displayName||"")+'</td><td>'+escHtml(u.userPrincipalName||"")+'</td><td>'+escHtml(u.jobTitle||"")+'</td></tr>').join("")
       + '</tbody></table>';
 
+  // Admin-gated reads — the real proof of the "capped by the user" model.
+  function secRow(label, scope, res){
+    let detail;
+    if(res.ok){ const n = (res.body && Array.isArray(res.body.value)) ? res.body.value.length : null;
+      detail = (n!=null ? (n + (res.body["@odata.nextLink"]?"+":"") + " returned") : "readable") + " — this account can read it"; }
+    else detail = res.status + " " + ((res.body&&res.body.error&&res.body.error.code)||"blocked") + " — this account can't (needs an admin role, or the scope isn't consented)";
+    return '<div class="secrow"><div><b>'+label+'</b> <span class="mono" style="font-size:11px;color:var(--muted)">'+scope+'</span></div><div class="'+(res.ok?"secok":"secbad")+'">'+escHtml(detail)+'</div></div>';
+  }
+  const secHtml = '<div style="margin-top:16px;font-weight:700;font-size:13px">Security &amp; governance reads — admin-gated (the real proof of the cap)</div>'
+    + '<div class="sub" style="margin:4px 0 8px">These need the scope <b>and</b> a directory role, so the app’s scope alone is never enough. As an <b>admin</b> they return data; sign in as an <b>ordinary user</b> (same app, same scopes) and they <b>403</b>. That gap is the delegated cap you can’t fake. <span class="mono" style="font-size:11px">Add Policy.Read.All, RoleManagement.Read.Directory, AuditLog.Read.All to the scopes and re-consent to test these.</span></div>'
+    + secRow("Conditional Access policies", "Policy.Read.All", ca)
+    + secRow("Directory role assignments (who is admin)", "RoleManagement.Read.Directory", raps)
+    + secRow("Sign-in logs", "AuditLog.Read.All", logs);
+
   const anyBlocked = [users,groups,devices,sps].some(r=>!r.ok);
   $("impact").innerHTML =
       '<div class="impact"><b>Everything below was read on your user’s behalf and shown here in your browser — nothing was sent anywhere.</b> A hostile multi-tenant app would <code>POST</code> exactly this to its own server the moment consent is granted: no further clicks, invisible to the user, and (with a backend + refresh token) it keeps reading for days until an admin revokes the app.</div>'
     + '<div class="hgrid">' + tile("Users", users) + tile("Groups", groups) + tile("Devices", devices) + tile("Apps / SPNs", sps) + '</div>'
-    + crown + samp
+    + crown + samp + secHtml
     + (anyBlocked ? '<div class="notice notice-info" style="margin-top:12px">Some reads were blocked — the consented scopes don’t cover them here. Add <code>Directory.Read.All</code> to the scopes and re-consent (as an admin), then re-run: a single broad admin consent is what turns one login into a full directory dump.</div>' : '');
   btn.disabled = false;
 }
