@@ -122,6 +122,10 @@
   .sig-uri { background:rgba(239,68,68,.10); color:var(--danger); border-color:rgba(239,68,68,.25); }
   .sig-all { background:rgba(239,68,68,.12); color:#ef4444; border-color:rgba(239,68,68,.25); }
   .sig-sup { background:rgba(249,115,22,.14); color:#f97316; border-color:rgba(249,115,22,.3); }
+  .sig-key { background:rgba(234,179,8,.16); color:#eab308; border-color:rgba(234,179,8,.35); }
+  .sig-own { background:rgba(56,189,248,.14); color:#38bdf8; border-color:rgba(56,189,248,.3); }
+  .sig-orphan { background:rgba(148,163,184,.12); color:var(--muted); border-color:rgba(148,163,184,.25); }
+  .sig-role { background:rgba(239,68,68,.18); color:var(--danger); border-color:rgba(239,68,68,.4); }
   .sig-none { color:var(--muted); font-size:12px; }
   /* Priority badge */
   .prio { font-size:13px; font-weight:700; padding:2px 10px; border-radius:11px; display:inline-block; min-width:26px; text-align:center; }
@@ -137,6 +141,16 @@
   .opcmd .cmt { color:#6b7280; }
   .copybtn { position:absolute; top:6px; right:6px; background:var(--panel-2); border:1px solid var(--border); color:var(--muted); font-size:10px; padding:2px 8px; border-radius:4px; cursor:pointer; }
   .copybtn:hover { color:var(--accent); border-color:var(--accent); }
+  /* Tenant takeover surface panel */
+  .tkpanel { margin:0 32px 6px; border:1px solid rgba(239,68,68,.35); border-radius:8px; background:rgba(239,68,68,.05); }
+  .tkpanel .tk-head { display:flex; align-items:center; gap:10px; padding:12px 18px; cursor:pointer; font-weight:600; color:var(--danger); font-size:14px; user-select:none; }
+  .tkpanel .tk-head .tk-count { margin-left:auto; font-size:12px; color:var(--muted); font-weight:400; }
+  .tkpanel .tk-body { padding:0 18px 16px; }
+  .tkpanel h6 { margin:14px 0 8px; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--accent); }
+  .tk-row { display:flex; justify-content:space-between; gap:12px; align-items:center; padding:7px 0; border-bottom:1px solid var(--border); flex-wrap:wrap; font-size:12.5px; }
+  .tk-type { font-size:11px; color:var(--muted); text-transform:capitalize; }
+  .tk-note { font-size:12px; color:var(--warn); background:rgba(245,158,11,.08); border:1px solid rgba(245,158,11,.25); border-radius:5px; padding:8px 12px; margin-top:10px; line-height:1.5; }
+  .tk-note code { background:var(--panel-2); padding:1px 5px; border-radius:3px; }
 </style>
 </head>
 <body>
@@ -144,7 +158,7 @@
 <header>
   <div>
     <h1>Entra Enterprise App Recon</h1>
-    <div class="subtitle">Enterprise apps accessible to any tenant user &middot; Admin-consented delegated permissions &middot; Read-only</div>
+    <div class="subtitle">Enterprise apps &amp; app-only service principals &middot; tenant-wide delegated consent or application permissions &middot; Read-only</div>
   </div>
   <div class="who" id="who"><em>Not signed in</em></div>
 </header>
@@ -198,6 +212,8 @@
     <div class="lbl">Privilege Escalation Risk</div>
   </div>
 </div>
+
+<div id="takeover" class="tkpanel" style="display:none"></div>
 
 <div id="controls" class="controls" style="display:none">
   <input id="q" type="search" placeholder="Search by name, appId, capability, permission…">
@@ -292,6 +308,7 @@
   var account = null;
   var cache = { results: null };
   var sortState = { key:'priority', dir:-1 };
+  var takeoverOpen = true;
 
   try {
     var saved = JSON.parse(localStorage.getItem('entraReconCfg') || '{}');
@@ -334,6 +351,15 @@
     'PrivilegedAccess.Read.AzureAD':        { cat:'privilege', label:'PIM (Entra)',           sev:4, detail:'All PIM eligible and active role assignments in Entra ID — includes just-in-time assignments.' },
     'PrivilegedAccess.Read.AzureResources': { cat:'privilege', label:'PIM (Azure)',           sev:3, detail:'All PIM assignments for Azure resource roles (Owner, Contributor, etc.).' },
     'EntitlementManagement.Read.All':       { cat:'privilege', label:'Entitlement mgmt',      sev:3, detail:'All access packages, assignments, and entitlement management policies.' },
+    // Escalation-class WRITE permissions — holding these on a service principal is a direct path to tenant takeover.
+    'RoleManagement.ReadWrite.Directory':   { cat:'privilege', label:'⚠ Assign ANY role',     sev:4, detail:'Assign any Entra directory role, including Global Administrator, to any identity (itself included) → full tenant takeover.' },
+    'AppRoleAssignment.ReadWrite.All':      { cat:'privilege', label:'⚠ Grant ANY app perm',  sev:4, detail:'Grant any application permission to any app (itself included) without further admin consent → self-escalate to tenant-wide app access.' },
+    'Application.ReadWrite.All':            { cat:'privilege', label:'⚠ Modify ANY app',       sev:4, detail:'Modify any app registration — add credentials to a higher-privileged app and authenticate as it → impersonation / persistence.' },
+    'Directory.ReadWrite.All':              { cat:'privilege', label:'⚠ Directory write',      sev:4, detail:'Broad directory write — modify users, groups, and app objects across the tenant.' },
+    'PrivilegedAccess.ReadWrite.AzureAD':   { cat:'privilege', label:'⚠ PIM write',           sev:4, detail:'Modify PIM role assignments in Entra ID → grant just-in-time or permanent privileged access.' },
+    'Application.ReadWrite.OwnedBy':        { cat:'privilege', label:'⚠ Write owned apps',     sev:3, detail:'Add credentials to apps this principal owns → take over owned apps.' },
+    'Group.ReadWrite.All':                  { cat:'privilege', label:'⚠ Group write',          sev:3, detail:'Modify any group, including adding members to privileged / CA-excluded groups → indirect escalation.' },
+    'User.ReadWrite.All':                   { cat:'privilege', label:'⚠ User write',           sev:3, detail:'Modify user objects across the tenant — reset properties, manipulate accounts.' },
     // Security & monitoring
     'AuditLog.Read.All':                    { cat:'security', label:'Audit logs',             sev:3, detail:'Full sign-in and audit history. Map monitoring coverage, find gaps, understand what defenders can see.' },
     'Policy.Read.All':                      { cat:'security', label:'CA policies',            sev:3, detail:'All Conditional Access policies — find authentication requirement bypasses and MFA gaps.' },
@@ -387,6 +413,36 @@
     return caps;
   }
 
+  // -------------------- Credential detection --------------------
+  // Secrets (passwordCredentials) and certificates (keyCredentials) reveal an app-only / client-credentials
+  // identity. Only readable for apps registered in THIS tenant — external multi-tenant apps keep their secret
+  // in the publisher's tenant, so we can only see service-principal-level creds (if any) for those.
+  function parseCred(c, kind, source){
+    var end = c.endDateTime ? new Date(c.endDateTime) : null;
+    var start = c.startDateTime ? new Date(c.startDateTime) : null;
+    var now = new Date();
+    return {
+      kind: kind, source: source,
+      id: c.customKeyIdentifier || c.keyId || '',
+      displayName: c.displayName || (c.customKeyIdentifier ? ('thumbprint ' + c.customKeyIdentifier) : (c.hint ? ('hint ' + c.hint + '…') : '(unnamed)')),
+      start: start ? start.toISOString().slice(0,10) : null,
+      end:   end   ? end.toISOString().slice(0,10)   : null,
+      expired:      end ? (end < now) : false,
+      expiringSoon: end ? (end >= now && (end - now) < 30*864e5) : false
+    };
+  }
+  function applyCredentials(r, regPwd, regKey){
+    var secrets = [], certs = [], certSeen = {};
+    (regPwd || []).forEach(function(c){ secrets.push(parseCred(c, 'secret', 'app registration')); });
+    (regKey || []).forEach(function(c){ var k = c.customKeyIdentifier || c.keyId; if(certSeen[k]) return; certSeen[k]=1; certs.push(parseCred(c, 'certificate', 'app registration')); });
+    (r._spPwdCreds || []).forEach(function(c){ secrets.push(parseCred(c, 'secret', 'service principal')); });
+    (r._spKeyCreds || []).forEach(function(c){ var k = c.customKeyIdentifier || c.keyId; if(certSeen[k]) return; certSeen[k]=1; certs.push(parseCred(c, 'certificate', 'service principal')); });
+    r.secrets = secrets; r.certificates = certs;
+    r.hasCred = !!(secrets.length || certs.length);
+    r.hasValidCred = secrets.concat(certs).some(function(c){ return !c.expired; });
+    delete r._spPwdCreds; delete r._spKeyCreds;
+  }
+
   // -------------------- Target prioritization --------------------
   // Exploitability score: severity of what it can reach + how easily an operator can turn it into a token.
   function priorityScore(r){
@@ -399,6 +455,16 @@
     if(aud.tenancy==='multi' && !r.isFirstPartyMicrosoft && !r.verifiedPublisherName) s += 3;   // supply chain
     if(r.caps.some(function(c){ return c.cap.cat==='privilege'; })) s += 3;
     if(r.caps.some(function(c){ return c.cap.cat==='content'; })) s += 2;
+    // Credential = app-only capable. A valid credential PLUS application permissions is a standing key.
+    if(r.hasValidCred && r.appPermissions && r.appPermissions.length) s += 4;
+    else if(r.hasValidCred) s += 1;
+    // Owner = takeover pivot: compromise an owner → add a credential → app-only access. Worth more when
+    // the app already has application permissions (takeover lands a standing key).
+    if(r.owners && r.owners.length){ s += (r.appPermissions && r.appPermissions.length) ? 2 : 1; }
+    // The SP itself holds a privileged directory role → compromising it grants that role directly.
+    if(r.spRoles && r.spRoles.length) s += 5;
+    // An owner who is also a tenant-wide admin/takeover principal → doubly hot pivot.
+    if(r.escalatedOwners && r.escalatedOwners.length) s += 2;
     return s;
   }
   function priorityTier(s){ return s>=15?4 : s>=10?3 : s>=6?2 : s>=1?1 : 0; }
@@ -413,6 +479,37 @@
     if(r.delegatedDetail.some(function(d){ return d.consentType==='AllPrincipals'; })) s.push('<span class="has-tip"><span class="sig sig-all">👥 Tenant-wide</span><span class="tip"><strong>AllPrincipals consent</strong><br>Admin-consented for every user — any tenant user can silently obtain a token.</span></span>');
     var aud = AUDIENCE_INFO[r.signInAudience] || AUDIENCE_INFO['_inferred'];
     if(aud.tenancy==='multi' && !r.isFirstPartyMicrosoft && !r.verifiedPublisherName) s.push('<span class="has-tip"><span class="sig sig-sup">🌍 Unverified multi-tenant</span><span class="tip"><strong>Supply-chain surface</strong><br>External publisher, unverified — a vendor compromise yields tokens valid in this tenant (T1199).</span></span>');
+    if(r.hasValidCred){
+      var nSec = (r.secrets||[]).filter(function(c){ return !c.expired; }).length;
+      var nCert = (r.certificates||[]).filter(function(c){ return !c.expired; }).length;
+      var credParts = []; if(nSec) credParts.push(nSec+' secret'+(nSec!==1?'s':'')); if(nCert) credParts.push(nCert+' cert'+(nCert!==1?'s':''));
+      var standingKey = r.appPermissions && r.appPermissions.length;
+      s.push('<span class="has-tip"><span class="sig sig-key">🔑 '+(standingKey?'App-only key':(nCert&&!nSec?'Certificate':'Secret'))+'</span>'
+        +'<span class="tip"><strong>Client credential present</strong> ('+credParts.join(' + ')+')<br>'
+        +(standingKey?'Application permissions + a credential = an app-only <strong>standing key</strong>: client-credentials reads Graph unattended, no user, until revoked.'
+                     :'This app can authenticate as itself via client-credentials — pair with application permissions for unattended Graph access.')
+        +'</span></span>');
+    } else if(r.hasCred){
+      s.push('<span class="has-tip"><span class="sig" style="background:rgba(148,163,184,.12);color:var(--muted)">🔑 expired cred</span><span class="tip">Only expired credentials — an operator with write access could add a fresh one (T1098.001).</span></span>');
+    }
+    if(r.owners && r.owners.length){
+      var ownerNames = r.owners.slice(0,5).map(function(o){ return escHtml(o.upn||o.displayName); }).join('<br>') + (r.owners.length>5 ? '<br>…+'+(r.owners.length-5)+' more' : '');
+      s.push('<span class="has-tip"><span class="sig sig-own">👤 '+r.owners.length+' owner'+(r.owners.length!==1?'s':'')+'</span>'
+        +'<span class="tip"><strong>Takeover pivot</strong><br>An owner can add a credential or alter redirect URIs — compromise one to take over the app'
+        +((r.appPermissions&&r.appPermissions.length)?' (and its application permissions → an app-only standing key)':'')+' (T1098.001).<br><br>'+ownerNames+'</span></span>');
+    } else {
+      s.push('<span class="has-tip"><span class="sig sig-orphan">🚩 no owner</span><span class="tip"><strong>Orphaned app</strong><br>No owner manages this app — governance gap: no one is accountable for its consent and credentials, and takeover needs directory-level rights rather than a single owner account.</span></span>');
+    }
+    if(r.spRoles && r.spRoles.length){
+      s.push('<span class="has-tip"><span class="sig sig-role">🛡 SP role: '+escHtml(r.spRoles[0])+(r.spRoles.length>1?' +'+(r.spRoles.length-1):'')+'</span>'
+        +'<span class="tip"><strong>This service principal holds a privileged directory role</strong><br>'+escHtml(r.spRoles.join(', '))+' — take over this app (owner/credential) and you inherit that role directly.</span></span>');
+    }
+    if(r.escalatedOwners && r.escalatedOwners.length){
+      s.push('<span class="has-tip"><span class="sig sig-role">👑 admin owner</span><span class="tip"><strong>An owner is also a tenant-wide admin/takeover principal</strong><br>'+r.escalatedOwners.map(function(o){return escHtml(o.upn||o.displayName);}).join('<br>')+'</span></span>');
+    }
+    if(r.appOnly){
+      s.push('<span class="has-tip"><span class="sig" style="background:rgba(56,189,248,.10);color:#38bdf8;border-color:rgba(56,189,248,.25)">app-only</span><span class="tip"><strong>App-only service principal</strong><br>No tenant-wide delegated grant — this SP acts as itself via client-credentials (application permissions).</span></span>');
+    }
     var cats = {}; r.caps.forEach(function(c){ cats[c.cap.cat] = true; });
     ['privilege','content','security'].forEach(function(cat){
       if(cats[cat]) s.push('<span class="badge cat-'+cat+'" style="margin:0">'+cat.charAt(0).toUpperCase()+cat.slice(1)+'</span>');
@@ -468,7 +565,7 @@
     if(msalInstance && account) msalInstance.logoutPopup({ account: account }).catch(function(){});
     account = null; cache = { results: null };
     el('who').innerHTML = '<em>Not signed in</em>';
-    hide('btn-signout'); hide('controls'); hide('tbl'); hide('empty'); hide('dashboard'); clearMsg();
+    hide('btn-signout'); hide('controls'); hide('tbl'); hide('empty'); hide('dashboard'); hide('takeover'); clearMsg();
     el('btn-signin').textContent = 'Sign in and scan';
   }
 
@@ -507,8 +604,94 @@
   }
 
   // -------------------- Audit --------------------
+  // -------------------- Tenant takeover surface --------------------
+  // Principals that can take over ANY app (add credentials / grant permissions / assign roles tenant-wide).
+  var GRAPH_APPID = '00000003-0000-0000-c000-000000000000';
+  var TAKEOVER_APP_ROLES = {
+    '1bfefb4e-e0b5-418b-a88f-73c46d2cc8e9': { value:'Application.ReadWrite.All',       why:'Add credentials to ANY app registration → authenticate as that app and inherit its permissions.' },
+    '9e3f62cf-ca93-4989-b6ce-bf83c28f9fe8': { value:'RoleManagement.ReadWrite.Directory', why:'Assign ANY Entra directory role, including Global Administrator → full tenant takeover.' },
+    '06b708a9-e830-4db3-a914-8e69da51d44f': { value:'AppRoleAssignment.ReadWrite.All', why:'Grant ANY application permission (even to itself) → self-escalate to tenant-wide app access.' },
+    '19dbc75e-c2e2-444c-a770-ec69d8559fc7': { value:'Directory.ReadWrite.All',         why:'Broad directory write — modify users, groups, and app objects.' },
+    '18a4783c-866b-4cc7-a460-3d5e5662c884': { value:'Application.ReadWrite.OwnedBy',    why:'Add credentials to apps it owns → take over owned apps.' }
+  };
+  var WHY_BY_VALUE = {}; Object.keys(TAKEOVER_APP_ROLES).forEach(function(k){ WHY_BY_VALUE[TAKEOVER_APP_ROLES[k].value] = TAKEOVER_APP_ROLES[k].why; });
+  var TAKEOVER_ROLES = {
+    '62e90394-69f5-4237-9190-012177145e10': 'Global Administrator',
+    'e8611ab8-c189-46e8-94e1-60213ab1f814': 'Privileged Role Administrator',
+    '9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3': 'Application Administrator',
+    '158c047a-c907-4556-b7ef-446551a6b5f7': 'Cloud Application Administrator',
+    '8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2': 'Hybrid Identity Administrator'
+  };
+
+  async function scanTakeover(token){
+    var out = { appHolders:[], appError:null, roleHolders:null, roleError:null, rolesByPrincipalId:{}, principalKeys:{} };
+    function mark(k){ if(k) out.principalKeys[String(k).toLowerCase()] = true; }
+    // A) service principals with dangerous Graph application permissions (readable with Application.Read.All)
+    try {
+      var gsp = await graphGet("https://graph.microsoft.com/v1.0/servicePrincipals(appId='"+GRAPH_APPID+"')?$select=id", token);
+      var assigns = await graphGetAllPages('https://graph.microsoft.com/v1.0/servicePrincipals/'+gsp.id+'/appRoleAssignedTo?$top=999', token);
+      var byPrincipal = {};
+      assigns.forEach(function(a){
+        var role = TAKEOVER_APP_ROLES[a.appRoleId]; if(!role) return;
+        var k = a.principalId || a.principalDisplayName;
+        if(!byPrincipal[k]) byPrincipal[k] = { name:a.principalDisplayName||'(unknown)', type:a.principalType||'', perms:[] };
+        if(byPrincipal[k].perms.indexOf(role.value)<0) byPrincipal[k].perms.push(role.value);
+        mark(a.principalId); mark(a.principalDisplayName);
+      });
+      out.appHolders = Object.keys(byPrincipal).map(function(k){ return byPrincipal[k]; }).sort(function(a,b){ return b.perms.length - a.perms.length; });
+    } catch(e){ out.appError = String(e.message||e); }
+    // B) privileged directory roles (best-effort — needs RoleManagement.Read.Directory / Directory.Read.All)
+    try {
+      var roles = await graphGet("https://graph.microsoft.com/v1.0/directoryRoles?$expand=members($select=id,displayName,userPrincipalName)", token);
+      var holders = [];
+      (roles.value||[]).forEach(function(role){
+        var rn = TAKEOVER_ROLES[role.roleTemplateId];
+        if(!rn || !role.members || !role.members.length) return;
+        holders.push({ role: rn, members: role.members.map(function(m){ return m.userPrincipalName || m.displayName || '(unknown)'; }) });
+        role.members.forEach(function(m){
+          mark(m.id); mark(m.userPrincipalName); mark(m.displayName);
+          if(m.id){ (out.rolesByPrincipalId[m.id] = out.rolesByPrincipalId[m.id] || []); if(out.rolesByPrincipalId[m.id].indexOf(rn)<0) out.rolesByPrincipalId[m.id].push(rn); }
+        });
+      });
+      out.roleHolders = holders;
+    } catch(e){ out.roleError = /403|Authorization_RequestDenied|permission/i.test(String(e.message||e)) ? 'scope' : String(e.message||e); }
+    return out;
+  }
+
+  function renderTakeover(){
+    var t = cache.takeover;
+    if(!t){ hide('takeover'); return; }
+    var appHtml = t.appHolders.length
+      ? t.appHolders.map(function(h){
+          var perms = h.perms.map(function(p){ return '<span class="sig sig-pub" title="'+escHtml(WHY_BY_VALUE[p]||'')+'">'+escHtml(p)+'</span>'; }).join(' ');
+          return '<div class="tk-row"><div><strong>'+escHtml(h.name)+'</strong> <span class="tk-type">'+escHtml(h.type||'')+'</span></div><div>'+perms+'</div></div>';
+        }).join('')
+      : (t.appError ? '<div class="tk-note">Could not read Graph app-role assignments: '+escHtml(t.appError)+'</div>'
+                    : '<p class="xmuted" style="margin:4px 0">None — no service principal holds an app-takeover application permission.</p>');
+    var roleHtml;
+    if(t.roleHolders && t.roleHolders.length)
+      roleHtml = t.roleHolders.map(function(rh){ return '<div class="tk-row"><div><strong>'+escHtml(rh.role)+'</strong></div><div class="raw-perms">'+rh.members.map(escHtml).join(', ')+'</div></div>'; }).join('');
+    else if(t.roleHolders)
+      roleHtml = '<p class="xmuted" style="margin:4px 0">No members in the app-takeover directory roles.</p>';
+    else if(t.roleError === 'scope')
+      roleHtml = '<div class="tk-note">Directory-role holders not shown — this app lacks <code>RoleManagement.Read.Directory</code> / <code>Directory.Read.All</code>. Add one and re-consent to include users in Global Administrator, Application Administrator, etc.</div>';
+    else
+      roleHtml = '<div class="tk-note">Could not read directory roles: '+escHtml(t.roleError||'unknown')+'</div>';
+    var roleCount = (t.roleHolders||[]).reduce(function(n,r){ return n + r.members.length; }, 0);
+    var count = t.appHolders.length + roleCount;
+    el('takeover').innerHTML =
+      '<div class="tk-head" id="tk-toggle">🏴 Tenant Takeover Surface — who can take over ANY app'
+      + '<span class="tk-count">'+count+' principal(s) · '+(takeoverOpen?'▲ hide':'▼ show')+'</span></div>'
+      + '<div class="tk-body"'+(takeoverOpen?'':' style="display:none"')+'>'
+      + '<p class="xmuted" style="margin:0 0 4px">These principals can add credentials to apps, grant permissions, or assign roles across the tenant — compromising any one of them means takeover of the whole app estate, not a single app.</p>'
+      + '<h6>Dangerous application permissions (service principals)</h6>'+appHtml
+      + '<h6>Privileged directory roles (users &amp; service principals)</h6>'+roleHtml
+      + '</div>';
+    show('takeover','');
+  }
+
   async function runAudit(){
-    clearError(); hide('tbl'); hide('empty'); hide('controls'); hide('dashboard');
+    clearError(); hide('tbl'); hide('empty'); hide('controls'); hide('dashboard'); hide('takeover');
     setMsg('Acquiring token…');
     var token = await getToken();
 
@@ -516,7 +699,7 @@
     var sps = await graphGetAllPages(
       'https://graph.microsoft.com/v1.0/servicePrincipals'
       + '?$filter=' + encodeURIComponent("servicePrincipalType eq 'Application'")
-      + '&$select=' + encodeURIComponent('id,appId,displayName,appRoleAssignmentRequired,appOwnerOrganizationId,publisherName,accountEnabled,createdDateTime')
+      + '&$select=' + encodeURIComponent('id,appId,displayName,appRoleAssignmentRequired,appOwnerOrganizationId,publisherName,accountEnabled,createdDateTime,keyCredentials,passwordCredentials')
       + '&$top=999&$count=true',
       token, function(n){ setMsg('Fetching service principals…', n + ' so far'); }
     );
@@ -549,34 +732,70 @@
       if(g.principalId) byRes[g.resourceId].principalIds[g.principalId] = true;
     });
 
-    // Collect all unique resourceIds from both grant types
+    var MS_TENANT = 'f8cdef31-a31e-4b4a-93e4-5f571e91255a';
+
+    // Fetch application permissions (appRoleAssignments) up front so app-only SPs are included and scored.
+    // Limit to apps with a delegated grant OR any non-Microsoft app (skips the noise of MS first-party SPs).
+    var appPermTargets = candidates.filter(function(sp){
+      return (grantsByClient[sp.id] && grantsByClient[sp.id].length) || principalGrantsByClient[sp.id] || (sp.appOwnerOrganizationId !== MS_TENANT);
+    });
+    var BATCH_MAX = 20;
+    var appRolesBySpId = {};
+    setMsg('Fetching application permissions…', '0 / ' + appPermTargets.length);
+    for(var bi=0; bi<appPermTargets.length; bi+=BATCH_MAX){
+      var bSlice = appPermTargets.slice(bi, bi+BATCH_MAX);
+      var bRequests = bSlice.map(function(sp){ return { id: sp.id, method:'GET', url:'/servicePrincipals/'+sp.id+'/appRoleAssignments' }; });
+      try {
+        var bResponses = await graphBatch(bRequests, token);
+        bResponses.forEach(function(resp){ appRolesBySpId[resp.id] = (resp.status===200 && resp.body && resp.body.value) ? resp.body.value : []; });
+      } catch(e){}
+      setMsg('Fetching application permissions…', Math.min(bi+BATCH_MAX, appPermTargets.length) + ' / ' + appPermTargets.length);
+    }
+
+    // Collect resourceIds from delegated grants AND application permissions, then resolve names + appRoles.
     var needed = {};
     Object.keys(grantsByClient).forEach(function(cid){ grantsByClient[cid].forEach(function(g){ needed[g.resourceId] = true; }); });
     Object.keys(principalGrantsByClient).forEach(function(cid){ Object.keys(principalGrantsByClient[cid]).forEach(function(r){ needed[r] = true; }); });
+    Object.keys(appRolesBySpId).forEach(function(spid){ (appRolesBySpId[spid]||[]).forEach(function(a){ if(a.resourceId) needed[a.resourceId] = true; }); });
 
     var resourceIds = Object.keys(needed);
     setMsg('Resolving resource APIs…', '0 / ' + resourceIds.length);
-    var resourceNames = {};
-    var resourceSPCache = {};
-    var batchSize = 15;
+    var resourceNames = {}, resourceSPCache = {}, batchSize = 15;
     for(var i=0; i<resourceIds.length; i+=batchSize){
       var slice = resourceIds.slice(i, i+batchSize);
       var filter = slice.map(function(id){ return "id eq '" + id + "'"; }).join(' or ');
       try {
         var page = await graphGet('https://graph.microsoft.com/v1.0/servicePrincipals?$filter=' + encodeURIComponent(filter) + '&$select=id,displayName,appRoles', token);
-        (page.value||[]).forEach(function(sp){
-          resourceNames[sp.id] = sp.displayName;
-          resourceSPCache[sp.id] = { displayName: sp.displayName, appRoles: sp.appRoles||[] };
-        });
+        (page.value||[]).forEach(function(sp){ resourceNames[sp.id] = sp.displayName; resourceSPCache[sp.id] = { displayName: sp.displayName, appRoles: sp.appRoles||[] }; });
       } catch(e){}
       setMsg('Resolving resource APIs…', Math.min(i+batchSize, resourceIds.length) + ' / ' + resourceIds.length);
     }
 
-    var MS_TENANT = 'f8cdef31-a31e-4b4a-93e4-5f571e91255a';
+    // resourceId_appRoleId -> { resourceName, roleName, roleValue }
+    var appRoleLookup = {};
+    Object.keys(resourceSPCache).forEach(function(spId){
+      (resourceSPCache[spId].appRoles||[]).forEach(function(role){
+        appRoleLookup[spId+'_'+role.id] = { resourceName:resourceSPCache[spId].displayName, roleName:role.displayName, roleValue:role.value||'' };
+      });
+    });
+    function resolveAppPerms(spId){
+      return (appRolesBySpId[spId]||[]).map(function(a){
+        if(a.appRoleId==='00000000-0000-0000-0000-000000000000') return { resourceName:a.resourceDisplayName||'(unknown)', roleName:'Default access', roleValue:'' };
+        var info = appRoleLookup[a.resourceId+'_'+a.appRoleId];
+        return info ? { resourceName:info.resourceName, roleName:info.roleName, roleValue:info.roleValue }
+                    : { resourceName:a.resourceDisplayName||'(unknown)', roleName:'(unknown)', roleValue:'' };
+      });
+    }
+
     var results = [];
     candidates.forEach(function(sp){
-      var spGrants = grantsByClient[sp.id];
-      if(!spGrants || !spGrants.length) return;
+      var isMS = sp.appOwnerOrganizationId === MS_TENANT;
+      var spGrants = grantsByClient[sp.id] || [];
+      var princByRes = principalGrantsByClient[sp.id];
+      var hasDelegated = spGrants.length || (princByRes && Object.keys(princByRes).length);
+      var appPermissions = resolveAppPerms(sp.id);
+      // Include if it has a delegated grant, OR application permissions on a non-Microsoft app (app-only SPs).
+      if(!hasDelegated && !(appPermissions.length && !isMS)) return;
 
       var allScopes = [], delegatedDetail = [];
       spGrants.forEach(function(g){
@@ -584,8 +803,6 @@
         allScopes = allScopes.concat(scopes);
         if(scopes.length) delegatedDetail.push({ resourceName: resourceNames[g.resourceId]||'(unknown)', scopes: scopes.join(', '), consentType: 'AllPrincipals' });
       });
-      // Append user-specific (Principal) grants
-      var princByRes = principalGrantsByClient[sp.id];
       if(princByRes){
         Object.keys(princByRes).forEach(function(resId){
           var entry = princByRes[resId];
@@ -596,65 +813,41 @@
         });
       }
 
-      var caps   = computeReconCaps(allScopes);
+      // Score from delegated scopes PLUS application-permission values (so app-only escalation perms rank).
+      var capScopes = allScopes.concat(appPermissions.map(function(p){ return p.roleValue; }).filter(Boolean));
+      var caps   = computeReconCaps(capScopes);
       var maxSev = caps.reduce(function(m,c){ return Math.max(m, c.cap.sev); }, 0);
 
       results.push({
         id: sp.id, appId: sp.appId, displayName: sp.displayName,
         publisherName: sp.publisherName, accountEnabled: sp.accountEnabled,
         appOwnerOrganizationId: sp.appOwnerOrganizationId,
-        isFirstPartyMicrosoft: sp.appOwnerOrganizationId === MS_TENANT,
+        isFirstPartyMicrosoft: isMS,
         createdDateTime: sp.createdDateTime,
-        delegatedDetail: delegatedDetail, caps: caps, accessLevel: maxSev,
+        _spKeyCreds: sp.keyCredentials || [], _spPwdCreds: sp.passwordCredentials || [],
+        delegatedDetail: delegatedDetail, appPermissions: appPermissions, caps: caps, accessLevel: maxSev,
+        appOnly: (!hasDelegated && appPermissions.length>0),
         portalUrl: 'https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/Overview/appId/' + sp.appId
       });
     });
 
-    // Batch-fetch appRoleAssignments (application permissions) for each result
-    setMsg('Fetching application permissions…', '0 / ' + results.length);
-    var appRolesBySpId = {};
-    var BATCH_MAX = 20;
-    for(var bi=0; bi<results.length; bi+=BATCH_MAX){
-      var bSlice = results.slice(bi, bi+BATCH_MAX);
-      var bRequests = bSlice.map(function(r){ return { id: r.id, method:'GET', url:'/servicePrincipals/'+r.id+'/appRoleAssignments' }; });
+    // Batch-fetch owners — accounts that can add credentials / alter the app (takeover pivot, T1098.001)
+    setMsg('Fetching app owners…', '0 / ' + results.length);
+    for(var oi=0; oi<results.length; oi+=BATCH_MAX){
+      var oSlice = results.slice(oi, oi+BATCH_MAX);
+      var oRequests = oSlice.map(function(r){ return { id: r.id, method:'GET', url:'/servicePrincipals/'+r.id+'/owners?$select=id,displayName,userPrincipalName,accountEnabled' }; });
       try {
-        var bResponses = await graphBatch(bRequests, token);
-        bResponses.forEach(function(resp){ appRolesBySpId[resp.id] = (resp.status===200 && resp.body && resp.body.value) ? resp.body.value : []; });
-      } catch(e){}
-      setMsg('Fetching application permissions…', Math.min(bi+BATCH_MAX, results.length) + ' / ' + results.length);
+        var oResponses = await graphBatch(oRequests, token);
+        var byId = {}; oResponses.forEach(function(resp){ byId[resp.id] = (resp.status===200 && resp.body && resp.body.value) ? resp.body.value : []; });
+        oSlice.forEach(function(r){
+          r.owners = (byId[r.id]||[]).map(function(o){
+            return { id:o.id, displayName:o.displayName||'(unknown)', upn:o.userPrincipalName||null, enabled:o.accountEnabled!==false };
+          });
+        });
+      } catch(e){ oSlice.forEach(function(r){ if(!r.owners) r.owners = []; }); }
+      setMsg('Fetching app owners…', Math.min(oi+BATCH_MAX, results.length) + ' / ' + results.length);
     }
-
-    // Resolve any resource SPs for app role assignments not already cached
-    var missingResSet = {};
-    results.forEach(function(r){ (appRolesBySpId[r.id]||[]).forEach(function(a){ if(!resourceSPCache[a.resourceId]) missingResSet[a.resourceId]=true; }); });
-    var missingResIds = Object.keys(missingResSet);
-    for(var mi=0; mi<missingResIds.length; mi+=batchSize){
-      var mSlice = missingResIds.slice(mi, mi+batchSize);
-      var mFilter = mSlice.map(function(id){ return "id eq '"+id+"'"; }).join(' or ');
-      try {
-        var mPage = await graphGet('https://graph.microsoft.com/v1.0/servicePrincipals?$filter='+encodeURIComponent(mFilter)+'&$select=id,displayName,appRoles', token);
-        (mPage.value||[]).forEach(function(sp){ resourceSPCache[sp.id]={ displayName:sp.displayName, appRoles:sp.appRoles||[] }; });
-      } catch(e){}
-    }
-
-    // Build role lookup: "resourceId_appRoleId" -> { resourceName, roleName, roleValue }
-    var appRoleLookup = {};
-    Object.keys(resourceSPCache).forEach(function(spId){
-      (resourceSPCache[spId].appRoles||[]).forEach(function(role){
-        appRoleLookup[spId+'_'+role.id] = { resourceName:resourceSPCache[spId].displayName, roleName:role.displayName, roleValue:role.value||'' };
-      });
-    });
-
-    // Attach appPermissions to each result
-    results.forEach(function(r){
-      r.appPermissions = (appRolesBySpId[r.id]||[]).map(function(a){
-        if(a.appRoleId==='00000000-0000-0000-0000-000000000000')
-          return { resourceName:a.resourceDisplayName||'(unknown)', roleName:'Default access', roleValue:'' };
-        var info = appRoleLookup[a.resourceId+'_'+a.appRoleId];
-        return info ? { resourceName:info.resourceName, roleName:info.roleName, roleValue:info.roleValue }
-                    : { resourceName:a.resourceDisplayName||'(unknown)', roleName:'(unknown)', roleValue:'' };
-      });
-    });
+    results.forEach(function(r){ if(!r.owners) r.owners = []; });
 
     // Batch-fetch app registrations for allowPublicClient + redirect URIs
     setMsg('Fetching app registration details…', '0 / ' + results.length);
@@ -663,7 +856,7 @@
       var aSlice = results.slice(ai, ai+BATCH_MAX);
       var aRequests = aSlice.map(function(r){
         return { id: r.id, method:'GET',
-          url:'/applications?$filter='+encodeURIComponent("appId eq '"+r.appId+"'")+'&$select=id,appId,allowPublicClient,isFallbackPublicClient,signInAudience,verifiedPublisher,web,spa,publicClient' };
+          url:'/applications?$filter='+encodeURIComponent("appId eq '"+r.appId+"'")+'&$select=id,appId,allowPublicClient,isFallbackPublicClient,signInAudience,verifiedPublisher,web,spa,publicClient,keyCredentials,passwordCredentials' };
       });
       try {
         var aResponses = await graphBatch(aRequests, token);
@@ -690,19 +883,38 @@
         r.signInAudience = reg.signInAudience || null;
         r.tenancy = (reg.signInAudience === 'AzureADMyOrg') ? 'single' : 'multi';
         r.verifiedPublisherName = (reg.verifiedPublisher && reg.verifiedPublisher.displayName) ? reg.verifiedPublisher.displayName : null;
+        r.credVisibility = 'full'; // registration is in this tenant — credentials are readable
+        applyCredentials(r, reg.passwordCredentials, reg.keyCredentials);
       } else {
         r.allowPublicClient = false; r.implicitGrant = false; r.redirectUris = [];
         r.signInAudience = null; r.tenancy = 'multi'; // inferred — external apps must be multi-tenant
         r.verifiedPublisherName = null;
+        r.credVisibility = 'sp-only'; // external registration — only service-principal creds are visible here
+        applyCredentials(r, null, null);
       }
     });
 
-    results.forEach(function(r){ r.priority = priorityScore(r); r.priorityTier = priorityTier(r.priority); });
+    setMsg('Mapping tenant takeover surface…');
+    try { cache.takeover = await scanTakeover(token); } catch(e){ cache.takeover = null; }
 
+    // Cross-reference: does this SP itself hold a privileged directory role, and are any of its owners
+    // tenant-wide admins/takeover principals? Both make compromise land far more than one app.
+    var tk = cache.takeover || {};
+    results.forEach(function(r){
+      r.spRoles = (tk.rolesByPrincipalId && tk.rolesByPrincipalId[r.id]) || [];
+      var keys = tk.principalKeys || {};
+      r.escalatedOwners = (r.owners||[]).filter(function(o){
+        return (o.id && keys[String(o.id).toLowerCase()]) || (o.upn && keys[String(o.upn).toLowerCase()]) || (o.displayName && keys[String(o.displayName).toLowerCase()]);
+      });
+    });
+
+    results.forEach(function(r){ r.priority = priorityScore(r); r.priorityTier = priorityTier(r.priority); });
     cache.results = results;
+
     clearMsg();
     updateDashboard();
     show('dashboard', 'grid');
+    renderTakeover();
     show('controls', 'flex');
     render();
   }
@@ -774,7 +986,7 @@
 
   function exportCsv(){
     var rows = filtered();
-    var cols = ['displayName','appId','priority','accessLevel','publicClient','implicitGrant','reconCapabilities','reconCategories','delegatedPermissions','applicationPermissions','publisherName','isFirstPartyMicrosoft','createdDateTime','portalUrl'];
+    var cols = ['displayName','appId','priority','accessLevel','appOnly','spDirectoryRoles','publicClient','implicitGrant','secrets','certificates','validCredential','owners','reconCapabilities','reconCategories','delegatedPermissions','applicationPermissions','publisherName','isFirstPartyMicrosoft','createdDateTime','portalUrl'];
     var lines = [cols.join(',')];
     rows.forEach(function(r){
       var caps  = r.caps.map(function(c){ return c.cap.label; }).join(' | ');
@@ -782,7 +994,8 @@
       r.caps.forEach(function(c){ if(!catSeen[c.cap.cat]){ catSeen[c.cap.cat]=true; catList.push(c.cap.cat); } });
       var delegated = r.delegatedDetail.map(function(d){ return d.resourceName + ': ' + d.scopes; }).join(' | ');
       var appPerms = (r.appPermissions||[]).map(function(p){ return p.resourceName + ': ' + (p.roleValue||p.roleName); }).join(' | ');
-      var row = [r.displayName, r.appId, r.priority, SEV_LABELS[r.accessLevel], !!r.allowPublicClient, !!r.implicitGrant, caps, catList.join(' | '), delegated, appPerms, r.publisherName, r.isFirstPartyMicrosoft, r.createdDateTime, r.portalUrl];
+      var owners = (r.owners||[]).map(function(o){ return o.upn||o.displayName; }).join(' | ');
+      var row = [r.displayName, r.appId, r.priority, SEV_LABELS[r.accessLevel], !!r.appOnly, (r.spRoles||[]).join(' | '), !!r.allowPublicClient, !!r.implicitGrant, (r.secrets||[]).length, (r.certificates||[]).length, !!r.hasValidCred, owners, caps, catList.join(' | '), delegated, appPerms, r.publisherName, r.isFirstPartyMicrosoft, r.createdDateTime, r.portalUrl];
       lines.push(row.map(function(v){
         if(v==null) v=''; v=String(v).replace(/"/g,'""');
         return /[,"\n]/.test(v) ? '"'+v+'"' : v;
@@ -818,7 +1031,11 @@
     'Chat.ReadWrite.All':                [{id:'T1213',name:'Data from Information Repositories',tactic:'Collection'}],
     'ChannelMessage.Read.All':           [{id:'T1213',name:'Data from Information Repositories',tactic:'Collection'}],
     'Application.Read.All':              [{id:'T1526',name:'Cloud Service Discovery',tactic:'Discovery'}],
-    'Application.ReadWrite.All':         [{id:'T1526',name:'Cloud Service Discovery',tactic:'Discovery'}],
+    'Application.ReadWrite.All':         [{id:'T1098.001',name:'Account Manipulation: Additional Cloud Credentials',tactic:'Persistence'},{id:'T1550.001',name:'Use Alternate Authentication Material: Application Access Token',tactic:'Defense Evasion'}],
+    'RoleManagement.ReadWrite.Directory':[{id:'T1098.003',name:'Account Manipulation: Additional Cloud Roles',tactic:'Privilege Escalation'}],
+    'AppRoleAssignment.ReadWrite.All':   [{id:'T1098.003',name:'Account Manipulation: Additional Cloud Roles',tactic:'Privilege Escalation'}],
+    'Directory.ReadWrite.All':           [{id:'T1098',name:'Account Manipulation',tactic:'Persistence'}],
+    'PrivilegedAccess.ReadWrite.AzureAD':[{id:'T1098.003',name:'Account Manipulation: Additional Cloud Roles',tactic:'Privilege Escalation'}],
     'DelegatedPermissionGrant.Read.All': [{id:'T1526',name:'Cloud Service Discovery',tactic:'Discovery'}],
     'SecurityEvents.Read.All':           [{id:'T1580',name:'Cloud Infrastructure Discovery',tactic:'Discovery'}],
     'SecurityIncident.Read.All':         [{id:'T1580',name:'Cloud Infrastructure Discovery',tactic:'Discovery'}],
@@ -839,6 +1056,11 @@
     'Sites.ReadWrite.All':            'Modify SharePoint content org-wide → document poisoning or script injection into shared resources',
     'SecurityEvents.Read.All':        'Real-time defender alert visibility → time lateral movement to avoid detection windows',
     'Application.ReadWrite.All':      'Modify other app registrations (add credentials, alter redirect URIs) → persistent backdoor creation in a different app',
+    'RoleManagement.ReadWrite.Directory':'Assign Global Administrator (or any role) to a controlled identity → immediate tenant takeover',
+    'AppRoleAssignment.ReadWrite.All':'Grant yourself any application permission (e.g. RoleManagement.ReadWrite.Directory) with no admin consent → bootstrap to full control',
+    'Directory.ReadWrite.All':        'Write across the directory — manipulate group membership (incl. CA-exclusion groups) and app objects',
+    'Group.ReadWrite.All':            'Add a controlled account to a privileged or CA-excluded group → indirect privilege escalation',
+    'PrivilegedAccess.ReadWrite.AzureAD':'Create PIM assignments → grant just-in-time or standing privileged access to a controlled identity',
     'UserAuthenticationMethod.Read.All':'Enumerate every MFA method per user → identify SMS/phone MFA accounts for SIM-swap targeting',
     'DelegatedPermissionGrant.Read.All': 'Enumerate all admin-consented grants → find additional high-privilege token acquisition paths',
   };
@@ -914,11 +1136,41 @@
     if(r.implicitGrant) authTxt.push('Implicit grant');
     authTxt.push((r.redirectUris||[]).length+' redirect URI'+((r.redirectUris||[]).length!==1?'s':''));
     var created = r.createdDateTime ? new Date(r.createdDateTime).toISOString().slice(0,10) : '—';
+    var creds = (r.secrets||[]).concat(r.certificates||[]);
+    var credHtml;
+    if(creds.length){
+      credHtml = creds.map(function(c){
+        var tag = c.expired ? '<span class="sig" style="background:rgba(148,163,184,.12);color:var(--muted)">expired</span>'
+                : c.expiringSoon ? '<span class="sig sig-imp">expires soon</span>'
+                : '<span class="sig sig-key">valid</span>';
+        var icon = c.kind==='certificate' ? '📜' : '🔐';
+        return '<div>'+icon+' <strong>'+escHtml(c.kind)+'</strong> '+tag+' <span class="res">'+escHtml(c.displayName)+'</span>'
+          + ' <span class="xmuted" style="font-size:11px">'+(c.start||'?')+' → '+(c.end||'?')+' · '+escHtml(c.source)+'</span></div>';
+      }).join('');
+    } else if(r.credVisibility==='sp-only'){
+      credHtml = '<span class="xmuted">Client secret not readable — app is registered in another tenant (external multi-tenant). Only service-principal-level credentials would show here.</span>';
+    } else {
+      credHtml = '<span class="xmuted">No secret or certificate on the registration.</span>';
+    }
+    var escOwnerIds = {}; (r.escalatedOwners||[]).forEach(function(o){ escOwnerIds[o.id||o.upn||o.displayName] = 1; });
+    var ownersHtml = (r.owners && r.owners.length)
+      ? r.owners.map(function(o){
+          var dis = o.enabled ? '' : ' <span class="sig" style="background:rgba(148,163,184,.12);color:var(--muted)">disabled</span>';
+          var esc = escOwnerIds[o.id||o.upn||o.displayName] ? ' <span class="sig sig-role">👑 tenant admin</span>' : '';
+          return '<div>👤 <span class="res">'+escHtml(o.displayName)+'</span>'+(o.upn?' <span class="xmuted" style="font-size:11px">'+escHtml(o.upn)+'</span>':'')+dis+esc+'</div>';
+        }).join('')
+      : '<span class="xmuted">🚩 No owners — orphaned. No user account manages this app; takeover requires directory-level rights instead of a single owner.</span>';
+    var spRolesHtml = (r.spRoles && r.spRoles.length)
+      ? r.spRoles.map(function(rn){ return '<span class="sig sig-role">🛡 '+escHtml(rn)+'</span>'; }).join(' ')
+      : '<span class="xmuted">This service principal holds no privileged directory role'+(cache.takeover && cache.takeover.roleError==='scope' ? ' (not fully checked — needs RoleManagement.Read.Directory)' : '')+'.</span>';
     return '<div class="dossier"><h5>📋 Application Dossier</h5>'
       + '<div class="dfield" style="margin-bottom:12px"><span class="k">Recon capabilities</span>'+capHtml+'</div>'
       + '<div class="dgrid2">'
       + '<div class="dfield"><span class="k">Delegated permissions</span><div class="raw-perms">'+delHtml+'</div></div>'
       + '<div class="dfield"><span class="k">Application permissions</span><div class="raw-perms">'+appHtml+'</div></div>'
+      + '<div class="dfield" style="grid-column:1/-1"><span class="k">Client credentials (secret / certificate)</span><div class="raw-perms">'+credHtml+'</div></div>'
+      + '<div class="dfield" style="grid-column:1/-1"><span class="k">Owners (takeover pivot)</span><div class="raw-perms">'+ownersHtml+'</div></div>'
+      + '<div class="dfield" style="grid-column:1/-1"><span class="k">Directory roles held by this service principal</span><div class="raw-perms">'+spRolesHtml+'</div></div>'
       + '<div class="dfield"><span class="k">Tenancy</span>'+escHtml(aud.label)+'</div>'
       + '<div class="dfield"><span class="k">Publisher</span>'+pub+'</div>'
       + '<div class="dfield"><span class="k">Auth config</span>'+escHtml(authTxt.join(' · '))+'</div>'
@@ -936,6 +1188,26 @@
     if(!r.allowPublicClient && !r.implicitGrant) notes.push('<li><strong>Acquisition:</strong> confidential client — needs interactive consent as a user, or a stolen refresh token / session cookie to mint access tokens.</li>');
     if(r.delegatedDetail.some(function(d){ return d.consentType==='AllPrincipals'; })) notes.push('<li><strong>Reach — tenant-wide:</strong> AllPrincipals consent means any user in the tenant can silently obtain a token; no per-user consent prompt stands in the way.</li>');
     if(aud.tenancy==='multi' && !r.isFirstPartyMicrosoft && !r.verifiedPublisherName) notes.push('<li><strong>Supply chain (T1199):</strong> external, unverified publisher. Compromising the vendor tenant yields tokens valid here without ever touching your directory.</li>');
+    var hasAppPerms = r.appPermissions && r.appPermissions.length;
+    if(hasAppPerms && r.hasValidCred)
+      notes.push('<li><strong>App-only standing key:</strong> holds a valid credential (secret/cert) <em>and</em> application permissions — the client-credentials flow reads Graph <strong>unattended, no user, until revoked</strong>. The secret value isn\'t readable here, but its presence confirms a live app-only identity; revocation is the only stop.</li>');
+    else if(hasAppPerms && !r.hasCred && r.credVisibility==='full')
+      notes.push('<li><strong>Latent app-only identity:</strong> has application permissions but <em>no</em> credential. An operator with <code>Application.ReadWrite.All</code> could add one (<strong>T1098.001</strong>) to activate unattended app-only access — a classic persistence/backdoor move.</li>');
+    else if(r.hasValidCred && !hasAppPerms)
+      notes.push('<li><strong>Credential without app roles:</strong> client-credentials would yield an app-only token carrying no Graph application permissions — low value until app roles are also granted.</li>');
+    if(r.owners && r.owners.length){
+      var owr = r.owners.slice(0,4).map(function(o){ return escHtml(o.upn||o.displayName); }).join(', ') + (r.owners.length>4?', +'+(r.owners.length-4)+' more':'');
+      notes.push('<li><strong>Ownership takeover (T1098.001):</strong> compromising an owner — '+owr+' — lets you add a credential or redirect URI to this app'
+        + (hasAppPerms ? ', then use client-credentials to read Graph as the app <em>(its application permissions become an app-only standing key)</em>' : ' and hijack its auth flow') + '.</li>');
+    } else {
+      notes.push('<li><strong>Orphaned (no owner):</strong> no owner account to phish for takeover — but also no one governing its consent/credentials. Takeover needs a directory role (e.g. Application Administrator) rather than a single account.</li>');
+    }
+    if(r.spRoles && r.spRoles.length)
+      notes.push('<li><strong>SP is itself privileged:</strong> this service principal holds <strong>'+escHtml(r.spRoles.join(', '))+'</strong>. Taking over the app (owner phish or credential add) inherits that role directly — no separate escalation step.</li>');
+    if(r.escalatedOwners && r.escalatedOwners.length)
+      notes.push('<li><strong>Owner is a tenant-wide admin:</strong> '+r.escalatedOwners.map(function(o){return escHtml(o.upn||o.displayName);}).join(', ')+' — that owner account is a doubly-hot target (owns this app <em>and</em> holds tenant-wide takeover rights).</li>');
+    if(r.appOnly && r.hasValidCred)
+      notes.push('<li><strong>Bypasses user Conditional Access / MFA:</strong> client-credentials auth is non-interactive — standard user CA policies (MFA, compliant device) don\'t apply. A stolen secret works from anywhere until revoked, unless <em>workload-identity</em> Conditional Access is scoped to this SP.</li>');
     var cats = {}; r.caps.forEach(function(c){ (cats[c.cap.cat]=cats[c.cap.cat]||[]).push(c.cap.label); });
     var grants = Object.keys(cats).map(function(cat){ return '<strong>'+cat+':</strong> '+escHtml(cats[cat].join(', ')); });
     if(grants.length) notes.push('<li><strong>What the token grants:</strong> '+grants.join(' · ')+'.</li>');
@@ -967,6 +1239,15 @@
         + 'https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize?client_id=' + escHtml(r.appId) + '\n'
         + '  &response_type=code&response_mode=query\n'
         + '  &scope=' + escHtml(encodeURIComponent(scopes.slice(0,4).join(' ') || 'https://graph.microsoft.com/.default'))));
+    }
+    if(r.appPermissions && r.appPermissions.length){
+      blocks.push(cmdBlock('App-only token — client-credentials (needs the client secret/cert)',
+        '<span class="cmt"># this app has application permissions — with its credential you read Graph unattended, no user</span>\n'
+        + '<span class="cmt"># the secret is NOT readable here (lives in the registration): compromise it, or add one via Application.ReadWrite.All (T1098.001)</span>\n'
+        + 'curl -s https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token \\\n'
+        + '  -d grant_type=client_credentials -d client_id=' + escHtml(r.appId) + ' \\\n'
+        + '  -d scope=https://graph.microsoft.com/.default \\\n'
+        + '  -d client_secret=$CLIENT_SECRET'));
     }
     var reconLines = scopes.map(function(s){ return RECON_CMD[s] ? '<span class="cmt"># '+escHtml(s)+'</span>\n'+escHtml(RECON_CMD[s]) : null; }).filter(Boolean);
     if(reconLines.length) blocks.push(cmdBlock('Graph recon — run with the acquired token (Authorization: Bearer …)', reconLines.join('\n')));
@@ -1033,6 +1314,9 @@
     }
     if(r.signInAudience === 'AzureADandPersonalMicrosoftAccount' || r.signInAudience === 'PersonalMicrosoftAccount'){
       mitreById['T1566'] = {id:'T1566', name:'Phishing (consumer MSA token vector)', tactic:'Initial Access'};
+    }
+    if(r.appPermissions && r.appPermissions.length){
+      mitreById['T1098.001'] = {id:'T1098.001', name:'Account Manipulation: Additional Cloud Credentials', tactic:'Persistence'};
     }
     var mitreTechs = Object.keys(mitreById).sort().map(function(k){ return mitreById[k]; });
 
@@ -1206,6 +1490,7 @@
   el('btn-signin').addEventListener('click', signIn);
   el('btn-signout').addEventListener('click', signOut);
   el('btn-refresh').addEventListener('click', runAudit);
+  el('takeover').addEventListener('click', function(e){ if(e.target.closest('#tk-toggle')){ takeoverOpen = !takeoverOpen; renderTakeover(); } });
   el('btn-csv').addEventListener('click', exportCsv);
   el('q').addEventListener('input', render);
   el('f-level').addEventListener('change', render);
