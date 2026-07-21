@@ -104,6 +104,23 @@
   .gcall pre { margin: 0; padding: 11px 13px; background: var(--code-bg); font-family: "Cascadia Code", Consolas, monospace; font-size: 11.5px; line-height: 1.5; overflow-x: auto; max-height: 260px; }
   .expander { cursor: pointer; user-select: none; color: var(--accent); font-weight: 600; font-size: 12px; }
   pre.raw { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 11px 13px; font-family: "Cascadia Code", Consolas, monospace; font-size: 11px; line-height: 1.5; overflow-x: auto; max-height: 340px; word-break: break-all; white-space: pre-wrap; }
+  /* attack-impact preview */
+  .impact { border: 2px solid var(--red); background: var(--red-bg); color: var(--text); border-radius: 10px; padding: 14px 18px; margin: 14px 0 16px; font-size: 13px; line-height: 1.55; }
+  .impact b { font-weight: 700; }
+  .hgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 14px; }
+  .hstat { border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; background: var(--card); }
+  .hstat .n { font-size: 28px; font-weight: 800; line-height: 1; }
+  .hstat .n.hot { color: var(--red); }
+  .hstat .n.na { color: var(--muted); font-size: 15px; font-weight: 600; }
+  .hstat .l { font-size: 12px; color: var(--muted); margin-top: 6px; text-transform: uppercase; letter-spacing: .3px; }
+  .crown { border: 1px solid var(--red); border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; background: var(--red-bg); }
+  .crown h4 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--red); }
+  .crown ul { margin: 0; padding-left: 18px; font-size: 12.5px; line-height: 1.7; }
+  .crown ul b { color: var(--text); }
+  .samp { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  .samp td, .samp th { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .samp th { color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .3px; font-size: 11px; }
+  .samp td { font-family: "Cascadia Code", Consolas, monospace; }
 </style>
 </head>
 <body>
@@ -177,6 +194,15 @@
       <h2>Live Microsoft Graph reads (as the signed-in user)</h2>
       <div class="sub">Same app, same code — the data returned belongs to whichever tenant the account is from, capped by that user's own privileges.</div>
       <div id="graph"></div>
+    </div>
+
+    <div class="card" id="impactCard">
+      <h2>Attack-impact preview — what a hostile app could capture</h2>
+      <div class="sub">Uses this session's token to enumerate the <b>breadth</b> of what it can read in <span id="impactTenant">this tenant</span>.
+        For a CISO demo: this is what a malicious multi-tenant app would silently harvest the instant your user consents.
+        <b>Nothing here leaves your browser</b> — it's read-only and sent only to Microsoft Graph; the only thing a real attacker adds is a <code>POST</code> to their own server.</div>
+      <button id="btn-impact">Preview what this session can read</button>
+      <div id="impact" style="margin-top:14px"></div>
     </div>
   </section>
 </main>
@@ -286,8 +312,57 @@ async function readAndRender(loginRes){
   // ---- graph calls ----
   $("graph").innerHTML = [gcall("GET","/me", me), gcall("GET","/organization", org), gcall("GET","/me/memberOf", memb)].join("");
 
+  // reset the attack-impact preview for the (possibly new) tenant
+  $("impactTenant").textContent = tenantName;
+  $("impact").innerHTML = ""; $("btn-impact").disabled = false;
+
   $("results").classList.remove("hidden");
   setStatus("Read complete — token tenant " + tid + ".");
+}
+// Attack-impact preview: enumerate the BREADTH this session can read (counts + a small sample + the
+// privileged accounts). Read-only; nothing leaves the browser. It shows a CISO exactly what a hostile
+// multi-tenant app would harvest on consent — the only thing a real attacker adds is exfiltration.
+const PRIV_ROLE_RX = /Global Administrator|Privileged Role|Privileged Authentication|Security Administrator|Application Administrator|Cloud Application Administrator|User Administrator|Exchange Administrator|SharePoint Administrator|Authentication Administrator|Hybrid Identity|Helpdesk Administrator|Conditional Access/i;
+async function harvestPreview(){
+  const btn = $("btn-impact"); btn.disabled = true;
+  $("impact").innerHTML = '<p class="sub"><span class="spinner"></span> Enumerating the directory this session can reach…</p>';
+  let token; try { token = await getToken(); } catch(e){ $("impact").innerHTML = '<div class="notice notice-warn">Could not get a token: '+escHtml(e.message||String(e))+'</div>'; btn.disabled=false; return; }
+  const users   = await graphGet("/users?$count=true&$top=8&$select=displayName,userPrincipalName,jobTitle", token);
+  const groups  = await graphGet("/groups?$count=true&$top=1&$select=id", token);
+  const devices = await graphGet("/devices?$count=true&$top=1&$select=id", token);
+  const sps     = await graphGet("/servicePrincipals?$count=true&$top=1&$select=id", token);
+  const roles   = await graphGet("/directoryRoles?$expand=members($select=displayName,userPrincipalName)", token);
+
+  const cnt = (res)=> (res.ok && typeof res.body["@odata.count"] === "number") ? res.body["@odata.count"] : null;
+  function tile(label, res){
+    const n = cnt(res);
+    const cls = !res.ok ? "na" : (n>0 ? "hot" : "");
+    const val = !res.ok ? "blocked" : (n==null ? (Array.isArray(res.body.value) ? res.body.value.length+"+" : "readable") : n.toLocaleString());
+    return '<div class="hstat"><div class="n '+cls+'">'+escHtml(String(val))+'</div><div class="l">'+label+(res.ok?'':' — needs a broader scope')+'</div></div>';
+  }
+
+  let crown = "";
+  if(roles.ok && Array.isArray(roles.body.value)){
+    const priv = roles.body.value.filter(r=> PRIV_ROLE_RX.test(r.displayName||"") && r.members && r.members.length);
+    const admins = {}; priv.forEach(r=> (r.members||[]).forEach(m=>{ admins[m.userPrincipalName||m.displayName]=1; }));
+    if(priv.length) crown = '<div class="crown"><h4>⚠ Privileged accounts this session can enumerate ('+Object.keys(admins).length+' distinct)</h4><ul>'
+      + priv.map(r=> '<li><b>'+escHtml(r.displayName)+'</b>: '+(r.members||[]).map(m=> escHtml(m.displayName||m.userPrincipalName)).join(", ")+'</li>').join("")
+      + '</ul></div>';
+  }
+
+  let samp = "";
+  if(users.ok && Array.isArray(users.body.value) && users.body.value.length)
+    samp = '<div class="sub" style="margin:6px 0 4px"><b>Sample of the user directory it just read</b> (first '+users.body.value.length+'):</div><table class="samp"><thead><tr><th>Name</th><th>UPN</th><th>Title</th></tr></thead><tbody>'
+      + users.body.value.map(u=> '<tr><td>'+escHtml(u.displayName||"")+'</td><td>'+escHtml(u.userPrincipalName||"")+'</td><td>'+escHtml(u.jobTitle||"")+'</td></tr>').join("")
+      + '</tbody></table>';
+
+  const anyBlocked = [users,groups,devices,sps].some(r=>!r.ok);
+  $("impact").innerHTML =
+      '<div class="impact"><b>Everything below was read on your user’s behalf and shown here in your browser — nothing was sent anywhere.</b> A hostile multi-tenant app would <code>POST</code> exactly this to its own server the moment consent is granted: no further clicks, invisible to the user, and (with a backend + refresh token) it keeps reading for days until an admin revokes the app.</div>'
+    + '<div class="hgrid">' + tile("Users", users) + tile("Groups", groups) + tile("Devices", devices) + tile("Apps / SPNs", sps) + '</div>'
+    + crown + samp
+    + (anyBlocked ? '<div class="notice notice-info" style="margin-top:12px">Some reads were blocked — the consented scopes don’t cover them here. Add <code>Directory.Read.All</code> to the scopes and re-consent (as an admin), then re-run: a single broad admin consent is what turns one login into a full directory dump.</div>' : '');
+  btn.disabled = false;
 }
 function gcall(verb, path, res){
   const stat = res.status + (res.ok?"":" — "+((res.body&&res.body.error&&res.body.error.code)||"error"));
@@ -314,6 +389,7 @@ function showAuthError(e){
   console.error(e);
 }
 
+$("btn-impact").addEventListener("click", harvestPreview);
 $("btn-signin").addEventListener("click", ()=>signIn("select_account"));
 $("btn-switch").addEventListener("click", ()=>signIn("select_account"));
 $("btn-signout").addEventListener("click", signOut);
