@@ -189,8 +189,9 @@
         <div class="hint">An app registration of type <b>SPA</b> with delegated, <b>read-only</b> permissions
           <code>Directory.Read.All</code>, <code>RoleManagement.Read.All</code>,
           <code>Application.Read.All</code>, <code>User.Read</code>. All require admin consent.
-          <br><b>Optional:</b> PIM eligibility (<code>roleEligibilityScheduleInstances</code>) degrades gracefully
-          when Entra ID P2 is absent.</div>
+          <br><b>Optional (each degrades gracefully):</b> <code>Policy.Read.All</code> adds Conditional Access
+          gap edges (uncovered admins, legacy-auth bypass); PIM eligibility
+          (<code>roleEligibilityScheduleInstances</code>) needs Entra ID P2.</div>
       </div>
       <div>
         <label for="tenantId">Directory (tenant) ID or domain</label>
@@ -255,6 +256,7 @@
           <option value="user">User</option>
           <option value="servicePrincipal">Service principal</option>
           <option value="group">Group</option>
+          <option value="external">External (CA gap)</option>
         </select>
         <select id="fltRel">
           <option value="">All reliability</option>
@@ -403,6 +405,14 @@ async function token() {
   catch { return (await msalInstance.acquireTokenPopup({ scopes: SCOPES, account })).accessToken; }
 }
 
+// Optional scope. Requested silently so a tenant that never consented Policy.Read.All still gets
+// every other feature — Conditional Access edges just don't appear, with a notice explaining why.
+const CA_SCOPES = ["Policy.Read.All"];
+async function optionalToken(scopes) {
+  try { return (await msalInstance.acquireTokenSilent({ scopes, account })).accessToken; }
+  catch { return null; }
+}
+
 // ---- Graph helpers ----
 async function graphGetAll(url, accessToken) {
   let out = [], next = url;
@@ -481,8 +491,69 @@ const MITRE = {
   addMember:   { id: "T1098.003", name: "Account Manipulation: Additional Cloud Roles", tactic: "Persistence" },
   addCred:     { id: "T1098.001", name: "Account Manipulation: Additional Cloud Credentials", tactic: "Persistence" },
   grantRole:   { id: "T1098.003", name: "Account Manipulation: Additional Cloud Roles", tactic: "Privilege Escalation" },
-  pim:         { id: "T1078.004", name: "Valid Accounts: Cloud Accounts (PIM activation)", tactic: "Privilege Escalation" }
+  pim:         { id: "T1078.004", name: "Valid Accounts: Cloud Accounts (PIM activation)", tactic: "Privilege Escalation" },
+  phish:       { id: "T1566", name: "Phishing", tactic: "Initial Access" },
+  spray:       { id: "T1110.003", name: "Brute Force: Password Spraying", tactic: "Credential Access" },
+  validAcct:   { id: "T1078.004", name: "Valid Accounts: Cloud Accounts", tactic: "Initial Access" }
 };
+
+// ---- Conditional Access evaluation (heuristic, not Microsoft's What-If) -----------
+// A policy "enforces strong auth" if it is enabled (report-only / disabled do NOT enforce),
+// grants (not blocks) with mfa / compliant / hybrid-joined device / an authentication strength.
+function policyStrongAuth(p) {
+  const gc = p.grantControls;
+  if (!gc) return { enforcing: false, reportOnly: false };
+  const c = gc.builtInControls || [];
+  if (c.indexOf("block") >= 0) return { enforcing: false, reportOnly: false }; // block policies handled separately
+  const strong = c.indexOf("mfa") >= 0 || c.indexOf("compliantDevice") >= 0 || c.indexOf("domainJoinedDevice") >= 0 || !!(gc.authenticationStrength && gc.authenticationStrength.id);
+  if (!strong) return { enforcing: false, reportOnly: false };
+  if (p.state === "enabled") return { enforcing: true, reportOnly: false };
+  if (p.state === "enabledForReportingButNotEnforced") return { enforcing: false, reportOnly: true };
+  return { enforcing: false, reportOnly: false };
+}
+function caCoversAllApps(p) { const inc = (p.conditions && p.conditions.applications && p.conditions.applications.includeApplications) || []; return inc.indexOf("All") >= 0; }
+function caCoversInteractive(p) { const t = (p.conditions && p.conditions.clientAppTypes) || ["all"]; return t.indexOf("all") >= 0 || t.indexOf("browser") >= 0 || t.indexOf("mobileAppsAndDesktopClients") >= 0; }
+// u = { id, groups:Set(groupIds), roles:Set(roleTemplateIds) }
+function caIncludes(p, u) {
+  const c = (p.conditions && p.conditions.users) || {};
+  if ((c.includeUsers || []).indexOf("All") >= 0) return true;
+  if ((c.includeUsers || []).indexOf(u.id) >= 0) return true;
+  if ((c.includeGroups || []).some((g) => u.groups.has(g))) return true;
+  if ((c.includeRoles || []).some((r) => u.roles.has(r))) return true;
+  return false;
+}
+function caExcludes(p, u) {
+  const c = (p.conditions && p.conditions.users) || {};
+  if ((c.excludeUsers || []).indexOf(u.id) >= 0) return true;
+  if ((c.excludeGroups || []).some((g) => u.groups.has(g))) return true;
+  if ((c.excludeRoles || []).some((r) => u.roles.has(r))) return true;
+  return false;
+}
+// Returns { covered, reportOnly, excluded } for a user against the full policy set.
+function caCoverage(policies, u) {
+  let covered = false, reportOnly = false, excluded = false;
+  policies.forEach((p) => {
+    const sa = policyStrongAuth(p);
+    if (!sa.enforcing && !sa.reportOnly) return;
+    if (!caCoversAllApps(p) || !caCoversInteractive(p)) return;
+    if (!caIncludes(p, u)) return;
+    if (caExcludes(p, u)) { if (sa.enforcing) excluded = true; return; }
+    if (sa.enforcing) covered = true; else if (sa.reportOnly) reportOnly = true;
+  });
+  return { covered, reportOnly, excluded };
+}
+// Is legacy authentication blocked tenant-wide? (broad enabled block policy targeting legacy clients)
+function caBlocksLegacyAuth(policies) {
+  return policies.some((p) => {
+    if (p.state !== "enabled") return false;
+    const gc = p.grantControls;
+    if (!gc || (gc.builtInControls || []).indexOf("block") < 0) return false;
+    const t = (p.conditions && p.conditions.clientAppTypes) || [];
+    const legacy = t.indexOf("exchangeActiveSync") >= 0 || t.indexOf("other") >= 0;
+    const allUsers = ((p.conditions && p.conditions.users && p.conditions.users.includeUsers) || []).indexOf("All") >= 0;
+    return legacy && caCoversAllApps(p) && allUsers;
+  });
+}
 
 // ============================================================================
 //  Analysis
@@ -541,6 +612,7 @@ async function analyze() {
     // ---- Build the graph model --------------------------------------------------
     const paths = [];
     const tier0Holders = [];
+    const directUserHolders = {}; // userId -> most-privileged direct role held (for CA evaluation)
     let pid = 0;
     const nextId = () => "p" + ++pid;
 
@@ -555,8 +627,12 @@ async function analyze() {
       }
       const rec = { type: kind, name: principalLabel(princ), id: princ.id, upn: princ.userPrincipalName || princ.appId || "", roleName, tier, via };
       if (tier === 0) tier0Holders.push(rec);
-      // A directly-held role is not an "escalation path" per se, but a Tier-0 SP holding it
-      // AND carrying dangerous perms is surfaced under abusable SPs below. Users are inventory.
+      // Track every user who holds a privileged role directly, keeping their most-privileged role
+      // (lowest tier number). CA evaluation turns any of these that lack MFA into initial-access paths.
+      if (kind === "user" && princ.id) {
+        const cur = directUserHolders[princ.id];
+        if (!cur || tier < cur.tier) directUserHolders[princ.id] = { id: princ.id, name: principalLabel(princ), upn: princ.userPrincipalName || "", tier, roleName };
+      }
     }
     assignments.forEach((a) => noteHolder(a.principal || { id: a.principalId }, PRIV_ROLES[a.roleDefinitionId].name, PRIV_ROLES[a.roleDefinitionId].tier, "active"));
     eligible.forEach((a) => {
@@ -703,6 +779,96 @@ async function analyze() {
       });
     });
 
+    // (d) Conditional Access gap edges (optional — needs Policy.Read.All) ---------
+    // CA weaknesses are the "initial access" layer: an admin with no enforced MFA is a walkable
+    // path from the internet to their role; unblocked legacy auth lets password spray bypass MFA.
+    MODEL.caAvailable = false;
+    MODEL.caStats = { uncoveredAdmins: 0, legacyOpen: false, evaluated: 0, truncated: false };
+    setStatus("Evaluating Conditional Access coverage…", false, true);
+    const caToken = await optionalToken(CA_SCOPES);
+    if (caToken) {
+      try {
+        const policies = await graphGetAll(base + "/identity/conditionalAccess/policies", caToken);
+        MODEL.caAvailable = true;
+
+        // Legacy-auth bypass — a single tenant-wide finding.
+        if (!caBlocksLegacyAuth(policies)) {
+          MODEL.caStats.legacyOpen = true;
+          const reachTier0 = tier0Holders.length > 0;
+          paths.push({
+            id: nextId(), sourceType: "external", source: "Any password-only attacker", sourceId: "", sourceUpn: "",
+            target: reachTier0 ? "Account takeover (MFA bypass)" : "Account takeover (MFA bypass)", tier: reachTier0 ? 0 : 1,
+            sev: reachTier0 ? "critical" : "high", reliability: "high", hops: 2, technique: "Legacy authentication not blocked",
+            edges: [{ label: "legacy endpoint (IMAP/POP/SMTP/EAS)", node: "password spray — MFA not evaluated" }, { label: "→", node: "any account with a password" }],
+            mitre: [MITRE.spray, MITRE.validAcct],
+            evidence: "No enabled Conditional Access policy blocks legacy authentication tenant-wide. Legacy protocols do not support modern auth, so per-user MFA and CA grant controls are <b>never evaluated</b> — a password-spray or basic-auth login succeeds with credentials alone" + (reachTier0 ? ", including against the " + tier0Holders.length + " Tier-0 account(s) below." : "."),
+            remediation: [
+              "Create an enabled Conditional Access policy: All users, All cloud apps, client apps = Exchange ActiveSync + Other, grant = Block.",
+              "Confirm no service account still depends on basic auth before enforcing (check sign-in logs, client app = 'Other').",
+              "Disable per-protocol legacy auth in Exchange Online (authentication policies) as defence in depth."
+            ],
+            chokeKey: "ca:legacy", chokeFix: "Block legacy authentication tenant-wide via Conditional Access", chokeSev: reachTier0 ? "critical" : "high"
+          });
+        }
+
+        // Per-principal MFA coverage for privileged accounts + user path-sources.
+        const relevant = new Map();
+        Object.values(directUserHolders).forEach((u) => relevant.set(u.id, { id: u.id, name: u.name, upn: u.upn }));
+        paths.forEach((p) => { if (p.sourceType === "user" && p.sourceId && !relevant.has(p.sourceId)) relevant.set(p.sourceId, { id: p.sourceId, name: p.source, upn: p.sourceUpn }); });
+        let relArr = Array.from(relevant.values());
+        if (relArr.length > 300) { relArr = relArr.slice(0, 300); MODEL.caStats.truncated = true; }
+        MODEL.caStats.evaluated = relArr.length;
+
+        setStatus("Resolving Conditional Access scope for " + relArr.length + " privileged account(s)…", false, true);
+        const membership = await mapPool(relArr, 8, async (u) => {
+          const objs = await graphGetAll(base + "/users/" + u.id + "/transitiveMemberOf?$select=id,roleTemplateId&$top=999", at).catch(() => []);
+          const groups = new Set(), roles = new Set();
+          objs.forEach((o) => { if (o.roleTemplateId) roles.add(o.roleTemplateId); else if (o.id) groups.add(o.id); });
+          return { id: u.id, groups, roles };
+        }, null);
+        const membById = {}; (membership || []).forEach((m) => { if (m) membById[m.id] = m; });
+
+        relArr.forEach((u) => {
+          const scope = membById[u.id] || { id: u.id, groups: new Set(), roles: new Set() };
+          const cov = caCoverage(policies, scope);
+          if (cov.covered) return; // protected by an enforcing policy
+          const dh = directUserHolders[u.id];
+          // A direct privileged holder with no enforced MFA → standalone internet-to-role path.
+          if (dh) {
+            MODEL.caStats.uncoveredAdmins++;
+            const sev = tierToSev(dh.tier);
+            const why = cov.excluded
+              ? "This account is explicitly <b>excluded</b> from an otherwise-enforcing MFA policy — a common backdoor left on admin or break-glass accounts."
+              : cov.reportOnly
+                ? "The only in-scope MFA policy is in <b>report-only</b> mode, so nothing is actually enforced."
+                : "No enabled Conditional Access policy requires MFA or strong auth for this account on interactive sign-in.";
+            paths.push({
+              id: nextId(), sourceType: "user", source: dh.name, sourceId: u.id, sourceUpn: dh.upn,
+              target: dh.roleName, tier: dh.tier, sev, reliability: cov.reportOnly ? "conditional" : "high",
+              hops: 2, technique: "Privileged account not covered by MFA", internetReachable: true,
+              edges: [{ label: "internet sign-in, password only", node: "account takeover (phish / spray)" }, { label: "holds", node: dh.roleName }],
+              mitre: [MITRE.phish, MITRE.spray, MITRE.validAcct],
+              evidence: why + " With a single credential-phishing or password-spray step an attacker operates directly as <b>" + escapeHtml(dh.roleName) + "</b> — no escalation required.",
+              remediation: [
+                "Bring this account into an enforced Conditional Access policy requiring phishing-resistant MFA.",
+                cov.excluded ? "Remove this account from the exclusion list of the MFA policy; use a monitored break-glass exception instead." : "Scope the admin-MFA policy to the Directory Roles this account holds so coverage follows the role, not a static list.",
+                "Place the role under PIM so the standing account carries no privilege at rest."
+              ],
+              chokeKey: "ca:admin-mfa", chokeFix: "Enforce phishing-resistant MFA for all privileged roles via Conditional Access", chokeSev: "critical"
+            });
+          } else {
+            // Not a direct holder but the source of an escalation path → mark those paths internet-reachable.
+            paths.forEach((p) => {
+              if (p.sourceId === u.id && !p.internetReachable && p.chokeKey.indexOf("ca:") !== 0) {
+                p.internetReachable = true;
+                p.caNote = "Source account is also not covered by MFA — this escalation path is reachable directly from the internet, no prior foothold needed.";
+              }
+            });
+          }
+        });
+      } catch (e) { MODEL.caAvailable = false; MODEL.caError = e.message || String(e); }
+    }
+
     MODEL.paths = paths;
     MODEL.tier0Holders = tier0Holders;
     MODEL.generatedAt = new Date();
@@ -740,9 +906,23 @@ function computeStats() {
 // ============================================================================
 
 function render() {
+  renderNotices();
   renderSummary();
   renderQueue();
   renderTable();
+}
+
+function renderNotices() {
+  const n = [];
+  if (!MODEL.caAvailable) {
+    n.push('<div class="notice notice-warn">Conditional Access not evaluated — grant <code>Policy.Read.All</code> (admin consent) so no-MFA admins and legacy-auth bypass surface as paths.'
+      + (MODEL.caError ? ' <span class="mono">(' + escapeHtml(MODEL.caError) + ')</span>' : "") + '</div>');
+  } else {
+    const c = MODEL.caStats || {};
+    n.push('<div class="notice notice-info">Conditional Access evaluated for ' + (c.evaluated || 0) + ' privileged account(s)'
+      + (c.truncated ? ' (capped at 300)' : "") + '. Coverage is a heuristic evaluation, not Microsoft’s What-If — verify flagged accounts before reporting.</div>');
+  }
+  $("notices").innerHTML = n.join("");
 }
 
 function statTile(id, n, label, crit) {
@@ -753,17 +933,20 @@ function statTile(id, n, label, crit) {
 function renderSummary() {
   const s = MODEL.stats;
   const chokeCount = Object.keys(s.chokes || {}).length;
+  const ca = MODEL.caStats || {};
   $("summary").innerHTML =
     statTile("all", s.total, "Attack paths", false)
     + statTile("critical", s.critical, "Critical (to Tier-0)", s.critical > 0)
     + statTile("tier0", s.tier0Direct, "Tier-0 role holders", false)
     + statTile("sp", s.abusableSp, "Over-privileged SPs", s.abusableSp > 0)
+    + (MODEL.caAvailable ? statTile("ca", ca.uncoveredAdmins || 0, "No-MFA admins", (ca.uncoveredAdmins || 0) > 0) : "")
     + statTile("choke", chokeCount, "Choke points", false);
   $("summary").querySelectorAll(".stat").forEach((el) => el.addEventListener("click", () => {
     const id = el.getAttribute("data-stat");
     if (id === "all") { activeStat = null; $("fltSev").value = ""; $("fltType").value = ""; }
-    else if (id === "critical") { activeStat = id; $("fltSev").value = "critical"; $("fltType").value = ""; }
-    else if (id === "sp") { activeStat = id; $("fltSev").value = ""; $("fltType").value = "servicePrincipal"; }
+    else if (id === "critical") { activeStat = null; $("fltSev").value = "critical"; $("fltType").value = ""; }
+    else if (id === "sp") { activeStat = null; $("fltSev").value = ""; $("fltType").value = "servicePrincipal"; }
+    else if (id === "ca") { activeStat = "ca"; $("fltSev").value = ""; $("fltType").value = ""; }
     else if (id === "tier0" || id === "choke") { activeStat = id; document.getElementById(id === "choke" ? "rqCard" : "table").scrollIntoView({ behavior: "smooth" }); }
     renderSummary(); renderTable();
   }));
@@ -794,6 +977,7 @@ function filtered() {
   if (fSev === "high") rows = rows.filter((r) => SEV[r.sev].rank >= 2);
   if (fType) rows = rows.filter((r) => r.sourceType === fType);
   if (fRel) rows = rows.filter((r) => r.reliability === fRel);
+  if (activeStat === "ca") rows = rows.filter((r) => r.internetReachable);
   const key = sortState.key, dir = sortState.dir;
   rows.sort((a, b) => {
     let av, bv;
@@ -806,7 +990,8 @@ function filtered() {
   return rows;
 }
 
-const typeBadge = (t) => t === "user" ? '<span class="badge b-user">User</span>' : t === "servicePrincipal" ? '<span class="badge b-sp">Service principal</span>' : '<span class="badge b-group">Group</span>';
+const typeBadge = (t) => t === "user" ? '<span class="badge b-user">User</span>' : t === "servicePrincipal" ? '<span class="badge b-sp">Service principal</span>' : t === "external" ? '<span class="badge b-high">External</span>' : '<span class="badge b-group">Group</span>';
+const reachBadge = '<span class="badge b-crit" title="Account is not covered by an enforced MFA policy — reachable directly from the internet">No MFA · internet-reachable</span>';
 
 function chainHtml(r) {
   let h = '<div class="chain"><span class="node src">' + escapeHtml(r.source) + '</span>';
@@ -824,7 +1009,7 @@ function renderTable() {
     return '<tr class="rowx" data-id="' + r.id + '">'
       + '<td class="chev">▸</td>'
       + '<td><span class="badge ' + SEV[r.sev].cls + '">' + r.sev.toUpperCase() + '</span></td>'
-      + '<td>' + escapeHtml(r.source) + '<br>' + typeBadge(r.sourceType) + (r.sourceUpn ? '<div class="mono">' + escapeHtml(r.sourceUpn) + '</div>' : "") + '</td>'
+      + '<td>' + escapeHtml(r.source) + '<br>' + typeBadge(r.sourceType) + (r.internetReachable ? " " + reachBadge : "") + (r.sourceUpn ? '<div class="mono">' + escapeHtml(r.sourceUpn) + '</div>' : "") + '</td>'
       + '<td>' + chainHtml(r) + '</td>'
       + '<td><b>' + escapeHtml(r.target) + '</b></td>'
       + '<td style="text-align:center">' + r.hops + '</td>'
@@ -846,7 +1031,7 @@ function detailHtml(r) {
   const rem = r.remediation.map((x) => "<li>" + x + "</li>").join("");
   return '<div class="dpanel">'
     + '<div class="dsec dsec-wide"><div class="dhead">Technique — ' + escapeHtml(r.technique) + '</div>'
-    + '<div class="evidence">' + r.evidence + '</div></div>'
+    + '<div class="evidence">' + r.evidence + (r.caNote ? '<br><br><b>Conditional Access:</b> ' + escapeHtml(r.caNote) : "") + '</div></div>'
     + '<div class="dsec"><div class="dhead">Attack steps</div><ol class="dlist steps">'
     + '<li>Start from control of <b>' + escapeHtml(r.source) + '</b>.</li>'
     + r.edges.map((e) => "<li>" + escapeHtml(e.label) + " <b>" + escapeHtml(e.node) + "</b>.</li>").join("")
@@ -859,15 +1044,15 @@ function detailHtml(r) {
 
 // ---- exports ----
 function exportJson() {
-  const blob = new Blob([JSON.stringify({ generatedAt: MODEL.generatedAt, stats: { total: MODEL.stats.total, critical: MODEL.stats.critical }, paths: MODEL.paths, tier0Holders: MODEL.tier0Holders }, null, 2)], { type: "application/json" });
+  const blob = new Blob([JSON.stringify({ generatedAt: MODEL.generatedAt, stats: { total: MODEL.stats.total, critical: MODEL.stats.critical }, conditionalAccess: { available: MODEL.caAvailable, ...(MODEL.caStats || {}) }, paths: MODEL.paths, tier0Holders: MODEL.tier0Holders }, null, 2)], { type: "application/json" });
   triggerDownload(blob, "entra-attack-paths-" + new Date().toISOString().slice(0, 10) + ".json");
 }
 function exportCsv() {
-  const cols = ["severity", "reliability", "sourceType", "source", "sourceUpn", "technique", "path", "target", "hops", "recommendedFix"];
+  const cols = ["severity", "reliability", "sourceType", "source", "sourceUpn", "technique", "path", "target", "hops", "internetReachable", "recommendedFix"];
   const lines = [cols.join(",")];
   MODEL.paths.forEach((r) => {
     const path = r.source + " " + r.edges.map((e) => e.label + " " + e.node).join(" ");
-    const row = [r.sev, r.reliability, r.sourceType, r.source, r.sourceUpn, r.technique, path, r.target, r.hops, r.chokeFix];
+    const row = [r.sev, r.reliability, r.sourceType, r.source, r.sourceUpn, r.technique, path, r.target, r.hops, r.internetReachable ? "yes" : "", r.chokeFix];
     lines.push(row.map((v) => { v = v == null ? "" : String(v).replace(/"/g, '""'); return /[",\n]/.test(v) ? '"' + v + '"' : v; }).join(","));
   });
   triggerDownload(new Blob([lines.join("\n")], { type: "text/csv" }), "entra-attack-paths-" + new Date().toISOString().slice(0, 10) + ".csv");
