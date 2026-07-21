@@ -113,6 +113,11 @@
   .samp td, .samp th { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
   .samp th { color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .3px; font-size: 11px; }
   .samp td { font-family: "Cascadia Code", Consolas, monospace; }
+  .secrow { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; font-size: 12.5px; flex-wrap: wrap; }
+  .secrow .secok { color: var(--red); font-weight: 700; }
+  .secrow .secbad { color: var(--red); font-weight: 700; }
+  .secrow .secwarn { color: var(--amber); font-weight: 700; }
+  .mono { font-family: "Cascadia Code", Consolas, monospace; }
 </style>
 </head>
 <body>
@@ -179,12 +184,6 @@
       <h2>Token claims — the app itself, no user</h2>
       <div class="sub"><code>roles</code> = the <b>application permissions</b> this token carries · <code>appid</code> = the app · <code>tid</code> = the tenant it reads · and note there is <b>no</b> <code>scp</code>/<code>upn</code>/<code>name</code> — no signed-in user.</div>
       <table class="kv" id="claims"></table>
-    </div>
-
-    <div class="card">
-      <h2>Live Microsoft Graph reads (app-only, unattended)</h2>
-      <div class="sub">No user is present. If a call 403s, the token doesn't carry that application role — grant it and admin-consent it in this tenant, then re-acquire.</div>
-      <div id="graph"></div>
     </div>
 
     <div class="card" id="impactCard">
@@ -282,7 +281,6 @@ async function readTenant(){
   setStatus("Reading the tenant…", false, true);
   const org  = await graphGet("/organization?$select=displayName,id", token);
   const users = await graphGet("/users?$top=5&$select=displayName,userPrincipalName", token);
-  const sps  = await graphGet("/servicePrincipals?$top=5&$select=displayName,appId", token);
 
   const tid = claims.tid || "?";
   const orgName = (org.ok && org.body.value && org.body.value[0] && org.body.value[0].displayName) || null;
@@ -310,7 +308,6 @@ async function readTenant(){
   ["scp","upn","name","preferred_username"].forEach(k=>{ if(!(k in claims)) html += '<tr class="absent"><td class="k">'+k+'</td><td class="v">— absent (no signed-in user)</td></tr>'; });
   $("claims").innerHTML = html;
 
-  $("graph").innerHTML = [gcall("GET","/organization", org), gcall("GET","/users?$top=5", users), gcall("GET","/servicePrincipals?$top=5", sps)].join("");
   $("impactTenant").textContent = tenantName; $("impact").innerHTML = ""; $("btn-impact").disabled = false;
   $("results").classList.remove("hidden");
   setStatus("Done — app-only read of tenant " + tid + ".");
@@ -328,6 +325,12 @@ async function harvestPreview(){
   const devices = await graphGet("/devices?$count=true&$top=1&$select=id", token);
   const sps     = await graphGet("/servicePrincipals?$count=true&$top=1&$select=id", token);
   const roles   = await graphGet("/directoryRoles?$expand=members($select=displayName,userPrincipalName)", token);
+  // Security/governance reads — the same three the delegated tester used to prove the USER cap.
+  // Here there is NO user: they succeed purely on the app roles in the token, unattended and uncapped.
+  const ca   = await graphGet("/identity/conditionalAccess/policies?$select=id,displayName,state&$top=100", token);
+  const raps = await graphGet("/roleManagement/directory/roleAssignments?$top=5&$select=id", token);
+  const logs = await graphGet("/auditLogs/signIns?$top=1&$select=id", token);
+  const roleSet = new Set((Array.isArray((decodeJwt(token)||{}).roles) ? (decodeJwt(token)||{}).roles : []).map(String));
 
   const cnt = (res)=> (res.ok && typeof res.body["@odata.count"] === "number") ? res.body["@odata.count"] : null;
   function tile(label, res){
@@ -349,23 +352,35 @@ async function harvestPreview(){
     samp = '<div class="sub" style="margin:6px 0 4px"><b>Sample of the user directory it just read</b> (first '+users.body.value.length+'):</div><table class="samp"><thead><tr><th>Name</th><th>UPN</th><th>Title</th></tr></thead><tbody>'
       + users.body.value.map(u=> '<tr><td>'+escHtml(u.displayName||"")+'</td><td>'+escHtml(u.userPrincipalName||"")+'</td><td>'+escHtml(u.jobTitle||"")+'</td></tr>').join("")
       + '</tbody></table>';
+  // Security/governance reads — no user, no cap: gated only by the app roles in the token.
+  //   200                      → the app role is present, and it reads it unattended (red = this is the risk)
+  //   403 + role NOT in token  → the app lacks that Application role — a config gap, add + admin-consent it (amber)
+  //   403 + role IS in token   → blocked despite the role present (red)
+  function secRow(label, appRole, res){
+    let cls, detail;
+    if(res.ok){ const n = (res.body && Array.isArray(res.body.value)) ? res.body.value.length : null;
+      cls = "secok";
+      detail = (n!=null ? (n + (res.body["@odata.nextLink"]?"+":"") + " returned") : "readable") + " — read on the credential alone, no user, no cap"; }
+    else { const code = (res.body&&res.body.error&&res.body.error.code) || "blocked";
+      if(!roleSet.has(appRole)){ cls = "secwarn";
+        detail = res.status + " " + code + " — the app has no " + appRole + " application role. Grant + admin-consent it, then re-acquire. (A config gap, not a cap.)"; }
+      else { cls = "secbad";
+        detail = res.status + " " + code + " — blocked even though the app role is in the token."; } }
+    return '<div class="secrow"><div><b>'+label+'</b> <span class="mono" style="font-size:11px;color:var(--muted)">'+appRole+'</span></div><div class="'+cls+'">'+escHtml(detail)+'</div></div>';
+  }
+  const secHtml = '<div style="margin-top:16px;font-weight:700;font-size:13px">Security &amp; governance reads — on the credential alone</div>'
+    + '<div class="sub" style="margin:4px 0 8px">In the <b>delegated</b> tester these same three reads were the proof of the <b>user cap</b> — an ordinary user got <code>403</code> even with the scope. Here there is <b>no user to cap it</b>: if the app carries the <b>Application</b> role, it reads them <b>unattended</b>, no admin sign-in, no session. A <span style="color:var(--amber);font-weight:700">amber</span> row just means the app role isn’t granted yet — add it and this goes red too.</div>'
+    + secRow("Conditional Access policies", "Policy.Read.All", ca)
+    + secRow("Directory role assignments (who is admin)", "RoleManagement.Read.Directory", raps)
+    + secRow("Sign-in logs", "AuditLog.Read.All", logs);
+
   const anyBlocked = [users,groups,devices,sps].some(r=>!r.ok);
   $("impact").innerHTML =
       '<div class="impact"><b>No user was involved.</b> This app read the directory on its <b>credential alone</b> and it all stayed in your browser. The publisher — whoever holds the client secret — reads exactly this <b>silently and unattended, any time, for as long as the credential and consent live</b>. Unlike the delegated case, there is no session to expire and no user to disable: only <b>revoking the app / its permission</b> stops it.</div>'
     + '<div class="hgrid">' + tile("Users", users) + tile("Groups", groups) + tile("Devices", devices) + tile("Apps / SPNs", sps) + '</div>'
-    + crown + samp
+    + crown + samp + secHtml
     + (anyBlocked ? '<div class="notice notice-amber" style="margin-top:12px">Some reads were blocked — this token lacks that <b>application</b> role. Add it (e.g. <code>Directory.Read.All</code>), admin-consent it in this tenant, re-acquire the token, and the breadth unlocks.</div>' : '');
   btn.disabled = false;
-}
-function gcall(verb, path, res){
-  const stat = res.status + (res.ok?"":" — "+((res.body&&res.body.error&&res.body.error.code)||"error"));
-  let body = JSON.stringify(res.body, null, 2);
-  if(!res.ok && res.body && res.body.error){
-    body = res.body.error.code + ": " + res.body.error.message
-      + "\n\n// App-only means the token needs the matching APPLICATION permission (app role), admin-consented in THIS tenant."
-      + "\n// e.g. Directory.Read.All or User.Read.All. Grant + consent it, then re-acquire the token.";
-  }
-  return '<div class="gcall"><div class="g-top"><span class="verb">'+verb+'</span> '+escHtml(path)+'<span class="stat '+(res.ok?"ok":"bad")+'">'+escHtml(stat)+'</span></div><pre>'+escHtml(body)+'</pre></div>';
 }
 $("btn-read").addEventListener("click", readTenant);
 $("btn-impact").addEventListener("click", harvestPreview);
