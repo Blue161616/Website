@@ -118,6 +118,7 @@
   .secrow { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; font-size: 12.5px; flex-wrap: wrap; }
   .secrow .secok { color: var(--green); font-weight: 700; }
   .secrow .secbad { color: var(--red); font-weight: 700; }
+  .secrow .secwarn { color: var(--amber); font-weight: 700; }
 </style>
 </head>
 <body>
@@ -312,6 +313,7 @@ async function harvestPreview(){
   const btn = $("btn-impact"); btn.disabled = true;
   $("impact").innerHTML = '<p class="sub"><span class="spinner"></span> Enumerating the directory this session can reach…</p>';
   let token; try { token = await getToken(); } catch(e){ $("impact").innerHTML = '<div class="notice notice-warn">Could not get a token: '+escHtml(e.message||String(e))+'</div>'; btn.disabled=false; return; }
+  const scpSet = new Set((((decodeJwt(token)||{}).scp)||"").split(/\s+/).filter(Boolean));
   const users   = await graphGet("/users?$count=true&$top=8&$select=displayName,userPrincipalName,jobTitle", token);
   const groups  = await graphGet("/groups?$count=true&$top=1&$select=id", token);
   const devices = await graphGet("/devices?$count=true&$top=1&$select=id", token);
@@ -347,15 +349,26 @@ async function harvestPreview(){
       + '</tbody></table>';
 
   // Admin-gated reads — the real proof of the "capped by the user" model.
+  // Three outcomes, told apart by the token's own scp claim so an admin isn't misled:
+  //   200                     → scope in token AND the role allows it (green)
+  //   403 + scope NOT in scp  → the scope was never consented — a config gap, not the cap (amber)
+  //   403 + scope IS in scp   → the scope is present but this account's role can't read it — the real cap (red)
   function secRow(label, scope, res){
-    let detail;
+    let cls, detail;
     if(res.ok){ const n = (res.body && Array.isArray(res.body.value)) ? res.body.value.length : null;
-      detail = (n!=null ? (n + (res.body["@odata.nextLink"]?"+":"") + " returned") : "readable") + " — this account can read it"; }
-    else detail = res.status + " " + ((res.body&&res.body.error&&res.body.error.code)||"blocked") + " — this account can't (needs an admin role, or the scope isn't consented)";
-    return '<div class="secrow"><div><b>'+label+'</b> <span class="mono" style="font-size:11px;color:var(--muted)">'+scope+'</span></div><div class="'+(res.ok?"secok":"secbad")+'">'+escHtml(detail)+'</div></div>';
+      cls = "secok";
+      detail = (n!=null ? (n + (res.body["@odata.nextLink"]?"+":"") + " returned") : "readable") + " — scope in token, and this account’s role allows it"; }
+    else { const code = (res.body&&res.body.error&&res.body.error.code) || "blocked";
+      if(!scpSet.has(scope)){ cls = "secwarn";
+        detail = res.status + " " + code + " — " + scope + " isn’t in your token: it was never consented. Grant + admin-consent it, then re-acquire. (A config gap, not the cap.)"; }
+      else if(/Authorization_RequestDenied/i.test(code)){ cls = "secbad";
+        detail = res.status + " " + code + " — the scope IS in your token, but this account’s role can’t read it. This is the delegated cap."; }
+      else { cls = "secbad";
+        detail = res.status + " " + code + " — blocked even though the scope is present in the token."; } }
+    return '<div class="secrow"><div><b>'+label+'</b> <span class="mono" style="font-size:11px;color:var(--muted)">'+scope+'</span></div><div class="'+cls+'">'+escHtml(detail)+'</div></div>';
   }
   const secHtml = '<div style="margin-top:16px;font-weight:700;font-size:13px">Security &amp; governance reads — admin-gated (the real proof of the cap)</div>'
-    + '<div class="sub" style="margin:4px 0 8px">These need the scope <b>and</b> a directory role, so the app’s scope alone is never enough. As an <b>admin</b> they return data; sign in as an <b>ordinary user</b> (same app, same scopes) and they <b>403</b>. That gap is the delegated cap you can’t fake. <span class="mono" style="font-size:11px">Add Policy.Read.All, RoleManagement.Read.Directory, AuditLog.Read.All to the scopes and re-consent to test these.</span></div>'
+    + '<div class="sub" style="margin:4px 0 8px">Each read needs the scope <b>in your token</b> <b>and</b> a directory role. There are two different 403s: <span style="color:var(--amber);font-weight:700">amber</span> = the scope was never consented (a config gap — fix it and re-acquire); <span style="color:var(--red);font-weight:700">red</span> = the scope <b>is</b> in your token but your role still can’t read it — <b>that</b> is the cap. As a <b>Global Admin</b> the red case turns green; an <b>ordinary user</b> 403s red on the very same token. <span class="mono" style="font-size:11px">First get all three scopes into the token — add Policy.Read.All, RoleManagement.Read.Directory, AuditLog.Read.All and admin-consent them — then compare admin vs user.</span></div>'
     + secRow("Conditional Access policies", "Policy.Read.All", ca)
     + secRow("Directory role assignments (who is admin)", "RoleManagement.Read.Directory", raps)
     + secRow("Sign-in logs", "AuditLog.Read.All", logs);
