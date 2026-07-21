@@ -94,6 +94,25 @@
   .gcall .g-top .stat { margin-left: auto; font-weight: 700; }
   .gcall .g-top .stat.ok { color: var(--green); } .gcall .g-top .stat.bad { color: var(--red); }
   .gcall pre { margin: 0; padding: 11px 13px; background: var(--code-bg); font-family: "Cascadia Code", Consolas, monospace; font-size: 11.5px; line-height: 1.5; overflow-x: auto; max-height: 240px; }
+  .spinner { display: inline-block; width: 15px; height: 15px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -3px; margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  /* attack-impact preview */
+  .impact { border: 2px solid var(--red); background: var(--red-bg); color: var(--text); border-radius: 10px; padding: 14px 18px; margin: 14px 0 16px; font-size: 13px; line-height: 1.55; }
+  .impact b { font-weight: 700; }
+  .hgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 14px; }
+  .hstat { border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; background: var(--card); }
+  .hstat .n { font-size: 28px; font-weight: 800; line-height: 1; }
+  .hstat .n.hot { color: var(--red); }
+  .hstat .n.na { color: var(--muted); font-size: 15px; font-weight: 600; }
+  .hstat .l { font-size: 12px; color: var(--muted); margin-top: 6px; text-transform: uppercase; letter-spacing: .3px; }
+  .crown { border: 1px solid var(--red); border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; background: var(--red-bg); }
+  .crown h4 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--red); }
+  .crown ul { margin: 0; padding-left: 18px; font-size: 12.5px; line-height: 1.7; }
+  .crown ul b { color: var(--text); }
+  .samp { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  .samp td, .samp th { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .samp th { color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .3px; font-size: 11px; }
+  .samp td { font-family: "Cascadia Code", Consolas, monospace; }
 </style>
 </head>
 <body>
@@ -166,6 +185,15 @@
       <h2>Live Microsoft Graph reads (app-only, unattended)</h2>
       <div class="sub">No user is present. If a call 403s, the token doesn't carry that application role — grant it and admin-consent it in this tenant, then re-acquire.</div>
       <div id="graph"></div>
+    </div>
+
+    <div class="card" id="impactCard">
+      <h2>Attack-impact preview — what this credential reads unattended</h2>
+      <div class="sub">Enumerates the <b>breadth</b> this app-only token can read in <span id="impactTenant">this tenant</span> — with <b>no user involved at all</b>, on the app's credential alone.
+        For a CISO demo: this is what the publisher (whoever holds the secret) reads silently, forever, until you revoke the app.
+        <b>Nothing here leaves your browser</b> — read-only, sent only to Microsoft Graph.</div>
+      <button id="btn-impact">Preview what this credential can read</button>
+      <div id="impact" style="margin-top:14px"></div>
     </div>
 
     <div class="notice notice-info" style="margin-top:16px">
@@ -283,8 +311,51 @@ async function readTenant(){
   $("claims").innerHTML = html;
 
   $("graph").innerHTML = [gcall("GET","/organization", org), gcall("GET","/users?$top=5", users), gcall("GET","/servicePrincipals?$top=5", sps)].join("");
+  $("impactTenant").textContent = tenantName; $("impact").innerHTML = ""; $("btn-impact").disabled = false;
   $("results").classList.remove("hidden");
   setStatus("Done — app-only read of tenant " + tid + ".");
+}
+// Attack-impact preview (app-only): enumerate the BREADTH this credential reads — no user at all.
+// Read-only; nothing leaves the browser. This is the "publisher holds a standing key" case made concrete.
+const PRIV_ROLE_RX = /Global Administrator|Privileged Role|Privileged Authentication|Security Administrator|Application Administrator|Cloud Application Administrator|User Administrator|Exchange Administrator|SharePoint Administrator|Authentication Administrator|Hybrid Identity|Helpdesk Administrator|Conditional Access/i;
+async function harvestPreview(){
+  const btn = $("btn-impact"); btn.disabled = true;
+  const token = $("token").value.trim();
+  if(!token){ $("impact").innerHTML = '<div class="notice notice-warn">Paste a token first.</div>'; btn.disabled = false; return; }
+  $("impact").innerHTML = '<p class="sub"><span class="spinner"></span> Enumerating the directory this credential can reach…</p>';
+  const users   = await graphGet("/users?$count=true&$top=8&$select=displayName,userPrincipalName,jobTitle", token);
+  const groups  = await graphGet("/groups?$count=true&$top=1&$select=id", token);
+  const devices = await graphGet("/devices?$count=true&$top=1&$select=id", token);
+  const sps     = await graphGet("/servicePrincipals?$count=true&$top=1&$select=id", token);
+  const roles   = await graphGet("/directoryRoles?$expand=members($select=displayName,userPrincipalName)", token);
+
+  const cnt = (res)=> (res.ok && typeof res.body["@odata.count"] === "number") ? res.body["@odata.count"] : null;
+  function tile(label, res){
+    const n = cnt(res);
+    const cls = !res.ok ? "na" : (n>0 ? "hot" : "");
+    const val = !res.ok ? "blocked" : (n==null ? (Array.isArray(res.body.value) ? res.body.value.length+"+" : "readable") : n.toLocaleString());
+    return '<div class="hstat"><div class="n '+cls+'">'+escHtml(String(val))+'</div><div class="l">'+label+(res.ok?'':' — role not granted')+'</div></div>';
+  }
+  let crown = "";
+  if(roles.ok && Array.isArray(roles.body.value)){
+    const priv = roles.body.value.filter(r=> PRIV_ROLE_RX.test(r.displayName||"") && r.members && r.members.length);
+    const admins = {}; priv.forEach(r=> (r.members||[]).forEach(m=>{ admins[m.userPrincipalName||m.displayName]=1; }));
+    if(priv.length) crown = '<div class="crown"><h4>⚠ Privileged accounts this credential can enumerate ('+Object.keys(admins).length+' distinct)</h4><ul>'
+      + priv.map(r=> '<li><b>'+escHtml(r.displayName)+'</b>: '+(r.members||[]).map(m=> escHtml(m.displayName||m.userPrincipalName)).join(", ")+'</li>').join("")
+      + '</ul></div>';
+  }
+  let samp = "";
+  if(users.ok && Array.isArray(users.body.value) && users.body.value.length)
+    samp = '<div class="sub" style="margin:6px 0 4px"><b>Sample of the user directory it just read</b> (first '+users.body.value.length+'):</div><table class="samp"><thead><tr><th>Name</th><th>UPN</th><th>Title</th></tr></thead><tbody>'
+      + users.body.value.map(u=> '<tr><td>'+escHtml(u.displayName||"")+'</td><td>'+escHtml(u.userPrincipalName||"")+'</td><td>'+escHtml(u.jobTitle||"")+'</td></tr>').join("")
+      + '</tbody></table>';
+  const anyBlocked = [users,groups,devices,sps].some(r=>!r.ok);
+  $("impact").innerHTML =
+      '<div class="impact"><b>No user was involved.</b> This app read the directory on its <b>credential alone</b> and it all stayed in your browser. The publisher — whoever holds the client secret — reads exactly this <b>silently and unattended, any time, for as long as the credential and consent live</b>. Unlike the delegated case, there is no session to expire and no user to disable: only <b>revoking the app / its permission</b> stops it.</div>'
+    + '<div class="hgrid">' + tile("Users", users) + tile("Groups", groups) + tile("Devices", devices) + tile("Apps / SPNs", sps) + '</div>'
+    + crown + samp
+    + (anyBlocked ? '<div class="notice notice-amber" style="margin-top:12px">Some reads were blocked — this token lacks that <b>application</b> role. Add it (e.g. <code>Directory.Read.All</code>), admin-consent it in this tenant, re-acquire the token, and the breadth unlocks.</div>' : '');
+  btn.disabled = false;
 }
 function gcall(verb, path, res){
   const stat = res.status + (res.ok?"":" — "+((res.body&&res.body.error&&res.body.error.code)||"error"));
@@ -297,6 +368,7 @@ function gcall(verb, path, res){
   return '<div class="gcall"><div class="g-top"><span class="verb">'+verb+'</span> '+escHtml(path)+'<span class="stat '+(res.ok?"ok":"bad")+'">'+escHtml(stat)+'</span></div><pre>'+escHtml(body)+'</pre></div>';
 }
 $("btn-read").addEventListener("click", readTenant);
+$("btn-impact").addEventListener("click", harvestPreview);
 </script>
 </body>
 </html>
