@@ -198,7 +198,8 @@
           <code>Directory.Read.All</code>, <code>RoleManagement.Read.All</code>,
           <code>Application.Read.All</code>, <code>User.Read</code>. All require admin consent.
           <br><b>Optional (each degrades gracefully):</b> <code>Policy.Read.All</code> adds Conditional Access
-          gap edges (uncovered admins, legacy-auth bypass); PIM eligibility
+          gap edges (uncovered admins, legacy-auth bypass); <code>AuditLog.Read.All</code> adds per-admin
+          MFA-method posture (phishing-resistant registered vs weak vs none); PIM eligibility
           (<code>roleEligibilityScheduleInstances</code>) needs Entra ID P2.</div>
       </div>
       <div>
@@ -415,9 +416,22 @@ async function token() {
 // Optional scope. Requested silently so a tenant that never consented Policy.Read.All still gets
 // every other feature — Conditional Access edges just don't appear, with a notice explaining why.
 const CA_SCOPES = ["Policy.Read.All"];
+// Optional too — authentication-method registration (per-user MFA posture of privileged accounts).
+const AUTH_SCOPES = ["AuditLog.Read.All"];
 async function optionalToken(scopes) {
   try { return (await msalInstance.acquireTokenSilent({ scopes, account })).accessToken; }
   catch { return null; }
+}
+
+// Which registered methods are phishing-resistant. userRegistrationDetails.methodsRegistered strings vary
+// by tenant/version, so match by pattern: FIDO2 keys, Windows Hello for Business, passkeys, certificate/x509.
+const PHISH_RESISTANT_RX = /fido2|windowshello|passkey|certificate|x509/i;
+function classifyMfa(reg) {
+  if (!reg) return { level: "unknown", methods: [] };
+  const methods = reg.methodsRegistered || [];
+  if (methods.some((m) => PHISH_RESISTANT_RX.test(m))) return { level: "phishres", methods };
+  if (reg.isMfaRegistered && methods.length) return { level: "weak", methods };
+  return { level: "nomfa", methods };
 }
 
 // ---- Graph helpers ----
@@ -492,6 +506,11 @@ const DANGEROUS_APPROLES = {
 
 const SEV = { critical: { cls: "b-crit", rank: 3, key: "critical" }, high: { cls: "b-high", rank: 2, key: "high" }, medium: { cls: "b-med", rank: 1, key: "medium" } };
 function tierToSev(tier) { return tier === 0 ? "critical" : tier === 1 ? "high" : "medium"; }
+// PIM policy: roles whose activation must require ADMIN APPROVAL. All other roles may self-activate
+// (self-approval) as long as phishing-resistant MFA is enforced on activation. Edit this set to match
+// your tenant's PIM standard. Default per current policy: approval reserved for Global Administrator only.
+const APPROVAL_REQUIRED_ROLES = new Set(["Global Administrator"]);
+const requiresApproval = (roleName) => APPROVAL_REQUIRED_ROLES.has(roleName);
 
 const MITRE = {
   memberOf:    { id: "T1078.004", name: "Valid Accounts: Cloud Accounts", tactic: "Privilege Escalation" },
@@ -648,20 +667,32 @@ async function analyze() {
       const kind = principalType(princ);
       if (kind === "group") { (privGroupRole[princ.id] = privGroupRole[princ.id] || []).push({ roleName: r.name, tier: r.tier, via: "eligible" }); return; }
       // PIM-eligible principal → activate → hold role
+      const reqAppr = requiresApproval(r.name);
       paths.push({
         id: nextId(), sourceType: kind, source: principalLabel(princ), sourceId: princ.id, sourceUpn: princ.userPrincipalName || "",
         target: r.name, tier: r.tier, sev: tierToSev(r.tier), reliability: "high",
         hops: 1, technique: "PIM self-activation",
         edges: [{ label: "eligible for → activates", node: r.name }],
         mitre: [MITRE.pim],
-        evidence: "Principal has an <b>eligible</b> PIM assignment for " + escapeHtml(r.name) + ". Activation is self-service; with no approval or phishing-resistant MFA gate on activation it is a single step to the active role.",
-        remediation: [
-          "Require approval and phishing-resistant MFA on activation of " + escapeHtml(r.name) + " in PIM.",
-          "Scope activation with justification + ticketing, and shorten the maximum activation duration.",
-          "Review whether this principal needs eligibility at all — remove if unused (check PIM activation history)."
-        ],
+        evidence: "Principal has an <b>eligible</b> PIM assignment for " + escapeHtml(r.name) + ". Activation is self-service; "
+          + (reqAppr
+              ? "per policy this role must require <b>admin approval</b> — without an approval gate (and phishing-resistant MFA) on activation it is a single step to the active role."
+              : "under your PIM policy self-activation is acceptable for this role (approval is reserved for Global Administrator) — ensure <b>phishing-resistant MFA</b> is enforced on activation so the single step still requires a strong credential."),
+        remediation: reqAppr
+          ? [
+            "Require <b>admin approval</b> and phishing-resistant MFA on activation of " + escapeHtml(r.name) + " in PIM.",
+            "Scope activation with justification + ticketing, and shorten the maximum activation duration.",
+            "Review whether this principal needs eligibility at all — remove if unused (check PIM activation history)."
+          ]
+          : [
+            "Enforce <b>phishing-resistant MFA</b> on activation of " + escapeHtml(r.name) + " in PIM. Self-service activation (no approval) is acceptable for this role under your policy — approval is reserved for Global Administrator.",
+            "Scope activation with justification + ticketing, and shorten the maximum activation duration.",
+            "Review whether this principal needs eligibility at all — remove if unused (check PIM activation history)."
+          ],
         chokeKey: "pim:" + princ.id + ":" + a.roleDefinitionId,
-        chokeFix: "Add approval + phishing-resistant MFA to PIM activation of " + r.name + " for " + principalLabel(princ),
+        chokeFix: reqAppr
+          ? "Require admin approval + phishing-resistant MFA on PIM activation of " + r.name + " for " + principalLabel(princ)
+          : "Enforce phishing-resistant MFA on PIM activation of " + r.name + " for " + principalLabel(princ) + " (self-approval per policy)",
         chokeSev: tierToSev(r.tier)
       });
     });
@@ -876,6 +907,27 @@ async function analyze() {
       } catch (e) { MODEL.caAvailable = false; MODEL.caError = e.message || String(e); }
     }
 
+    // (e) Authentication-method posture (optional — needs AuditLog.Read.All) --------
+    // Per-user MFA registration for privileged accounts: is a phishing-resistant method registered,
+    // only weak MFA, or none? NOTE: registered ≠ enforced — the CA authentication-strength check (d) is
+    // authoritative for what is actually required; this shows capability/hygiene per admin.
+    MODEL.authAvailable = false;
+    MODEL.authStats = { phishres: 0, weak: 0, nomfa: 0, unknown: 0 };
+    MODEL.authPosture = {};
+    setStatus("Reading authentication-method registration…", false, true);
+    const authToken = await optionalToken(AUTH_SCOPES);
+    if (authToken) {
+      try {
+        const regs = await graphGetAll(base + "/reports/authenticationMethods/userRegistrationDetails?$select=id,userPrincipalName,methodsRegistered,isMfaRegistered,isMfaCapable,isPasswordlessCapable&$top=999", authToken);
+        MODEL.authAvailable = true;
+        regs.forEach((u) => { MODEL.authPosture[u.id] = classifyMfa(u); });
+        const privUserIds = new Set();
+        Object.values(directUserHolders).forEach((u) => privUserIds.add(u.id));
+        paths.forEach((p) => { if (p.sourceType === "user" && p.sourceId) privUserIds.add(p.sourceId); });
+        privUserIds.forEach((id) => { const lvl = (MODEL.authPosture[id] || { level: "unknown" }).level; MODEL.authStats[lvl] = (MODEL.authStats[lvl] || 0) + 1; });
+      } catch (e) { MODEL.authAvailable = false; MODEL.authError = e.message || String(e); }
+    }
+
     MODEL.paths = paths;
     MODEL.tier0Holders = tier0Holders;
     MODEL.generatedAt = new Date();
@@ -929,6 +981,13 @@ function renderNotices() {
     n.push('<div class="notice notice-info">Conditional Access evaluated for ' + (c.evaluated || 0) + ' privileged account(s)'
       + (c.truncated ? ' (capped at 300)' : "") + '. Coverage is a heuristic evaluation, not Microsoft’s What-If — verify flagged accounts before reporting.</div>');
   }
+  if (!MODEL.authAvailable) {
+    n.push('<div class="notice notice-warn">Authentication-method posture not read — grant <code>AuditLog.Read.All</code> (admin consent) to show, per admin, whether a phishing-resistant method (FIDO2 / Windows Hello / passkey / certificate) is registered.'
+      + (MODEL.authError ? ' <span class="mono">(' + escapeHtml(MODEL.authError) + ')</span>' : "") + '</div>');
+  } else {
+    const a = MODEL.authStats || {};
+    n.push('<div class="notice notice-info">MFA registration read: ' + (a.phishres || 0) + ' admin(s) with a phishing-resistant method, ' + (a.weak || 0) + ' weak-only, ' + (a.nomfa || 0) + ' none. <b>Registered ≠ enforced</b> — the Conditional Access authentication-strength check is authoritative; use this for capability/hygiene.</div>');
+  }
   $("notices").innerHTML = n.join("");
 }
 
@@ -947,6 +1006,7 @@ function renderSummary() {
     + statTile("tier0", s.tier0Direct, "Tier-0 role holders", false)
     + statTile("sp", s.abusableSp, "Over-privileged SPs", s.abusableSp > 0)
     + (MODEL.caAvailable ? statTile("ca", ca.uncoveredAdmins || 0, "No-MFA admins", (ca.uncoveredAdmins || 0) > 0) : "")
+    + (MODEL.authAvailable ? statTile("weakmfa", (MODEL.authStats.weak || 0) + (MODEL.authStats.nomfa || 0), "Admins w/o phishing-resistant MFA", ((MODEL.authStats.weak || 0) + (MODEL.authStats.nomfa || 0)) > 0) : "")
     + statTile("choke", chokeCount, "Choke points", false);
   $("summary").querySelectorAll(".stat").forEach((el) => el.addEventListener("click", () => {
     const id = el.getAttribute("data-stat");
@@ -954,6 +1014,7 @@ function renderSummary() {
     else if (id === "critical") { activeStat = null; $("fltSev").value = "critical"; $("fltType").value = ""; }
     else if (id === "sp") { activeStat = null; $("fltSev").value = ""; $("fltType").value = "servicePrincipal"; }
     else if (id === "ca") { activeStat = "ca"; $("fltSev").value = ""; $("fltType").value = ""; }
+    else if (id === "weakmfa") { activeStat = "weakmfa"; $("fltSev").value = ""; $("fltType").value = ""; }
     else if (id === "tier0" || id === "choke") { activeStat = id; document.getElementById(id === "choke" ? "rqCard" : "table").scrollIntoView({ behavior: "smooth" }); }
     renderSummary(); renderTable();
   }));
@@ -981,7 +1042,7 @@ function groupByPrincipal(paths) {
   paths.forEach((p) => {
     const key = p.sourceId || (p.sourceType + ":" + p.source);
     let g = map[key];
-    if (!g) g = map[key] = { key, source: p.source, sourceType: p.sourceType, sourceUpn: p.sourceUpn || "", internetReachable: false, paths: [], roles: {}, anyConfirmed: false };
+    if (!g) g = map[key] = { key, source: p.source, sourceType: p.sourceType, sourceId: p.sourceId || "", sourceUpn: p.sourceUpn || "", internetReachable: false, paths: [], roles: {}, anyConfirmed: false };
     g.paths.push(p);
     if (p.internetReachable) g.internetReachable = true;
     if (p.reliability === "high") g.anyConfirmed = true;
@@ -994,6 +1055,7 @@ function groupByPrincipal(paths) {
     g.topSev = g.roleList.length ? g.roleList[0].sev : "medium";
     g.minHops = Math.min.apply(null, g.paths.map((p) => p.hops));
     g.pathCount = g.paths.length;
+    g.mfa = (MODEL.authAvailable && g.sourceType === "user" && g.sourceId) ? (MODEL.authPosture[g.sourceId] || { level: "unknown", methods: [] }) : null;
     g.risk = principalRisk(g);
     g.paths.sort((a, b) => (SEV[b.sev].rank - SEV[a.sev].rank) || (a.hops - b.hops));
   });
@@ -1006,7 +1068,10 @@ function principalRisk(g) {
   const reach = g.internetReachable ? 25 : 0;
   const confirmed = g.anyConfirmed ? 8 : 0;
   const hopsBonus = g.minHops <= 1 ? 7 : g.minHops === 2 ? 4 : 0;
-  return Math.min(100, sevBase + breadth + reach + confirmed + hopsBonus);
+  // MFA posture: no phishing-resistant method makes the account more phishable; a registered
+  // phishing-resistant method lowers it. Only applied when auth data was available.
+  const mfaAdj = g.mfa ? (g.mfa.level === "nomfa" ? 12 : g.mfa.level === "weak" ? 6 : g.mfa.level === "phishres" ? -10 : 0) : 0;
+  return Math.max(1, Math.min(100, sevBase + breadth + reach + confirmed + hopsBonus + mfaAdj));
 }
 function riskTier(score) { return score >= 65 ? "critical" : score >= 40 ? "high" : "medium"; }
 
@@ -1015,6 +1080,7 @@ function filtered() {
   const fSev = $("fltSev").value, fType = $("fltType").value, fRel = $("fltRel").value;
   let groups = groupByPrincipal(MODEL.paths);
   if (activeStat === "ca") groups = groups.filter((g) => g.internetReachable);
+  if (activeStat === "weakmfa") groups = groups.filter((g) => g.mfa && (g.mfa.level === "weak" || g.mfa.level === "nomfa"));
   if (q) groups = groups.filter((g) => (g.source + " " + g.sourceUpn + " " + g.roleList.map((r) => r.name).join(" ") + " " + g.paths.map((p) => p.technique + " " + p.edges.map((e) => e.node).join(" ")).join(" ")).toLowerCase().indexOf(q) >= 0);
   if (fSev === "critical") groups = groups.filter((g) => g.topSev === "critical");
   if (fSev === "high") groups = groups.filter((g) => SEV[g.topSev].rank >= 2);
@@ -1034,6 +1100,14 @@ function filtered() {
 }
 
 const typeBadge = (t) => t === "user" ? '<span class="badge b-user">User</span>' : t === "servicePrincipal" ? '<span class="badge b-sp">Service principal</span>' : t === "external" ? '<span class="badge b-high">External</span>' : '<span class="badge b-group">Group</span>';
+function mfaBadge(mfa) {
+  if (!mfa) return "";
+  const t = mfa.methods && mfa.methods.length ? ' title="Registered: ' + escapeHtml(mfa.methods.join(", ")) + '"' : "";
+  if (mfa.level === "phishres") return ' <span class="badge b-low"' + t + '>Phishing-resistant MFA</span>';
+  if (mfa.level === "weak") return ' <span class="badge b-med"' + t + '>Weak MFA only</span>';
+  if (mfa.level === "nomfa") return ' <span class="badge b-crit">No MFA registered</span>';
+  return "";
+}
 const reachBadge = '<span class="badge b-crit" title="Account is not covered by an enforced MFA policy — reachable directly from the internet">No MFA · internet-reachable</span>';
 
 function chainHtml(r) {
@@ -1055,7 +1129,7 @@ function renderTable() {
     return '<tr class="rowx" data-id="' + gi + '">'
       + '<td class="chev">▸</td>'
       + '<td><span class="riskscore ' + SEV[rt].cls + '">' + g.risk + '</span><div class="risklbl">' + rt.toUpperCase() + '</div></td>'
-      + '<td>' + escapeHtml(g.source) + '<br>' + typeBadge(g.sourceType) + (g.internetReachable ? " " + reachBadge : "") + (g.sourceUpn ? '<div class="mono">' + escapeHtml(g.sourceUpn) + '</div>' : "") + '</td>'
+      + '<td>' + escapeHtml(g.source) + '<br>' + typeBadge(g.sourceType) + (g.internetReachable ? " " + reachBadge : "") + mfaBadge(g.mfa) + (g.sourceUpn ? '<div class="mono">' + escapeHtml(g.sourceUpn) + '</div>' : "") + '</td>'
       + '<td><div class="rolechips">' + roleChips + '</div></td>'
       + '<td style="text-align:center">' + g.pathCount + '<div class="mono" style="font-size:11px;opacity:.7">min ' + g.minHops + ' hop' + (g.minHops === 1 ? "" : "s") + '</div></td>'
       + '<td>' + relBadge + '</td>'
@@ -1077,6 +1151,12 @@ function principalDetailHtml(g) {
     + '<div class="pgroup-head"><b>' + g.pathCount + '</b> verified path' + (g.pathCount === 1 ? "" : "s") + ' from <b>' + escapeHtml(g.source) + '</b> · risk score <b>' + g.risk + '</b> (' + riskTier(g.risk).toUpperCase() + ')'
     + (g.internetReachable ? ' · <b style="color:var(--red)">internet-reachable / no enforced MFA</b>' : "")
     + ' · reaches: ' + g.roleList.map((r) => escapeHtml(r.name)).join(", ") + '</div>'
+    + (g.mfa ? '<div class="pgroup-head" style="margin-top:-6px">Registered MFA: ' + (
+        g.mfa.level === "phishres" ? '<b style="color:var(--green)">phishing-resistant</b> (' + escapeHtml((g.mfa.methods || []).join(", ")) + ')'
+        : g.mfa.level === "weak" ? '<b style="color:var(--amber)">weak methods only</b> (' + escapeHtml((g.mfa.methods || []).join(", ") || "—") + ') — phishable; register FIDO2 / Windows Hello / passkey'
+        : g.mfa.level === "nomfa" ? '<b style="color:var(--red)">none registered</b>'
+        : 'unknown')
+      + ' <span style="opacity:.7">· registered ≠ enforced — a CA authentication-strength policy is what actually requires it</span></div>' : "")
     + g.paths.map((p) => '<div class="ppath">'
         + '<div class="ppath-top"><span class="badge ' + SEV[p.sev].cls + '">' + p.sev.toUpperCase() + '</span> <b>→ ' + escapeHtml(p.target) + '</b> <span class="mono" style="opacity:.7">· ' + escapeHtml(p.technique) + ' · ' + p.hops + ' hop' + (p.hops === 1 ? "" : "s") + '</span></div>'
         + chainHtml(p)
