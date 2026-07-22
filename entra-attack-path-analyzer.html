@@ -98,6 +98,14 @@
   .b-high { background: var(--red-bg); color: var(--red); }
   .b-med  { background: var(--amber-bg); color: var(--amber); }
   .b-low  { background: var(--green-bg); color: var(--green); }
+  /* Grouped-by-principal view */
+  .rolechips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .rolechip { font-size: 11px; padding: 2px 8px; border-radius: 11px; font-weight: 600; white-space: nowrap; }
+  .riskscore { font-size: 18px; font-weight: 800; padding: 2px 10px; border-radius: 8px; display: inline-block; min-width: 34px; text-align: center; }
+  .risklbl { font-size: 10px; opacity: .7; text-align: center; margin-top: 3px; letter-spacing: .03em; }
+  .pgroup-head { font-size: 12.5px; color: var(--muted); margin: 0 0 12px; line-height: 1.5; }
+  .ppath { border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; background: var(--card-2, transparent); }
+  .ppath-top { margin-bottom: 8px; font-size: 13px; }
   .b-user { background: var(--cert-bg); color: var(--accent-dark); }
   .b-sp   { background: var(--amber-bg); color: var(--amber); }
   .b-group{ background: var(--hover); color: var(--muted); }
@@ -265,17 +273,16 @@
         </select>
         <span class="count" id="tableCount"></span>
       </div>
-      <div class="hint" style="margin:-4px 0 10px">Each row is a <b>verified</b> path — every edge is backed by a live directory fact. Click a row for the technique, MITRE mapping, evidence and the specific fix.</div>
+      <div class="hint" style="margin:-4px 0 10px">Each row is <b>one source principal</b>, scored by risk, showing <b>every privileged role it can reach</b>. Click a row to expand all of that principal's verified paths — each with technique, MITRE mapping, evidence and the specific fix.</div>
       <div style="overflow-x:auto">
         <table id="table">
           <thead>
             <tr>
               <th style="width:22px"></th>
-              <th class="sortable" data-key="sev">Severity <span class="arrow"></span></th>
+              <th class="sortable" data-key="risk">Risk <span class="arrow">▼</span></th>
               <th class="sortable" data-key="source">Source principal <span class="arrow"></span></th>
-              <th>Path</th>
-              <th class="sortable" data-key="target">Target role <span class="arrow"></span></th>
-              <th class="sortable" data-key="hops" style="text-align:center">Hops <span class="arrow"></span></th>
+              <th class="sortable" data-key="roles">Reachable privileged roles <span class="arrow"></span></th>
+              <th class="sortable" data-key="paths" style="text-align:center">Paths <span class="arrow"></span></th>
               <th>Reliability</th>
             </tr>
           </thead>
@@ -560,7 +567,7 @@ function caBlocksLegacyAuth(policies) {
 // ============================================================================
 
 let MODEL = { paths: [], tier0Holders: [], stats: {}, pimAvailable: true, generatedAt: null };
-let sortState = { key: "sev", dir: -1 };
+let sortState = { key: "risk", dir: -1 };
 let activeStat = null;
 
 function principalType(p) {
@@ -968,26 +975,62 @@ function renderQueue() {
   }).join("");
 }
 
+// Aggregate the flat path list into one entry per SOURCE PRINCIPAL, keeping every reachable role and path.
+function groupByPrincipal(paths) {
+  const map = {};
+  paths.forEach((p) => {
+    const key = p.sourceId || (p.sourceType + ":" + p.source);
+    let g = map[key];
+    if (!g) g = map[key] = { key, source: p.source, sourceType: p.sourceType, sourceUpn: p.sourceUpn || "", internetReachable: false, paths: [], roles: {}, anyConfirmed: false };
+    g.paths.push(p);
+    if (p.internetReachable) g.internetReachable = true;
+    if (p.reliability === "high") g.anyConfirmed = true;
+    const cur = g.roles[p.target];
+    if (!cur || p.tier < cur.tier) g.roles[p.target] = { name: p.target, tier: p.tier, sev: p.sev };
+  });
+  const groups = Object.values(map);
+  groups.forEach((g) => {
+    g.roleList = Object.values(g.roles).sort((a, b) => a.tier - b.tier); // most privileged first
+    g.topSev = g.roleList.length ? g.roleList[0].sev : "medium";
+    g.minHops = Math.min.apply(null, g.paths.map((p) => p.hops));
+    g.pathCount = g.paths.length;
+    g.risk = principalRisk(g);
+    g.paths.sort((a, b) => (SEV[b.sev].rank - SEV[a.sev].rank) || (a.hops - b.hops));
+  });
+  return groups;
+}
+// Risk score 0-100: highest role reached + breadth of roles + internet reachability + confirmed + how few hops.
+function principalRisk(g) {
+  const sevBase = { critical: 60, high: 40, medium: 22 }[g.topSev] || 22;
+  const breadth = Math.min(20, (g.roleList.length - 1) * 5);
+  const reach = g.internetReachable ? 25 : 0;
+  const confirmed = g.anyConfirmed ? 8 : 0;
+  const hopsBonus = g.minHops <= 1 ? 7 : g.minHops === 2 ? 4 : 0;
+  return Math.min(100, sevBase + breadth + reach + confirmed + hopsBonus);
+}
+function riskTier(score) { return score >= 65 ? "critical" : score >= 40 ? "high" : "medium"; }
+
 function filtered() {
   const q = $("fltSearch").value.toLowerCase().trim();
   const fSev = $("fltSev").value, fType = $("fltType").value, fRel = $("fltRel").value;
-  let rows = MODEL.paths.slice();
-  if (q) rows = rows.filter((r) => (r.source + " " + r.target + " " + r.technique + " " + r.edges.map((e) => e.node).join(" ")).toLowerCase().indexOf(q) >= 0);
-  if (fSev === "critical") rows = rows.filter((r) => r.sev === "critical");
-  if (fSev === "high") rows = rows.filter((r) => SEV[r.sev].rank >= 2);
-  if (fType) rows = rows.filter((r) => r.sourceType === fType);
-  if (fRel) rows = rows.filter((r) => r.reliability === fRel);
-  if (activeStat === "ca") rows = rows.filter((r) => r.internetReachable);
+  let groups = groupByPrincipal(MODEL.paths);
+  if (activeStat === "ca") groups = groups.filter((g) => g.internetReachable);
+  if (q) groups = groups.filter((g) => (g.source + " " + g.sourceUpn + " " + g.roleList.map((r) => r.name).join(" ") + " " + g.paths.map((p) => p.technique + " " + p.edges.map((e) => e.node).join(" ")).join(" ")).toLowerCase().indexOf(q) >= 0);
+  if (fSev === "critical") groups = groups.filter((g) => g.topSev === "critical");
+  if (fSev === "high") groups = groups.filter((g) => SEV[g.topSev].rank >= 2);
+  if (fType) groups = groups.filter((g) => g.sourceType === fType);
+  if (fRel === "high") groups = groups.filter((g) => g.anyConfirmed);
+  if (fRel === "conditional") groups = groups.filter((g) => !g.anyConfirmed);
   const key = sortState.key, dir = sortState.dir;
-  rows.sort((a, b) => {
+  groups.sort((a, b) => {
     let av, bv;
-    if (key === "sev") { av = SEV[a.sev].rank; bv = SEV[b.sev].rank; }
-    else if (key === "hops") { av = a.hops; bv = b.hops; }
-    else if (key === "source") { av = a.source.toLowerCase(); bv = b.source.toLowerCase(); }
-    else { av = a.target.toLowerCase(); bv = b.target.toLowerCase(); }
+    if (key === "source") { av = a.source.toLowerCase(); bv = b.source.toLowerCase(); }
+    else if (key === "roles") { av = a.roleList.length; bv = b.roleList.length; }
+    else if (key === "paths") { av = a.pathCount; bv = b.pathCount; }
+    else { av = a.risk; bv = b.risk; }
     return av < bv ? -dir : av > bv ? dir : 0;
   });
-  return rows;
+  return groups;
 }
 
 const typeBadge = (t) => t === "user" ? '<span class="badge b-user">User</span>' : t === "servicePrincipal" ? '<span class="badge b-sp">Service principal</span>' : t === "external" ? '<span class="badge b-high">External</span>' : '<span class="badge b-group">Group</span>';
@@ -1000,30 +1043,46 @@ function chainHtml(r) {
 }
 
 function renderTable() {
-  const rows = filtered();
+  const groups = filtered();
+  const totalPrincipals = groupByPrincipal(MODEL.paths).length;
   const tb = $("table").querySelector("tbody");
-  tb.innerHTML = rows.map((r) => {
-    const relBadge = r.reliability === "high"
-      ? '<span class="badge b-rel-high" title="Every edge is backed by a live directory fact">Confirmed</span>'
-      : '<span class="badge b-rel-cond" title="Walkable only if a tenant-specific RBAC restriction is not enforced — verify">Conditional</span>';
-    return '<tr class="rowx" data-id="' + r.id + '">'
+  tb.innerHTML = groups.map((g, gi) => {
+    const rt = riskTier(g.risk);
+    const relBadge = g.anyConfirmed
+      ? '<span class="badge b-rel-high" title="At least one path is fully confirmed — every edge backed by a live directory fact">Confirmed</span>'
+      : '<span class="badge b-rel-cond" title="Only conditional paths — walkable if a tenant RBAC restriction is not enforced; verify">Conditional</span>';
+    const roleChips = g.roleList.map((r) => '<span class="rolechip ' + SEV[r.sev].cls + '" title="' + r.sev.toUpperCase() + '">' + escapeHtml(r.name) + '</span>').join(" ");
+    return '<tr class="rowx" data-id="' + gi + '">'
       + '<td class="chev">▸</td>'
-      + '<td><span class="badge ' + SEV[r.sev].cls + '">' + r.sev.toUpperCase() + '</span></td>'
-      + '<td>' + escapeHtml(r.source) + '<br>' + typeBadge(r.sourceType) + (r.internetReachable ? " " + reachBadge : "") + (r.sourceUpn ? '<div class="mono">' + escapeHtml(r.sourceUpn) + '</div>' : "") + '</td>'
-      + '<td>' + chainHtml(r) + '</td>'
-      + '<td><b>' + escapeHtml(r.target) + '</b></td>'
-      + '<td style="text-align:center">' + r.hops + '</td>'
+      + '<td><span class="riskscore ' + SEV[rt].cls + '">' + g.risk + '</span><div class="risklbl">' + rt.toUpperCase() + '</div></td>'
+      + '<td>' + escapeHtml(g.source) + '<br>' + typeBadge(g.sourceType) + (g.internetReachable ? " " + reachBadge : "") + (g.sourceUpn ? '<div class="mono">' + escapeHtml(g.sourceUpn) + '</div>' : "") + '</td>'
+      + '<td><div class="rolechips">' + roleChips + '</div></td>'
+      + '<td style="text-align:center">' + g.pathCount + '<div class="mono" style="font-size:11px;opacity:.7">min ' + g.minHops + ' hop' + (g.minHops === 1 ? "" : "s") + '</div></td>'
       + '<td>' + relBadge + '</td>'
       + '</tr>'
-      + '<tr class="detail hidden" data-detail="' + r.id + '"><td colspan="7">' + detailHtml(r) + '</td></tr>';
+      + '<tr class="detail hidden" data-detail="' + gi + '"><td colspan="6">' + principalDetailHtml(g) + '</td></tr>';
   }).join("");
-  $("tableCount").textContent = rows.length + " of " + MODEL.paths.length + " path" + (MODEL.paths.length === 1 ? "" : "s");
+  $("tableCount").textContent = groups.length + " of " + totalPrincipals + " principal" + (totalPrincipals === 1 ? "" : "s");
   tb.querySelectorAll("tr.rowx").forEach((tr) => tr.addEventListener("click", () => {
     const d = tb.querySelector('tr[data-detail="' + tr.getAttribute("data-id") + '"]');
     const open = !d.classList.contains("hidden");
     d.classList.toggle("hidden", open);
     tr.querySelector(".chev").textContent = open ? "▸" : "▾";
   }));
+}
+
+// One principal's expanded view: a summary line + every underlying path in full.
+function principalDetailHtml(g) {
+  return '<div class="pgroup">'
+    + '<div class="pgroup-head"><b>' + g.pathCount + '</b> verified path' + (g.pathCount === 1 ? "" : "s") + ' from <b>' + escapeHtml(g.source) + '</b> · risk score <b>' + g.risk + '</b> (' + riskTier(g.risk).toUpperCase() + ')'
+    + (g.internetReachable ? ' · <b style="color:var(--red)">internet-reachable / no enforced MFA</b>' : "")
+    + ' · reaches: ' + g.roleList.map((r) => escapeHtml(r.name)).join(", ") + '</div>'
+    + g.paths.map((p) => '<div class="ppath">'
+        + '<div class="ppath-top"><span class="badge ' + SEV[p.sev].cls + '">' + p.sev.toUpperCase() + '</span> <b>→ ' + escapeHtml(p.target) + '</b> <span class="mono" style="opacity:.7">· ' + escapeHtml(p.technique) + ' · ' + p.hops + ' hop' + (p.hops === 1 ? "" : "s") + '</span></div>'
+        + chainHtml(p)
+        + detailHtml(p)
+      + '</div>').join("")
+    + '</div>';
 }
 
 function detailHtml(r) {
@@ -1080,7 +1139,7 @@ $("rqToggle").addEventListener("click", () => {
 });
 $("table").querySelectorAll("th.sortable").forEach((th) => th.addEventListener("click", () => {
   const k = th.getAttribute("data-key");
-  if (sortState.key === k) sortState.dir *= -1; else { sortState.key = k; sortState.dir = k === "source" || k === "target" ? 1 : -1; }
+  if (sortState.key === k) sortState.dir *= -1; else { sortState.key = k; sortState.dir = k === "source" ? 1 : -1; }
   $("table").querySelectorAll("th .arrow").forEach((a) => (a.textContent = ""));
   th.querySelector(".arrow").textContent = sortState.dir === 1 ? "▲" : "▼";
   renderTable();
