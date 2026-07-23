@@ -1106,7 +1106,7 @@ async function fetchOrg() {
 async function fetchServicePrincipals() {
   if (STATE.data.servicePrincipals) return STATE.data.servicePrincipals;
   try {
-    const items = await ggetAll(`${GRAPH}/servicePrincipals?$top=500&$select=id,displayName,appId,publisherName,homepage,accountEnabled,appOwnerOrganizationId,tags,createdDateTime,servicePrincipalType,notes,description,alternativeNames,applicationTemplateId,appRoleAssignmentRequired,passwordCredentials,keyCredentials,signInActivity&$count=true`, 8, true);
+    const items = await ggetAll(`${GRAPH}/servicePrincipals?$top=500&$select=id,displayName,appId,publisherName,homepage,accountEnabled,appOwnerOrganizationId,tags,createdDateTime,servicePrincipalType,notes,description,alternativeNames,applicationTemplateId,appRoleAssignmentRequired,passwordCredentials,keyCredentials&$count=true`, 8, true);
     STATE.data.servicePrincipals = items;
   } catch (e) { STATE.data.servicePrincipals = []; STATE.data.spError = e.message; }
   return STATE.data.servicePrincipals;
@@ -2721,24 +2721,35 @@ function buildAiAlerts({ aiApps, grants, signIns, riskyUsers, secAlerts, agentSp
   return { allAlerts, sevCounts, derivedCount: allAlerts.length - defenderCount, defenderCount, hiddenAlerts: (secAlerts||[]).length - aiSecAlerts.length };
 }
 
+// Bound a slow (esp. Advanced Hunting) fetch so it can't hang the dashboard: resolve to `fallback`
+// on timeout OR error. The value is cached by the underlying fetch, so it repopulates on next load.
+function withTimeout(promise, ms, fallback) {
+  return Promise.race([
+    Promise.resolve(promise).catch(() => fallback),
+    new Promise((res) => setTimeout(() => res(fallback), ms)),
+  ]);
+}
+const HUNT_TIMEOUT = 11000;
+
 async function loadDashboard() {
   const el = document.getElementById('dash-content');
   try {
     // Defender AI Assets (silent token) — fetched in parallel so the AI Models
     // tile can use the SAME inventory builder as the Models page (counts agree).
-    const defenderListP = fetchDefenderAiAgentsList().catch(() => ({ ok: false, agents: [] }));
+    const defenderListP = withTimeout(fetchDefenderAiAgentsList(), HUNT_TIMEOUT, { ok: false, agents: [] });
     // Governance signals (moved here from the dissolved Compliance page).
     // fetchGrantPolicies also populates STATE.data.authPolicy + secDefaults.
     const govDataP = Promise.all([ fetchGrantPolicies().catch(() => []), fetchTenantRegion().catch(() => null) ]);
     // Alerts feed (folded in from the removed AI Security Alerts page) + DLP-for-AI coverage.
     // Also pull the real Defender AI detections that don't arrive via alerts_v2:
     // agent threat alerts (AlertInfo) and DLP-to-AI incidents (fetchDlpAiBlocks).
+    // The Advanced-Hunting ones are timeout-bounded so a slow Defender query can't hang the dashboard.
     const alertDataP = Promise.all([
       fetchSecurityAlerts().catch(() => []),
-      fetchDlpProtectionScope().catch(() => null),
-      fetchAgentThreatAlerts().catch(() => ({ ok: false, alerts: [] })),
-      fetchDlpAiBlocks().catch(() => ({ ok: false, incidents: [] })),
-      fetchCopilotUsage().catch(() => ({ summary: null, userDetail: [] })),
+      withTimeout(fetchDlpProtectionScope(), HUNT_TIMEOUT, null),
+      withTimeout(fetchAgentThreatAlerts(), HUNT_TIMEOUT, { ok: false, alerts: [] }),
+      withTimeout(fetchDlpAiBlocks(), HUNT_TIMEOUT, { ok: false, incidents: [] }),
+      withTimeout(fetchCopilotUsage(), HUNT_TIMEOUT, { summary: null, userDetail: [] }),
     ]);
     // Shared AI-users population (same union the AI & Agent Users page headlines)
     // so the dashboard KPI can't disagree with that page.
@@ -2788,7 +2799,7 @@ async function loadDashboard() {
     // Shadow IT / app-discovery policy alerts for GenAI apps (AlertInfo, MDCA). Fetched
     // here — after the mcasApps population above — so its GenAI title-scoping can match
     // discovered app names. Cached, so the Shadow AI page reuses this result.
-    const dashShadowAi = await fetchShadowAiPolicyAlerts().catch(() => ({ ok: false, alerts: [] }));
+    const dashShadowAi = await withTimeout(fetchShadowAiPolicyAlerts(), HUNT_TIMEOUT, { ok: false, alerts: [] });
     const copilotLicensed = (dashCopilot && dashCopilot.userDetail && dashCopilot.userDetail.length) || 0;
     const copilotActive = dashCopilot?.summary?.totalActiveUsers
       ?? (dashCopilot?.userDetail || []).filter(u => u.teamsChatCount || u.wordCount || u.excelCount || u.powerPointCount || u.outlookCount).length;
