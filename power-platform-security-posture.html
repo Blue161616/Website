@@ -211,9 +211,10 @@
           <input id="clientId" placeholder="00000000-0000-0000-0000-000000000000" autocomplete="off" spellcheck="false" />
           <div class="hint"><b>Required</b> — a <b>SPA</b> app registration with delegated <b>Dynamics CRM</b> <code>user_impersonation</code>
             (this page's URL as an SPA redirect URI). The default is Blue16's published, read-only app.<br>
-            <b>Optional</b> — add the <b>Power Platform API</b> (delegated, tenant governance / DLP read) and grant admin consent to also read
-            tenant <b>DLP policies</b> and the full environment list. You also need the <b>Power Platform Administrator</b> (or Global Admin) role.
-            Without it those checks are skipped, so the baseline below is computed <b>excluding DLP gaps</b> and may read better than reality.</div>
+            <b>Optional — full environment list:</b> add <b>Power Platform API</b> → <code>EnvironmentManagement.Environments.Read</code> (delegated) and grant admin consent.<br>
+            <b>Optional — tenant DLP:</b> only readable through the <b>legacy Power Platform admin API</b> (<code>api.bap.microsoft.com</code>); the Power Platform API has
+            <b>no DLP permission</b> (its <code>Governance</code> namespace covers only cross-tenant connection reports). Either way you also need the
+            <b>Power Platform Administrator</b> (or Global Admin) role. Without DLP the baseline is computed <b>excluding DLP gaps</b> and may read better than reality.</div>
         </div>
         <div>
           <label for="envs">Environment URLs — one per line (or use “Discover”)</label>
@@ -318,6 +319,11 @@ const REDIRECT = location.origin + location.pathname.replace(/\/{2,}/g, '/');
 if (/\/{2,}/.test(location.pathname)) { try { history.replaceState(null, '', REDIRECT + location.search + location.hash); } catch (e) {} }
 const GDS = "https://globaldisco.crm.dynamics.com";
 const BAP = "https://api.bap.microsoft.com";
+// Modern Power Platform API. Different audience from BAP, so it needs its own token.
+// It can list environments (EnvironmentManagement.Environments.Read) but exposes NO
+// DLP/data-policy scope — its Governance namespace only covers cross-tenant connection
+// reports — so tenant DLP still has to come from the legacy BAP endpoint below.
+const PPAPI = "https://api.powerplatform.com";
 $("clientId").value = localStorage.getItem("ppsp_clientId") || DEFAULT_CLIENT_ID;
 $("envs").value = localStorage.getItem("ppsp_envs") || "";
 let msalApp = null, account = null, msalClientId = null;
@@ -457,24 +463,50 @@ async function scan(){
   } catch(e){ setStatus(""); showAuthError(e); }
 }
 
+const mapEnv = e => { const p = e.properties || e; return {
+  id: e.name || e.id,
+  display: p.displayName || p.name,
+  type: (p.environmentSku || p.environmentType || "?"),
+  isDefault: !!p.isDefault,
+  dataverseUrl: ((p.linkedEnvironmentMetadata && p.linkedEnvironmentMetadata.instanceApiUrl) || "").replace(/\/$/,"") || null,
+  region: p.azureRegion || p.geographicalRegion }; };
+
 async function scanTenant(){
   const t = { available:false, dlpAvailable:false, dlpPolicies:[], environments:null, note:null };
+  const notes = [];
+
+  // 1) Environment list — prefer the modern Power Platform API
+  //    (delegated EnvironmentManagement.Environments.Read).
+  const ppTok = await optionalToken(PPAPI);
+  if (ppTok){
+    try {
+      const r = await fetch(PPAPI + "/environmentmanagement/environments?api-version=2024-10-01", { headers:{ Authorization:"Bearer "+ppTok, Accept:"application/json" } });
+      if (r.ok){ const j = await r.json(); t.available = true; t.environments = (j.value||[]).map(mapEnv); }
+    } catch(e){ notes.push("Power Platform API environment list blocked by the browser (CORS)."); }
+  }
+
+  // 2) Legacy BAP — the only source for tenant DLP policies (the Power Platform API
+  //    has no DLP scope), plus a fallback for the environment list.
   const bapTok = await optionalToken(BAP);
-  if(!bapTok){ t.note = "Power Platform admin API (BAP) not consented for this app registration — tenant DLP / governance skipped, so the baseline below excludes DLP gaps and may read better than reality. Per-environment Dataverse analysis is shown. Fix: add the Power Platform API (delegated) to this app registration, grant admin consent, and hold the Power Platform Administrator role."; return t; }
-  // Environments (full list with type/managed) — attempt; CORS or 403 degrade.
-  try {
-    const r = await fetch(BAP + "/providers/Microsoft.BusinessAppPlatform/environments?api-version=2020-10-01&$expand=properties", { headers:{ Authorization:"Bearer "+bapTok, Accept:"application/json" } });
-    if(r.ok){ const j = await r.json(); t.available = true;
-      t.environments = (j.value||[]).map(e=>{ const p=e.properties||{}; return { id:e.name, display:p.displayName, type:(p.environmentSku||p.environmentType||"?"), isDefault:!!p.isDefault, dataverseUrl:(p.linkedEnvironmentMetadata&&p.linkedEnvironmentMetadata.instanceApiUrl||"").replace(/\/$/,"")||null, region:p.azureRegion||p.geographicalRegion }; });
+  if (bapTok){
+    if (!t.environments){
+      try {
+        const r = await fetch(BAP + "/providers/Microsoft.BusinessAppPlatform/environments?api-version=2020-10-01&$expand=properties", { headers:{ Authorization:"Bearer "+bapTok, Accept:"application/json" } });
+        if(r.ok){ const j = await r.json(); t.available = true; t.environments = (j.value||[]).map(mapEnv); }
+      } catch(e){ notes.push("Tenant environment list (BAP) blocked by the browser (CORS) — using Dataverse discovery only."); }
     }
-  } catch(e){ t.note = "Tenant environment list (BAP) blocked by the browser (CORS) — using Dataverse discovery only."; }
-  // DLP policies — attempt.
-  try {
-    const r = await fetch(BAP + "/providers/PowerPlatform.Governance/v2/policies?$expand=policyDefinition&api-version=2019-01-01", { headers:{ Authorization:"Bearer "+bapTok, Accept:"application/json" } });
-    if(r.ok){ const j = await r.json(); t.dlpAvailable = true;
-      t.dlpPolicies = (j.value||[]).map(p=>({ id:p.name, display:(p.properties&&p.properties.displayName)||p.name, defaultGroup:(p.properties&&p.properties.defaultConnectorsClassification), scope:(p.properties&&p.properties.environments) })); }
-  } catch(e){ /* dlp blocked */ }
-  if(!t.available && !t.note) t.note = "Power Platform admin API reachable but returned no data — tenant governance limited.";
+    try {
+      const r = await fetch(BAP + "/providers/PowerPlatform.Governance/v2/policies?$expand=policyDefinition&api-version=2019-01-01", { headers:{ Authorization:"Bearer "+bapTok, Accept:"application/json" } });
+      if(r.ok){ const j = await r.json(); t.dlpAvailable = true;
+        t.dlpPolicies = (j.value||[]).map(p=>({ id:p.name, display:(p.properties&&p.properties.displayName)||p.name, defaultGroup:(p.properties&&p.properties.defaultConnectorsClassification), scope:(p.properties&&p.properties.environments) })); }
+    } catch(e){ notes.push("Tenant DLP read (BAP) blocked by the browser (CORS)."); }
+  } else {
+    notes.push("Tenant DLP skipped — the legacy Power Platform admin API (BAP) is not consented for this app registration, so the baseline below excludes DLP gaps and may read better than reality. The Power Platform API cannot substitute here: it exposes no DLP/data-policy permission (its Governance namespace only covers cross-tenant connection reports), so DLP is readable via BAP only.");
+  }
+
+  if (!ppTok && !bapTok) notes.unshift("No tenant admin API consented — per-environment Dataverse analysis only.");
+  else if (!t.available && !notes.length) notes.push("Tenant admin API reachable but returned no data — tenant governance limited.");
+  t.note = notes.length ? notes.join(" ") : null;
   return t;
 }
 
