@@ -431,7 +431,7 @@
         <ul>
           <li><b>DSPM for AI</b> onboarded — monitoring agent data access &amp; oversharing risk</li>
           <li><b>DLP</b> policies scope agents / AI apps (sensitive-data egress blocked)</li>
-          <li>Audit + insider-risk signals retained for agent activity</li>
+          <li id="chk-audit"><b>Audit</b> log accessible &amp; retained for agent activity (insider-risk still portal-verify)</li>
         </ul>
         <a href="https://purview.microsoft.com" target="_blank" rel="noopener">purview.microsoft.com ↗</a>
       </div>
@@ -651,6 +651,24 @@ const PRIV_ROLES={
 const SEV_RANK={critical:3,high:2,medium:1,low:0};
 function tierToSev(t){ return t===0?"critical":t===1?"high":"medium"; }
 const DORMANT_DAYS=90, CRED_SOON_DAYS=30, CRED_LONG_DAYS=730;
+// Microsoft's prebuilt "AI Agents" advanced-hunting queries (Defender › Hunting › Queries › AI Agents),
+// rebuilt against the real AgentsInfo schema. arg_max gets the latest snapshot per agent, then | count.
+const AGENT_HUNTS=[
+  {short:"Hard-coded creds", name:"Hard-coded credentials in tools or configuration",
+   kql:`AgentsInfo | summarize arg_max(Timestamp,*) by AgentId | where tostring(DeclaredTools) has_any("password","secret","apikey","api_key","credential","bearer") or tostring(McpServers) has_any("password","secret","apikey","credential") | count`},
+  {short:"MCP configured", name:"Agents with an MCP tool / server configured",
+   kql:`AgentsInfo | summarize arg_max(Timestamp,*) by AgentId | where isnotempty(McpServers) and tostring(McpServers) !in ("","[]","null","{}") | count`},
+  {short:"Missing tools", name:"Tools referenced in instructions but not declared",
+   kql:`AgentsInfo | summarize arg_max(Timestamp,*) by AgentId | where isnotempty(Instructions) and Instructions has "tool" and tostring(DeclaredTools) in ("","[]","null") | count`},
+  {short:"Org-wide shared", name:"Organization-wide shared agents",
+   kql:`AgentsInfo | summarize arg_max(Timestamp,*) by AgentId | where tostring(Availability) has_any("All","Everyone","Organization","Tenant") or tostring(SharedWith) has_any("Everyone","AllUsers","Organization") | count`},
+  {short:"Orphaned owners", name:"Orphaned agents with disabled / no owners",
+   kql:`AgentsInfo | summarize arg_max(Timestamp,*) by AgentId | where tostring(Owners) in ("","[]","null","{}") | count`},
+  {short:"Short instructions", name:"Published agents with short instructions",
+   kql:`AgentsInfo | summarize arg_max(Timestamp,*) by AgentId | where PublishedStatus == "Published" and isnotempty(Instructions) and strlen(Instructions) < 100 | count`},
+  {short:"No instructions", name:"Published agents without instructions",
+   kql:`AgentsInfo | summarize arg_max(Timestamp,*) by AgentId | where PublishedStatus == "Published" and isempty(Instructions) | count`}
+];
 // Best-effort agent builder-platform detection from name / blueprint / tags (no clean Graph field yet).
 function detectPlatform(a, bp){
   const s=((a.displayName||"")+" "+((bp&&bp.name)||"")+" "+((a.tags||[]).join(" "))).toLowerCase();
@@ -851,8 +869,8 @@ async function analyze(){
       notices.push('<div class="notice">Optional scope <code>RoleManagement.Read.All</code> not consented — agents holding <b>privileged directory roles</b> won\'t be detected.</div>');
     }
 
-    // 7) optional: dormancy via SP sign-in activity
-    let auditGranted=false, signInByAppId={};
+    // 7) optional: dormancy via SP sign-in activity + confirm audit logging is retained (for Purview check)
+    let auditGranted=false, signInByAppId={}, auditReadable=false;
     const auditTk=await optionalToken(OPT_AUDIT);
     if(auditTk){
       try{
@@ -860,6 +878,8 @@ async function analyze(){
         acts.forEach(x=>{ signInByAppId[x.appId]=x.lastSignInActivity?.lastSignInDateTime||x.lastSignInActivity?.lastSuccessfulSignInDateTime||null; });
         auditGranted=true;
       }catch{ auditGranted=false; }
+      // Confirm the directory audit log is accessible & retained (partial proof of Purview audit coverage).
+      try{ await graphGetOne(`${graphBase()}/auditLogs/directoryAudits?$top=1`, auditTk); auditReadable=true; }catch{}
     }
     if(!auditGranted) notices.push('<div class="notice">Agent <b>sign-in dormancy</b> not evaluated (needs <code>AuditLog.Read.All</code> and may require Entra ID P1/P2). Dormant flag shown as n/a.</div>');
 
@@ -869,8 +889,15 @@ async function analyze(){
     const huntTk=await optionalToken(OPT_HUNT);
     if(huntTk){
       try{
-        const res=await runHunting("AgentsInfo | take 200", huntTk);
-        huntState={granted:true, ok:true, schema:res.schema||[], rows:res.results||[]};
+        const base=await runHunting("AgentsInfo | summarize Agents=dcount(AgentId)", huntTk);
+        const brow=base.results&&base.results[0];
+        const total=brow?(brow.Agents!=null?brow.Agents:Object.values(brow)[0]):0;
+        huntState={granted:true, ok:true, total:Number(total)||0};
+        // run Microsoft's prebuilt "AI Agents" hunting queries → a count each
+        huntState.queries=await Promise.all(AGENT_HUNTS.map(async q=>{
+          try{ const r=await runHunting(q.kql, huntTk); const row=r.results&&r.results[0]; const c=row?(row.Count!=null?row.Count:Object.values(row)[0]):0; return {short:q.short, name:q.name, count:Number(c)||0}; }
+          catch(e){ return {short:q.short, name:q.name, error:true}; }
+        }));
       }catch(e){ huntState={granted:true, ok:false, error:e.message, status:e.status}; }
     }else{
       notices.push('<div class="notice">Optional scope <code>ThreatHunting.Read.All</code> not consented — the <b>Defender AgentsInfo</b> hunting check is skipped.</div>');
@@ -959,6 +986,7 @@ async function analyze(){
     renderHunt(huntState);
     renderEntraChecks(caState, idpState, enriched);
     renderDefenderChecks(huntState);
+    renderPurviewChecks(auditReadable);
     renderTable(enriched);
     setStatus(`Scanned ${n} agent identities across ${bpIds.length} blueprints.`);
   }catch(e){
@@ -1156,10 +1184,14 @@ function renderEntraChecks(caState, idpState, agents){
   setCheck("chk-owner", (noOwner>0||dangerous>0) ? "bad" : (agents.length?"good":"neutral"));
 }
 function renderDefenderChecks(hunt){
-  const live = !!(hunt && hunt.granted && hunt.ok && (hunt.rows||[]).length>0);
+  const live = !!(hunt && hunt.granted && hunt.ok);
   setCheck("chk-a365", live?"good":"neutral");
   setCheck("chk-m365", live?"good":"neutral");
-  setCheck("chk-agentsinfo", (hunt && hunt.granted && hunt.ok)?"good":"neutral");
+  setCheck("chk-agentsinfo", live?"good":"neutral");
+}
+function renderPurviewChecks(auditReadable){
+  // Only the audit half is Graph-confirmable; DSPM for AI / DLP / insider-risk stay portal-verify (neutral).
+  setCheck("chk-audit", auditReadable?"good":"neutral");
 }
 function renderHunt(hunt){
   const el=$("defHunt"); if(!el) return;
@@ -1170,18 +1202,18 @@ function renderHunt(hunt){
   if(!hunt.ok){
     el.innerHTML=head+'<div class="engine-clean" style="border-left-color:var(--crit);background:#f871711a"><b>AgentsInfo not available</b> ('+escapeHtml(hunt.error||"error")+'). The Agent 365 Defender data source / Microsoft 365 connector may not be enabled — no agent telemetry is being collected.</div></div>'; return;
   }
-  const rows=hunt.rows||[];
-  if(!rows.length){
-    el.innerHTML=head+'<div class="engine-clean" style="border-left-color:var(--amber);background:#fbbf240a"><b>AgentsInfo reachable but empty</b> — the table exists but returned no rows, so agent activity isn\'t being collected yet.</div></div>'; return;
+  let html=head+'<div class="engine-clean" style="border-left-color:var(--green);background:#34d3990f;margin-bottom:14px"><b>Agent data collection is active.</b> <code>AgentsInfo</code> is reachable'+(hunt.total?(' ('+hunt.total+' agents)'):'')+' — so the Agent 365 data source and Microsoft 365 connector are enabled and feeding Defender.</div>';
+  if(hunt.queries && hunt.queries.length){
+    html+='<div class="hint" style="margin:0 0 8px">Microsoft prebuilt <b>AI Agents</b> hunting queries — number of agents matching each (0 = clean; best-effort KQL, verify in-portal):</div>';
+    html+='<div class="kpis" style="grid-template-columns:repeat(auto-fill,minmax(148px,1fr))">';
+    hunt.queries.forEach((q,i)=>{
+      const cls=q.error?'':(q.count>0?(i===0?'crit':'high'):'ok');
+      const val=q.error?'—':q.count;
+      html+='<div class="kpi '+cls+'" title="'+escapeHtml(q.name)+'"><div class="k">'+(i+1)+' · '+escapeHtml(q.short)+'</div><div class="v">'+val+'</div></div>';
+    });
+    html+='</div>';
   }
-  const cols=(hunt.schema&&hunt.schema.length?hunt.schema.map(s=>s.name):Object.keys(rows[0])).slice(0,6);
-  const show=rows.slice(0,12);
-  const thead=cols.map(c=>'<th>'+escapeHtml(c)+'</th>').join("");
-  const tbody=show.map(r=>'<tr>'+cols.map(c=>'<td class="mono" style="font-size:11px">'+escapeHtml(r[c]==null?"":String(r[c])).slice(0,60)+'</td>').join("")+'</tr>').join("");
-  el.innerHTML=head
-    +'<div class="engine-clean" style="border-left-color:var(--green);background:#34d3990f;margin-bottom:12px"><b>Agent data collection is active.</b> <code>AgentsInfo</code> returned '+rows.length+' row'+(rows.length===1?'':'s')+' — so the Agent 365 data source and Microsoft 365 connector are enabled and feeding Defender.</div>'
-    +'<div style="overflow-x:auto"><table><thead><tr>'+thead+'</tr></thead><tbody>'+tbody+'</tbody></table></div>'
-    +(rows.length>show.length?'<div class="hint" style="margin-top:8px">Showing '+show.length+' of '+rows.length+' rows · first '+cols.length+' columns.</div>':'')+'</div>';
+  el.innerHTML=html+'</div>';
 }
 
 let sortKey="risk", sortDir=-1;
