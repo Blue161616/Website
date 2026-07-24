@@ -651,23 +651,47 @@ const PRIV_ROLES={
 const SEV_RANK={critical:3,high:2,medium:1,low:0};
 function tierToSev(t){ return t===0?"critical":t===1?"high":"medium"; }
 const DORMANT_DAYS=90, CRED_SOON_DAYS=30, CRED_LONG_DAYS=730;
-// Microsoft's prebuilt "AI Agents" advanced-hunting queries (Defender › Hunting › Queries › AI Agents),
-// rebuilt against the real AgentsInfo schema. arg_max gets the latest snapshot per agent, then | count.
+// Microsoft's OFFICIAL "AI Agents" advanced-hunting queries (Azure-Sentinel Hunting Queries/AI Agents),
+// reduced to a count of matching agents. arg_max = latest snapshot per agent (the table stores snapshots).
 const AGENT_HUNTS=[
-  {short:"Hard-coded creds", name:"Hard-coded credentials in tools or configuration",
-   kql:`AgentsInfo | summarize arg_max(Timestamp,*) by AgentId | where tostring(DeclaredTools) has_any("password","secret","apikey","api_key","credential","bearer") or tostring(McpServers) has_any("password","secret","apikey","credential") | count`},
-  {short:"MCP configured", name:"Agents with an MCP tool / server configured",
-   kql:`AgentsInfo | summarize arg_max(Timestamp,*) by AgentId | where isnotempty(McpServers) and tostring(McpServers) !in ("","[]","null","{}") | count`},
-  {short:"Missing tools", name:"Tools referenced in instructions but not declared",
-   kql:`AgentsInfo | summarize arg_max(Timestamp,*) by AgentId | where isnotempty(Instructions) and Instructions has "tool" and tostring(DeclaredTools) in ("","[]","null") | count`},
-  {short:"Org-wide shared", name:"Organization-wide shared agents",
-   kql:`AgentsInfo | summarize arg_max(Timestamp,*) by AgentId | where tostring(Availability) has_any("All","Everyone","Organization","Tenant") or tostring(SharedWith) has_any("Everyone","AllUsers","Organization") | count`},
-  {short:"Orphaned owners", name:"Orphaned agents with disabled / no owners",
-   kql:`AgentsInfo | summarize arg_max(Timestamp,*) by AgentId | where tostring(Owners) in ("","[]","null","{}") | count`},
-  {short:"Short instructions", name:"Published agents with short instructions",
-   kql:`AgentsInfo | summarize arg_max(Timestamp,*) by AgentId | where PublishedStatus == "Published" and isnotempty(Instructions) and strlen(Instructions) < 100 | count`},
-  {short:"No instructions", name:"Published agents without instructions",
-   kql:`AgentsInfo | summarize arg_max(Timestamp,*) by AgentId | where PublishedStatus == "Published" and isempty(Instructions) | count`}
+  {short:"Hard-coded creds", name:"Hard-coded credentials in tools or configuration", kql:
+`let suspicious_patterns = @"(AKIA[0-9A-Z]{16})|(AIza[0-9A-Za-z_\\-]{35})|(xox[baprs]-[0-9a-zA-Z]{10,48})|(ghp_[A-Za-z0-9]{36,59})|(sk_(live|test)_[A-Za-z0-9]{24})|(SG\\.[A-Za-z0-9]{22}\\.[A-Za-z0-9]{43})|(\\d{8}:[\\w\\-]{35})|(eyJ[A-Za-z0-9_\\-]+\\.[A-Za-z0-9_\\-]+\\.[A-Za-z0-9_\\-]+)|(Authorization\\s*:\\s*Basic\\s+[A-Za-z0-9=:+]+)|([A-Za-z]+:\\/\\/[^\\/\\s""']+:[^\\/\\s""']+@[^\\/\\s""']+)";
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| where LifecycleStatus != "Deleted"
+| extend ToolsStr = tostring(DeclaredTools), TriggersStr = tostring(Triggers), McpStr = tostring(McpServers), SkillsStr = tostring(Skills), CapsStr = tostring(Capabilities), RawStr = tostring(RawAgentInfo)
+| where ToolsStr matches regex suspicious_patterns or TriggersStr matches regex suspicious_patterns or McpStr matches regex suspicious_patterns or SkillsStr matches regex suspicious_patterns or CapsStr matches regex suspicious_patterns or RawStr matches regex suspicious_patterns or Instructions matches regex suspicious_patterns
+| summarize Count = dcount(AgentId)`},
+  {short:"MCP configured", name:"Agents with an MCP tool / server configured", kql:
+`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where array_length(McpServers) > 0 | summarize Count = dcount(AgentId)`},
+  {short:"Missing tools", name:"Tools configured but not mentioned in instructions", kql:
+`let LatestAgents = materialize (AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted");
+let AgentToolNames = LatestAgents | where array_length(DeclaredTools) > 0 | mv-expand Tool = DeclaredTools | extend ToolName = tostring(Tool.name) | where isnotempty(ToolName) | summarize ToolNames = make_set(ToolName) by AgentId;
+LatestAgents
+| where isnotempty(Instructions) and Instructions != "N/A"
+| join kind=inner AgentToolNames on AgentId
+| mv-apply ToolName = ToolNames to typeof(string) on (where Instructions !has ToolName | summarize MissingTools = make_list(ToolName))
+| where array_length(MissingTools) > 0
+| summarize Count = dcount(AgentId)`},
+  {short:"Org-wide shared", name:"Organization-wide shared agents (SharedWith = *)", kql:
+`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where array_length(SharedWith) > 0 | mv-expand Shared = SharedWith to typeof(string) | where tostring(Shared) == "*" | summarize Count = dcount(AgentId)`},
+  {short:"Orphaned owners", name:"Orphaned agents — all owners disabled / removed", kql:
+`let EnabledAccountIds = materialize (IdentityInfo | where IsAccountEnabled == 1 | distinct AccountObjectId = tostring(AccountObjectId));
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| where LifecycleStatus != "Deleted"
+| where array_length(Owners) > 0
+| mv-expand Owner = Owners to typeof(string)
+| extend OwnerId = tostring(Owner)
+| where isnotempty(OwnerId)
+| summarize OwnerIds = make_set(OwnerId) by AgentId
+| mv-apply OwnerId = OwnerIds to typeof(string) on (where OwnerId !in (EnabledAccountIds) | summarize DisabledOrMissingOwners = make_list(OwnerId))
+| where array_length(DisabledOrMissingOwners) == array_length(OwnerIds)
+| summarize Count = dcount(AgentId)`},
+  {short:"Short instructions", name:"Published agents with short instructions (<100 chars)", kql:
+`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where PublishedStatus == "Published" | where isnotempty(Instructions) and Instructions != "N/A" | where strlen(Instructions) < 100 | summarize Count = dcount(AgentId)`},
+  {short:"No instructions", name:"Published agents without instructions", kql:
+`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where PublishedStatus == "Published" | where isempty(Instructions) or Instructions == "N/A" | summarize Count = dcount(AgentId)`}
 ];
 // Best-effort agent builder-platform detection from name / blueprint / tags (no clean Graph field yet).
 function detectPlatform(a, bp){
@@ -1204,7 +1228,7 @@ function renderHunt(hunt){
   }
   let html=head+'<div class="engine-clean" style="border-left-color:var(--green);background:#34d3990f;margin-bottom:14px"><b>Agent data collection is active.</b> <code>AgentsInfo</code> is reachable'+(hunt.total?(' ('+hunt.total+' agents)'):'')+' — so the Agent 365 data source and Microsoft 365 connector are enabled and feeding Defender.</div>';
   if(hunt.queries && hunt.queries.length){
-    html+='<div class="hint" style="margin:0 0 8px">Microsoft prebuilt <b>AI Agents</b> hunting queries — number of agents matching each (0 = clean; best-effort KQL, verify in-portal):</div>';
+    html+='<div class="hint" style="margin:0 0 8px">Microsoft\'s official <b>AI Agents</b> hunting queries (Azure-Sentinel) — agents matching each (0 = clean; hover for detail):</div>';
     html+='<div class="kpis" style="grid-template-columns:repeat(auto-fill,minmax(148px,1fr))">';
     hunt.queries.forEach((q,i)=>{
       const cls=q.error?'':(q.count>0?(i===0?'crit':'high'):'ok');
