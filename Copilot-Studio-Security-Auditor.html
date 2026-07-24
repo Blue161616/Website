@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Copilot Studio Security Posture (Preview)</title>
+<title>Copilot Studio Agent Security Posture (Preview)</title>
 <!-- MSAL.js (delegated, public client). For production pin a version + SRI. -->
 <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2/lib/msal-browser.min.js"></script>
 <!-- Leaflet (map) -->
@@ -104,7 +104,7 @@
       <path d="M24 47 l5 5 l11 -12" fill="none" stroke="#0d1117" stroke-opacity=".35" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
       <path d="M24 46 l5 5 l11 -12" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
     </svg>
-    <span>Copilot Studio Security Posture <span style="font-size:12px;font-weight:600;color:var(--m);vertical-align:middle">(Preview)</span></span>
+    <span>Copilot Studio Agent Security Posture <span style="font-size:12px;font-weight:600;color:var(--m);vertical-align:middle">(Preview)</span></span>
   </h1>
   <span class="sub" id="acct"></span>
   <span class="spacer"></span>
@@ -316,6 +316,7 @@ async function scanEnvironment(orgUrl, opts){
 
   // 1) Agents (bot table) — No Auth, Authentication, Orphaned
   const bots = await dvGetAll(api + "/bots?$select=name,botid,authenticationmode,authenticationtrigger,authorizedsecuritygroupids,statecode,configuration,_ownerid_value,_createdby_value", H);
+  SCAN_AGENTS = bots.length;   // reported in the scan summary so "0 findings" can be told apart from "no access"
   for (const b of bots){
     AGENT_OWNER[envName+'|'+b.name] = b['_ownerid_value@OData.Community.Display.V1.FormattedValue']
                                    || b['_createdby_value@OData.Community.Display.V1.FormattedValue'] || '';
@@ -469,6 +470,7 @@ function dedupe(findings){
 // ─────────────────────────────────────────────────────────────────────────────
 let DATA = [];
 let AGENT_OWNER = {};   // "env|agent" -> owner display name (for the risk matrix)
+let SCAN_AGENTS = 0;    // agents read from the last-scanned environment (for the scan summary)
 async function runScan(){
   const clientId = document.getElementById('clientId').value.trim();
   const envs = document.getElementById('envs').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
@@ -488,15 +490,31 @@ async function runScan(){
     status('Detecting tenant region…'); try { await detectAndRenderRegions(envs); } catch(e){ console.warn('region detect failed', e); }
     AGENT_OWNER = {};
     let all = [];
+    const failures = [], envStats = [];
     for (const e of envs){
       status('Scanning '+e+' …');
-      try { all = all.concat(await scanEnvironment(e, opts)); }
-      catch(err){ status('  '+e+' failed: '+err.message); console.error(err); }
+      SCAN_AGENTS = 0;
+      try { const f = await scanEnvironment(e, opts); envStats.push({env:e, agents:SCAN_AGENTS}); all = all.concat(f); }
+      catch(err){ failures.push({env:e, msg:(err && err.message) || String(err)}); console.error(err); }
     }
     all = dedupe(all);
     all = all.concat(correlate(all));
     DATA = all;
-    status('Done — '+DATA.length+' findings.');
+    // A bare "0 findings" is ambiguous: a failed environment, an environment with no
+    // agents, and a genuinely clean tenant all looked identical. Spell out which it is.
+    const agentTotal = envStats.reduce((n,s)=>n+s.agents, 0);
+    const lines = ['Done — '+DATA.length+' finding'+(DATA.length===1?'':'s')
+      +' · '+agentTotal+' agent'+(agentTotal===1?'':'s')+' read'
+      +' · '+envStats.length+'/'+envs.length+' environment'+(envs.length===1?'':'s')+' scanned.'];
+    envStats.forEach(s=>{ if (!s.agents) lines.push('  • '+s.env+' — no Copilot Studio agents visible to your account (bot table empty).'); });
+    failures.forEach(f=>lines.push('  ✗ '+f.env+' — '+f.msg));
+    if (failures.length && !envStats.length)
+      lines.push('Every environment failed. Check the Dynamics CRM · user_impersonation consent, and that your account has a Dataverse security role in these environments.');
+    else if (!agentTotal && envStats.length)
+      lines.push('No agents were readable — you likely lack a Dataverse security role in these environments, or they contain no Copilot Studio agents.');
+    else if (!DATA.length && agentTotal)
+      lines.push('Agents were read but none matched a risk check — this is a clean result.');
+    status(lines.join('\n'));
     showDashboard();
     renderModelSummary();   // surface AI-model / EU-boundary exposure on the map
     collapseCfg();   // minimize the scan panel; map + findings take focus
