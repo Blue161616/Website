@@ -76,6 +76,7 @@
   .dna{width:52px; text-align:right; font-size:10px; color:var(--dim)}
 
   .kpis{display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-top:20px}
+  .kpis.k5{grid-template-columns:repeat(5,1fr)}
   .kpi{border:1px solid var(--border); background:var(--panel-2); border-radius:11px; padding:14px}
   .kpi .k{font-family:'Consolas',monospace; font-size:10px; letter-spacing:1px; text-transform:uppercase; color:var(--dim)}
   .kpi .v{font-size:26px; font-weight:800; margin-top:4px; font-variant-numeric:tabular-nums}
@@ -251,7 +252,7 @@
         <input id="clientId" placeholder="00000000-0000-0000-0000-000000000000" autocomplete="off" />
         <div class="hint">A <b>SPA</b> app registration with delegated, <b>read-only</b> permissions:
           <code>AgentIdentity.Read.All</code>, <code>Application.Read.All</code>, <code>Directory.Read.All</code>, <code>User.Read</code> (admin consent).
-          <br><b>Optional (each degrades gracefully):</b> <code>Policy.Read.All</code> = Conditional-Access coverage on agents; <code>RoleManagement.Read.All</code> = privileged directory roles held by agents; <code>AuditLog.Read.All</code> = agent sign-in dormancy.
+          <br><b>Optional (each degrades gracefully):</b> <code>Policy.Read.All</code> = Conditional Access for Agents coverage; <code>IdentityRiskyServicePrincipal.Read.All</code> = ID Protection for Agents risk (Entra ID P2); <code>RoleManagement.Read.All</code> = privileged directory roles; <code>AuditLog.Read.All</code> = agent sign-in dormancy.
           <br>The signed-in admin needs the <b>Agent ID Administrator</b> (or Global Reader) role to enumerate agent identities.</div>
       </div>
       <div>
@@ -356,6 +357,18 @@
     </div>
   </div>
 
+  <div class="card engine-card" id="secIDP" style="display:none; --eng:var(--entra)">
+    <div class="engine-head">
+      <svg aria-hidden="true" viewBox="0 0 32 32" width="34" height="34"><defs><linearGradient id="idpg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4fc7f2"/><stop offset="1" stop-color="#1e6fd2"/></linearGradient></defs><path d="M16 3 27 6.6v8c0 6.9-4.7 12.2-11 13.8C9.7 26.8 5 21.5 5 14.6v-8z" fill="url(#idpg)"/><path d="M13 15.5l2.4 2.4 4.6-5" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div><div class="eh-role">Microsoft Entra · ID Protection for Agents</div><h2>Agent identity risk</h2></div>
+      <div class="escore" id="scoreIDP"></div>
+    </div>
+    <div class="engine-note">Entra ID Protection risk detections for agent identities (from <code>riskyServicePrincipals</code>). Risk state &amp; level mirror the ID Protection for Agents blade. ID Protection for Agents will soon require a Microsoft Agent 365 license.</div>
+    <div class="kpis k5" id="idpKpis" style="margin:0 0 16px"></div>
+    <div id="findIDP"></div>
+    <div id="idpTable" style="margin-top:14px"></div>
+  </div>
+
   <div class="card engine-card" id="secDefender" style="display:none; --eng:var(--defender)">
     <div class="engine-head">
       <svg aria-hidden="true"><use href="#ic-defender"/></svg>
@@ -447,6 +460,7 @@ if(location.protocol==="file:"){
 // ---------- MSAL ----------
 const SCOPES = ["AgentIdentity.Read.All","Application.Read.All","Directory.Read.All","User.Read"];
 const OPT_POLICY = ["Policy.Read.All"];
+const OPT_IDP    = ["IdentityRiskyServicePrincipal.Read.All"];
 const OPT_ROLES  = ["RoleManagement.Read.All"];
 const OPT_AUDIT  = ["AuditLog.Read.All"];
 let msalInstance=null, msalConfigKey=null, account=null;
@@ -605,7 +619,7 @@ async function analyze(){
   try{
     setStatus("Enumerating agent identities…");
     $("scoreCard").style.display="none"; $("agentsCard").style.display="none";
-    ["secEntra","secDefender","secPurview"].forEach(id=>$(id).style.display="none");
+    ["secEntra","secIDP","secDefender","secPurview"].forEach(id=>$(id).style.display="none");
     $("notices").innerHTML="";
     const tk=await token();
     const ver=$("graphVer").value;
@@ -686,22 +700,55 @@ async function analyze(){
       bpMap[bid]={id:bid, name:sp?.displayName||"(unresolved)", resolved:!!sp, secretCount:secrets.length, certCount:certs.length, expired, expiringSoon, longLived, hasOwner:owners.length>0, owners};
     },null);
 
-    // 5) optional: Conditional Access coverage on agents/workload identities
-    let caState={granted:false, policies:0, coverAgents:0};
+    // 5) optional: Conditional Access for Agents coverage.
+    // CA for Agents is a beta feature — always query /beta so the agent-targeting condition is returned
+    // (on v1.0 the "All agent identities" target isn't surfaced). Match agent targeting broadly because
+    // the beta schema is still evolving: classic workload-identity SP targeting OR any agent-identity field.
+    let caState={granted:false, policies:0, coverAgents:0, agentPolicies:[]};
     const caTk=await optionalToken(OPT_POLICY);
     if(caTk){
       try{
-        const pols=await graphGetAll(`${graphBase()}/identity/conditionalAccess/policies?$select=id,displayName,state,conditions`, caTk);
+        const pols=await graphGetAll(`https://graph.microsoft.com/beta/identity/conditionalAccess/policies?$select=id,displayName,state,conditions,grantControls`, caTk);
         const enabled=pols.filter(p=>p.state==="enabled");
         caState.policies=enabled.length;
-        caState.coverAgents=enabled.filter(p=>{
-          const inc=p.conditions?.clientApplications?.includeServicePrincipals||[];
-          return inc.length>0; // targets workload identities (agents are SPs)
-        }).length;
+        const targetsAgents=(p)=>{
+          const ca=p.conditions?.clientApplications||{};
+          if((ca.includeServicePrincipals||[]).length>0) return true;   // classic workload identities
+          if(ca.servicePrincipalFilter) return true;
+          // CA for Agents (beta): "All agent identities" / agent targeting lives in a newer condition field
+          try{ if(/agent/i.test(JSON.stringify(p.conditions||{}))) return true; }catch(e){}
+          return false;
+        };
+        const agentPols=enabled.filter(targetsAgents);
+        caState.coverAgents=agentPols.length;
+        caState.agentPolicies=agentPols.map(p=>p.displayName||p.id);
         caState.granted=true;
-      }catch{ notices.push('<div class="notice">Conditional Access policies could not be read even though <code>Policy.Read.All</code> was requested. Coverage domain excluded.</div>'); }
+        if(caState.coverAgents>0) notices.push('<div class="notice info"><b>Conditional Access for Agents detected.</b> '+caState.coverAgents+' enabled polic'+(caState.coverAgents===1?'y':'ies')+' target agent identities: '+caState.agentPolicies.map(escapeHtml).join(", ")+'.</div>');
+      }catch(e){ notices.push('<div class="notice">Conditional Access policies could not be read even though <code>Policy.Read.All</code> was requested ('+escapeHtml(e.message||'error')+'). Coverage domain excluded.</div>'); }
     }else{
-      notices.push('<div class="notice">Optional scope <code>Policy.Read.All</code> not consented — <b>Conditional Access coverage</b> on agents can\'t be evaluated (Coverage domain shown as n/a).</div>');
+      notices.push('<div class="notice">Optional scope <code>Policy.Read.All</code> not consented — <b>Conditional Access for Agents</b> coverage can\'t be evaluated (Coverage domain shown as n/a).</div>');
+    }
+
+    // 5b) optional: ID Protection for Agents — risky service principals (agents are SPs). Beta + P2.
+    let idpState={granted:false, risky:[], counts:{total:0,high:0,medium:0,low:0,compromised:0,atRisk:0}};
+    const idpTk=await optionalToken(OPT_IDP);
+    if(idpTk){
+      try{
+        const rsp=await graphGetAll(`https://graph.microsoft.com/beta/identityProtection/riskyServicePrincipals?$select=id,appId,displayName,riskLevel,riskState,riskDetail,riskLastUpdatedDateTime,isEnabled,servicePrincipalType&$top=200`, idpTk);
+        const agentIdSet=new Set(enriched.map(a=>a.id));
+        const agentAppSet=new Set(enriched.map(a=>a.appId).filter(Boolean));
+        const active=rsp.filter(r=>!["confirmedSafe","remediated","dismissed","none"].includes(r.riskState))
+                        .map(r=>({...r, inInventory: agentIdSet.has(r.id)||agentAppSet.has(r.appId)}));
+        idpState={granted:true, risky:active,
+          counts:{ total:active.length,
+            high:active.filter(r=>r.riskLevel==="high").length,
+            medium:active.filter(r=>r.riskLevel==="medium").length,
+            low:active.filter(r=>r.riskLevel==="low").length,
+            compromised:active.filter(r=>r.riskState==="confirmedCompromised").length,
+            atRisk:active.filter(r=>r.riskState==="atRisk").length }};
+      }catch(e){ idpState={granted:false, error:e.message}; notices.push('<div class="notice">ID Protection for Agents could not be read ('+escapeHtml(e.message||'error')+') — needs <code>IdentityRiskyServicePrincipal.Read.All</code> and Entra ID P2.</div>'); }
+    }else{
+      notices.push('<div class="notice">Optional scope <code>IdentityRiskyServicePrincipal.Read.All</code> not consented — the <b>ID Protection for Agents</b> section can\'t be populated.</div>');
     }
 
     // 6) optional: directory roles held by agents/blueprints
@@ -802,13 +849,14 @@ async function analyze(){
     let wsum=0,tot=0; scored.forEach(d=>{ wsum+=weights[d.key]; tot+=d.val*weights[d.key]; });
     const overall=clamp(tot/wsum);
 
-    MODEL={agents:enriched, bpMap, domains, overall, caState, meta:{count:n, capped, blueprints:bpIds.length}};
+    MODEL={agents:enriched, bpMap, domains, overall, caState, idpState, meta:{count:n, capped, blueprints:bpIds.length}};
 
     // ---------- render ----------
     renderNotices(notices, capped, agents.length);
     renderDashboard(overall, domains, MODEL.meta);
     renderKpis(enriched, bpIds.length);
     renderEngineSections(enriched, bpMap, caState, domains);
+    renderIDP(idpState, n);
     renderTable(enriched);
     setStatus(`Scanned ${n} agent identities across ${bpIds.length} blueprints.`);
   }catch(e){
@@ -930,6 +978,42 @@ function renderEngineSections(agents, bpMap, caState, domains){
   setEngineScore("scoreDefender", dmap.risk);
   setEngineScore("scorePurview", dmap.compliance);
   $("secEntra").style.display="block"; $("secDefender").style.display="block"; $("secPurview").style.display="block";
+}
+
+function renderIDP(idp, totalAgents){
+  const el=$("secIDP");
+  if(!idp || !idp.granted){
+    $("scoreIDP").innerHTML='<div class="n" style="color:var(--dim);font-size:16px">n/a</div><div class="l">no data</div>';
+    $("idpKpis").className="kpis";
+    $("idpKpis").innerHTML='<div class="engine-clean" style="grid-column:1/-1;border-left-color:var(--dim);background:var(--panel-2)">ID Protection for Agents not evaluated — grant <b>IdentityRiskyServicePrincipal.Read.All</b> (Entra ID P2) and rescan to populate this section.</div>';
+    $("findIDP").innerHTML=""; $("idpTable").innerHTML="";
+    el.style.display="block"; return;
+  }
+  const c=idp.counts;
+  $("scoreIDP").innerHTML='<div class="n" style="color:'+(c.compromised?'var(--crit)':c.total?'var(--high)':'var(--green)')+'">'+c.compromised+'</div><div class="l">compromised</div>';
+  const kpi=(k,v,cls)=>'<div class="kpi '+(cls||'')+'"><div class="k">'+k+'</div><div class="v">'+v+'</div></div>';
+  $("idpKpis").className="kpis k5";
+  $("idpKpis").innerHTML=kpi("Agents protected",totalAgents)+kpi("At-risk agents",c.total,c.total?'high':'ok')+kpi("High risk",c.high,c.high?'crit':'ok')+kpi("Confirmed compromised",c.compromised,c.compromised?'crit':'ok')+kpi("At risk",c.atRisk,c.atRisk?'high':'ok');
+  const F=[];
+  const comp=idp.risky.filter(r=>r.riskState==="confirmedCompromised");
+  const at=idp.risky.filter(r=>r.riskState==="atRisk");
+  if(comp.length) F.push({sev:"critical",title:"Confirmed compromised agents",count:comp.length,names:comp.map(r=>r.displayName||r.id),
+    desc:"Entra ID Protection confirmed these agent identities as compromised.",
+    fix:"Disable the agent and rotate its blueprint credentials; hunt its activity in the Defender AgentsInfo table; then confirm-safe / dismiss in ID Protection once remediated."});
+  if(at.length) F.push({sev:"high",title:"Agents flagged at risk",count:at.length,names:at.map(r=>r.displayName||r.id),
+    desc:"ID Protection detected risky sign-in or behavior for these agents.",
+    fix:"Investigate and remediate in ID Protection for Agents; ensure a Conditional Access for Agents policy blocks high-risk agent sign-ins."});
+  renderGroup("findIDP", F, "No agent identities are currently flagged by ID Protection — good.");
+  if(idp.risky.length){
+    const ord={high:3,medium:2,low:1};
+    const rows=idp.risky.slice().sort((a,b)=>(ord[b.riskLevel]||0)-(ord[a.riskLevel]||0)).map(r=>{
+      const lvlc=r.riskLevel==="high"?"var(--crit)":r.riskLevel==="medium"?"var(--high)":"var(--muted)";
+      const stc=r.riskState==="confirmedCompromised"?"flagchip bad":"flagchip warn";
+      return '<tr><td><b>'+escapeHtml(r.displayName||r.id)+'</b>'+(r.inInventory?'':' <span class="flagchip">not in agent inventory</span>')+'</td><td><span class="'+stc+'">'+escapeHtml(r.riskState||"")+'</span></td><td style="color:'+lvlc+';font-weight:700;text-transform:capitalize">'+escapeHtml(r.riskLevel||"")+'</td><td class="mono" style="color:var(--dim)">'+(r.riskLastUpdatedDateTime?r.riskLastUpdatedDateTime.slice(0,10):"—")+'</td></tr>';
+    }).join("");
+    $("idpTable").innerHTML='<div class="hint" style="margin:6px 0 8px"><b>'+idp.risky.length+' agent identit'+(idp.risky.length===1?'y':'ies')+'</b> with an active ID Protection risk state.</div><div style="overflow-x:auto"><table><thead><tr><th>Agent</th><th>Risk state</th><th>Risk level</th><th>Last updated</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+  } else $("idpTable").innerHTML="";
+  el.style.display="block";
 }
 
 let sortKey="risk", sortDir=-1;
