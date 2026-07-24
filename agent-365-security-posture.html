@@ -724,18 +724,22 @@ async function analyze(){
         const pols=await graphGetAll(`https://graph.microsoft.com/beta/identity/conditionalAccess/policies?$select=id,displayName,state,conditions,grantControls`, caTk);
         const enabled=pols.filter(p=>p.state==="enabled");
         caState.policies=enabled.length;
-        const targetsAgents=(p)=>{
-          const ca=p.conditions?.clientApplications||{};
-          if((ca.includeServicePrincipals||[]).length>0) return true;   // classic workload identities
-          if(ca.servicePrincipalFilter) return true;
-          // CA for Agents (beta): "All agent identities" / agent targeting lives in a newer condition field
-          try{ if(/agent/i.test(JSON.stringify(p.conditions||{}))) return true; }catch(e){}
-          return false;
+        // Match ONLY policies that target agents, by their targeting VALUES (agent blueprints / identities / users),
+        // never by key names. The previous whole-conditions /agent/i matched property NAMES present on every policy
+        // (that's why generic MFA / device-compliance / GSA policies were wrongly included). Here we walk only the
+        // leaf string VALUES of `conditions`, matching an agent token or one of this tenant's real agent IDs.
+        const agentTargetSet=new Set([...enriched.map(a=>a.id), ...enriched.map(a=>a.appId).filter(Boolean), ...bpIds]);
+        const leafVals=(o,acc)=>{ acc=acc||[]; if(o==null) return acc; if(typeof o==="string"){acc.push(o);return acc;} if(Array.isArray(o)){o.forEach(x=>leafVals(x,acc));return acc;} if(typeof o==="object"){Object.keys(o).forEach(k=>leafVals(o[k],acc));} return acc; };
+        const agentMatch=(p)=>{
+          const hits=[];
+          leafVals(p.conditions||{}).forEach(v=>{ if(/agent/i.test(v)) hits.push(v); else if(agentTargetSet.has(v)) hits.push("agent identity/blueprint"); });
+          return [...new Set(hits)];
         };
-        const allAgentPols=pols.filter(targetsAgents).map(p=>({
+        const allAgentPols=pols.map(p=>({p,hits:agentMatch(p)})).filter(x=>x.hits.length).map(({p,hits})=>({
           name:p.displayName||p.id, state:p.state,
           block:(((p.grantControls||{}).builtInControls)||[]).includes("block"),
-          controls:(((p.grantControls||{}).builtInControls)||[]).join(", ")||"—"
+          controls:(((p.grantControls||{}).builtInControls)||[]).join(", ")||"—",
+          targets:hits.slice(0,3).join(", ")
         }));
         const enforcedAgent=allAgentPols.filter(p=>p.state==="enabled");
         caState.agentPolicies=allAgentPols;
@@ -1029,9 +1033,9 @@ function renderEngineSections(agents, bpMap, caState, domains){
         const st=p.state==="enabled"
           ? '<span class="flagchip" style="color:var(--green);border-color:#34d39944;background:#34d39910">enforced</span>'
           : (p.state==="enabledForReportingButNotEnforced" ? '<span class="flagchip warn">report-only</span>' : '<span class="flagchip">'+escapeHtml(p.state||"")+'</span>');
-        return '<tr><td><b>'+escapeHtml(p.name)+'</b></td><td>'+st+'</td><td>'+(p.block?'<span style="color:var(--crit);font-weight:700">Block</span>':escapeHtml(p.controls||"—"))+'</td></tr>';
+        return '<tr><td><b>'+escapeHtml(p.name)+'</b></td><td>'+st+'</td><td class="mono" style="font-size:10px;color:var(--dim)">'+escapeHtml(p.targets||"—")+'</td><td>'+(p.block?'<span style="color:var(--crit);font-weight:700">Block</span>':escapeHtml(p.controls||"—"))+'</td></tr>';
       }).join("");
-      caEl.innerHTML='<div class="verify-block"><div class="vt">Conditional Access for Agents — '+caState.agentPolicies.length+' agent-targeting polic'+(caState.agentPolicies.length===1?'y':'ies')+'</div><div style="overflow-x:auto"><table><thead><tr><th>Policy</th><th>State</th><th>Access control</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+      caEl.innerHTML='<div class="verify-block"><div class="vt">Conditional Access for Agents — '+caState.agentPolicies.length+' agent-targeting polic'+(caState.agentPolicies.length===1?'y':'ies')+'</div><div style="overflow-x:auto"><table><thead><tr><th>Policy</th><th>State</th><th>Targets</th><th>Access control</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
     } else if(caState.granted){
       caEl.innerHTML='<div class="verify-block"><div class="vt">Conditional Access for Agents</div><div class="engine-clean" style="border-left-color:var(--amber);background:#fbbf240a">No Conditional Access policy targets agent identities. Create one to guard agent sign-ins.</div></div>';
     } else {
