@@ -252,7 +252,7 @@
         <input id="clientId" placeholder="00000000-0000-0000-0000-000000000000" autocomplete="off" />
         <div class="hint">A <b>SPA</b> app registration with delegated, <b>read-only</b> permissions:
           <code>AgentIdentity.Read.All</code>, <code>Application.Read.All</code>, <code>Directory.Read.All</code>, <code>User.Read</code> (admin consent).
-          <br><b>Optional (each degrades gracefully):</b> <code>Policy.Read.All</code> = Conditional Access for Agents coverage; <code>IdentityRiskyServicePrincipal.Read.All</code> = ID Protection for Agents risk (Entra ID P2); <code>RoleManagement.Read.All</code> = privileged directory roles; <code>AuditLog.Read.All</code> = agent sign-in dormancy.
+          <br><b>Optional (each degrades gracefully):</b> <code>Policy.Read.All</code> = Conditional Access for Agents coverage; <code>IdentityRiskyServicePrincipal.Read.All</code> + <code>IdentityRiskyUser.Read.All</code> = ID Protection for Agents (agent identities + agent users · P2); <code>RoleManagement.Read.All</code> = privileged directory roles; <code>AuditLog.Read.All</code> = agent sign-in dormancy.
           <br>The signed-in admin needs the <b>Agent ID Administrator</b> (or Global Reader) role to enumerate agent identities.</div>
       </div>
       <div>
@@ -344,6 +344,7 @@
     </div>
     <div class="engine-note">How each agent authenticates and what it can reach — Agent IDs, permissions, blueprint credentials and ownership — plus <b>Conditional Access for Agents</b> and <b>ID Protection for Agents</b>.</div>
     <div id="findEntra"></div>
+    <div id="caAgents"></div>
     <div class="verify-block">
       <div class="vt">Agent 365 · Entra controls to confirm in-portal</div>
       <div class="pc" style="max-width:none">
@@ -461,6 +462,7 @@ if(location.protocol==="file:"){
 const SCOPES = ["AgentIdentity.Read.All","Application.Read.All","Directory.Read.All","User.Read"];
 const OPT_POLICY = ["Policy.Read.All"];
 const OPT_IDP    = ["IdentityRiskyServicePrincipal.Read.All"];
+const OPT_RISKUSER = ["IdentityRiskyUser.Read.All"];
 const OPT_ROLES  = ["RoleManagement.Read.All"];
 const OPT_AUDIT  = ["AuditLog.Read.All"];
 let msalInstance=null, msalConfigKey=null, account=null;
@@ -719,11 +721,17 @@ async function analyze(){
           try{ if(/agent/i.test(JSON.stringify(p.conditions||{}))) return true; }catch(e){}
           return false;
         };
-        const agentPols=enabled.filter(targetsAgents);
-        caState.coverAgents=agentPols.length;
-        caState.agentPolicies=agentPols.map(p=>p.displayName||p.id);
+        const allAgentPols=pols.filter(targetsAgents).map(p=>({
+          name:p.displayName||p.id, state:p.state,
+          block:(((p.grantControls||{}).builtInControls)||[]).includes("block"),
+          controls:(((p.grantControls||{}).builtInControls)||[]).join(", ")||"—"
+        }));
+        const enforcedAgent=allAgentPols.filter(p=>p.state==="enabled");
+        caState.agentPolicies=allAgentPols;
+        caState.coverAgents=enforcedAgent.length;
+        caState.reportOnly=allAgentPols.filter(p=>p.state==="enabledForReportingButNotEnforced").length;
         caState.granted=true;
-        if(caState.coverAgents>0) notices.push('<div class="notice info"><b>Conditional Access for Agents detected.</b> '+caState.coverAgents+' enabled polic'+(caState.coverAgents===1?'y':'ies')+' target agent identities: '+caState.agentPolicies.map(escapeHtml).join(", ")+'.</div>');
+        if(allAgentPols.length>0) notices.push('<div class="notice info"><b>Conditional Access for Agents:</b> '+allAgentPols.length+' agent-targeting polic'+(allAgentPols.length===1?'y':'ies')+' — '+enforcedAgent.length+' enforced, '+caState.reportOnly+' report-only. Listed in the Microsoft Entra section.</div>');
       }catch(e){ notices.push('<div class="notice">Conditional Access policies could not be read even though <code>Policy.Read.All</code> was requested ('+escapeHtml(e.message||'error')+'). Coverage domain excluded.</div>'); }
     }else{
       notices.push('<div class="notice">Optional scope <code>Policy.Read.All</code> not consented — <b>Conditional Access for Agents</b> coverage can\'t be evaluated (Coverage domain shown as n/a).</div>');
@@ -734,18 +742,38 @@ async function analyze(){
     const idpTk=await optionalToken(OPT_IDP);
     if(idpTk){
       try{
+        const RESOLVED=["confirmedSafe","remediated","dismissed","none"];
+        // (a) agent identities — risky service principals
         const rsp=await graphGetAll(`https://graph.microsoft.com/beta/identityProtection/riskyServicePrincipals?$select=id,appId,displayName,riskLevel,riskState,riskDetail,riskLastUpdatedDateTime,isEnabled,servicePrincipalType&$top=200`, idpTk);
         const agentIdSet=new Set(enriched.map(a=>a.id));
         const agentAppSet=new Set(enriched.map(a=>a.appId).filter(Boolean));
-        const active=rsp.filter(r=>!["confirmedSafe","remediated","dismissed","none"].includes(r.riskState))
-                        .map(r=>({...r, inInventory: agentIdSet.has(r.id)||agentAppSet.has(r.appId)}));
-        idpState={granted:true, risky:active,
-          counts:{ total:active.length,
-            high:active.filter(r=>r.riskLevel==="high").length,
-            medium:active.filter(r=>r.riskLevel==="medium").length,
-            low:active.filter(r=>r.riskLevel==="low").length,
-            compromised:active.filter(r=>r.riskState==="confirmedCompromised").length,
-            atRisk:active.filter(r=>r.riskState==="atRisk").length }};
+        const spRisky=rsp.filter(r=>!RESOLVED.includes(r.riskState)).map(r=>({
+          id:r.id, displayName:r.displayName, riskLevel:r.riskLevel, riskState:r.riskState,
+          riskLastUpdatedDateTime:r.riskLastUpdatedDateTime, type:"agent identity",
+          inInventory: agentIdSet.has(r.id)||agentAppSet.has(r.appId) }));
+        // (b) agent users — the ID Protection for Agents blade also counts agent users, which live in riskyUsers.
+        // Match by agent name pattern (P2-gated separate scope).
+        let userRisky=[], ruGranted=false;
+        const ruTk=await optionalToken(OPT_RISKUSER);
+        if(ruTk){
+          try{
+            const ru=await graphGetAll(`https://graph.microsoft.com/beta/identityProtection/riskyUsers?$select=id,userPrincipalName,userDisplayName,riskLevel,riskState,riskLastUpdatedDateTime&$top=200`, ruTk);
+            userRisky=ru.filter(u=>!RESOLVED.includes(u.riskState) && /agent/i.test((u.userDisplayName||"")+" "+(u.userPrincipalName||""))).map(u=>({
+              id:u.id, displayName:u.userDisplayName||u.userPrincipalName, riskLevel:u.riskLevel, riskState:u.riskState,
+              riskLastUpdatedDateTime:u.riskLastUpdatedDateTime, type:"agent user", inInventory:false }));
+            ruGranted=true;
+          }catch(e){}
+        } else {
+          notices.push('<div class="notice">Optional scope <code>IdentityRiskyUser.Read.All</code> not consented — <b>agent users</b> at risk aren\'t included (only agent identities). The ID Protection for Agents blade counts both, so its total may be higher.</div>');
+        }
+        const combined=spRisky.concat(userRisky);
+        idpState={granted:true, ruGranted, risky:combined,
+          counts:{ total:combined.length,
+            high:combined.filter(r=>r.riskLevel==="high").length,
+            medium:combined.filter(r=>r.riskLevel==="medium").length,
+            low:combined.filter(r=>r.riskLevel==="low").length,
+            compromised:combined.filter(r=>r.riskState==="confirmedCompromised").length,
+            atRisk:combined.filter(r=>r.riskState==="atRisk").length }};
       }catch(e){ idpState={granted:false, error:e.message}; notices.push('<div class="notice">ID Protection for Agents could not be read ('+escapeHtml(e.message||'error')+') — needs <code>IdentityRiskyServicePrincipal.Read.All</code> and Entra ID P2.</div>'); }
     }else{
       notices.push('<div class="notice">Optional scope <code>IdentityRiskyServicePrincipal.Read.All</code> not consented — the <b>ID Protection for Agents</b> section can\'t be populated.</div>');
@@ -953,9 +981,17 @@ function renderEngineSections(agents, bpMap, caState, domains){
   add("entra","medium","Agents without an owner / sponsor", agents.filter(a=>!a.hasOwner).map(a=>a.displayName),
     "No accountable owner is assigned — orphaned agents accumulate risk and evade review.",
     "Assign an owner (sponsor) to every agent identity as part of onboarding.");
-  if(caState.granted && caState.coverAgents===0) g.entra.push({sev:"high",title:"No Conditional Access for Agents in place",count:1,names:[],
-    desc:"No enabled Conditional Access policy targets workload identities, so Conditional Access for Agents isn't guarding agent sign-ins with adaptive, risk-based controls.",
-    fix:"Create a Conditional Access for Agents policy that blocks risky agent sign-ins and restricts access by risk / location; pair it with ID Protection for Agents."});
+  if(caState.granted && caState.coverAgents===0){
+    if(caState.agentPolicies && caState.agentPolicies.length>0){
+      g.entra.push({sev:"high",title:"Conditional Access for Agents is report-only",count:caState.agentPolicies.length,names:caState.agentPolicies.map(p=>p.name),
+        desc:"Agent-targeting Conditional Access policies exist but none are enforced — they're all in report-only mode, so they log but don't block risky agent sign-ins.",
+        fix:"Switch the agent Conditional Access policies from report-only to On so they actually enforce."});
+    } else {
+      g.entra.push({sev:"high",title:"No Conditional Access for Agents in place",count:1,names:[],
+        desc:"No Conditional Access policy targets agent identities, so Conditional Access for Agents isn't guarding agent sign-ins with adaptive, risk-based controls.",
+        fix:"Create a Conditional Access for Agents policy that blocks risky agent sign-ins and restricts access by risk / location; pair it with ID Protection for Agents."});
+    }
+  }
   // ── Defender — runtime threat ──
   add("defender","critical","Agents disabled by Microsoft", agents.filter(a=>a.disabledByMicrosoftStatus).map(a=>a.displayName),
     "Microsoft flagged these agent identities as unsafe or compromised and disabled them.",
@@ -974,6 +1010,23 @@ function renderEngineSections(agents, bpMap, caState, domains){
   renderGroup("findEntra", g.entra, "No identity or access findings on the signals this scan can read — confirm the Entra controls below.");
   renderGroup("findDefender", g.defender, "No Graph-visible runtime-risk signals — confirm Defender's real-time protection & connectors below.");
   renderGroup("findPurview", g.purview, "No agent data-permission findings from Graph — confirm Purview DSPM / DLP coverage below.");
+  // Conditional Access for Agents — visible policy list in the Entra section
+  const caEl=$("caAgents");
+  if(caEl){
+    if(caState.granted && caState.agentPolicies && caState.agentPolicies.length){
+      const rows=caState.agentPolicies.map(p=>{
+        const st=p.state==="enabled"
+          ? '<span class="flagchip" style="color:var(--green);border-color:#34d39944;background:#34d39910">enforced</span>'
+          : (p.state==="enabledForReportingButNotEnforced" ? '<span class="flagchip warn">report-only</span>' : '<span class="flagchip">'+escapeHtml(p.state||"")+'</span>');
+        return '<tr><td><b>'+escapeHtml(p.name)+'</b></td><td>'+st+'</td><td>'+(p.block?'<span style="color:var(--crit);font-weight:700">Block</span>':escapeHtml(p.controls||"—"))+'</td></tr>';
+      }).join("");
+      caEl.innerHTML='<div class="verify-block"><div class="vt">Conditional Access for Agents — '+caState.agentPolicies.length+' agent-targeting polic'+(caState.agentPolicies.length===1?'y':'ies')+'</div><div style="overflow-x:auto"><table><thead><tr><th>Policy</th><th>State</th><th>Access control</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+    } else if(caState.granted){
+      caEl.innerHTML='<div class="verify-block"><div class="vt">Conditional Access for Agents</div><div class="engine-clean" style="border-left-color:var(--amber);background:#fbbf240a">No Conditional Access policy targets agent identities. Create one to guard agent sign-ins.</div></div>';
+    } else {
+      caEl.innerHTML='<div class="verify-block"><div class="vt">Conditional Access for Agents</div><div class="engine-clean" style="border-left-color:var(--dim);background:var(--panel-2)">Grant <b>Policy.Read.All</b> and rescan to list agent Conditional Access policies.</div></div>';
+    }
+  }
   setEngineScore("scoreEntra", dmap.security);
   setEngineScore("scoreDefender", dmap.risk);
   setEngineScore("scorePurview", dmap.compliance);
@@ -1009,9 +1062,11 @@ function renderIDP(idp, totalAgents){
     const rows=idp.risky.slice().sort((a,b)=>(ord[b.riskLevel]||0)-(ord[a.riskLevel]||0)).map(r=>{
       const lvlc=r.riskLevel==="high"?"var(--crit)":r.riskLevel==="medium"?"var(--high)":"var(--muted)";
       const stc=r.riskState==="confirmedCompromised"?"flagchip bad":"flagchip warn";
-      return '<tr><td><b>'+escapeHtml(r.displayName||r.id)+'</b>'+(r.inInventory?'':' <span class="flagchip">not in agent inventory</span>')+'</td><td><span class="'+stc+'">'+escapeHtml(r.riskState||"")+'</span></td><td style="color:'+lvlc+';font-weight:700;text-transform:capitalize">'+escapeHtml(r.riskLevel||"")+'</td><td class="mono" style="color:var(--dim)">'+(r.riskLastUpdatedDateTime?r.riskLastUpdatedDateTime.slice(0,10):"—")+'</td></tr>';
+      const typeTag='<span class="flagchip">'+(r.type==="agent user"?"agent user":"agent identity")+'</span>';
+      return '<tr><td><b>'+escapeHtml(r.displayName||r.id)+'</b> '+typeTag+'</td><td><span class="'+stc+'">'+escapeHtml(r.riskState||"")+'</span></td><td style="color:'+lvlc+';font-weight:700;text-transform:capitalize">'+escapeHtml(r.riskLevel||"")+'</td><td class="mono" style="color:var(--dim)">'+(r.riskLastUpdatedDateTime?r.riskLastUpdatedDateTime.slice(0,10):"—")+'</td></tr>';
     }).join("");
-    $("idpTable").innerHTML='<div class="hint" style="margin:6px 0 8px"><b>'+idp.risky.length+' agent identit'+(idp.risky.length===1?'y':'ies')+'</b> with an active ID Protection risk state.</div><div style="overflow-x:auto"><table><thead><tr><th>Agent</th><th>Risk state</th><th>Risk level</th><th>Last updated</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+    const note=idp.ruGranted===false?' <span style="color:var(--amber)">· agent users excluded (grant IdentityRiskyUser.Read.All to match the portal total)</span>':'';
+    $("idpTable").innerHTML='<div class="hint" style="margin:6px 0 8px"><b>'+idp.risky.length+' at-risk agent'+(idp.risky.length===1?'':'s')+'</b> (identities + users) with an active ID Protection risk state.'+note+'</div><div style="overflow-x:auto"><table><thead><tr><th>Agent</th><th>Risk state</th><th>Risk level</th><th>Last updated</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
   } else $("idpTable").innerHTML="";
   el.style.display="block";
 }
