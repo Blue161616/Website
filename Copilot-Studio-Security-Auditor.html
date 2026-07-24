@@ -162,6 +162,24 @@
         <button id="scanBtn" onclick="runScan()">Sign in &amp; scan</button>
         <button class="ghost" id="discoverBtn" onclick="discoverEnvs()">Discover my environments</button>
       </div>
+      <details id="regGuide" style="margin-top:14px;border:1px solid var(--bd,#2a3142);border-radius:8px;padding:10px 12px">
+        <summary style="cursor:pointer;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--m)">App registration requirements</summary>
+        <div style="font-size:12px;line-height:1.6;margin-top:10px">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+            <span style="color:var(--m)">This tool's own app:</span>
+            <code id="regDefaultCid">96e9b5f4-e974-4355-ae9f-4487099ef210</code>
+            <button class="ghost" style="font-size:11px;padding:3px 9px" onclick="useDefaultClientId()">Use this Client ID</button>
+          </div>
+          <div style="margin-bottom:8px"><b>Platform</b> — <b>Single-page application (SPA)</b>. Add this exact <b>Redirect URI</b>:<br>
+            <code id="regRedirect" style="word-break:break-all">…</code></div>
+          <div><b>API permissions</b> (delegated) — <i>API permissions → Add a permission</i>:</div>
+          <ul style="margin:4px 0 8px 18px;padding:0">
+            <li><b>Microsoft Graph</b> → <code>User.Read</code> — sign-in only.</li>
+            <li><b>Dynamics CRM</b> → <code>user_impersonation</code> — <b>required</b>; reads agents from Dataverse and discovers environments. Found under <i>APIs my organization uses</i> → <b>Dynamics CRM</b> (<code>00000007-0000-0000-c000-000000000000</code>). Without it every environment fails with <code>AADSTS650057</code>.</li>
+          </ul>
+          <div style="color:var(--m)">Then <b>Grant admin consent</b>. Coverage is still limited to environments where your account holds a <b>Dataverse security role</b> — permissions alone don't grant data access.</div>
+        </div>
+      </details>
     </div>
     <div id="status"></div>
   </div>
@@ -471,6 +489,22 @@ function dedupe(findings){
 let DATA = [];
 let AGENT_OWNER = {};   // "env|agent" -> owner display name (for the risk matrix)
 let SCAN_AGENTS = 0;    // agents read from the last-scanned environment (for the scan summary)
+// Turn the raw AAD/Dataverse failures into something actionable. AADSTS650057 in
+// particular means the signed-in app registration has no Dynamics CRM permission —
+// easy to hit when a portal handoff or a stale cs_clientId swaps in another app.
+function dvErrMsg(err){
+  const m = (err && err.message) || String(err);
+  if (/AADSTS650057|Invalid resource/i.test(m)){
+    const c = /Client app ID:\s*([0-9a-f-]{36})\s*(?:\(([^)]*)\))?/i.exec(m) || [];
+    const who = c[1] ? ' "' + (c[2] || c[1]) + '"' : '';
+    return 'app registration' + who + ' has no Dataverse permission (only Microsoft Graph). '
+      + 'Fix: API permissions → Add a permission → APIs my organization uses → Dynamics CRM → '
+      + 'Delegated → user_impersonation → Grant admin consent. Or put the correct Client ID in the field above.';
+  }
+  if (/\b403\b|Forbidden/i.test(m)) return m + ' — your account has no Dataverse security role in this environment.';
+  return m;
+}
+
 async function runScan(){
   const clientId = document.getElementById('clientId').value.trim();
   const envs = document.getElementById('envs').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
@@ -495,7 +529,7 @@ async function runScan(){
       status('Scanning '+e+' …');
       SCAN_AGENTS = 0;
       try { const f = await scanEnvironment(e, opts); envStats.push({env:e, agents:SCAN_AGENTS}); all = all.concat(f); }
-      catch(err){ failures.push({env:e, msg:(err && err.message) || String(err)}); console.error(err); }
+      catch(err){ failures.push({env:e, msg:dvErrMsg(err)}); console.error(err); }
     }
     all = dedupe(all);
     all = all.concat(correlate(all));
@@ -506,10 +540,14 @@ async function runScan(){
     const lines = ['Done — '+DATA.length+' finding'+(DATA.length===1?'':'s')
       +' · '+agentTotal+' agent'+(agentTotal===1?'':'s')+' read'
       +' · '+envStats.length+'/'+envs.length+' environment'+(envs.length===1?'':'s')+' scanned.'];
+    lines.push('  signed in with app ' + clientId);
     envStats.forEach(s=>{ if (!s.agents) lines.push('  • '+s.env+' — no Copilot Studio agents visible to your account (bot table empty).'); });
-    failures.forEach(f=>lines.push('  ✗ '+f.env+' — '+f.msg));
+    // One cause failing every environment is one problem, not six — collapse it.
+    const uniqErr = [...new Set(failures.map(f=>f.msg))];
+    if (uniqErr.length === 1 && failures.length > 1) lines.push('  ✗ all '+failures.length+' environments — '+uniqErr[0]);
+    else failures.forEach(f=>lines.push('  ✗ '+f.env+' — '+f.msg));
     if (failures.length && !envStats.length)
-      lines.push('Every environment failed. Check the Dynamics CRM · user_impersonation consent, and that your account has a Dataverse security role in these environments.');
+      lines.push('Every environment failed — fix the cause above, then re-scan.');
     else if (!agentTotal && envStats.length)
       lines.push('No agents were readable — you likely lack a Dataverse security role in these environments, or they contain no Copilot Studio agents.');
     else if (!DATA.length && agentTotal)
@@ -823,6 +861,20 @@ function render(){
     } else { c4.textContent=d.Detail; }
     tr.append(c0,c1,c2,c3,c4); tb.appendChild(tr);
   }
+}
+
+// Show the exact redirect URI this page needs registered (SPA platform), and let the
+// user snap the Client ID back to this tool's own app — a portal handoff can leave
+// another app's ID in the box, which then has no Dataverse permission (AADSTS650057).
+(function(){
+  const r = document.getElementById('regRedirect'); if (r) r.textContent = REDIRECT;
+  const d = document.getElementById('regDefaultCid'); if (d) d.textContent = DEFAULT_CLIENT_ID;
+})();
+function useDefaultClientId(){
+  document.getElementById('clientId').value = DEFAULT_CLIENT_ID;
+  localStorage.setItem('cs_clientId', DEFAULT_CLIENT_ID);
+  msalApp = null;   // force MSAL to re-init against the new client
+  status('Client ID set to ' + DEFAULT_CLIENT_ID + ' — click “Sign in & scan”.');
 }
 
 // restore last config — a portal handoff clientId takes precedence
