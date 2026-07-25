@@ -496,7 +496,7 @@
       <span id="huntFilterChip"></span>
       <span class="count" id="tableCount"></span>
     </div>
-    <div class="hint" style="margin:-4px 0 10px">Each row is <b>one agent identity</b>, risk-scored 0-100 from its permissions, roles, ownership, blueprint credential hygiene and Microsoft-disabled status. The <b>blueprint is the security boundary</b> — it holds the credentials and impersonates its agents, so a blueprint compromise affects every agent under it. Click a row for the breakdown.</div>
+    <div class="hint" style="margin:-4px 0 10px">Each row is <b>one agent identity</b>, risk-scored 0-100 from its permissions, roles, ownership, blueprint credential hygiene and Microsoft-disabled status. Permissions include both grants on the agent's own service principal <b>and permissions <span class="mono" style="color:var(--blue-bright)">inherited</span> from its blueprint</b> (shown in the portal as Grant source = “Inherited”) — the agent SP looks empty but still holds them. The <b>blueprint is the security boundary</b> — it holds the credentials and impersonates its agents, so a blueprint compromise affects every agent under it. Click a row for the breakdown.</div>
     <div style="overflow-x:auto"><table id="table"><thead><tr>
       <th style="width:20px"></th>
       <th data-key="risk">Risk ▼</th>
@@ -848,20 +848,38 @@ async function analyze(){
     blueprints.forEach(b=>{ bpByKey[b.id]=b; if(b.appId) bpByKey[b.appId]=b; });
     await mapPool(bpIds,6,async(bid)=>{
       const now=Date.now();
-      let app=bpByKey[bid]||null, name=app?app.displayName:null, msManaged=false;
+      let app=bpByKey[bid]||null, name=app?app.displayName:null, msManaged=false, bpSpId=null, bpAppId=app?app.appId:null;
       // Known Microsoft-owned universal blueprint (e.g. Copilot Studio) — a first-party app, not a tenant object.
       if(KNOWN_BLUEPRINTS[bid]){ name=KNOWN_BLUEPRINTS[bid]; msManaged=true; }
-      if(!app){
-        // Resolve the blueprint PRINCIPAL (SP) — exists in-tenant even for MS-owned blueprints. Try object id, then appId.
+      // Resolve the blueprint PRINCIPAL (SP) — exists in-tenant even for MS-owned blueprints. Try object id, then appId.
+      {
         let sp=null;
         try{ sp=await graphGetOne(`${graphBase()}/servicePrincipals/${bid}?$select=id,appId,displayName`, tk); }catch{}
-        if(!sp){ try{ sp=await graphGetOne(`${graphBase()}/servicePrincipals(appId='${bid}')?$select=id,appId,displayName`, tk); }catch{} }
+        if(!sp){ const aid=bpAppId||bid; try{ sp=await graphGetOne(`${graphBase()}/servicePrincipals(appId='${aid}')?$select=id,appId,displayName`, tk); }catch{} }
         if(sp){
-          name=name||sp.displayName;
+          bpSpId=sp.id; bpAppId=bpAppId||sp.appId; name=name||sp.displayName;
           if(KNOWN_BLUEPRINTS[sp.appId]){ name=KNOWN_BLUEPRINTS[sp.appId]; msManaged=true; }
-          app=bpByKey[sp.appId]||null;
-          if(!app && !msManaged){ try{ const apps=await graphGetAll(`${graphBase()}/applications?$filter=appId eq '${sp.appId}'&$select=id,appId,displayName,passwordCredentials,keyCredentials`, tk); if(apps.length) app=apps[0]; }catch{} }
+          if(!app){
+            app=bpByKey[sp.appId]||null;
+            if(!app && !msManaged){ try{ const apps=await graphGetAll(`${graphBase()}/applications?$filter=appId eq '${sp.appId}'&$select=id,appId,displayName,passwordCredentials,keyCredentials`, tk); if(apps.length){ app=apps[0]; bpAppId=app.appId; } }catch{} }
+          }
         }
+      }
+      // Inherited permissions: app-only Graph roles granted to the BLUEPRINT's SP are inherited by EVERY agent
+      // under it — the portal shows them on the agent with Grant source = "Inherited". The agent's own SP has
+      // none (that's why the Permissions column read "—"); the real grant lives on the blueprint principal.
+      let inheritedPerms=[], inheritedOtherCount=0;
+      if(bpSpId){
+        try{
+          const asg=await graphGetAll(`${graphBase()}/servicePrincipals/${bpSpId}/appRoleAssignments?$top=100`, tk);
+          asg.forEach(x=>{
+            if(x.resourceId===window.__graphSpId){
+              const val=graphRoleMap[x.appRoleId]||x.appRoleId;
+              const d=DANGEROUS_APPROLES[val];
+              inheritedPerms.push({value:val, tier:d?d.tier:null, path:d?d.path:null, inherited:true});
+            }else inheritedOtherCount++;
+          });
+        }catch{}
       }
       const owners = app ? await graphGetAll(`${graphBase()}/applications/${app.id}/owners?$select=id,displayName&$top=20`, tk).catch(()=>[]) : [];
       const secrets=(app?.passwordCredentials||[]);
@@ -871,7 +889,7 @@ async function analyze(){
       const expiringSoon=allCreds.filter(c=>{const t=c.endDateTime?new Date(c.endDateTime).getTime():0; return t>now&&t<now+CRED_SOON_DAYS*864e5;}).length;
       const longLived=allCreds.filter(c=>{const s=c.startDateTime?new Date(c.startDateTime).getTime():now,eD=c.endDateTime?new Date(c.endDateTime).getTime():now; return (eD-s)>CRED_LONG_DAYS*864e5;}).length;
       // MS-managed blueprints: no tenant credential/owner to audit — mark resolved & owned to avoid false findings.
-      bpMap[bid]={id:bid, name:(app&&app.displayName)||name||"(unresolved)", resolved:(!!app||!!name), msManaged, secretCount:secrets.length, certCount:certs.length, expired, expiringSoon, longLived, hasOwner:(msManaged?true:owners.length>0), owners};
+      bpMap[bid]={id:bid, name:(app&&app.displayName)||name||"(unresolved)", resolved:(!!app||!!name), msManaged, secretCount:secrets.length, certCount:certs.length, expired, expiringSoon, longLived, hasOwner:(msManaged?true:owners.length>0), owners, inheritedPerms, inheritedOtherCount};
     },null);
 
     // 5) optional: Conditional Access for Agents coverage.
@@ -1077,13 +1095,18 @@ async function analyze(){
     enriched.forEach(a=>{
       const bp=bpMap[a.agentIdentityBlueprintId]||null;
       const roles=principalRoles[a.id]||[];
-      const dangerous=a.graphPerms.filter(p=>p.tier!=null);
+      // Effective permissions = the agent's OWN grants + everything INHERITED from its blueprint (see section 4).
+      const ownPerms=a.graphPerms.filter(p=>p.tier!=null);
+      const inheritedAll=(bp&&bp.inheritedPerms)||[];
+      const inheritedDanger=inheritedAll.filter(p=>p.tier!=null);
+      const dangerous=[...ownPerms, ...inheritedDanger];
+      const inheritedOtherCount=(bp&&bp.inheritedOtherCount)||0;
       let last=null; if(a.appId && signInByAppId[a.appId]!==undefined) last=signInByAppId[a.appId];
       const dormant = auditGranted ? (a.accountEnabled && (!last || (now-new Date(last).getTime())>DORMANT_DAYS*864e5)) : null;
 
       const reasons=[]; let risk=0;
       if(a.disabledByMicrosoftStatus){ risk+=45; reasons.push(["critical","Disabled by Microsoft — flagged as unsafe/compromised. Investigate immediately."]); }
-      dangerous.forEach(p=>{ const pts=p.tier===0?30:p.tier===1?18:8; risk+=pts; reasons.push([tierToSev(p.tier),"Graph permission "+p.value+" — "+p.path]); });
+      dangerous.forEach(p=>{ const pts=p.tier===0?30:p.tier===1?18:8; risk+=pts; reasons.push([tierToSev(p.tier),"Graph permission "+p.value+" — "+p.path+(p.inherited?" (inherited from blueprint '"+(bp&&bp.name||"?")+"')":"")]); });
       roles.forEach(r=>{ const pts=r.tier===0?35:r.tier===1?20:8; risk+=pts; reasons.push([tierToSev(r.tier),"Holds directory role "+r.name+" — an agent should rarely hold admin roles."]); });
       if(!a.hasOwner){ risk+=10; reasons.push(["medium","No owner / sponsor assigned — accountability gap."]); }
       else if(a.ownerDeparted){ risk+=14; reasons.push(["high","Owner has left — every assigned owner is a disabled account. The agent still runs with no accountable sponsor; reassign or retire it."]); }
@@ -1114,7 +1137,8 @@ async function analyze(){
 
       risk=Math.min(100,Math.round(risk));
       let sev="low"; if(risk>=70)sev="critical"; else if(risk>=45)sev="high"; else if(risk>=20)sev="medium";
-      Object.assign(a,{bp,roles,dangerous,dormant,last,risk,sev,reasons,idpRisk,platform,riskDetections:dets});
+      Object.assign(a,{bp,roles,dangerous,dormant,last,risk,sev,reasons,idpRisk,platform,riskDetections:dets,
+        ownPermCount:ownPerms.length, inheritedPerms:inheritedAll, inheritedDangerCount:inheritedDanger.length, inheritedOtherCount});
     });
 
     // ---------- domain scores ----------
@@ -1280,6 +1304,9 @@ function renderEngineSections(agents, bpMap, caState, domains, idpState){
   add("entra","high","Blueprints backed by client secrets", Object.values(bpMap).filter(b=>b&&b.secretCount>0).map(b=>b.name),
     "The blueprint is the security boundary and holds an exfiltratable client secret; a leaked secret compromises every agent under it.",
     "Replace client secrets with certificates or an Azure managed identity on the blueprint.");
+  add("entra","high","Blueprints granting inherited Graph permissions", Object.values(bpMap).filter(b=>b&&b.inheritedPerms&&b.inheritedPerms.length).map(b=>b.name+" ("+b.inheritedPerms.map(p=>p.value).join(", ")+")"),
+    "These blueprints hold admin-consented Graph permissions that EVERY agent under them inherits at runtime (the portal shows them on each agent as Grant source = “Inherited”). The agents' own service principals look empty, so this access is easy to miss — one over-permissioned blueprint silently grants all its agents the same reach (e.g. Mail.Send / Mail.Read / User.Read.All = send-as-anyone, read all mail, enumerate all users).",
+    "Review each blueprint's granted permissions at the blueprint, not the agent — remove anything the agents don't all need. Fixing the blueprint fixes every agent under it at once.");
   add("entra","high","Agents with broad directory / group write", agents.filter(a=>a.dangerous.some(p=>p.tier===1 && !dataRx.test(p.value))).map(a=>a.displayName),
     "Directory or group write permissions enable lateral movement and changes to the groups that gate access.",
     "Scope down; remove write where read suffices.");
@@ -1554,7 +1581,10 @@ function renderTable(agents){
     if(a.dormant)flags.push('<span class="flagchip warn">dormant</span>');
     if(!a.accountEnabled)flags.push('<span class="flagchip">disabled</span>');
     if(a.platform)flags.push('<span class="flagchip plat">'+escapeHtml(a.platform)+'</span>');
-    const perms=(a.dangerous.length?a.dangerous.length+" risky":"—")+(a.otherPermCount?(" · "+a.otherPermCount+" other"):"");
+    const otherTotal=(a.otherPermCount||0)+(a.inheritedOtherCount||0);
+    const permBits=[]; if(a.dangerous.length)permBits.push(a.dangerous.length+" risky"); if(otherTotal)permBits.push(otherTotal+" other");
+    const inhChip=(a.inheritedDangerCount||a.inheritedOtherCount)?' <span class="flagchip plat" style="font-size:9px" title="granted on the blueprint, inherited by this agent">inherited</span>':'';
+    const perms=(permBits.length?permBits.join(" · "):"—")+inhChip;
     return `<tr data-i="${i}" class="mainrow">
       <td class="expand">▸</td>
       <td><span class="rbadge" style="color:${rc};background:${rc}18">${a.risk}</span></td>
@@ -1591,8 +1621,9 @@ function detailHtml(a){
   h+='<li>Owner / sponsor: '+(a.owners.length?a.owners.map(o=>escapeHtml(o.displayName||o.userPrincipalName||o.id)+(o.accountEnabled===false?" <span style='color:var(--crit)'>(disabled)</span>":"")).join(", ")+(a.ownerDeparted?" <span style='color:var(--crit)'>· owner departed</span>":""):"<span style=\'color:var(--crit)\'>none</span>")+'</li>';
   if(a.riskDetections&&a.riskDetections.length){ h+='<li>ID Protection detections: '+a.riskDetections.map(d=>escapeHtml(d.type)+(d.level?" ("+escapeHtml(d.level)+")":"")+(d.when?" · "+escapeHtml(String(d.when).slice(0,10)):"")).join("; ")+'</li>'; }
   h+='<li>Blueprint: '+escapeHtml(a.bp?.name||"—")+(a.bp?(' · '+a.bp.secretCount+' secret(s), '+a.bp.certCount+' cert(s)'+(a.bp.hasOwner?"":" · no owner")):"")+'</li>';
-  if(a.dangerous.length) h+='<li>Risky Graph permissions: '+a.dangerous.map(p=>escapeHtml(p.value)).join(", ")+'</li>';
-  if(a.otherPermCount) h+='<li>Other API permissions: '+a.otherPermCount+'</li>';
+  if(a.dangerous.length) h+='<li>Risky Graph permissions (effective): '+a.dangerous.map(p=>escapeHtml(p.value)+(p.inherited?" <span style='color:var(--muted)'>(inherited)</span>":"")).join(", ")+'</li>';
+  if(a.inheritedPerms&&a.inheritedPerms.length) h+='<li><b>Inherited from blueprint</b> '+escapeHtml(a.bp?.name||"")+': '+a.inheritedPerms.map(p=>escapeHtml(p.value)).join(", ")+(a.inheritedOtherCount?' · +'+a.inheritedOtherCount+' non-Graph':'')+' <span style=\'color:var(--muted)\'>— granted on the blueprint, so every agent under it holds these at runtime</span></li>';
+  if(a.otherPermCount) h+='<li>Other API permissions (direct on agent): '+a.otherPermCount+'</li>';
   h+='<li>Last sign-in: '+(a.last?new Date(a.last).toISOString().slice(0,10):(a.dormant===null?"n/a":"none recorded"))+'</li>';
   h+='<li>Created: '+(a.createdDateTime?a.createdDateTime.slice(0,10):"—")+'</li>';
   h+='</ul>';
@@ -1607,8 +1638,8 @@ function exportJson(){
 }
 function exportCsv(){
   if(!MODEL)return;
-  const head=["risk","severity","agent","agentId","blueprint","enabled","msDisabled","hasOwner","ownerDeparted","riskDetections","dangerousPerms","directoryRoles","blueprintSecrets","dormant"];
-  const rows=MODEL.agents.map(a=>[a.risk,a.sev,csv(a.displayName),a.id,csv(a.bp?.name||""),a.accountEnabled,!!a.disabledByMicrosoftStatus,a.hasOwner,!!a.ownerDeparted,csv((a.riskDetections||[]).map(d=>d.type).join("; ")),csv(a.dangerous.map(p=>p.value).join("; ")),csv(a.roles.map(r=>r.name).join("; ")),a.bp?.secretCount||0,a.dormant===null?"n/a":a.dormant].join(","));
+  const head=["risk","severity","agent","agentId","blueprint","enabled","msDisabled","hasOwner","ownerDeparted","riskDetections","dangerousPerms","inheritedPerms","directoryRoles","blueprintSecrets","dormant"];
+  const rows=MODEL.agents.map(a=>[a.risk,a.sev,csv(a.displayName),a.id,csv(a.bp?.name||""),a.accountEnabled,!!a.disabledByMicrosoftStatus,a.hasOwner,!!a.ownerDeparted,csv((a.riskDetections||[]).map(d=>d.type).join("; ")),csv(a.dangerous.map(p=>p.value).join("; ")),csv((a.inheritedPerms||[]).map(p=>p.value).join("; ")),csv(a.roles.map(r=>r.name).join("; ")),a.bp?.secretCount||0,a.dormant===null?"n/a":a.dormant].join(","));
   dl(new Blob([head.join(",")+"\n"+rows.join("\n")],{type:"text/csv"}),"agent-365-overview.csv");
 }
 function csv(s){ s=String(s==null?"":s); return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s; }
