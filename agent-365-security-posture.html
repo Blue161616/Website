@@ -688,6 +688,11 @@ const PRIV_ROLES={
 const SEV_RANK={critical:3,high:2,medium:1,low:0};
 function tierToSev(t){ return t===0?"critical":t===1?"high":"medium"; }
 const DORMANT_DAYS=90, CRED_SOON_DAYS=30, CRED_LONG_DAYS=730;
+// Microsoft-owned UNIVERSAL agent blueprints — not tenant applications, so they never resolve to a tenant
+// app object (no tenant-visible credentials to audit; Microsoft owns the impersonation boundary).
+const KNOWN_BLUEPRINTS={
+  "25664c89-cea5-4ab9-b924-a54fd8a19ae0":"Microsoft Copilot Studio (universal blueprint)"
+};
 // Microsoft's OFFICIAL "AI Agents" advanced-hunting queries (Azure-Sentinel Hunting Queries/AI Agents),
 // reduced to a count of matching agents. arg_max = latest snapshot per agent (the table stores snapshots).
 const AGENT_HUNTS=[
@@ -828,13 +833,19 @@ async function analyze(){
     blueprints.forEach(b=>{ bpByKey[b.id]=b; if(b.appId) bpByKey[b.appId]=b; });
     await mapPool(bpIds,6,async(bid)=>{
       const now=Date.now();
-      let app=bpByKey[bid]||null, name=app?app.displayName:null;
-      // Fallback: agentIdentityBlueprintId may be the blueprint PRINCIPAL (SP) id — resolve to its application.
+      let app=bpByKey[bid]||null, name=app?app.displayName:null, msManaged=false;
+      // Known Microsoft-owned universal blueprint (e.g. Copilot Studio) — a first-party app, not a tenant object.
+      if(KNOWN_BLUEPRINTS[bid]){ name=KNOWN_BLUEPRINTS[bid]; msManaged=true; }
       if(!app){
+        // Resolve the blueprint PRINCIPAL (SP) — exists in-tenant even for MS-owned blueprints. Try object id, then appId.
         let sp=null;
         try{ sp=await graphGetOne(`${graphBase()}/servicePrincipals/${bid}?$select=id,appId,displayName`, tk); }catch{}
-        if(sp){ name=sp.displayName; app=bpByKey[sp.appId]||null;
-          if(!app){ try{ const apps=await graphGetAll(`${graphBase()}/applications?$filter=appId eq '${sp.appId}'&$select=id,appId,displayName,passwordCredentials,keyCredentials`, tk); if(apps.length) app=apps[0]; }catch{} }
+        if(!sp){ try{ sp=await graphGetOne(`${graphBase()}/servicePrincipals(appId='${bid}')?$select=id,appId,displayName`, tk); }catch{} }
+        if(sp){
+          name=name||sp.displayName;
+          if(KNOWN_BLUEPRINTS[sp.appId]){ name=KNOWN_BLUEPRINTS[sp.appId]; msManaged=true; }
+          app=bpByKey[sp.appId]||null;
+          if(!app && !msManaged){ try{ const apps=await graphGetAll(`${graphBase()}/applications?$filter=appId eq '${sp.appId}'&$select=id,appId,displayName,passwordCredentials,keyCredentials`, tk); if(apps.length) app=apps[0]; }catch{} }
         }
       }
       const owners = app ? await graphGetAll(`${graphBase()}/applications/${app.id}/owners?$select=id,displayName&$top=20`, tk).catch(()=>[]) : [];
@@ -844,7 +855,8 @@ async function analyze(){
       const expired=allCreds.filter(c=>c.endDateTime&&new Date(c.endDateTime).getTime()<now).length;
       const expiringSoon=allCreds.filter(c=>{const t=c.endDateTime?new Date(c.endDateTime).getTime():0; return t>now&&t<now+CRED_SOON_DAYS*864e5;}).length;
       const longLived=allCreds.filter(c=>{const s=c.startDateTime?new Date(c.startDateTime).getTime():now,eD=c.endDateTime?new Date(c.endDateTime).getTime():now; return (eD-s)>CRED_LONG_DAYS*864e5;}).length;
-      bpMap[bid]={id:bid, name:(app&&app.displayName)||name||"(unresolved)", resolved:!!app, secretCount:secrets.length, certCount:certs.length, expired, expiringSoon, longLived, hasOwner:owners.length>0, owners};
+      // MS-managed blueprints: no tenant credential/owner to audit — mark resolved & owned to avoid false findings.
+      bpMap[bid]={id:bid, name:(app&&app.displayName)||name||"(unresolved)", resolved:(!!app||!!name), msManaged, secretCount:secrets.length, certCount:certs.length, expired, expiringSoon, longLived, hasOwner:(msManaged?true:owners.length>0), owners};
     },null);
 
     // 5) optional: Conditional Access for Agents coverage.
@@ -1389,7 +1401,7 @@ function renderTable(agents){
       <td class="expand">▸</td>
       <td><span class="rbadge" style="color:${rc};background:${rc}18">${a.risk}</span></td>
       <td><b>${escapeHtml(a.displayName||"(no name)")}</b><br><span class="mono" style="font-size:10px;color:var(--dim)">${escapeHtml(a.id.slice(0,8))}…</span></td>
-      <td>${escapeHtml(a.bp?.name||"—")}${a.bp&&!a.bp.resolved?' <span class="flagchip">unresolved</span>':''}</td>
+      <td>${escapeHtml(a.bp?.name||"—")}${a.bp&&a.bp.msManaged?' <span class="flagchip plat">MS-managed</span>':(a.bp&&!a.bp.resolved?' <span class="flagchip">unresolved</span>':'')}</td>
       <td>${perms}</td>
       <td>${flags.join("")||"—"}</td>
     </tr>
