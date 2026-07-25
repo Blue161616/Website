@@ -660,12 +660,21 @@ function renderLicense(res){
   }
 }
 // Microsoft Defender advanced hunting (KQL) via Graph security API.
-async function runHunting(kql, tk){
+// The advanced-hunting API throttles bursts of queries (429), so retry with backoff — otherwise the tail of a
+// multi-query scan (e.g. the per-tool detail queries) fails silently.
+async function runHunting(kql, tk, _try){
+  _try=_try||0;
   const resp=await fetch("https://graph.microsoft.com/v1.0/security/runHuntingQuery", {
     method:"POST",
     headers:{Authorization:"Bearer "+tk, "Content-Type":"application/json"},
     body:JSON.stringify({Query:kql})
   });
+  if((resp.status===429||resp.status===503) && _try<4){
+    const ra=Number(resp.headers.get("Retry-After"));
+    const wait=Math.min(20, (ra>0?ra:Math.pow(2,_try)+1));
+    await new Promise(r=>setTimeout(r, wait*1000));
+    return runHunting(kql, tk, _try+1);
+  }
   if(!resp.ok){ let d=""; try{d=(await resp.json()).error?.message||"";}catch{} const e=new Error("HTTP "+resp.status+(d?" — "+d:"")); e.status=resp.status; throw e; }
   return resp.json(); // { schema:[{name,type}], results:[ {...} ] }
 }
@@ -1082,23 +1091,35 @@ async function analyze(){
           const sch=await runHunting("AgentsInfo | getschema | project ColumnName, ColumnType", huntTk);
           const cols=(sch.results||[]).map(r=>({name:r.ColumnName||Object.values(r)[0], type:r.ColumnType||r.DataType||""}));
           const colSet=new Set(cols.map(c=>c.name));
+          // Bridge Defender AgentId → Entra Agent ID so the hunting tiles can filter the Entra agent table.
+          // (AgentId is Defender's id-space; EntraAgentID is the SP/app id that matches our agent rows. The column
+          //  name is case-sensitive — the old "EntraAgentId" failed; find the real casing from the schema.)
+          const eidCol=[...colSet].find(c=>/^entraagentid$/i.test(c));
+          if(eidCol){
+            try{
+              const mr=await runHunting(`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where isnotempty(tostring(${eidCol})) | project A=tostring(AgentId), E=tostring(${eidCol})`, huntTk);
+              const emap={}; (mr.results||[]).forEach(x=>{ if(x.A&&x.E) emap[String(x.A).toLowerCase()]=String(x.E).toLowerCase(); });
+              (huntState.queries||[]).forEach(q=>{ if(q.ids&&q.ids.length) q.entraIds=[...new Set(q.ids.map(a=>emap[a]).filter(Boolean))]; });
+            }catch(e){}
+          }
           const tools={schema:cols, present:[]};
           const LATEST=`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted"`;
           // array-shaped tool columns → how many agents carry each, and total refs (array_length is safe on dynamic)
           const ARR=["DeclaredTools","McpServers","Connectors","Skills","Capabilities","Plugins"].filter(c=>colSet.has(c));
-          tools.present=ARR; tools.details={};
+          tools.present=ARR; tools.details={}; tools.detailErr={};
           if(ARR.length){
-            const exts=ARR.map(c=>`| extend n_${c}=array_length(${c})`).join(" ");
+            const exts=ARR.map(c=>`| extend n_${c}=array_length(todynamic(${c}))`).join(" ");
             const aggs=["Agents=count()"].concat(ARR.map(c=>`With_${c}=countif(n_${c}>0)`)).concat(ARR.map(c=>`Sum_${c}=sum(n_${c})`)).join(", ");
             try{ const r=await runHunting(`${LATEST} ${exts} | summarize ${aggs}`, huntTk); tools.row=(r.results||[])[0]||{}; }catch(e){ tools.err=(e&&e.message)||"error"; }
-            // Per-column DETAIL: the actual distinct item names + how many agents use each (defensive extraction —
-            // elements may be strings or objects; dynamic-indexing a string yields null, so coalesce is safe).
+            // Per-column DETAIL: the actual distinct item names + how many agents use each. Defensive:
+            // todynamic() handles columns stored as JSON strings; tostring(_e) ALWAYS yields a value (object→JSON,
+            // scalar→string) so we never drop a non-empty element; name fields are preferred when present.
             for(const c of ARR){
               setStatus("Enumerating "+c+"…");
               try{
-                const r=await runHunting(`${LATEST} | where array_length(${c})>0 | mv-expand _e=${c} | extend _n=coalesce(tostring(_e.name), tostring(_e.displayName), tostring(_e.title), tostring(_e.type), tostring(_e.connectorId), tostring(_e.id), tostring(_e)) | where isnotempty(_n) and _n != "" | summarize Agents=dcount(AgentId) by name=_n | top 200 by Agents`, huntTk);
-                tools.details[c]=(r.results||[]).map(x=>({name:x.name, agents:Number(x.Agents)||0}));
-              }catch(e){ tools.details[c]=null; }
+                const r=await runHunting(`${LATEST} | mv-expand _e = todynamic(${c}) | extend _n = iff(gettype(_e)=="dictionary", coalesce(tostring(_e.name), tostring(_e.displayName), tostring(_e.title), tostring(_e.type), tostring(_e.connectorId), tostring(_e.id), tostring(_e)), tostring(_e)) | where isnotempty(_n) | summarize Agents=dcount(AgentId) by Item=_n | top 200 by Agents`, huntTk);
+                tools.details[c]=(r.results||[]).map(x=>({name:x.Item, agents:Number(x.Agents)||0}));
+              }catch(e){ tools.details[c]=null; tools.detailErr[c]=(e&&e.message)||"error"; }
             }
           }
           // tool authentication types (unauthenticated tools = a real risk) — tostring is safe if the column exists
@@ -1622,13 +1643,16 @@ function renderHunt(hunt){
   }
   let html=head+'<div class="engine-clean" style="border-left-color:var(--green);background:#34d3990f;margin-bottom:14px"><b>Agent data collection is active.</b> <code>AgentsInfo</code> is reachable'+(hunt.total?(' ('+hunt.total+' agents)'):'')+' — so the Agent 365 data source and Microsoft 365 connector are enabled and feeding Defender.</div>';
   if(hunt.queries && hunt.queries.length){
-    html+='<div class="hint" style="margin:0 0 8px">Microsoft\'s official <b>AI Agents</b> hunting queries (Azure-Sentinel) — number of agents matching each (0 = clean). <span style="color:var(--dim)">Click a non-zero tile to filter the Agents view to the matching agents.</span></div>';
+    html+='<div class="hint" style="margin:0 0 8px">Microsoft\'s official <b>AI Agents</b> hunting queries (Azure-Sentinel) — number of agents matching each (0 = clean). <span style="color:var(--dim)">Click a highlighted tile to filter the Agents view to the matching Entra agents (tiles whose agents are all local/store/classic — no Entra Agent ID — aren\'t clickable).</span></div>';
     html+='<div class="kpis" style="grid-template-columns:repeat('+hunt.queries.length+',minmax(0,1fr))">';
     hunt.queries.forEach((q,i)=>{
       const cls=q.error?'':(q.count>0?(i===0?'crit':'high'):'ok');
       const val=q.error?'—':q.count;
-      const clickable=(!q.error && q.count>0 && q.ids && q.ids.length) ? ' hq-tile' : '';
-      const tip=q.error?(q.errMsg||'query failed'):(clickable?'Filter the Agents view to these '+q.count+' agents':q.name);
+      const mapped=(q.entraIds&&q.entraIds.length)?q.entraIds.length:0;
+      const clickable=(!q.error && mapped>0) ? ' hq-tile' : '';
+      const tip=q.error?(q.errMsg||'query failed')
+        :(clickable?('Filter the Agents view to the '+mapped+' matching Entra agent'+(mapped===1?'':'s'))
+          :(q.count>0?'None of these '+q.count+' agents map to an Entra Agent ID (AgentsInfo also counts local / store / classic agents)':q.name));
       html+='<div class="kpi '+cls+clickable+'" data-hq="'+i+'" title="'+escapeHtml(tip)+'"><div class="k">'+(i+1)+' · '+escapeHtml(q.short)+'</div><div class="v">'+val+'</div></div>';
     });
     html+='</div>';
@@ -1637,8 +1661,11 @@ function renderHunt(hunt){
   }
   el.innerHTML=html+'</div>';
   el.querySelectorAll('.hq-tile').forEach(t=>t.addEventListener('click',()=>{
-    const q=hunt.queries[+t.dataset.hq]; if(!q||q.error||!(q.ids&&q.ids.length)) return;
-    HUNT_FILTER={short:q.short, ids:new Set(q.ids), count:q.count}; FINDING_FILTER=null;
+    const q=hunt.queries[+t.dataset.hq]; if(!q||q.error) return;
+    // prefer the mapped Entra Agent IDs (match our table); fall back to raw AgentId if no mapping was available
+    const ids=(q.entraIds&&q.entraIds.length)?q.entraIds:(q.ids||[]);
+    if(!ids.length) return;
+    HUNT_FILTER={short:q.short, ids:new Set(ids), count:q.count}; FINDING_FILTER=null;
     ["fltSev","fltFlag","fltBp","fltPlat"].forEach(id=>{ const e=$(id); if(e) e.value=""; });
     const s=$("fltSearch"); if(s) s.value="";
     if(MODEL) renderTable(MODEL.agents);
@@ -1672,6 +1699,12 @@ function renderTools(hunt){
     });
     html+='</div>';
     html+='<div class="hint" style="margin-top:6px;color:var(--dim)">Distinct items per type across '+(r.Agents!=null?r.Agents:'?')+' live agents — <b>click a tile</b> to list them. Every MCP server / connector is an external data-reach &amp; egress path — the real agent attack surface.</div>';
+    // surface detail-query errors so a missing drill-down is explained, not silent
+    const errCols=(t.detailErr?Object.keys(t.detailErr):[]).filter(c=>t.detailErr[c] && !(det[c]&&det[c].length));
+    if(errCols.length){
+      const msg=escapeHtml(t.detailErr[errCols[0]]);
+      html+='<div class="hint" style="margin-top:6px;color:var(--amber)">Couldn\'t enumerate items for <b>'+escapeHtml(errCols.map(c=>labels[c]||c).join(", "))+'</b> — <span class="mono">'+msg+'</span>. Tiles show agents-carrying instead; send me this message and I\'ll adjust the query to your table\'s shape.</div>';
+    }
     html+='<div id="toolsDetail" style="margin-top:14px"></div>';
   } else if(t.schema){
     html+='<div class="engine-clean" style="border-left-color:var(--dim);background:var(--panel-2)">None of the expected tool columns (<code>DeclaredTools</code>, <code>McpServers</code>, <code>Connectors</code>…) are present in this tenant\'s AgentsInfo table — tool detail isn\'t available here. The full registry (publishers, plugins) needs the Copilot registry API (AI Administrator).</div>';
