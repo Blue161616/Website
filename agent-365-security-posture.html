@@ -997,10 +997,12 @@ async function analyze(){
     if(incTk){
       try{
         const incs=await graphGetAll(`${graphBase()}/security/incidents?$select=id,displayName,severity,status,createdDateTime,incidentWebUrl&$top=50`, incTk);
-        const open=incs.filter(i=>i.status!=="resolved" && i.status!=="redirected");
         const rx=/agent|copilot/i;
-        const agentIncs=open.filter(i=>rx.test(i.displayName||"")).map(i=>({name:i.displayName, severity:i.severity, created:i.createdDateTime, url:i.incidentWebUrl}));
-        incidentState={granted:true, ok:true, total:open.length, agentIncidents:agentIncs, count:agentIncs.length};
+        // ALL agent incidents (any status) — a resolved/older one still proves Defender detected an agent threat.
+        const agentIncs=incs.filter(i=>rx.test(i.displayName||"")).map(i=>({name:i.displayName, severity:i.severity, status:i.status, created:i.createdDateTime, url:i.incidentWebUrl}))
+                            .sort((a,b)=>String(b.created||"").localeCompare(String(a.created||"")));
+        const openCount=agentIncs.filter(i=>i.status!=="resolved" && i.status!=="redirected").length;
+        incidentState={granted:true, ok:true, total:incs.length, agentIncidents:agentIncs, count:agentIncs.length, openCount};
       }catch(e){ incidentState={granted:true, ok:false, error:(e&&e.message)||"error"}; notices.push('<div class="notice">Defender incidents could not be read — <span class="mono">'+escapeHtml((e&&e.message)||'error')+'</span>. Needs <code>SecurityIncident.Read.All</code>.</div>'); }
     }else{
       notices.push('<div class="notice">Optional scope <code>SecurityIncident.Read.All</code> not consented — <b>XDR incidents implicating agents</b> aren\'t checked.</div>');
@@ -1289,9 +1291,10 @@ function renderDefenderChecks(hunt, inc){
   setCheck("chk-m365", live?"good":"neutral");
   setCheck("chk-agentsinfo", live?"good":"neutral");
   const incOk = !!(inc && inc.granted && inc.ok);
-  setCheck("chk-incident", incOk ? (inc.count>0?"bad":"good") : "neutral");
+  setCheck("chk-incident", incOk ? ((inc.openCount||0)>0?"bad":"good") : "neutral");
   // A runtime/block agent incident (e.g. "AI agent tool invocation blocked by Microsoft Defender") proves
-  // real-time protection is ACTIVE and the Copilot Studio connector is feeding runtime telemetry to Defender.
+  // real-time protection is ACTIVE and the Copilot Studio connector is feeding runtime telemetry to Defender —
+  // this holds even for a RESOLVED / older incident (the block still happened).
   const runtimeSignal = incOk && (inc.agentIncidents||[]).some(i=>/block|invocation|runtime|prompt|inject|copilot/i.test(i.name||""));
   setCheck("chk-copilot", runtimeSignal?"good":"neutral");
   setCheck("chk-realtime", runtimeSignal?"good":"neutral");
@@ -1302,13 +1305,21 @@ function renderIncidents(inc){
   if(!inc.ok){ el.innerHTML='<div class="engine-clean" style="border-left-color:var(--amber);background:#fbbf240a;margin-top:0">Defender incidents check failed — <span class="mono">'+escapeHtml(inc.error||"error")+'</span>. Grant <b>SecurityIncident.Read.All</b> (delegated, admin consent).</div>'; return; }
   if(!inc.count){ el.innerHTML=""; return; }
   const sevc=(s)=>s==="high"?"var(--crit)":s==="medium"?"var(--high)":"var(--muted)";
+  const stChip=(s)=>{ const resolved=(s==="resolved"||s==="redirected"); return '<span class="flagchip'+(resolved?'':' warn')+'">'+escapeHtml(s||"active")+'</span>'; };
   const rows=inc.agentIncidents.slice(0,20).map(i=>
-    '<tr><td><b>'+escapeHtml(i.name||"(incident)")+'</b></td><td style="color:'+sevc(i.severity)+';text-transform:capitalize">'+escapeHtml(i.severity||"")+'</td><td class="mono" style="color:var(--dim)">'+(i.created?String(i.created).slice(0,10):"—")+'</td><td>'+(i.url?'<a href="'+escapeHtml(i.url)+'" target="_blank" rel="noopener" style="color:var(--blue-bright)">open ↗</a>':'')+'</td></tr>'
+    '<tr><td><b>'+escapeHtml(i.name||"(incident)")+'</b></td><td style="color:'+sevc(i.severity)+';text-transform:capitalize">'+escapeHtml(i.severity||"")+'</td><td>'+stChip(i.status)+'</td><td class="mono" style="color:var(--dim)">'+(i.created?String(i.created).slice(0,10):"—")+'</td><td>'+(i.url?'<a href="'+escapeHtml(i.url)+'" target="_blank" rel="noopener" style="color:var(--blue-bright)">open ↗</a>':'')+'</td></tr>'
   ).join("");
-  el.innerHTML='<div class="finding" style="--sevc:var(--crit);margin-top:0"><div class="fh"><span class="sev critical">critical</span><span class="ft">Open XDR incidents implicate agents</span><span class="fcount">'+inc.count+' of '+inc.total+' open</span></div>'
-    +'<div class="fd">Microsoft Defender has open incidents referencing agents / Copilot — these are live threats, investigate in the XDR portal.</div>'
-    +'<div style="overflow-x:auto;margin-top:10px"><table><thead><tr><th>Incident</th><th>Severity</th><th>Created</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
-    +'<div class="fx"><b>Fix:</b> Triage each incident; if an agent is compromised, disable it, rotate its blueprint credentials, and hunt its activity in the AgentsInfo table.</div></div>';
+  const table='<div style="overflow-x:auto;margin-top:10px"><table><thead><tr><th>Incident</th><th>Severity</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+  if((inc.openCount||0)>0){
+    el.innerHTML='<div class="finding" style="--sevc:var(--crit);margin-top:0"><div class="fh"><span class="sev critical">critical</span><span class="ft">Open XDR incidents implicate agents</span><span class="fcount">'+inc.openCount+' open · '+inc.count+' total</span></div>'
+      +'<div class="fd">Microsoft Defender has open incidents referencing agents / Copilot — these are live threats, investigate in the XDR portal.</div>'
+      +table
+      +'<div class="fx"><b>Fix:</b> Triage each incident; if an agent is compromised, disable it, rotate its blueprint credentials, and hunt its activity in the AgentsInfo table.</div></div>';
+  } else {
+    el.innerHTML='<div class="finding" style="--sevc:var(--low);margin-top:0"><div class="fh"><span class="sev low">history</span><span class="ft">Agent XDR incidents (resolved)</span><span class="fcount">'+inc.count+' historical · 0 open</span></div>'
+      +'<div class="fd">No <b>open</b> agent incident right now, but Defender <b>has</b> detected agent threats before — proof that runtime protection &amp; the connectors are working.</div>'
+      +table+'</div>';
+  }
 }
 function renderPurviewChecks(auditReadable){
   // Only the audit half is Graph-confirmable; DSPM for AI / DLP / insider-risk stay portal-verify (neutral).
