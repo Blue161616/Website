@@ -719,9 +719,9 @@ AgentsInfo
 | where LifecycleStatus != "Deleted"
 | extend ToolsStr = tostring(DeclaredTools), TriggersStr = tostring(Triggers), McpStr = tostring(McpServers), SkillsStr = tostring(Skills), CapsStr = tostring(Capabilities), RawStr = tostring(RawAgentInfo)
 | where ToolsStr matches regex suspicious_patterns or TriggersStr matches regex suspicious_patterns or McpStr matches regex suspicious_patterns or SkillsStr matches regex suspicious_patterns or CapsStr matches regex suspicious_patterns or RawStr matches regex suspicious_patterns or Instructions matches regex suspicious_patterns
-| summarize Count = dcount(AgentId)`},
+| summarize Count = dcount(AgentId), Ids = make_set(AgentId, 100000)`},
   {short:"MCP configured", name:"Agents with an MCP tool / server configured", kql:
-`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where array_length(McpServers) > 0 | summarize Count = dcount(AgentId)`},
+`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where array_length(McpServers) > 0 | summarize Count = dcount(AgentId), Ids = make_set(AgentId, 100000)`},
   {short:"Missing tools", name:"Tools configured but not mentioned in instructions", kql:
 `let LatestAgents = materialize (AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted");
 let AgentToolNames = LatestAgents | where array_length(DeclaredTools) > 0 | mv-expand Tool = DeclaredTools | extend ToolName = tostring(Tool.name) | where isnotempty(ToolName) | summarize ToolNames = make_set(ToolName) by AgentId;
@@ -730,9 +730,9 @@ LatestAgents
 | join kind=inner AgentToolNames on AgentId
 | mv-apply ToolName = ToolNames to typeof(string) on (where Instructions !has ToolName | summarize MissingTools = make_list(ToolName))
 | where array_length(MissingTools) > 0
-| summarize Count = dcount(AgentId)`},
+| summarize Count = dcount(AgentId), Ids = make_set(AgentId, 100000)`},
   {short:"Org-wide shared", name:"Organization-wide shared agents (SharedWith = *)", kql:
-`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where array_length(SharedWith) > 0 | mv-expand Shared = SharedWith to typeof(string) | where tostring(Shared) == "*" | summarize Count = dcount(AgentId)`},
+`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where array_length(SharedWith) > 0 | mv-expand Shared = SharedWith to typeof(string) | where tostring(Shared) == "*" | summarize Count = dcount(AgentId), Ids = make_set(AgentId, 100000)`},
   {short:"Orphaned owners", name:"Orphaned agents — all owners disabled / removed", kql:
 `let EnabledAccountIds = materialize (IdentityInfo | where IsAccountEnabled == 1 | distinct AccountObjectId = tostring(AccountObjectId));
 AgentsInfo
@@ -745,9 +745,9 @@ AgentsInfo
 | summarize OwnerIds = make_set(OwnerId) by AgentId
 | mv-apply OwnerId = OwnerIds to typeof(string) on (where OwnerId !in (EnabledAccountIds) | summarize DisabledOrMissingOwners = make_list(OwnerId))
 | where array_length(DisabledOrMissingOwners) == array_length(OwnerIds)
-| summarize Count = dcount(AgentId)`},
+| summarize Count = dcount(AgentId), Ids = make_set(AgentId, 100000)`},
   {short:"No instructions", name:"Published agents without instructions", kql:
-`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where PublishedStatus == "Published" | where isempty(Instructions) or Instructions == "N/A" | summarize Count = dcount(AgentId)`}
+`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where PublishedStatus == "Published" | where isempty(Instructions) or Instructions == "N/A" | summarize Count = dcount(AgentId), Ids = make_set(AgentId, 100000)`}
 ];
 // Best-effort agent builder-platform detection from name / blueprint / tags (no clean Graph field yet).
 function detectPlatform(a, bp){
@@ -1057,7 +1057,10 @@ async function analyze(){
             const r=await runHunting(q.kql, huntTk);
             const row=(r.results&&r.results[0])||{};
             const c=row.Count!=null?row.Count:Object.values(row)[0];
-            qres.push({short:q.short, name:q.name, count:Number(c)||0});
+            let ids=row.Ids;
+            if(typeof ids==="string"){ try{ ids=JSON.parse(ids); }catch{ ids=[]; } }
+            ids=Array.isArray(ids)?ids.map(x=>String(x).toLowerCase()):[];
+            qres.push({short:q.short, name:q.name, count:Number(c)||0, ids});
           }catch(e){ qres.push({short:q.short, name:q.name, error:true, errMsg:(e&&e.message)||"error"}); }
         }
         huntState.queries=qres;
@@ -1574,13 +1577,14 @@ function renderHunt(hunt){
   }
   let html=head+'<div class="engine-clean" style="border-left-color:var(--green);background:#34d3990f;margin-bottom:14px"><b>Agent data collection is active.</b> <code>AgentsInfo</code> is reachable'+(hunt.total?(' ('+hunt.total+' agents)'):'')+' — so the Agent 365 data source and Microsoft 365 connector are enabled and feeding Defender.</div>';
   if(hunt.queries && hunt.queries.length){
-    html+='<div class="hint" style="margin:0 0 8px">Microsoft\'s official <b>AI Agents</b> hunting queries (Azure-Sentinel) — number of agents matching each (0 = clean).</div>';
+    html+='<div class="hint" style="margin:0 0 8px">Microsoft\'s official <b>AI Agents</b> hunting queries (Azure-Sentinel) — number of agents matching each (0 = clean). <span style="color:var(--dim)">Click a non-zero tile to filter the Agents view to the matching agents.</span></div>';
     html+='<div class="kpis" style="grid-template-columns:repeat('+hunt.queries.length+',minmax(0,1fr))">';
     hunt.queries.forEach((q,i)=>{
       const cls=q.error?'':(q.count>0?(i===0?'crit':'high'):'ok');
       const val=q.error?'—':q.count;
-      const clickable='';
-      html+='<div class="kpi '+cls+clickable+'" data-hq="'+i+'" title="'+escapeHtml(q.error?(q.errMsg||'query failed'):q.name)+'"><div class="k">'+(i+1)+' · '+escapeHtml(q.short)+'</div><div class="v">'+val+'</div></div>';
+      const clickable=(!q.error && q.count>0 && q.ids && q.ids.length) ? ' hq-tile' : '';
+      const tip=q.error?(q.errMsg||'query failed'):(clickable?'Filter the Agents view to these '+q.count+' agents':q.name);
+      html+='<div class="kpi '+cls+clickable+'" data-hq="'+i+'" title="'+escapeHtml(tip)+'"><div class="k">'+(i+1)+' · '+escapeHtml(q.short)+'</div><div class="v">'+val+'</div></div>';
     });
     html+='</div>';
     const errs=hunt.queries.filter(q=>q.error);
@@ -1588,8 +1592,10 @@ function renderHunt(hunt){
   }
   el.innerHTML=html+'</div>';
   el.querySelectorAll('.hq-tile').forEach(t=>t.addEventListener('click',()=>{
-    const q=hunt.queries[+t.dataset.hq]; if(!q||q.error) return;
-    HUNT_FILTER={short:q.short, ids:new Set(q.ids||[]), count:q.count};
+    const q=hunt.queries[+t.dataset.hq]; if(!q||q.error||!(q.ids&&q.ids.length)) return;
+    HUNT_FILTER={short:q.short, ids:new Set(q.ids), count:q.count}; FINDING_FILTER=null;
+    ["fltSev","fltFlag","fltBp","fltPlat"].forEach(id=>{ const e=$(id); if(e) e.value=""; });
+    const s=$("fltSearch"); if(s) s.value="";
     if(MODEL) renderTable(MODEL.agents);
     showView('agents');
   }));
@@ -1608,7 +1614,8 @@ function renderTable(agents){
   const sevF=$("fltSev").value, flagF=$("fltFlag").value, bpF=$("fltBp").value, platF=$("fltPlat").value;
   let rows=agents.filter(a=>{
     if(FINDING_FILTER && !FINDING_FILTER.ids.has(a.id))return false;
-    if(HUNT_FILTER && !HUNT_FILTER.ids.has((a.id||"").toLowerCase()))return false;
+    if(HUNT_FILTER){ const idl=(a.id||"").toLowerCase(), apl=(a.appId||"").toLowerCase();
+      if(!HUNT_FILTER.ids.has(idl) && !(apl && HUNT_FILTER.ids.has(apl)))return false; }
     if(sevF==="critical"&&a.sev!=="critical")return false;
     if(sevF==="high"&&SEV_RANK[a.sev]<2)return false;
     if(sevF==="medium"&&SEV_RANK[a.sev]<1)return false;
@@ -1675,7 +1682,7 @@ function renderTable(agents){
       hc.innerHTML='<span class="hfchip" title="Filtered to a finding\'s affected agents">Finding · '+escapeHtml(FINDING_FILTER.title)+' ('+rows.length+' of '+FINDING_FILTER.ids.size+') <b>✕</b></span>';
       hc.firstChild.onclick=()=>{ FINDING_FILTER=null; renderTable(MODEL.agents); };
     } else if(HUNT_FILTER){
-      const note = HUNT_FILTER.ids.size===0 ? " · 0 in this inventory (local/store agents)" : "";
+      const note = rows.length===0 ? " · none map to an Entra Agent ID (AgentsInfo also counts local / store / classic agents)" : "";
       hc.innerHTML='<span class="hfchip" title="AgentsInfo hunting-query filter">AgentsInfo · '+escapeHtml(HUNT_FILTER.short)+' ('+rows.length+' of '+HUNT_FILTER.count+')'+note+' <b>✕</b></span>';
       hc.firstChild.onclick=()=>{ HUNT_FILTER=null; renderTable(MODEL.agents); };
     } else hc.innerHTML="";
@@ -1748,8 +1755,8 @@ $("setupToggle").addEventListener("click",()=>{
   $("setupToggle").classList.toggle("open", !hidden);
 });
 document.querySelectorAll('#sidenav .navitem[data-view]').forEach(b=>b.addEventListener("click",()=>{
-  // a direct menu click to Agents clears any finding drill-down so the menu always shows the full list
-  if(b.dataset.view==="agents" && FINDING_FILTER){ FINDING_FILTER=null; if(MODEL) renderTable(MODEL.agents); }
+  // a direct menu click to Agents clears any drill-down (finding or hunting-query) so the menu shows the full list
+  if(b.dataset.view==="agents" && (FINDING_FILTER||HUNT_FILTER)){ FINDING_FILTER=null; HUNT_FILTER=null; if(MODEL) renderTable(MODEL.agents); }
   showView(b.dataset.view);
 }));
 $("loadBtn").addEventListener("click",analyze);
