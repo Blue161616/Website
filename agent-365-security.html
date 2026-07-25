@@ -504,6 +504,7 @@
       <span id="huntFilterChip"></span>
       <span class="count" id="tableCount"></span>
     </div>
+    <div id="tableNote"></div>
     <div class="hint" style="margin:-4px 0 10px">Each row is <b>one agent identity</b>, risk-scored 0-100 from its permissions, roles, ownership, blueprint credential hygiene and Microsoft-disabled status. Permissions include both grants on the agent's own service principal <b>and permissions <span class="mono" style="color:var(--blue-bright)">inherited</span> from its blueprint</b> (shown in the portal as Grant source = “Inherited”) — the agent SP looks empty but still holds them. The <b>blueprint is the security boundary</b> — it holds the credentials and impersonates its agents, so a blueprint compromise affects every agent under it. Click a row for the breakdown.</div>
     <div style="overflow-x:auto"><table id="table"><thead><tr>
       <th style="width:20px"></th>
@@ -768,6 +769,18 @@ AgentsInfo
   {short:"No instructions", name:"Published agents without instructions", kql:
 `AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where PublishedStatus == "Published" | where isempty(Instructions) or Instructions == "N/A" | summarize Count = dcount(AgentId), Ids = make_set(AgentId, 100000)`}
 ];
+// Extract display names from an AgentsInfo dynamic tool column (array of objects or strings, possibly a JSON string).
+function toolNames(v){
+  if(v==null) return [];
+  if(typeof v==="string"){ try{ v=JSON.parse(v); }catch{ return v.trim()?[v.trim()]:[]; } }
+  if(!Array.isArray(v)) v=[v];
+  return v.map(e=>{
+    if(e==null) return null;
+    if(typeof e==="string") return e.trim()||null;
+    if(typeof e==="object") return e.name||e.displayName||e.title||e.type||e.connectorId||e.id||null;
+    return String(e);
+  }).filter(Boolean);
+}
 // Best-effort agent builder-platform detection from name / blueprint / tags (no clean Graph field yet).
 function detectPlatform(a, bp){
   const s=((a.displayName||"")+" "+((bp&&bp.name)||"")+" "+((a.tags||[]).join(" "))).toLowerCase();
@@ -1097,9 +1110,19 @@ async function analyze(){
           const eidCol=[...colSet].find(c=>/^entraagentid$/i.test(c));
           if(eidCol){
             try{
-              const mr=await runHunting(`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where isnotempty(tostring(${eidCol})) | project A=tostring(AgentId), E=tostring(${eidCol})`, huntTk);
-              const emap={}; (mr.results||[]).forEach(x=>{ if(x.A&&x.E) emap[String(x.A).toLowerCase()]=String(x.E).toLowerCase(); });
+              // one query does double duty: AgentId→EntraAgentID map (for hunt-tile filtering) AND the per-agent
+              // tool inventory (DeclaredTools / McpServers / Connectors / Capabilities) for the agent detail drawer.
+              const toolCols=["McpServers","DeclaredTools","Connectors","Capabilities","Skills"].filter(c=>colSet.has(c));
+              const proj=["A=tostring(AgentId)","E=tostring("+eidCol+")"].concat(toolCols).join(", ");
+              const mr=await runHunting(`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where isnotempty(tostring(${eidCol})) | project ${proj}`, huntTk);
+              const emap={}, agentTools={};
+              (mr.results||[]).forEach(x=>{
+                if(x.A&&x.E) emap[String(x.A).toLowerCase()]=String(x.E).toLowerCase();
+                const eid=String(x.E||"").toLowerCase(); if(!eid) return;
+                agentTools[eid]={ mcp:toolNames(x.McpServers), tools:toolNames(x.DeclaredTools), connectors:toolNames(x.Connectors), capabilities:toolNames(x.Capabilities), skills:toolNames(x.Skills) };
+              });
               (huntState.queries||[]).forEach(q=>{ if(q.ids&&q.ids.length) q.entraIds=[...new Set(q.ids.map(a=>emap[a]).filter(Boolean))]; });
+              huntState.agentTools=agentTools;
             }catch(e){}
           }
           const tools={schema:cols, present:[]};
@@ -1245,7 +1268,9 @@ async function analyze(){
 
       risk=Math.min(100,Math.round(risk));
       let sev="low"; if(risk>=70)sev="critical"; else if(risk>=45)sev="high"; else if(risk>=20)sev="medium";
-      Object.assign(a,{bp,roles,dangerous,dormant,last,risk,sev,reasons,idpRisk,platform,riskDetections:dets,
+      // per-agent tool inventory from AgentsInfo (via the EntraAgentID bridge) — matched by SP id or appId.
+      const tools=(huntState.agentTools && (huntState.agentTools[String(a.id).toLowerCase()] || (a.appId&&huntState.agentTools[String(a.appId).toLowerCase()]))) || null;
+      Object.assign(a,{bp,roles,dangerous,dormant,last,risk,sev,reasons,idpRisk,platform,riskDetections:dets,tools,
         ownPermCount:ownPerms.length, inheritedPerms:inheritedAll, inheritedDangerCount:inheritedDanger.length, inheritedOtherCount});
     });
 
@@ -1817,10 +1842,19 @@ function renderTable(agents){
       hc.innerHTML='<span class="hfchip" title="Filtered to a finding\'s affected agents">Finding · '+escapeHtml(FINDING_FILTER.title)+' ('+rows.length+' of '+FINDING_FILTER.ids.size+') <b>✕</b></span>';
       hc.firstChild.onclick=()=>{ FINDING_FILTER=null; renderTable(MODEL.agents); };
     } else if(HUNT_FILTER){
-      const note = rows.length===0 ? " · none map to an Entra Agent ID (AgentsInfo also counts local / store / classic agents)" : "";
-      hc.innerHTML='<span class="hfchip" title="AgentsInfo hunting-query filter">AgentsInfo · '+escapeHtml(HUNT_FILTER.short)+' ('+rows.length+' of '+HUNT_FILTER.count+')'+note+' <b>✕</b></span>';
+      hc.innerHTML='<span class="hfchip" title="AgentsInfo hunting-query filter — shows only the matched agents that have an Entra Agent ID">AgentsInfo · '+escapeHtml(HUNT_FILTER.short)+' ('+rows.length+' of '+HUNT_FILTER.count+') <b>✕</b></span>';
       hc.firstChild.onclick=()=>{ HUNT_FILTER=null; renderTable(MODEL.agents); };
     } else hc.innerHTML="";
+  }
+  // Explicit callout: how many of the matched agents are CLASSIC (no Entra Agent ID) and therefore out of scope here.
+  const noteEl=$("tableNote");
+  if(noteEl){
+    if(HUNT_FILTER){
+      const gap=Math.max(0,(HUNT_FILTER.count||0)-rows.length);
+      if(gap>0){
+        noteEl.innerHTML='<div class="engine-clean" style="border-left-color:var(--amber);background:#fbbf240a;margin:2px 0 10px"><b>'+gap+' of '+HUNT_FILTER.count+' matched agent'+(gap===1?'':'s')+' '+(gap===1?'is a':'are')+' classic agent'+(gap===1?'':'s')+' — not shown here.</b> They exist in Defender\'s <code>AgentsInfo</code> table but have <b>no Entra Agent ID</b> (older Copilot Studio / Foundry, Teams-store or local agents), so they\'re <b>out of scope for this tool</b>, which governs modern Entra Agent ID agents. Hunt them directly in Defender advanced hunting (they have an <code>AgentId</code> but no <code>EntraAgentID</code>).</div>';
+      } else noteEl.innerHTML="";
+    } else noteEl.innerHTML="";
   }
   $("agentsCard").style.display="block";
   tb.querySelectorAll(".mainrow").forEach(tr=>tr.addEventListener("click",()=>{
@@ -1857,6 +1891,12 @@ function detailHtml(a){
   if(a.dangerous.length) h+='<li>Risky Graph permissions (effective): '+a.dangerous.map(p=>escapeHtml(p.value)+(p.inherited?" <span style='color:var(--muted)'>(inherited)</span>":"")).join(", ")+'</li>';
   if(a.inheritedPerms&&a.inheritedPerms.length) h+='<li><b>Inherited from blueprint</b> '+escapeHtml(a.bp?.name||"")+': '+a.inheritedPerms.map(p=>escapeHtml(p.value)).join(", ")+(a.inheritedOtherCount?' · +'+a.inheritedOtherCount+' non-Graph':'')+' <span style=\'color:var(--muted)\'>— granted on the blueprint, so every agent under it holds these at runtime</span></li>';
   if(a.otherPermCount) h+='<li>Other API permissions (direct on agent): '+a.otherPermCount+'</li>';
+  if(a.tools){
+    const T=a.tools, parts=[];
+    const addT=(label,arr,hot)=>{ if(arr&&arr.length) parts.push('<li>'+label+' <b>('+arr.length+')</b>: '+(hot?"<span style='color:var(--blue-bright)'>":"")+arr.slice(0,25).map(escapeHtml).join(", ")+(hot?"</span>":"")+(arr.length>25?' … +'+(arr.length-25)+' more':'')+'</li>'); };
+    addT("MCP servers", T.mcp, true); addT("Tools", T.tools, false); addT("Connectors", T.connectors, true); addT("Capabilities", T.capabilities, false); addT("Skills", T.skills, false);
+    h+= parts.length ? ('<li style="list-style:none;margin-left:-14px;color:var(--dim);font-size:11px;margin-top:4px">Action surface (from Defender AgentsInfo):</li>'+parts.join("")) : '<li>Tools / MCP servers: <span style="color:var(--muted)">none configured</span></li>';
+  }
   if(a.last){
     const days=Math.floor((Date.now()-new Date(a.last).getTime())/864e5);
     const col=days>=DORMANT_DAYS?"var(--amber)":"var(--muted)";
