@@ -820,7 +820,7 @@ async function analyze(){
     }catch{}
 
     // 3) per-agent enrichment: appRoleAssignments + owners
-    let sponsorsBlocked=false;
+    let sponsorsBlocked=false, spAttempts=0, spErrs=0;
     const enriched=await mapPool(agents,6,async(a)=>{
       const [assigns,owners]=await Promise.all([
         graphGetAll(`${graphBase()}/servicePrincipals/${a.id}/appRoleAssignments?$top=100`, tk).catch(()=>[]),
@@ -832,8 +832,9 @@ async function analyze(){
       // authorised by the signed-in user's directory role (Global Reader / Directory Readers), so degrade if blocked.
       let sponsors=[];
       if(!sponsorsBlocked){
+        spAttempts++;
         try{ sponsors=await graphGetAll(`https://graph.microsoft.com/beta/servicePrincipals/${a.id}/microsoft.graph.agentIdentity/sponsors?$select=id,displayName,userPrincipalName,accountEnabled&$top=50`, tk); }
-        catch(e){ if(/40[13]|forbidden|authoriz|privile/i.test(String((e&&e.message)||""))) sponsorsBlocked=true; }
+        catch(e){ spErrs++; if(/40[13]|forbidden|authoriz|privile/i.test(String((e&&e.message)||""))) sponsorsBlocked=true; }
       }
       const graphPerms=[], otherPerms=[];
       assigns.forEach(x=>{
@@ -853,8 +854,11 @@ async function analyze(){
       const ownerDeparted = parties.length>0 && parties.every(o=>o.accountEnabled===false);
       return {...a, graphPerms, otherPermCount:otherPerms.length, otherPerms, owners, sponsors, hasOwner:owners.length>0, hasSponsor:sponsors.length>0, accountable, ownerDeparted};
     },{});
+    // If EVERY sponsor call failed (whatever the error — bad $select, endpoint missing, throttling), the data is
+    // unusable: treat as unreadable rather than asserting "Sponsors: none" for all agents.
+    if(!sponsorsBlocked && spAttempts>0 && spErrs===spAttempts) sponsorsBlocked=true;
     SPONSORS_READABLE=!sponsorsBlocked;
-    if(sponsorsBlocked) notices.push('<div class="notice">Agent <b>sponsors</b> couldn\'t be read (the beta <code>agentIdentity/sponsors</code> relationship needs the signed-in user to hold a <b>Global Reader</b> / <b>Directory Readers</b> role — there\'s no delegated scope for it). Ownership below reflects Entra <b>owners</b> only, so "no owner" may over-report versus the Agent 365 portal, which counts sponsors.</div>');
+    if(sponsorsBlocked) notices.push('<div class="notice">Agent <b>sponsors</b> couldn\'t be read — the beta <code>agentIdentity/sponsors</code> relationship needs the signed-in user to hold a <b>Global Reader</b> / <b>Directory Readers</b> role (there\'s no delegated scope for it), or the endpoint isn\'t available in this tenant yet. Ownership below reflects Entra <b>owners</b> only, so "no owner" may over-report versus the Agent 365 portal, which counts sponsors.</div>');
 
     // 4) blueprints — credential hygiene + ownership (blueprint = security boundary).
     // Agent blueprints are an APPLICATION subtype (microsoft.graph.agentIdentityBlueprint); the client
@@ -913,7 +917,7 @@ async function analyze(){
       const expiringSoon=allCreds.filter(c=>{const t=c.endDateTime?new Date(c.endDateTime).getTime():0; return t>now&&t<now+CRED_SOON_DAYS*864e5;}).length;
       const longLived=allCreds.filter(c=>{const s=c.startDateTime?new Date(c.startDateTime).getTime():now,eD=c.endDateTime?new Date(c.endDateTime).getTime():now; return (eD-s)>CRED_LONG_DAYS*864e5;}).length;
       // MS-managed blueprints: no tenant credential/owner to audit — mark resolved & owned to avoid false findings.
-      bpMap[bid]={id:bid, name:(app&&app.displayName)||name||"(unresolved)", resolved:(!!app||!!name), msManaged, secretCount:secrets.length, certCount:certs.length, expired, expiringSoon, longLived, hasOwner:(msManaged?true:(owners.length>0||bpSponsors.length>0)), owners, sponsors:bpSponsors, inheritedPerms, inheritedOtherCount};
+      bpMap[bid]={id:bid, resolvedId:bpSpId, name:(app&&app.displayName)||name||"(unresolved)", resolved:(!!app||!!name), msManaged, secretCount:secrets.length, certCount:certs.length, expired, expiringSoon, longLived, hasOwner:(msManaged?true:(owners.length>0||bpSponsors.length>0)), owners, sponsors:bpSponsors, inheritedPerms, inheritedOtherCount};
     },null);
 
     // 5) optional: Conditional Access for Agents coverage.
@@ -1116,6 +1120,9 @@ async function analyze(){
 
     // ---------- score each agent ----------
     const now=Date.now();
+    // Display-name occurrence count — the ID Protection name-fallback below must only fire for UNIQUE names
+    // (duplicate names like "Agent 2 (Microsoft Copilot Studio)" would mark every same-named agent compromised).
+    const nameCount={}; enriched.forEach(x=>{ const k=(x.displayName||"").toLowerCase(); if(k) nameCount[k]=(nameCount[k]||0)+1; });
     enriched.forEach(a=>{
       const bp=bpMap[a.agentIdentityBlueprintId]||null;
       const roles=principalRoles[a.id]||[];
@@ -1126,7 +1133,10 @@ async function analyze(){
       const dangerous=[...ownPerms, ...inheritedDanger];
       const inheritedOtherCount=(bp&&bp.inheritedOtherCount)||0;
       let last=null; if(a.appId && signInByAppId[a.appId]!==undefined) last=signInByAppId[a.appId];
-      const dormant = auditGranted ? (a.accountEnabled && (!last || (now-new Date(last).getTime())>DORMANT_DAYS*864e5)) : null;
+      // Dormant = enabled with no sign-in for DORMANT_DAYS. With NO recorded sign-in, require the agent to be
+      // at least that old — a freshly created agent hasn't had 90 days to sign in yet.
+      const ageMs = a.createdDateTime ? (now-new Date(a.createdDateTime).getTime()) : Infinity;
+      const dormant = auditGranted ? (a.accountEnabled && (last ? (now-new Date(last).getTime())>DORMANT_DAYS*864e5 : ageMs>DORMANT_DAYS*864e5)) : null;
 
       const reasons=[]; let risk=0;
       if(a.disabledByMicrosoftStatus){ risk+=45; reasons.push(["critical","Disabled by Microsoft — flagged as unsafe/compromised. Investigate immediately."]); }
@@ -1144,8 +1154,12 @@ async function analyze(){
       if(dormant){ risk+=8; reasons.push(["medium","No sign-in in "+DORMANT_DAYS+"+ days but still enabled with access — candidate for removal."]); }
       if(dangerous.length && caState.granted && caState.coverAgents===0){ risk+=8; reasons.push(["high","Dangerous permissions and no Conditional Access policy targets workload identities — no adaptive guardrail if compromised."]); }
 
-      // Cross-reference ID Protection (riskyAgents): flag agents Entra flagged as risky/compromised.
-      const idpHit=(idpState.risky||[]).find(r=> r.id===a.id || (r.displayName && a.displayName && r.displayName.toLowerCase()===a.displayName.toLowerCase()));
+      // Cross-reference ID Protection (riskyAgents): match by id; the display-name fallback fires ONLY when
+      // that name is unique in the tenant — otherwise one risky "Agent 2" would flag every same-named agent.
+      const idpHit=(idpState.risky||[]).find(r=>r.id===a.id)
+        || ((a.displayName && nameCount[a.displayName.toLowerCase()]===1)
+            ? (idpState.risky||[]).find(r=>r.displayName && r.displayName.toLowerCase()===a.displayName.toLowerCase())
+            : null);
       const idpRisk = idpHit ? idpHit.riskState : null;
       // Reason severity mirrors Microsoft's ID Protection risk level (compromised = High, atRisk = Medium); the
       // +points are our internal weighting and stay as-is.
@@ -1636,9 +1650,13 @@ function renderTable(agents){
     if(a.dormant)flags.push('<span class="flagchip warn">dormant</span>');
     if(!a.accountEnabled)flags.push('<span class="flagchip">disabled</span>');
     if(a.platform)flags.push('<span class="flagchip plat">'+escapeHtml(a.platform)+'</span>');
-    const otherTotal=(a.otherPermCount||0)+(a.inheritedOtherCount||0);
+    // "other" = non-Graph API grants + NON-dangerous Graph perms (own + inherited) — so an agent holding only
+    // e.g. AgentIdentity.CreateAsManager doesn't misleadingly show "—".
+    const otherTotal=(a.otherPermCount||0)+(a.inheritedOtherCount||0)
+      +((a.graphPerms||[]).filter(p=>p.tier==null).length)
+      +((a.inheritedPerms||[]).filter(p=>p.tier==null).length);
     const permBits=[]; if(a.dangerous.length)permBits.push(a.dangerous.length+" risky"); if(otherTotal)permBits.push(otherTotal+" other");
-    const inhChip=(a.inheritedDangerCount||a.inheritedOtherCount)?' <span class="flagchip plat" style="font-size:9px" title="granted on the blueprint, inherited by this agent">inherited</span>':'';
+    const inhChip=((a.inheritedPerms&&a.inheritedPerms.length)||a.inheritedOtherCount)?' <span class="flagchip plat" style="font-size:9px" title="granted on the blueprint, inherited by this agent">inherited</span>':'';
     const perms=(permBits.length?permBits.join(" · "):"—")+inhChip;
     return `<tr data-i="${i}" class="mainrow">
       <td class="expand">▸</td>
