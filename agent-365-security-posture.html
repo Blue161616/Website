@@ -132,6 +132,10 @@
   .finding .fcount{margin-left:auto; font-family:'Consolas',monospace; font-size:11px; color:var(--muted)}
   .finding .fd{font-size:12.5px; color:var(--muted); margin-top:7px}
   .finding .fx{font-size:12px; color:var(--text); margin-top:9px; padding-top:9px; border-top:1px solid var(--border)}
+  .finding.clickable{cursor:pointer; transition:border-color .15s, box-shadow .15s, transform .15s}
+  .finding.clickable:hover{border-color:var(--accent); box-shadow:0 6px 20px -12px var(--accent); transform:translateY(-1px)}
+  .finding .fview{font-family:'Consolas',monospace; font-size:11px; color:var(--accent); margin-top:9px; font-weight:700}
+  .finding.clickable:hover .fview{text-decoration:underline}
   .finding .fx b{color:var(--green)}
   .finding .agents{font-family:'Consolas',monospace; font-size:11px; color:var(--dim); margin-top:8px; word-break:break-word}
 
@@ -758,6 +762,8 @@ function detectPlatform(a, bp){
 // ---------- Scan ----------
 let MODEL=null;
 let HUNT_FILTER=null; // {short, ids:Set(EntraAgentId lc), count} — set by clicking an AgentsInfo query tile
+let FINDING_FILTER=null; // {ids:Set(agent id), title} — set by clicking a finding card
+let SPONSORS_READABLE=true; // false if the beta agentIdentity/sponsors relationship is blocked (no directory role)
 let CURRENT_VIEW="overview";
 function showView(v){
   CURRENT_VIEW=v;
@@ -814,11 +820,21 @@ async function analyze(){
     }catch{}
 
     // 3) per-agent enrichment: appRoleAssignments + owners
+    let sponsorsBlocked=false;
     const enriched=await mapPool(agents,6,async(a)=>{
       const [assigns,owners]=await Promise.all([
         graphGetAll(`${graphBase()}/servicePrincipals/${a.id}/appRoleAssignments?$top=100`, tk).catch(()=>[]),
         graphGetAll(`${graphBase()}/servicePrincipals/${a.id}/owners?$select=id,displayName,userPrincipalName,accountEnabled&$top=50`, tk).catch(()=>[])
       ]);
+      // SPONSORS = the REQUIRED business owner shown in the portal's "Owners and sponsors" blade — a SEPARATE
+      // beta relationship from owners (technical admins). The scanner only read owners before, so agents with
+      // a sponsor but no owner were falsely flagged "no owner". No delegated scope exists for this — it's
+      // authorised by the signed-in user's directory role (Global Reader / Directory Readers), so degrade if blocked.
+      let sponsors=[];
+      if(!sponsorsBlocked){
+        try{ sponsors=await graphGetAll(`https://graph.microsoft.com/beta/servicePrincipals/${a.id}/microsoft.graph.agentIdentity/sponsors?$select=id,displayName,userPrincipalName,accountEnabled&$top=50`, tk); }
+        catch(e){ if(/40[13]|forbidden|authoriz|privile/i.test(String((e&&e.message)||""))) sponsorsBlocked=true; }
+      }
       const graphPerms=[], otherPerms=[];
       assigns.forEach(x=>{
         if(x.resourceId===window.__graphSpId){
@@ -829,11 +845,16 @@ async function analyze(){
           otherPerms.push(x.resourceDisplayName||"resource");
         }
       });
-      // owner-departed: agent HAS owners but every one is a disabled account (owner left the org).
-      // accountEnabled is undefined for group/SP owners → those never count as "departed" (conservative).
-      const ownerDeparted = owners.length>0 && owners.every(o=>o.accountEnabled===false);
-      return {...a, graphPerms, otherPermCount:otherPerms.length, otherPerms, owners, hasOwner:owners.length>0, ownerDeparted};
+      // Accountability = an owner (technical) OR a sponsor (business) — matches the portal's "has an owner".
+      const parties=[...owners,...sponsors];
+      const accountable = parties.length>0;
+      // owner-departed: the agent HAS accountable parties but every one is a disabled account (they left the org).
+      // accountEnabled is undefined for group/SP parties → those never count as "departed" (conservative).
+      const ownerDeparted = parties.length>0 && parties.every(o=>o.accountEnabled===false);
+      return {...a, graphPerms, otherPermCount:otherPerms.length, otherPerms, owners, sponsors, hasOwner:owners.length>0, hasSponsor:sponsors.length>0, accountable, ownerDeparted};
     },{});
+    SPONSORS_READABLE=!sponsorsBlocked;
+    if(sponsorsBlocked) notices.push('<div class="notice">Agent <b>sponsors</b> couldn\'t be read (the beta <code>agentIdentity/sponsors</code> relationship needs the signed-in user to hold a <b>Global Reader</b> / <b>Directory Readers</b> role — there\'s no delegated scope for it). Ownership below reflects Entra <b>owners</b> only, so "no owner" may over-report versus the Agent 365 portal, which counts sponsors.</div>');
 
     // 4) blueprints — credential hygiene + ownership (blueprint = security boundary).
     // Agent blueprints are an APPLICATION subtype (microsoft.graph.agentIdentityBlueprint); the client
@@ -882,6 +903,9 @@ async function analyze(){
         }catch{}
       }
       const owners = app ? await graphGetAll(`${graphBase()}/applications/${app.id}/owners?$select=id,displayName&$top=20`, tk).catch(()=>[]) : [];
+      // Blueprints also require a SPONSOR (business owner). Readable delegated with Application.Read.All (already held).
+      let bpSponsors=[];
+      if(app){ try{ bpSponsors=await graphGetAll(`https://graph.microsoft.com/beta/applications/${app.id}/microsoft.graph.agentIdentityBlueprint/sponsors?$select=id,displayName&$top=20`, tk); }catch{} }
       const secrets=(app?.passwordCredentials||[]);
       const certs=(app?.keyCredentials||[]);
       const allCreds=[...secrets,...certs];
@@ -889,7 +913,7 @@ async function analyze(){
       const expiringSoon=allCreds.filter(c=>{const t=c.endDateTime?new Date(c.endDateTime).getTime():0; return t>now&&t<now+CRED_SOON_DAYS*864e5;}).length;
       const longLived=allCreds.filter(c=>{const s=c.startDateTime?new Date(c.startDateTime).getTime():now,eD=c.endDateTime?new Date(c.endDateTime).getTime():now; return (eD-s)>CRED_LONG_DAYS*864e5;}).length;
       // MS-managed blueprints: no tenant credential/owner to audit — mark resolved & owned to avoid false findings.
-      bpMap[bid]={id:bid, name:(app&&app.displayName)||name||"(unresolved)", resolved:(!!app||!!name), msManaged, secretCount:secrets.length, certCount:certs.length, expired, expiringSoon, longLived, hasOwner:(msManaged?true:owners.length>0), owners, inheritedPerms, inheritedOtherCount};
+      bpMap[bid]={id:bid, name:(app&&app.displayName)||name||"(unresolved)", resolved:(!!app||!!name), msManaged, secretCount:secrets.length, certCount:certs.length, expired, expiringSoon, longLived, hasOwner:(msManaged?true:(owners.length>0||bpSponsors.length>0)), owners, sponsors:bpSponsors, inheritedPerms, inheritedOtherCount};
     },null);
 
     // 5) optional: Conditional Access for Agents coverage.
@@ -1108,8 +1132,8 @@ async function analyze(){
       if(a.disabledByMicrosoftStatus){ risk+=45; reasons.push(["critical","Disabled by Microsoft — flagged as unsafe/compromised. Investigate immediately."]); }
       dangerous.forEach(p=>{ const pts=p.tier===0?30:p.tier===1?18:8; risk+=pts; reasons.push([tierToSev(p.tier),"Graph permission "+p.value+" — "+p.path+(p.inherited?" (inherited from blueprint '"+(bp&&bp.name||"?")+"')":"")]); });
       roles.forEach(r=>{ const pts=r.tier===0?35:r.tier===1?20:8; risk+=pts; reasons.push([tierToSev(r.tier),"Holds directory role "+r.name+" — an agent should rarely hold admin roles."]); });
-      if(!a.hasOwner){ risk+=10; reasons.push(["medium","No owner / sponsor assigned — accountability gap."]); }
-      else if(a.ownerDeparted){ risk+=14; reasons.push(["high","Owner has left — every assigned owner is a disabled account. The agent still runs with no accountable sponsor; reassign or retire it."]); }
+      if(!a.accountable){ risk+=10; reasons.push(["medium","No owner or sponsor assigned — accountability gap. (Owners are technical admins; a sponsor is the required business owner — this agent has neither.)"]); }
+      else if(a.ownerDeparted){ risk+=14; reasons.push(["high","Owner / sponsor has left — every assigned owner and sponsor is a disabled account. The agent still runs with nobody accountable; reassign or retire it."]); }
       if(bp && bp.secretCount>0){ risk+=8; reasons.push(["high","Blueprint '"+bp.name+"' is backed by "+bp.secretCount+" client secret(s) — an exfiltratable credential on the security boundary. Prefer certificates / managed identity."]); }
       if(bp && bp.expired>0){ risk+=4; reasons.push(["medium","Blueprint has "+bp.expired+" expired credential(s) — clean up."]); }
       if(bp && bp.expiringSoon>0){ reasons.push(["low","Blueprint credential expiring within 30 days."]); }
@@ -1155,7 +1179,7 @@ async function analyze(){
     const exposure=clamp(100-expPenalty*100/Math.max(8,n*4));
     // Compliance: ownership, lifecycle, naming
     let compPenalty=0;
-    enriched.forEach(a=>{ if(!a.hasOwner)compPenalty+=6; if(!a.accountEnabled)compPenalty+=2; if(a.bp&&!a.bp.hasOwner)compPenalty+=4; if(a.bp&&!a.bp.resolved)compPenalty+=3; });
+    enriched.forEach(a=>{ if(!a.accountable)compPenalty+=6; if(!a.accountEnabled)compPenalty+=2; if(a.bp&&!a.bp.hasOwner)compPenalty+=4; if(a.bp&&!a.bp.resolved)compPenalty+=3; });
     const compliance=clamp(100-compPenalty*100/Math.max(6,n*7));
     // Risk (runtime): MS-flagged, dormant, uncovered dangerous
     let riskPenalty=0;
@@ -1274,16 +1298,32 @@ function renderKpis(agents, bpCount, idp){
 }
 function findingHtml(f){
   const cls=f.sev==='critical'?'crit':f.sev==='high'?'high':f.sev==='medium'?'med':'low';
-  return `<div class="finding" style="--sevc:var(--${cls})">
+  const clickable=f.ids&&f.ids.length;
+  const view=clickable?`<div class="fview">→ Show the ${f.ids.length} affected agent${f.ids.length===1?'':'s'} in the Agents view</div>`:"";
+  return `<div class="finding${clickable?' clickable':''}" style="--sevc:var(--${cls})"${clickable?` data-fkey="${f._k}"`:''}>
       <div class="fh"><span class="sev ${f.sev}">${f.sev}</span><span class="ft">${escapeHtml(f.title)}</span><span class="fcount">${f.count} affected</span></div>
       <div class="fd">${escapeHtml(f.desc)}</div>
-      ${f.names.length?`<div class="agents">${f.names.map(escapeHtml).join(" · ")}${f.count>f.names.length?" · +"+(f.count-f.names.length)+" more":""}</div>`:""}
       <div class="fx"><b>Fix:</b> ${escapeHtml(f.fix)}</div>
+      ${view}
     </div>`;
 }
 function renderGroup(containerId, list, cleanMsg){
   list.sort((a,b)=>SEV_RANK[b.sev]-SEV_RANK[a.sev]);
-  $(containerId).innerHTML = list.length ? list.map(findingHtml).join("") : '<div class="engine-clean">'+escapeHtml(cleanMsg)+'</div>';
+  const el=$(containerId); if(!el) return;
+  window.__findingSets=window.__findingSets||{};
+  el.innerHTML = list.length ? list.map(f=>{
+    if(f.ids&&f.ids.length){ const k='fk'+(window.__fkey=(window.__fkey||0)+1); window.__findingSets[k]={ids:new Set(f.ids), title:f.title}; f._k=k; }
+    return findingHtml(f);
+  }).join("") : '<div class="engine-clean">'+escapeHtml(cleanMsg)+'</div>';
+  el.querySelectorAll('.finding.clickable').forEach(node=>node.addEventListener('click',()=>filterAgentsByFinding(node.dataset.fkey)));
+}
+function filterAgentsByFinding(key){
+  const set=window.__findingSets&&window.__findingSets[key]; if(!set||!MODEL) return;
+  FINDING_FILTER={ids:set.ids, title:set.title}; HUNT_FILTER=null;
+  ["fltSev","fltFlag","fltBp","fltPlat"].forEach(id=>{ const e=$(id); if(e) e.value=""; });
+  const s=$("fltSearch"); if(s) s.value="";
+  renderTable(MODEL.agents);
+  showView('agents');
 }
 function setEngineScore(id, d){
   if(!d || d.val===null){ $(id).innerHTML='<div class="n" style="color:var(--dim);font-size:16px">n/a</div><div class="l">no data</div>'; return; }
@@ -1291,35 +1331,45 @@ function setEngineScore(id, d){
 }
 function renderEngineSections(agents, bpMap, caState, domains, idpState){
   const dmap={}; domains.forEach(d=>dmap[d.key]=d);
+  window.__findingSets={}; window.__fkey=0;   // reset the finding→agents click registry each scan
   const g={entra:[], defender:[], purview:[]};
-  const add=(eng,sev,title,arr,desc,fix)=>{ if(arr.length) g[eng].push({sev,title,count:arr.length,names:arr.slice(0,12),desc,fix}); };
+  // `items` drives the count; `agentIds` (optional) is the set of agent ids the finding maps to — clicking the
+  // card filters the Agents view to exactly those. If agentIds is omitted, items are assumed to be agent objects.
+  const add=(eng,sev,title,items,desc,fix,agentIds)=>{
+    if(!items.length) return;
+    const ids = agentIds!==undefined ? agentIds : (items[0]&&items[0].id ? items.map(x=>x.id) : []);
+    g[eng].push({sev,title,count:items.length,desc,fix,ids});
+  };
   const dataRx=/Mail|Files|Sites/i;
+  const idsOf=(arr)=>arr.map(a=>a.id);
   // ── Entra — identity & access ──
-  add("entra","critical","Agents holding privileged directory roles", agents.filter(a=>a.roles.some(r=>r.tier===0)).map(a=>a.displayName),
+  add("entra","critical","Agents holding privileged directory roles", agents.filter(a=>a.roles.some(r=>r.tier===0)),
     "These agents hold tier-0 admin roles (e.g. Global / Application Administrator) — crown-jewel access an agent should almost never have.",
     "Remove the role; grant the narrowest resource-scoped permission the agent actually needs.");
-  add("entra","critical","Agents with tier-0 escalation permissions", agents.filter(a=>a.dangerous.some(p=>p.tier===0)).map(a=>a.displayName),
+  add("entra","critical","Agents with tier-0 escalation permissions", agents.filter(a=>a.dangerous.some(p=>p.tier===0)),
     "These agents hold Graph permissions that allow self-escalation to Global Administrator (RoleManagement.ReadWrite.Directory, AppRoleAssignment.ReadWrite.All, Application.ReadWrite.All).",
     "Revoke and re-consent only the specific least-privilege scope the agent's task requires.");
-  add("entra","high","Blueprints backed by client secrets", Object.values(bpMap).filter(b=>b&&b.secretCount>0).map(b=>b.name),
-    "The blueprint is the security boundary and holds an exfiltratable client secret; a leaked secret compromises every agent under it.",
-    "Replace client secrets with certificates or an Azure managed identity on the blueprint.");
-  add("entra","high","Blueprints granting inherited Graph permissions", Object.values(bpMap).filter(b=>b&&b.inheritedPerms&&b.inheritedPerms.length).map(b=>b.name+" ("+b.inheritedPerms.map(p=>p.value).join(", ")+")"),
+  add("entra","high","Blueprints backed by client secrets", Object.values(bpMap).filter(b=>b&&b.secretCount>0),
+    "The blueprint is the security boundary and holds an exfiltratable client secret; a leaked secret compromises every agent under it. Click to see the agents inheriting this boundary.",
+    "Replace client secrets with certificates or an Azure managed identity on the blueprint.",
+    idsOf(agents.filter(a=>a.bp&&a.bp.secretCount>0)));
+  add("entra","high","Blueprints granting inherited Graph permissions", Object.values(bpMap).filter(b=>b&&b.inheritedPerms&&b.inheritedPerms.length),
     "These blueprints hold admin-consented Graph permissions that EVERY agent under them inherits at runtime (the portal shows them on each agent as Grant source = “Inherited”). The agents' own service principals look empty, so this access is easy to miss — one over-permissioned blueprint silently grants all its agents the same reach (e.g. Mail.Send / Mail.Read / User.Read.All = send-as-anyone, read all mail, enumerate all users).",
-    "Review each blueprint's granted permissions at the blueprint, not the agent — remove anything the agents don't all need. Fixing the blueprint fixes every agent under it at once.");
-  add("entra","high","Agents with broad directory / group write", agents.filter(a=>a.dangerous.some(p=>p.tier===1 && !dataRx.test(p.value))).map(a=>a.displayName),
+    "Review each blueprint's granted permissions at the blueprint, not the agent — remove anything the agents don't all need. Fixing the blueprint fixes every agent under it at once.",
+    idsOf(agents.filter(a=>a.bp&&a.bp.inheritedPerms&&a.bp.inheritedPerms.length)));
+  add("entra","high","Agents with broad directory / group write", agents.filter(a=>a.dangerous.some(p=>p.tier===1 && !dataRx.test(p.value))),
     "Directory or group write permissions enable lateral movement and changes to the groups that gate access.",
     "Scope down; remove write where read suffices.");
-  add("entra","medium","Agents without an owner / sponsor", agents.filter(a=>!a.hasOwner).map(a=>a.displayName),
-    "No accountable owner is assigned — orphaned agents accumulate risk and evade review.",
-    "Assign an owner (sponsor) to every agent identity as part of onboarding.");
-  add("entra","high","Agents whose owner has left the org", agents.filter(a=>a.ownerDeparted).map(a=>a.displayName),
-    "Every assigned owner is a disabled account — the sponsor left the organization but the agent keeps running with its permissions and no accountable owner.",
-    "Reassign the agent to a current owner, or retire it if no one still needs it.");
+  add("entra","medium","Agents without an owner or sponsor", agents.filter(a=>!a.accountable),
+    "No accountable party is assigned — neither a technical owner nor a business sponsor. Orphaned agents accumulate risk and evade review."+(SPONSORS_READABLE?"":" (Sponsors couldn't be read this scan — grant the signed-in user a Global/Directory Reader role for an accurate count; this reflects owners only.)"),
+    "Assign a sponsor (the required business owner) to every agent identity as part of onboarding.");
+  add("entra","high","Agents whose owner / sponsor has left the org", agents.filter(a=>a.ownerDeparted),
+    "Every assigned owner and sponsor is a disabled account — the accountable people left the organization but the agent keeps running with its permissions and nobody accountable.",
+    "Reassign the agent to a current sponsor, or retire it if no one still needs it.");
   if(idpState && idpState.granted && idpState.detTotal>0){
     const detAgents=agents.filter(a=>a.riskDetections&&a.riskDetections.length);
     const typeList=Object.entries(idpState.detTypes||{}).sort((a,b)=>b[1]-a[1]).map(([t,c])=>t+" ×"+c).join(", ");
-    add("entra","high","Agents with ID Protection risk detections", detAgents.map(a=>a.displayName),
+    add("entra","high","Agents with ID Protection risk detections", detAgents,
       "Entra ID Protection raised "+idpState.detTotal+" risk detection(s) on these agents"+(typeList?" ("+typeList+")":"")+" — each is concrete evidence of anomalous or unsafe agent behaviour.",
       "Open ID Protection for Agents, review the detection evidence, and confirm safe / compromised so the risk state resolves.");
   }
@@ -1335,17 +1385,17 @@ function renderEngineSections(agents, bpMap, caState, domains, idpState){
     }
   }
   // ── Defender — runtime threat ──
-  add("defender","critical","Agents disabled by Microsoft", agents.filter(a=>a.disabledByMicrosoftStatus).map(a=>a.displayName),
+  add("defender","critical","Agents disabled by Microsoft", agents.filter(a=>a.disabledByMicrosoftStatus),
     "Microsoft flagged these agent identities as unsafe or compromised and disabled them.",
     "Investigate the blueprint and rotate its credentials; hunt the agent's activity in the Defender AgentsInfo advanced-hunting table.");
-  add("defender","medium","Dormant but enabled agents", agents.filter(a=>a.dormant).map(a=>a.displayName),
+  add("defender","medium","Dormant but enabled agents", agents.filter(a=>a.dormant),
     "Enabled agents with no recent sign-in still hold live permissions — a standing runtime attack surface.",
     "Disable or delete unused agents; add an access-review recertification and watch them in real-time protection.");
   // ── Purview — data governance ──
-  add("purview","high","Agents that can write org data", agents.filter(a=>a.dangerous.some(p=>dataRx.test(p.value) && p.tier<=1)).map(a=>a.displayName),
+  add("purview","high","Agents that can write org data", agents.filter(a=>a.dangerous.some(p=>dataRx.test(p.value) && p.tier<=1)),
     "Mail / Files / Sites write permissions let an agent modify or exfiltrate content across the org.",
     "Scope to specific mailboxes / sites; bring these agents into Purview DLP for AI.");
-  add("purview","medium","Agents with broad data-read reach", agents.filter(a=>a.dangerous.some(p=>(dataRx.test(p.value)||p.value==='Directory.Read.All') && p.tier===2)).map(a=>a.displayName),
+  add("purview","medium","Agents with broad data-read reach", agents.filter(a=>a.dangerous.some(p=>(dataRx.test(p.value)||p.value==='Directory.Read.All') && p.tier===2)),
     "Org-wide read of mail / files / directory is a large data-exposure surface even without write.",
     "Confirm these agents are in scope of Purview DSPM for AI and sensitivity-label enforcement.");
 
@@ -1423,7 +1473,7 @@ function setCheck(id, state, label){
 function renderEntraChecks(caState, idpState, agents){
   setCheck("chk-idp", (idpState && idpState.granted) ? "good" : "neutral");
   setCheck("chk-ca", (caState && caState.granted) ? (caState.coverAgents>0?"good":"bad") : "neutral");
-  const noOwner=agents.filter(a=>!a.hasOwner).length;
+  const noOwner=agents.filter(a=>!a.accountable).length;
   const dangerous=agents.filter(a=>a.dangerous && a.dangerous.length).length;
   setCheck("chk-owner", (noOwner>0||dangerous>0) ? "bad" : (agents.length?"good":"neutral"));
 }
@@ -1540,6 +1590,7 @@ function renderTable(agents){
   const q=$("fltSearch").value.toLowerCase().trim();
   const sevF=$("fltSev").value, flagF=$("fltFlag").value, bpF=$("fltBp").value, platF=$("fltPlat").value;
   let rows=agents.filter(a=>{
+    if(FINDING_FILTER && !FINDING_FILTER.ids.has(a.id))return false;
     if(HUNT_FILTER && !HUNT_FILTER.ids.has((a.id||"").toLowerCase()))return false;
     if(sevF==="critical"&&a.sev!=="critical")return false;
     if(sevF==="high"&&SEV_RANK[a.sev]<2)return false;
@@ -1549,7 +1600,7 @@ function renderTable(agents){
     if(flagF==="risky"&&!a.idpRisk)return false;
     if(flagF==="dangerous"&&!a.dangerous.length)return false;
     if(flagF==="role"&&!a.roles.length)return false;
-    if(flagF==="noowner"&&a.hasOwner)return false;
+    if(flagF==="noowner"&&a.accountable)return false;
     if(flagF==="msdisabled"&&!a.disabledByMicrosoftStatus)return false;
     if(flagF==="secret"&&!(a.bp&&a.bp.secretCount>0))return false;
     if(flagF==="dormant"&&!a.dormant)return false;
@@ -1575,8 +1626,9 @@ function renderTable(agents){
     if(a.dangerous.some(p=>p.tier===0))flags.push('<span class="flagchip bad">tier-0 perm</span>');
     else if(a.dangerous.length)flags.push('<span class="flagchip warn">'+a.dangerous.length+' risky perm</span>');
     if(a.riskDetections&&a.riskDetections.length)flags.push('<span class="flagchip bad">'+a.riskDetections.length+' risk detection'+(a.riskDetections.length>1?'s':'')+'</span>');
-    if(!a.hasOwner)flags.push('<span class="flagchip warn">no owner</span>');
-    else if(a.ownerDeparted)flags.push('<span class="flagchip bad">owner departed</span>');
+    if(!a.accountable)flags.push('<span class="flagchip warn">no owner/sponsor</span>');
+    else if(a.ownerDeparted)flags.push('<span class="flagchip bad">owner/sponsor departed</span>');
+    else if(a.hasSponsor&&!a.hasOwner)flags.push('<span class="flagchip">sponsored</span>');
     if(a.bp&&a.bp.secretCount>0)flags.push('<span class="flagchip warn">secret blueprint</span>');
     if(a.dormant)flags.push('<span class="flagchip warn">dormant</span>');
     if(!a.accountEnabled)flags.push('<span class="flagchip">disabled</span>');
@@ -1598,7 +1650,10 @@ function renderTable(agents){
   $("tableCount").textContent=rows.length+" of "+agents.length+" agents";
   const hc=$("huntFilterChip");
   if(hc){
-    if(HUNT_FILTER){
+    if(FINDING_FILTER){
+      hc.innerHTML='<span class="hfchip" title="Filtered to a finding\'s affected agents">Finding · '+escapeHtml(FINDING_FILTER.title)+' ('+rows.length+' of '+FINDING_FILTER.ids.size+') <b>✕</b></span>';
+      hc.firstChild.onclick=()=>{ FINDING_FILTER=null; renderTable(MODEL.agents); };
+    } else if(HUNT_FILTER){
       const note = HUNT_FILTER.ids.size===0 ? " · 0 in this inventory (local/store agents)" : "";
       hc.innerHTML='<span class="hfchip" title="AgentsInfo hunting-query filter">AgentsInfo · '+escapeHtml(HUNT_FILTER.short)+' ('+rows.length+' of '+HUNT_FILTER.count+')'+note+' <b>✕</b></span>';
       hc.firstChild.onclick=()=>{ HUNT_FILTER=null; renderTable(MODEL.agents); };
@@ -1618,7 +1673,9 @@ function detailHtml(a){
   h+= rs.length?'<ul>'+rs.map(r=>'<li><span class="sev '+r[0]+'" style="margin-right:6px">'+r[0]+'</span>'+escapeHtml(r[1])+'</li>').join("")+'</ul>':'<div class="hint">No risk signals — well-scoped agent.</div>';
   h+='<div class="lbl">Facts</div><ul>';
   h+='<li>Enabled: '+(a.accountEnabled?"yes":"no")+(a.disabledByMicrosoftStatus?" · disabled by Microsoft":"")+'</li>';
-  h+='<li>Owner / sponsor: '+(a.owners.length?a.owners.map(o=>escapeHtml(o.displayName||o.userPrincipalName||o.id)+(o.accountEnabled===false?" <span style='color:var(--crit)'>(disabled)</span>":"")).join(", ")+(a.ownerDeparted?" <span style='color:var(--crit)'>· owner departed</span>":""):"<span style=\'color:var(--crit)\'>none</span>")+'</li>';
+  const fmtParty=(o)=>escapeHtml(o.displayName||o.userPrincipalName||o.id)+(o.accountEnabled===false?" <span style='color:var(--crit)'>(disabled)</span>":"");
+  h+='<li>Owners (technical): '+(a.owners.length?a.owners.map(fmtParty).join(", "):"<span style='color:var(--muted)'>none</span>")+'</li>';
+  h+='<li>Sponsors (business owner): '+(a.hasSponsor?a.sponsors.map(fmtParty).join(", "):(SPONSORS_READABLE?"<span style='color:var(--crit)'>none</span>":"<span style='color:var(--muted)'>not readable (needs Global/Directory Reader role)</span>"))+(a.ownerDeparted?" <span style='color:var(--crit)'>· all accountable parties departed</span>":"")+'</li>';
   if(a.riskDetections&&a.riskDetections.length){ h+='<li>ID Protection detections: '+a.riskDetections.map(d=>escapeHtml(d.type)+(d.level?" ("+escapeHtml(d.level)+")":"")+(d.when?" · "+escapeHtml(String(d.when).slice(0,10)):"")).join("; ")+'</li>'; }
   h+='<li>Blueprint: '+escapeHtml(a.bp?.name||"—")+(a.bp?(' · '+a.bp.secretCount+' secret(s), '+a.bp.certCount+' cert(s)'+(a.bp.hasOwner?"":" · no owner")):"")+'</li>';
   if(a.dangerous.length) h+='<li>Risky Graph permissions (effective): '+a.dangerous.map(p=>escapeHtml(p.value)+(p.inherited?" <span style='color:var(--muted)'>(inherited)</span>":"")).join(", ")+'</li>';
@@ -1638,8 +1695,8 @@ function exportJson(){
 }
 function exportCsv(){
   if(!MODEL)return;
-  const head=["risk","severity","agent","agentId","blueprint","enabled","msDisabled","hasOwner","ownerDeparted","riskDetections","dangerousPerms","inheritedPerms","directoryRoles","blueprintSecrets","dormant"];
-  const rows=MODEL.agents.map(a=>[a.risk,a.sev,csv(a.displayName),a.id,csv(a.bp?.name||""),a.accountEnabled,!!a.disabledByMicrosoftStatus,a.hasOwner,!!a.ownerDeparted,csv((a.riskDetections||[]).map(d=>d.type).join("; ")),csv(a.dangerous.map(p=>p.value).join("; ")),csv((a.inheritedPerms||[]).map(p=>p.value).join("; ")),csv(a.roles.map(r=>r.name).join("; ")),a.bp?.secretCount||0,a.dormant===null?"n/a":a.dormant].join(","));
+  const head=["risk","severity","agent","agentId","blueprint","enabled","msDisabled","hasOwner","hasSponsor","accountable","ownerDeparted","riskDetections","dangerousPerms","inheritedPerms","directoryRoles","blueprintSecrets","dormant"];
+  const rows=MODEL.agents.map(a=>[a.risk,a.sev,csv(a.displayName),a.id,csv(a.bp?.name||""),a.accountEnabled,!!a.disabledByMicrosoftStatus,a.hasOwner,!!a.hasSponsor,!!a.accountable,!!a.ownerDeparted,csv((a.riskDetections||[]).map(d=>d.type).join("; ")),csv(a.dangerous.map(p=>p.value).join("; ")),csv((a.inheritedPerms||[]).map(p=>p.value).join("; ")),csv(a.roles.map(r=>r.name).join("; ")),a.bp?.secretCount||0,a.dormant===null?"n/a":a.dormant].join(","));
   dl(new Blob([head.join(",")+"\n"+rows.join("\n")],{type:"text/csv"}),"agent-365-overview.csv");
 }
 function csv(s){ s=String(s==null?"":s); return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s; }
@@ -1652,7 +1709,11 @@ $("setupToggle").addEventListener("click",()=>{
   const hidden=$("setupDetails").classList.toggle("hidden");
   $("setupToggle").classList.toggle("open", !hidden);
 });
-document.querySelectorAll('#sidenav .navitem[data-view]').forEach(b=>b.addEventListener("click",()=>showView(b.dataset.view)));
+document.querySelectorAll('#sidenav .navitem[data-view]').forEach(b=>b.addEventListener("click",()=>{
+  // a direct menu click to Agents clears any finding drill-down so the menu always shows the full list
+  if(b.dataset.view==="agents" && FINDING_FILTER){ FINDING_FILTER=null; if(MODEL) renderTable(MODEL.agents); }
+  showView(b.dataset.view);
+}));
 $("loadBtn").addEventListener("click",analyze);
 $("exportCsv").addEventListener("click",exportCsv);
 $("exportJson").addEventListener("click",exportJson);
