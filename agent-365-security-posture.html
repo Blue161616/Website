@@ -1147,8 +1147,10 @@ async function analyze(){
       // Cross-reference ID Protection (riskyAgents): flag agents Entra flagged as risky/compromised.
       const idpHit=(idpState.risky||[]).find(r=> r.id===a.id || (r.displayName && a.displayName && r.displayName.toLowerCase()===a.displayName.toLowerCase()));
       const idpRisk = idpHit ? idpHit.riskState : null;
-      if(idpRisk==="confirmedCompromised"){ risk+=40; reasons.push(["critical","Entra ID Protection flagged this agent as CONFIRMED COMPROMISED."]); }
-      else if(idpRisk==="atRisk"){ risk+=20; reasons.push(["high","Entra ID Protection flagged this agent as AT RISK."]); }
+      // Reason severity mirrors Microsoft's ID Protection risk level (compromised = High, atRisk = Medium); the
+      // +points are our internal weighting and stay as-is.
+      if(idpRisk==="confirmedCompromised"){ risk+=40; reasons.push(["high","Entra ID Protection flagged this agent as CONFIRMED COMPROMISED (risk level High)."]); }
+      else if(idpRisk==="atRisk"){ risk+=20; reasons.push(["medium","Entra ID Protection flagged this agent as AT RISK (risk level Medium)."]); }
       // agentRiskDetections: the specific detections behind the risk (riskEventType) — link by identity id.
       const dets=(idpState.detByAgent&&idpState.detByAgent[String(a.id).toLowerCase()])||[];
       if(dets.length){
@@ -1436,11 +1438,12 @@ function renderIDP(idp, totalAgents){
   const F=[];
   const comp=idp.risky.filter(r=>r.riskState==="confirmedCompromised");
   const at=idp.risky.filter(r=>r.riskState==="atRisk");
-  if(comp.length) F.push({sev:"critical",title:"Confirmed compromised agents",count:comp.length,names:comp.map(r=>r.displayName||r.id),
-    desc:"Entra ID Protection confirmed these agent identities as compromised.",
+  // Severity mirrors Microsoft's ID Protection risk LEVEL shown in the table: confirmedCompromised = High, atRisk = Medium.
+  if(comp.length) F.push({sev:"high",title:"Confirmed compromised agents",count:comp.length,names:comp.map(r=>r.displayName||r.id),
+    desc:"Entra ID Protection confirmed these agent identities as compromised (risk level High).",
     fix:"Disable the agent and rotate its blueprint credentials; hunt its activity in the Defender AgentsInfo table; then confirm-safe / dismiss in ID Protection once remediated."});
-  if(at.length) F.push({sev:"high",title:"Agents flagged at risk",count:at.length,names:at.map(r=>r.displayName||r.id),
-    desc:"ID Protection detected risky sign-in or behavior for these agents.",
+  if(at.length) F.push({sev:"medium",title:"Agents flagged at risk",count:at.length,names:at.map(r=>r.displayName||r.id),
+    desc:"ID Protection detected risky sign-in or behavior for these agents (risk level Medium).",
     fix:"Investigate and remediate in ID Protection for Agents; ensure a Conditional Access for Agents policy blocks high-risk agent sign-ins."});
   renderGroup("findIDP", F, "No agent identities are currently flagged by ID Protection — good.");
   if(idp.risky.length){
@@ -1667,6 +1670,15 @@ function renderTable(agents){
   // store for detail render
   window.__rows=rows;
 }
+function relAgeText(d){
+  if(d<0) return "future date?";
+  if(d<1) return "used today";
+  if(d<7) return "not used in "+d+" day"+(d===1?"":"s");
+  if(d<30){ const w=Math.round(d/7); return "not used in "+w+" week"+(w===1?"":"s"); }
+  if(d<365){ const m=Math.round(d/30); return "not used in "+m+" month"+(m===1?"":"s"); }
+  const y=Math.floor(d/365), rem=Math.round((d%365)/30);
+  return "not used in "+y+" year"+(y===1?"":"s")+(rem?(" "+rem+" month"+(rem===1?"":"s")):"");
+}
 function detailHtml(a){
   const rs=a.reasons.slice().sort((x,y)=>SEV_RANK[y[0]]-SEV_RANK[x[0]]);
   let h='<div class="lbl">Why this score</div>';
@@ -1677,11 +1689,19 @@ function detailHtml(a){
   h+='<li>Owners (technical): '+(a.owners.length?a.owners.map(fmtParty).join(", "):"<span style='color:var(--muted)'>none</span>")+'</li>';
   h+='<li>Sponsors (business owner): '+(a.hasSponsor?a.sponsors.map(fmtParty).join(", "):(SPONSORS_READABLE?"<span style='color:var(--crit)'>none</span>":"<span style='color:var(--muted)'>not readable (needs Global/Directory Reader role)</span>"))+(a.ownerDeparted?" <span style='color:var(--crit)'>· all accountable parties departed</span>":"")+'</li>';
   if(a.riskDetections&&a.riskDetections.length){ h+='<li>ID Protection detections: '+a.riskDetections.map(d=>escapeHtml(d.type)+(d.level?" ("+escapeHtml(d.level)+")":"")+(d.when?" · "+escapeHtml(String(d.when).slice(0,10)):"")).join("; ")+'</li>'; }
-  h+='<li>Blueprint: '+escapeHtml(a.bp?.name||"—")+(a.bp?(' · '+a.bp.secretCount+' secret(s), '+a.bp.certCount+' cert(s)'+(a.bp.hasOwner?"":" · no owner")):"")+'</li>';
+  if(a.bp){
+    const sec = a.bp.secretCount>0 ? "<span style='color:var(--crit);font-weight:700'>"+a.bp.secretCount+" secret(s)</span>" : a.bp.secretCount+" secret(s)";
+    const own = a.bp.hasOwner ? "" : " · <span style='color:var(--crit);font-weight:700'>no owner</span>";
+    h+='<li>Blueprint: '+escapeHtml(a.bp.name)+' · '+sec+', '+a.bp.certCount+' cert(s)'+own+'</li>';
+  } else h+='<li>Blueprint: —</li>';
   if(a.dangerous.length) h+='<li>Risky Graph permissions (effective): '+a.dangerous.map(p=>escapeHtml(p.value)+(p.inherited?" <span style='color:var(--muted)'>(inherited)</span>":"")).join(", ")+'</li>';
   if(a.inheritedPerms&&a.inheritedPerms.length) h+='<li><b>Inherited from blueprint</b> '+escapeHtml(a.bp?.name||"")+': '+a.inheritedPerms.map(p=>escapeHtml(p.value)).join(", ")+(a.inheritedOtherCount?' · +'+a.inheritedOtherCount+' non-Graph':'')+' <span style=\'color:var(--muted)\'>— granted on the blueprint, so every agent under it holds these at runtime</span></li>';
   if(a.otherPermCount) h+='<li>Other API permissions (direct on agent): '+a.otherPermCount+'</li>';
-  h+='<li>Last sign-in: '+(a.last?new Date(a.last).toISOString().slice(0,10):(a.dormant===null?"n/a":"none recorded"))+'</li>';
+  if(a.last){
+    const days=Math.floor((Date.now()-new Date(a.last).getTime())/864e5);
+    const col=days>=DORMANT_DAYS?"var(--amber)":"var(--muted)";
+    h+='<li>Last sign-in: '+new Date(a.last).toISOString().slice(0,10)+" <span style='color:"+col+"'>("+relAgeText(days)+")</span></li>";
+  } else h+='<li>Last sign-in: '+(a.dormant===null?"n/a":"<span style='color:var(--amber)'>never signed in</span>")+'</li>';
   h+='<li>Created: '+(a.createdDateTime?a.createdDateTime.slice(0,10):"—")+'</li>';
   h+='</ul>';
   return h;
