@@ -176,6 +176,8 @@
   th,td{text-align:left; padding:9px 11px; border-bottom:1px solid var(--border); vertical-align:top}
   th{font-family:'Consolas',monospace; font-size:10.5px; letter-spacing:.5px; text-transform:uppercase; color:var(--dim); font-weight:600; cursor:pointer; user-select:none}
   tbody tr:hover{background:#11192640}
+  tbody tr.toolrow{cursor:pointer}
+  tbody tr.toolrow:hover{background:#5b8def18}
   .rbadge{display:inline-block; min-width:34px; text-align:center; font-weight:800; font-variant-numeric:tabular-nums; padding:2px 7px; border-radius:6px; font-size:12px}
   .flagchip{display:inline-block; font-family:'Consolas',monospace; font-size:9.5px; letter-spacing:.3px; padding:2px 6px; border-radius:5px; margin:2px 3px 0 0; border:1px solid var(--border); color:var(--muted); white-space:nowrap}
   .flagchip.bad{color:var(--crit); border-color:#f8717144; background:#f8717110}
@@ -1129,21 +1131,24 @@ async function analyze(){
           const LATEST=`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted"`;
           // array-shaped tool columns → how many agents carry each, and total refs (array_length is safe on dynamic)
           const ARR=["DeclaredTools","McpServers","Connectors","Skills","Capabilities","Plugins"].filter(c=>colSet.has(c));
-          tools.present=ARR; tools.details={}; tools.detailErr={};
-          if(ARR.length){
+          tools.present=ARR; tools.details={};
+          // Build the per-type breakdown from the PER-AGENT tool map (huntState.agentTools) built above — this keeps
+          // the counts consistent with the agents you can actually click through to, and needs no extra KQL.
+          const AT=huntState.agentTools, catFor={DeclaredTools:"tools",McpServers:"mcp",Connectors:"connectors",Capabilities:"capabilities",Skills:"skills"};
+          if(ARR.length && AT && Object.keys(AT).length){
+            const eids=Object.keys(AT); tools.row={Agents:eids.length};
+            ARR.forEach(c=>{
+              const cat=catFor[c]; if(!cat) return;
+              const m={}; let withc=0;
+              eids.forEach(eid=>{ const arr=(AT[eid]&&AT[eid][cat])||[]; if(arr.length) withc++; arr.forEach(nm=>{ (m[nm]=m[nm]||new Set()).add(eid); }); });
+              tools.row["With_"+c]=withc;
+              tools.details[c]=Object.entries(m).map(([name,set])=>({name, agents:set.size})).sort((a,b)=>b.agents-a.agents).slice(0,500);
+            });
+          } else if(ARR.length){
+            // fallback: no per-agent map (tenant has no EntraAgentID column) → aggregate counts only, not clickable
             const exts=ARR.map(c=>`| extend n_${c}=array_length(todynamic(${c}))`).join(" ");
-            const aggs=["Agents=count()"].concat(ARR.map(c=>`With_${c}=countif(n_${c}>0)`)).concat(ARR.map(c=>`Sum_${c}=sum(n_${c})`)).join(", ");
+            const aggs=["Agents=count()"].concat(ARR.map(c=>`With_${c}=countif(n_${c}>0)`)).join(", ");
             try{ const r=await runHunting(`${LATEST} ${exts} | summarize ${aggs}`, huntTk); tools.row=(r.results||[])[0]||{}; }catch(e){ tools.err=(e&&e.message)||"error"; }
-            // Per-column DETAIL: the actual distinct item names + how many agents use each. Defensive:
-            // todynamic() handles columns stored as JSON strings; tostring(_e) ALWAYS yields a value (object→JSON,
-            // scalar→string) so we never drop a non-empty element; name fields are preferred when present.
-            for(const c of ARR){
-              setStatus("Enumerating "+c+"…");
-              try{
-                const r=await runHunting(`${LATEST} | mv-expand _e = todynamic(${c}) | extend _n = iff(gettype(_e)=="dictionary", coalesce(tostring(_e['name']), tostring(_e['displayName']), tostring(_e['title']), tostring(_e['type']), tostring(_e['connectorId']), tostring(_e['id']), tostring(_e)), tostring(_e)) | where isnotempty(_n) | summarize Agents=dcount(AgentId) by Item=_n | top 200 by Agents`, huntTk);
-                tools.details[c]=(r.results||[]).map(x=>({name:x.Item, agents:Number(x.Agents)||0}));
-              }catch(e){ tools.details[c]=null; tools.detailErr[c]=(e&&e.message)||"error"; }
-            }
           }
           // tool authentication types (unauthenticated tools = a real risk) — tostring is safe if the column exists
           if(colSet.has("ToolsAuthenticationType")){
@@ -1723,7 +1728,7 @@ function renderTools(hunt){
           +'<div class="ksub" style="color:var(--dim)">'+(distinct!=null?'distinct':'')+(withc!=null?(' · in '+withc+' agent'+(withc===1?'':'s')):'')+'</div></div>';
     });
     html+='</div>';
-    html+='<div class="hint" style="margin-top:6px;color:var(--dim)">Distinct items per type across '+(r.Agents!=null?r.Agents:'?')+' live agents — <b>click a tile</b> to list them. Every MCP server / connector is an external data-reach &amp; egress path — the real agent attack surface.</div>';
+    html+='<div class="hint" style="margin-top:6px;color:var(--dim)">Distinct items per type across '+(r.Agents!=null?r.Agents:'?')+' Entra-registered agents — <b>click a tile</b> to list them, then a row to see which agents. Every MCP server / connector is an external data-reach &amp; egress path — the real agent attack surface.</div>';
     // surface detail-query errors so a missing drill-down is explained, not silent
     const errCols=(t.detailErr?Object.keys(t.detailErr):[]).filter(c=>t.detailErr[c] && !(det[c]&&det[c].length));
     if(errCols.length){
@@ -1745,8 +1750,9 @@ function renderTools(hunt){
     }
   }
   el.innerHTML=html+'</div>';
-  // Click a tile → list that type's distinct items and how many agents use each.
+  // Click a tile → list that type's distinct items; click a row → filter the Agents view to the agents using it.
   const box=$("toolsDetail");
+  const catFor={DeclaredTools:"tools",McpServers:"mcp",Connectors:"connectors",Capabilities:"capabilities",Skills:"skills"};
   el.querySelectorAll('.kpi[data-tcol]').forEach(tile=>{
     const c=tile.dataset.tcol, d=det[c]; if(!d||!d.length) return;
     tile.addEventListener('click',()=>{
@@ -1754,11 +1760,22 @@ function renderTools(hunt){
       el.querySelectorAll('.kpi[data-tcol]').forEach(x=>x.classList.remove('sel'));
       if(active){ box.innerHTML=""; return; }   // toggle off
       tile.classList.add('sel');
-      box.innerHTML='<div class="hint" style="margin:0 0 6px"><b>'+escapeHtml(labels[c]||c)+'</b> — '+d.length+' distinct, by number of agents using each'+(d.length>=200?' (top 200)':'')+':</div>'
+      box.innerHTML='<div class="hint" style="margin:0 0 6px"><b>'+escapeHtml(labels[c]||c)+'</b> — '+d.length+' distinct'+(d.length>=500?' (top 500)':'')+'. <span style="color:var(--dim)">Click a row to filter the Agents view to the agents using it.</span></div>'
         +'<div style="overflow-x:auto"><table><thead><tr><th>'+escapeHtml(labels[c]||c)+'</th><th>Agents</th></tr></thead><tbody>'
-        +d.map(x=>'<tr><td class="mono">'+escapeHtml(String(x.name).slice(0,160))+'</td><td>'+x.agents+'</td></tr>').join("")+'</tbody></table></div>';
+        +d.map((x,i)=>'<tr class="toolrow" data-idx="'+i+'" title="Show the agents using this"><td class="mono">'+escapeHtml(String(x.name).slice(0,160))+'</td><td>'+x.agents+' →</td></tr>').join("")+'</tbody></table></div>';
+      box.querySelectorAll('.toolrow').forEach(row=>row.addEventListener('click',()=>filterAgentsByTool(catFor[c], d[+row.dataset.idx].name)));
     });
   });
+}
+// Filter the Agents table to the agents whose tool inventory (from AgentsInfo) includes a given item.
+function filterAgentsByTool(cat, name){
+  if(!MODEL || !cat) return;
+  const ids=new Set(MODEL.agents.filter(a=>a.tools && Array.isArray(a.tools[cat]) && a.tools[cat].includes(name)).map(a=>a.id));
+  FINDING_FILTER={ids, title:"uses “"+name+"”"}; HUNT_FILTER=null;
+  ["fltSev","fltFlag","fltBp","fltPlat"].forEach(id=>{ const e=$(id); if(e) e.value=""; });
+  const s=$("fltSearch"); if(s) s.value="";
+  renderTable(MODEL.agents);
+  showView('agents');
 }
 
 let sortKey="risk", sortDir=-1;
