@@ -110,8 +110,8 @@
   .notice{border:1px solid var(--border); border-left:3px solid var(--amber); background:#fbbf240a; border-radius:9px; padding:12px 15px; font-size:12.5px; color:var(--text); margin-bottom:10px}
   .notice.info{border-left-color:var(--blue); background:#1e90ff0a}
   .notice b{color:var(--blue-bright)}
-  .license-bar{border-radius:12px; padding:15px 18px; margin-bottom:16px; display:flex; gap:14px; align-items:flex-start; font-size:13px; line-height:1.5}
-  .license-bar .lbi{font-size:20px; flex:none; line-height:1.2}
+  .license-bar{border-radius:10px; padding:9px 13px; margin-bottom:13px; display:flex; gap:10px; align-items:flex-start; font-size:11.5px; line-height:1.45}
+  .license-bar .lbi{font-size:15px; flex:none; line-height:1.2}
   .license-bar.bad{border:1px solid #f8717166; background:linear-gradient(120deg,#f8717116,transparent)}
   .license-bar.bad b{color:#fca5a5}
   .license-bar.ok{border:1px solid #34d39944; background:#34d39910}
@@ -640,10 +640,8 @@ function renderLicense(res){
     el.className="license-bar ok";
     el.innerHTML='<span class="lbi">✓</span><div><b>Licensed for Agent 365.</b> Detected '+escapeHtml(names)+'. The Agent-specific security capabilities across Entra, Defender and Purview are enabled.</div>';
   }else{
-    const found=res.skus.slice(0,14).map(s=>s.skuPartNumber).join(" · ");
     el.className="license-bar bad";
-    el.innerHTML='<span class="lbi">⚠</span><div><b>No Agent 365 or Microsoft 365 E7 license detected.</b> License enforcement began <b>1 July 2026</b> — without a qualifying license, agents cannot use the Agent-specific security capabilities of <b>Entra</b> (ID Protection / Conditional Access for Agents), <b>Defender</b> (real-time protection, AgentsInfo hunting) or <b>Purview</b> (DSPM / DLP for AI). Acquire and assign <b>Agent 365</b> or <b>Microsoft 365 E7</b> before relying on the overview below.'
-      +'<div class="skus">Tenant SKUs seen: '+escapeHtml(found||"none")+(res.skus.length>14?" · +"+(res.skus.length-14)+" more":"")+' — if your qualifying license uses a different part number, tell me and I\'ll match it.</div></div>';
+    el.innerHTML='<span class="lbi">⚠</span><div><b>No Agent 365 or Microsoft 365 E7 license detected.</b> License enforcement began <b>1 July 2026</b> — without a qualifying license, agents cannot use the Agent-specific security capabilities of <b>Entra</b> (ID Protection / Conditional Access for Agents), <b>Defender</b> (real-time protection, AgentsInfo hunting) or <b>Purview</b> (DSPM / DLP for AI). Acquire and assign <b>Agent 365</b> or <b>Microsoft 365 E7</b> before relying on the overview below.</div>';
   }
 }
 // Microsoft Defender advanced hunting (KQL) via Graph security API.
@@ -911,7 +909,6 @@ async function analyze(){
         caState.coverAgents=enforcedAgent.length;
         caState.reportOnly=allAgentPols.filter(p=>p.state==="enabledForReportingButNotEnforced").length;
         caState.granted=true;
-        if(allAgentPols.length>0) notices.push('<div class="notice info"><b>Conditional Access for Agents:</b> '+allAgentPols.length+' agent-targeting polic'+(allAgentPols.length===1?'y':'ies')+' — '+enforcedAgent.length+' enforced, '+caState.reportOnly+' report-only. Listed in the Microsoft Entra section.</div>');
       }catch(e){ notices.push('<div class="notice">Conditional Access policies could not be read even though <code>Policy.Read.All</code> was requested ('+escapeHtml(e.message||'error')+'). Coverage domain excluded.</div>'); }
     }else{
       notices.push('<div class="notice">Optional scope <code>Policy.Read.All</code> not consented — <b>Conditional Access for Agents</b> coverage can\'t be evaluated (Coverage domain shown as n/a).</div>');
@@ -1027,13 +1024,21 @@ async function analyze(){
     const incTk=await optionalToken(OPT_INCIDENT);
     if(incTk){
       try{
-        const incs=await graphGetAll(`${graphBase()}/security/incidents?$select=id,displayName,severity,status,createdDateTime,incidentWebUrl&$top=50`, incTk);
+        // No date filter — graphGetAll pages past $top=50 (the incidents API cap) through every incident Graph
+        // returns, so the lookback = Defender XDR's incident RETENTION (~180 days). Expand alerts so we match on
+        // the alert title/category too (incident titles are often generic; "agent/copilot" lives in the alert).
+        let incs;
+        try{ incs=await graphGetAll(`${graphBase()}/security/incidents?$select=id,displayName,severity,status,createdDateTime,incidentWebUrl,tags&$expand=alerts($select=title,category,serviceSource)&$top=50`, incTk); }
+        catch{ incs=await graphGetAll(`${graphBase()}/security/incidents?$select=id,displayName,severity,status,createdDateTime,incidentWebUrl,tags&$top=50`, incTk); }
         const rx=/agent|copilot/i;
+        const isAgent=(i)=> rx.test(i.displayName||"") || (i.tags||[]).some(t=>rx.test(t)) || (i.alerts||[]).some(a=>rx.test(a.title||"")||rx.test(a.category||""));
         // ALL agent incidents (any status) — a resolved/older one still proves Defender detected an agent threat.
-        const agentIncs=incs.filter(i=>rx.test(i.displayName||"")).map(i=>({name:i.displayName, severity:i.severity, status:i.status, created:i.createdDateTime, url:i.incidentWebUrl}))
+        const agentIncs=incs.filter(isAgent).map(i=>({name:i.displayName, severity:i.severity, status:i.status, created:i.createdDateTime, url:i.incidentWebUrl}))
                             .sort((a,b)=>String(b.created||"").localeCompare(String(a.created||"")));
         const openCount=agentIncs.filter(i=>i.status!=="resolved" && i.status!=="redirected").length;
-        incidentState={granted:true, ok:true, total:incs.length, agentIncidents:agentIncs, count:agentIncs.length, openCount};
+        // oldest incident returned = how far Defender's retention actually reached this scan
+        const dates=incs.map(i=>i.createdDateTime).filter(Boolean).sort();
+        incidentState={granted:true, ok:true, total:incs.length, oldest:dates[0]||null, agentIncidents:agentIncs, count:agentIncs.length, openCount};
       }catch(e){ incidentState={granted:true, ok:false, error:(e&&e.message)||"error"}; notices.push('<div class="notice">Defender incidents could not be read — <span class="mono">'+escapeHtml((e&&e.message)||'error')+'</span>. Needs <code>SecurityIncident.Read.All</code>.</div>'); }
     }else{
       notices.push('<div class="notice">Optional scope <code>SecurityIncident.Read.All</code> not consented — <b>XDR incidents implicating agents</b> aren\'t checked.</div>');
@@ -1381,7 +1386,11 @@ function renderIncidents(inc){
   const el=$("defIncidents"); if(!el) return;
   if(!inc || !inc.granted){ el.innerHTML=""; return; }
   if(!inc.ok){ el.innerHTML='<div class="engine-clean" style="border-left-color:var(--amber);background:#fbbf240a;margin-top:0">Defender incidents check failed — <span class="mono">'+escapeHtml(inc.error||"error")+'</span>. Grant <b>SecurityIncident.Read.All</b> (delegated, admin consent).</div>'; return; }
-  if(!inc.count){ el.innerHTML=""; return; }
+  if(!inc.count){
+    const win = inc.oldest ? ('back to <b class="mono">'+String(inc.oldest).slice(0,10)+'</b> (oldest of '+inc.total+' incident'+(inc.total===1?'':'s')+' Defender still retains)') : ('the full Defender XDR retention window (~180 days · '+inc.total+' incident'+(inc.total===1?'':'s')+' scanned)');
+    el.innerHTML='<div class="engine-clean" style="border-left-color:var(--green);background:#34d3990a;margin-top:0">No XDR incident references an agent or Copilot — scanned '+win+'. There is no date cap in the query, so an incident older than Defender\'s retention has aged out of the incident queue and can\'t be returned here; check the security.microsoft.com incident history for anything beyond that window.</div>';
+    return;
+  }
   const sevc=(s)=>s==="high"?"var(--crit)":s==="medium"?"var(--high)":"var(--muted)";
   const stChip=(s)=>{ const resolved=(s==="resolved"||s==="redirected"); return '<span class="flagchip'+(resolved?'':' warn')+'">'+escapeHtml(s||"active")+'</span>'; };
   const rows=inc.agentIncidents.slice(0,20).map(i=>
