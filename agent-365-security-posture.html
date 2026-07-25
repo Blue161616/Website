@@ -698,9 +698,9 @@ AgentsInfo
 | where LifecycleStatus != "Deleted"
 | extend ToolsStr = tostring(DeclaredTools), TriggersStr = tostring(Triggers), McpStr = tostring(McpServers), SkillsStr = tostring(Skills), CapsStr = tostring(Capabilities), RawStr = tostring(RawAgentInfo)
 | where ToolsStr matches regex suspicious_patterns or TriggersStr matches regex suspicious_patterns or McpStr matches regex suspicious_patterns or SkillsStr matches regex suspicious_patterns or CapsStr matches regex suspicious_patterns or RawStr matches regex suspicious_patterns or Instructions matches regex suspicious_patterns
-| distinct AgentId, EntraAgentId`},
+| summarize Count = dcount(AgentId)`},
   {short:"MCP configured", name:"Agents with an MCP tool / server configured", kql:
-`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where array_length(McpServers) > 0 | distinct AgentId, EntraAgentId`},
+`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where array_length(McpServers) > 0 | summarize Count = dcount(AgentId)`},
   {short:"Missing tools", name:"Tools configured but not mentioned in instructions", kql:
 `let LatestAgents = materialize (AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted");
 let AgentToolNames = LatestAgents | where array_length(DeclaredTools) > 0 | mv-expand Tool = DeclaredTools | extend ToolName = tostring(Tool.name) | where isnotempty(ToolName) | summarize ToolNames = make_set(ToolName) by AgentId;
@@ -709,9 +709,9 @@ LatestAgents
 | join kind=inner AgentToolNames on AgentId
 | mv-apply ToolName = ToolNames to typeof(string) on (where Instructions !has ToolName | summarize MissingTools = make_list(ToolName))
 | where array_length(MissingTools) > 0
-| distinct AgentId, EntraAgentId`},
+| summarize Count = dcount(AgentId)`},
   {short:"Org-wide shared", name:"Organization-wide shared agents (SharedWith = *)", kql:
-`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where array_length(SharedWith) > 0 | mv-expand Shared = SharedWith to typeof(string) | where tostring(Shared) == "*" | distinct AgentId, EntraAgentId`},
+`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where array_length(SharedWith) > 0 | mv-expand Shared = SharedWith to typeof(string) | where tostring(Shared) == "*" | summarize Count = dcount(AgentId)`},
   {short:"Orphaned owners", name:"Orphaned agents — all owners disabled / removed", kql:
 `let EnabledAccountIds = materialize (IdentityInfo | where IsAccountEnabled == 1 | distinct AccountObjectId = tostring(AccountObjectId));
 AgentsInfo
@@ -721,12 +721,12 @@ AgentsInfo
 | mv-expand Owner = Owners to typeof(string)
 | extend OwnerId = tostring(Owner)
 | where isnotempty(OwnerId)
-| summarize OwnerIds = make_set(OwnerId) by AgentId, EntraAgentId
+| summarize OwnerIds = make_set(OwnerId) by AgentId
 | mv-apply OwnerId = OwnerIds to typeof(string) on (where OwnerId !in (EnabledAccountIds) | summarize DisabledOrMissingOwners = make_list(OwnerId))
 | where array_length(DisabledOrMissingOwners) == array_length(OwnerIds)
-| distinct AgentId, EntraAgentId`},
+| summarize Count = dcount(AgentId)`},
   {short:"No instructions", name:"Published agents without instructions", kql:
-`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where PublishedStatus == "Published" | where isempty(Instructions) or Instructions == "N/A" | distinct AgentId, EntraAgentId`}
+`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where PublishedStatus == "Published" | where isempty(Instructions) or Instructions == "N/A" | summarize Count = dcount(AgentId)`}
 ];
 // Best-effort agent builder-platform detection from name / blueprint / tags (no clean Graph field yet).
 function detectPlatform(a, bp){
@@ -968,9 +968,9 @@ async function analyze(){
           setStatus("Running AI Agents hunting query: "+q.short+"…");
           try{
             const r=await runHunting(q.kql, huntTk);
-            const results=r.results||[];
-            const ids=results.filter(x=>x.EntraAgentId).map(x=>String(x.EntraAgentId).toLowerCase());
-            qres.push({short:q.short, name:q.name, count:results.length, ids});
+            const row=(r.results&&r.results[0])||{};
+            const c=row.Count!=null?row.Count:Object.values(row)[0];
+            qres.push({short:q.short, name:q.name, count:Number(c)||0});
           }catch(e){ qres.push({short:q.short, name:q.name, error:true, errMsg:(e&&e.message)||"error"}); }
         }
         huntState.queries=qres;
@@ -1312,12 +1312,12 @@ function renderHunt(hunt){
   }
   let html=head+'<div class="engine-clean" style="border-left-color:var(--green);background:#34d3990f;margin-bottom:14px"><b>Agent data collection is active.</b> <code>AgentsInfo</code> is reachable'+(hunt.total?(' ('+hunt.total+' agents)'):'')+' — so the Agent 365 data source and Microsoft 365 connector are enabled and feeding Defender.</div>';
   if(hunt.queries && hunt.queries.length){
-    html+='<div class="hint" style="margin:0 0 8px">Microsoft\'s official <b>AI Agents</b> hunting queries (Azure-Sentinel) — agents matching each (0 = clean). <b>Click a tile</b> to filter the agents below.</div>';
+    html+='<div class="hint" style="margin:0 0 8px">Microsoft\'s official <b>AI Agents</b> hunting queries (Azure-Sentinel) — number of agents matching each (0 = clean).</div>';
     html+='<div class="kpis" style="grid-template-columns:repeat('+hunt.queries.length+',minmax(0,1fr))">';
     hunt.queries.forEach((q,i)=>{
       const cls=q.error?'':(q.count>0?(i===0?'crit':'high'):'ok');
       const val=q.error?'—':q.count;
-      const clickable=(!q.error && q.count>0)?' hq-tile':'';
+      const clickable='';
       html+='<div class="kpi '+cls+clickable+'" data-hq="'+i+'" title="'+escapeHtml(q.error?(q.errMsg||'query failed'):q.name)+'"><div class="k">'+(i+1)+' · '+escapeHtml(q.short)+'</div><div class="v">'+val+'</div></div>';
     });
     html+='</div>';
