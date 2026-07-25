@@ -452,6 +452,7 @@
     <div id="findDefender"></div>
     <div id="defIncidents"></div>
     <div id="defHunt"></div>
+    <div id="defTools"></div>
     <div class="verify-block">
       <div class="vt">Agent 365 · Defender controls to confirm in-portal</div>
       <div class="pc" style="max-width:none">
@@ -1064,6 +1065,36 @@ async function analyze(){
           }catch(e){ qres.push({short:q.short, name:q.name, error:true, errMsg:(e&&e.message)||"error"}); }
         }
         huntState.queries=qres;
+
+        // ── Tools & MCP surface — schema-adaptive. Probe the AgentsInfo columns first (this tenant's table has
+        // surprised us before, e.g. no EntraAgentId), then run ONLY the aggregates whose columns actually exist.
+        try{
+          setStatus("Probing AgentsInfo schema for the tool surface…");
+          const sch=await runHunting("AgentsInfo | getschema | project ColumnName, ColumnType", huntTk);
+          const cols=(sch.results||[]).map(r=>({name:r.ColumnName||Object.values(r)[0], type:r.ColumnType||r.DataType||""}));
+          const colSet=new Set(cols.map(c=>c.name));
+          const tools={schema:cols, present:[]};
+          const LATEST=`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted"`;
+          // array-shaped tool columns → how many agents carry each, and total refs (array_length is safe on dynamic)
+          const ARR=["DeclaredTools","McpServers","Connectors","Skills","Capabilities","Plugins"].filter(c=>colSet.has(c));
+          tools.present=ARR;
+          if(ARR.length){
+            const exts=ARR.map(c=>`| extend n_${c}=array_length(${c})`).join(" ");
+            const aggs=["Agents=count()"].concat(ARR.map(c=>`With_${c}=countif(n_${c}>0)`)).concat(ARR.map(c=>`Sum_${c}=sum(n_${c})`)).join(", ");
+            try{ const r=await runHunting(`${LATEST} ${exts} | summarize ${aggs}`, huntTk); tools.row=(r.results||[])[0]||{}; }catch(e){ tools.err=(e&&e.message)||"error"; }
+          }
+          // tool authentication types (unauthenticated tools = a real risk) — tostring is safe if the column exists
+          if(colSet.has("ToolsAuthenticationType")){
+            try{ const r=await runHunting(`${LATEST} | summarize Agents=dcount(AgentId) by Auth=tostring(ToolsAuthenticationType) | order by Agents desc`, huntTk);
+              tools.auth=(r.results||[]).map(x=>({auth:(x.Auth||"").trim()||"(none/blank)", agents:Number(x.Agents)||0})); }catch{}
+          }
+          // top MCP servers by agent count — defensive name extraction (dynamic indexing of a string yields null, no error)
+          if(colSet.has("McpServers")){
+            try{ const r=await runHunting(`${LATEST} | where array_length(McpServers)>0 | mv-expand M=McpServers | extend name=coalesce(tostring(M.name), tostring(M.serverLabel), tostring(M.url), tostring(M)) | where isnotempty(name) | summarize Agents=dcount(AgentId) by name | top 15 by Agents`, huntTk);
+              tools.mcp=(r.results||[]).map(x=>({name:x.name||"(unnamed)", agents:Number(x.Agents)||0})); }catch{}
+          }
+          huntState.tools=tools;
+        }catch(e){ huntState.tools={error:(e&&e.message)||"schema probe failed"}; }
       }catch(e){ huntState={granted:true, ok:false, error:e.message, status:e.status}; }
     }else{
       notices.push('<div class="notice">Optional scope <code>ThreatHunting.Read.All</code> not consented — the <b>Defender AgentsInfo</b> hunting check is skipped.</div>');
@@ -1236,6 +1267,7 @@ async function analyze(){
     renderEngineSections(enriched, bpMap, caState, domains, idpState);
     renderIDP(idpState, n);
     renderHunt(huntState);
+    renderTools(huntState);
     renderIncidents(incidentState);
     renderEntraChecks(caState, idpState, enriched);
     renderDefenderChecks(huntState, incidentState);
@@ -1599,6 +1631,50 @@ function renderHunt(hunt){
     if(MODEL) renderTable(MODEL.agents);
     showView('agents');
   }));
+}
+// Tools & MCP surface — where agents actually reach data / external code. Driven by the AgentsInfo schema
+// probe: shows the discovered columns and only the metrics whose columns exist (Phase 1: aggregate surface;
+// per-tool provenance/publisher risk needs the registry API and comes once we've seen the live nested shape).
+function renderTools(hunt){
+  const el=$("defTools"); if(!el) return;
+  const head='<div class="entra-sub def" style="border-left-color:var(--defender)"><div class="entra-sub-h"><span class="stag">Tools &amp; MCP</span> the agent action surface (AgentsInfo)</div>';
+  if(!hunt || !hunt.granted || !hunt.ok || !hunt.tools){ el.innerHTML=""; return; }
+  const t=hunt.tools;
+  if(t.error){ el.innerHTML=head+'<div class="engine-clean" style="border-left-color:var(--amber);background:#fbbf240a">Tool-surface probe failed — <span class="mono">'+escapeHtml(t.error)+'</span>.</div></div>'; return; }
+  let html=head;
+  // 1) discovered schema (the "probe" result) — collapsible chips
+  if(t.schema && t.schema.length){
+    const toolCols=new Set(["DeclaredTools","McpServers","Connectors","Skills","Capabilities","Plugins","ToolsAuthenticationType","Permissions"]);
+    const chips=t.schema.map(c=>{ const hot=toolCols.has(c.name); return '<span class="flagchip'+(hot?' plat':'')+'" title="'+escapeHtml(c.type||"")+'">'+escapeHtml(c.name)+'</span>'; }).join(" ");
+    html+='<div class="hint" style="margin:2px 0 6px"><b>'+t.schema.length+'</b> columns in <code>AgentsInfo</code> this tenant — tool-relevant ones highlighted:</div><div style="margin-bottom:12px;line-height:1.9">'+chips+'</div>';
+  }
+  // 2) tool-surface metrics for the array columns that exist
+  const r=t.row||{};
+  const labels={DeclaredTools:"tools",McpServers:"MCP servers",Connectors:"connectors",Skills:"skills",Capabilities:"capabilities",Plugins:"plugins"};
+  if(t.present && t.present.length){
+    html+='<div class="kpis" style="grid-template-columns:repeat('+Math.min(6,t.present.length)+',minmax(0,1fr))">';
+    t.present.forEach(c=>{
+      const withc=r["With_"+c], sum=r["Sum_"+c];
+      html+='<div class="kpi" title="'+escapeHtml(c)+'"><div class="k">'+escapeHtml(labels[c]||c)+'</div><div class="v">'+(withc!=null?withc:"—")+'</div>'
+          +(sum!=null?'<div class="ksub" style="color:var(--dim)">'+sum+' total refs</div>':'')+'</div>';
+    });
+    html+='</div>';
+    html+='<div class="hint" style="margin-top:6px;color:var(--dim)">Agents carrying each tool type (of '+(r.Agents!=null?r.Agents:"?")+' live agents). Every MCP server / connector is an external data-reach &amp; egress path — the real agent attack surface.</div>';
+  } else if(t.schema){
+    html+='<div class="engine-clean" style="border-left-color:var(--dim);background:var(--panel-2)">None of the expected tool columns (<code>DeclaredTools</code>, <code>McpServers</code>, <code>Connectors</code>…) are present in this tenant\'s AgentsInfo table — tool detail isn\'t available here. The full registry (publishers, plugins) needs the Copilot registry API (AI Administrator).</div>';
+  }
+  // 3) tool authentication types — unauthenticated tools are a real risk
+  if(t.auth && t.auth.length){
+    const chips=t.auth.map(a=>{ const risky=/none|blank|anon|^$/i.test(a.auth); return '<span class="flagchip'+(risky?' warn':'')+'">'+escapeHtml(a.auth)+' · '+a.agents+'</span>'; }).join(" ");
+    html+='<div class="hint" style="margin:12px 0 4px"><b>Tool authentication types</b> (agents per type — unauthenticated = risk):</div><div style="line-height:1.9">'+chips+'</div>';
+  }
+  // 4) top MCP servers by reach
+  if(t.mcp && t.mcp.length){
+    html+='<div class="hint" style="margin:12px 0 4px"><b>Most-used MCP servers</b> (external code endpoints — verify publisher &amp; egress):</div>';
+    html+='<div style="overflow-x:auto"><table><thead><tr><th>MCP server</th><th>Agents</th></tr></thead><tbody>'
+      +t.mcp.map(m=>'<tr><td class="mono">'+escapeHtml(String(m.name).slice(0,120))+'</td><td>'+m.agents+'</td></tr>').join("")+'</tbody></table></div>';
+  }
+  el.innerHTML=html+'</div>';
 }
 
 let sortKey="risk", sortDir=-1;
