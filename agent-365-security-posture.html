@@ -159,8 +159,11 @@
 
   /* table */
   .toolbar{display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px}
+  .toolbar{flex-wrap:nowrap}
   .toolbar input,.toolbar select{width:auto; flex:0 0 auto; padding:7px 10px; font-size:12px}
-  .toolbar input{flex:1; min-width:180px}
+  .toolbar select{max-width:150px; text-overflow:ellipsis}
+  .toolbar input{flex:1 1 120px; min-width:110px}
+  @media(max-width:820px){ .toolbar{flex-wrap:wrap} }
   .count{margin-left:auto; align-self:center; font-family:'Consolas',monospace; font-size:11px; color:var(--dim)}
   table{width:100%; border-collapse:collapse; font-size:12.5px}
   th,td{text-align:left; padding:9px 11px; border-bottom:1px solid var(--border); vertical-align:top}
@@ -316,7 +319,7 @@
       </div>
       <div class="hint">A <b>SPA</b> app registration with delegated, <b>read-only</b> permissions:
         <code>AgentIdentity.Read.All</code>, <code>Application.Read.All</code>, <code>Directory.Read.All</code>, <code>User.Read</code> (admin consent).
-        <br><b>Optional (each degrades gracefully):</b> <code>Policy.Read.All</code> = Conditional Access for Agents coverage; <code>IdentityRiskyAgent.Read.All</code> = ID Protection for Agents risk (agent identities, blueprint principals &amp; agent users · P2); <code>RoleManagement.Read.All</code> = privileged directory roles; <code>AuditLog.Read.All</code> = agent sign-in dormancy; <code>ThreatHunting.Read.All</code> = Defender <b>AgentsInfo</b> advanced-hunting (KQL).
+        <br><b>Optional (each degrades gracefully):</b> <code>Policy.Read.All</code> = Conditional Access for Agents coverage; <code>IdentityRiskyAgent.Read.All</code> = ID Protection for Agents risk (agent identities, blueprint principals &amp; agent users · P2); <code>RoleManagement.Read.All</code> = privileged directory roles; <code>AuditLog.Read.All</code> = agent sign-in dormancy; <code>ThreatHunting.Read.All</code> = Defender <b>AgentsInfo</b> advanced-hunting (KQL); <code>SecurityIncident.Read.All</code> = Defender XDR incidents implicating agents.
         <br>The signed-in admin needs the <b>Agent ID Administrator</b> (or Global Reader) role to enumerate agent identities.</div>
       <div class="hint" style="margin-top:10px">Register this page's URL as a <b>Single-page application</b> redirect URI: <code id="redirectUri"></code></div>
     </div>
@@ -434,6 +437,7 @@
     </div>
     <div class="engine-note">Runtime threat signals for agents. Defender's detections aren't exposed to a read-only Graph app, so the checks below flag Graph-visible runtime risk (Microsoft-disabled, dormant) alongside the Defender controls to verify in-portal.</div>
     <div id="findDefender"></div>
+    <div id="defIncidents"></div>
     <div id="defHunt"></div>
     <div class="verify-block">
       <div class="vt">Agent 365 · Defender controls to confirm in-portal</div>
@@ -441,10 +445,10 @@
         <ul>
           <li id="chk-a365"><b>Agent 365 data source</b> enabled — unified agent visibility &amp; AI-threat detection</li>
           <li id="chk-m365"><b>Microsoft 365 connector</b> connected with <i>Entra ID management events</i> + <i>Microsoft 365 activities</i> (investigation &amp; advanced hunting)</li>
-          <li><b>Copilot Studio connector</b> connected — runtime monitoring for suspicious behavior / cross-prompt-injection</li>
-          <li><b>Real-time protection</b> policy active · <b>Prompt evidence collection</b> configured</li>
+          <li id="chk-copilot"><b>Copilot Studio connector</b> connected — runtime monitoring for suspicious behavior / cross-prompt-injection</li>
+          <li id="chk-realtime"><b>Real-time protection</b> policy active · <b>Prompt evidence collection</b> configured</li>
           <li id="chk-agentsinfo">Hunt agent activity via the <b>AgentsInfo</b> advanced-hunting table (KQL)</li>
-          <li>No open XDR incident implicates an agent identity</li>
+          <li id="chk-incident">No open XDR incident implicates an agent identity</li>
         </ul>
         <a href="https://security.microsoft.com" target="_blank" rel="noopener">security.microsoft.com ↗</a>
       </div>
@@ -525,6 +529,7 @@ const SCOPES = ["AgentIdentity.Read.All","Application.Read.All","Directory.Read.
 const OPT_POLICY = ["Policy.Read.All"];
 const OPT_IDP    = ["IdentityRiskyAgent.Read.All"];
 const OPT_HUNT   = ["ThreatHunting.Read.All"];
+const OPT_INCIDENT = ["SecurityIncident.Read.All"];
 const OPT_ROLES  = ["RoleManagement.Read.All"];
 const OPT_AUDIT  = ["AuditLog.Read.All"];
 let msalInstance=null, msalConfigKey=null, account=null;
@@ -975,6 +980,21 @@ async function analyze(){
       notices.push('<div class="notice">Optional scope <code>ThreatHunting.Read.All</code> not consented — the <b>Defender AgentsInfo</b> hunting check is skipped.</div>');
     }
 
+    // 8b) optional: Defender XDR incidents implicating agents
+    let incidentState={granted:false};
+    const incTk=await optionalToken(OPT_INCIDENT);
+    if(incTk){
+      try{
+        const incs=await graphGetAll(`${graphBase()}/security/incidents?$select=id,displayName,severity,status,createdDateTime,incidentWebUrl&$top=200`, incTk);
+        const open=incs.filter(i=>i.status!=="resolved" && i.status!=="redirected");
+        const rx=/agent|copilot/i;
+        const agentIncs=open.filter(i=>rx.test(i.displayName||"")).map(i=>({name:i.displayName, severity:i.severity, created:i.createdDateTime, url:i.incidentWebUrl}));
+        incidentState={granted:true, ok:true, total:open.length, agentIncidents:agentIncs, count:agentIncs.length};
+      }catch(e){ incidentState={granted:true, ok:false, error:e.message}; notices.push('<div class="notice">Defender incidents could not be read ('+escapeHtml(e.message||'error')+') — needs <code>SecurityIncident.Read.All</code>.</div>'); }
+    }else{
+      notices.push('<div class="notice">Optional scope <code>SecurityIncident.Read.All</code> not consented — <b>XDR incidents implicating agents</b> aren\'t checked.</div>');
+    }
+
     // ---------- score each agent ----------
     const now=Date.now();
     enriched.forEach(a=>{
@@ -1047,7 +1067,7 @@ async function analyze(){
     let wsum=0,tot=0; scored.forEach(d=>{ wsum+=weights[d.key]; tot+=d.val*weights[d.key]; });
     const overall=clamp(tot/wsum);
 
-    MODEL={agents:enriched, bpMap, domains, overall, caState, idpState, huntState, meta:{count:n, capped, blueprints:bpIds.length}};
+    MODEL={agents:enriched, bpMap, domains, overall, caState, idpState, huntState, incidentState, meta:{count:n, capped, blueprints:bpIds.length}};
 
     // ---------- render ----------
     renderNotices(notices, capped, agents.length);
@@ -1056,8 +1076,9 @@ async function analyze(){
     renderEngineSections(enriched, bpMap, caState, domains);
     renderIDP(idpState, n);
     renderHunt(huntState);
+    renderIncidents(incidentState);
     renderEntraChecks(caState, idpState, enriched);
-    renderDefenderChecks(huntState);
+    renderDefenderChecks(huntState, incidentState);
     renderPurviewChecks(auditReadable);
     renderTable(enriched);
     showView(CURRENT_VIEW);
@@ -1252,11 +1273,30 @@ function renderEntraChecks(caState, idpState, agents){
   const dangerous=agents.filter(a=>a.dangerous && a.dangerous.length).length;
   setCheck("chk-owner", (noOwner>0||dangerous>0) ? "bad" : (agents.length?"good":"neutral"));
 }
-function renderDefenderChecks(hunt){
+function renderDefenderChecks(hunt, inc){
   const live = !!(hunt && hunt.granted && hunt.ok);
   setCheck("chk-a365", live?"good":"neutral");
   setCheck("chk-m365", live?"good":"neutral");
   setCheck("chk-agentsinfo", live?"good":"neutral");
+  const incOk = !!(inc && inc.granted && inc.ok);
+  setCheck("chk-incident", incOk ? (inc.count>0?"bad":"good") : "neutral");
+  // A runtime/block agent incident (e.g. "AI agent tool invocation blocked by Microsoft Defender") proves
+  // real-time protection is ACTIVE and the Copilot Studio connector is feeding runtime telemetry to Defender.
+  const runtimeSignal = incOk && (inc.agentIncidents||[]).some(i=>/block|invocation|runtime|prompt|inject|copilot/i.test(i.name||""));
+  setCheck("chk-copilot", runtimeSignal?"good":"neutral");
+  setCheck("chk-realtime", runtimeSignal?"good":"neutral");
+}
+function renderIncidents(inc){
+  const el=$("defIncidents"); if(!el) return;
+  if(!inc || !inc.granted || !inc.ok || !inc.count){ el.innerHTML=""; return; }
+  const sevc=(s)=>s==="high"?"var(--crit)":s==="medium"?"var(--high)":"var(--muted)";
+  const rows=inc.agentIncidents.slice(0,20).map(i=>
+    '<tr><td><b>'+escapeHtml(i.name||"(incident)")+'</b></td><td style="color:'+sevc(i.severity)+';text-transform:capitalize">'+escapeHtml(i.severity||"")+'</td><td class="mono" style="color:var(--dim)">'+(i.created?String(i.created).slice(0,10):"—")+'</td><td>'+(i.url?'<a href="'+escapeHtml(i.url)+'" target="_blank" rel="noopener" style="color:var(--blue-bright)">open ↗</a>':'')+'</td></tr>'
+  ).join("");
+  el.innerHTML='<div class="finding" style="--sevc:var(--crit);margin-top:0"><div class="fh"><span class="sev critical">critical</span><span class="ft">Open XDR incidents implicate agents</span><span class="fcount">'+inc.count+' of '+inc.total+' open</span></div>'
+    +'<div class="fd">Microsoft Defender has open incidents referencing agents / Copilot — these are live threats, investigate in the XDR portal.</div>'
+    +'<div style="overflow-x:auto;margin-top:10px"><table><thead><tr><th>Incident</th><th>Severity</th><th>Created</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+    +'<div class="fx"><b>Fix:</b> Triage each incident; if an agent is compromised, disable it, rotate its blueprint credentials, and hunt its activity in the AgentsInfo table.</div></div>';
 }
 function renderPurviewChecks(auditReadable){
   // Only the audit half is Graph-confirmable; DSPM for AI / DLP / insider-risk stay portal-verify (neutral).
