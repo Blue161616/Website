@@ -1031,15 +1031,30 @@ async function analyze(){
         let incs;
         try{ incs=await graphGetAll(`${graphBase()}/security/incidents?$select=id,displayName,severity,status,createdDateTime,incidentWebUrl&$expand=alerts($select=title,category,serviceSource)&$top=50`, incTk); }
         catch{ incs=await graphGetAll(`${graphBase()}/security/incidents?$select=id,displayName,severity,status,createdDateTime,incidentWebUrl&$top=50`, incTk); }
-        const rx=/agent|copilot/i;
-        const isAgent=(i)=> rx.test(i.displayName||"") || (i.tags||[]).some(t=>rx.test(t)) || (i.alerts||[]).some(a=>rx.test(a.title||"")||rx.test(a.category||""));
+        // Specific tokens (copilot / AI agent / agent identity / prompt injection) are high-confidence; bare
+        // "agent" is noisy (endpoint agent, user-agent) so we record WHY each incident matched and show it,
+        // rather than silently trusting it. rxStrong = confident; rxWeak = bare "agent" (flag for review).
+        const rxStrong=/copilot|\bAI[ -]?agent|agent identit|agentic|prompt inject/i;
+        const rxWeak=/\bagents?\b/i;
+        const matchInfo=(i)=>{
+          if(rxStrong.test(i.displayName||"")) return {why:"incident title", strong:true};
+          const alS=(i.alerts||[]).find(a=>rxStrong.test(a.title||"")||rxStrong.test(a.category||""));
+          if(alS) return {why:"alert: "+(alS.title||alS.category), strong:true};
+          if(rxWeak.test(i.displayName||"")) return {why:"incident title (“agent” — verify)", strong:false};
+          const alW=(i.alerts||[]).find(a=>rxWeak.test(a.title||"")||rxWeak.test(a.category||""));
+          if(alW) return {why:"alert: "+(alW.title||alW.category)+" (“agent” — verify)", strong:false};
+          return null;
+        };
         // ALL agent incidents (any status) — a resolved/older one still proves Defender detected an agent threat.
-        const agentIncs=incs.filter(isAgent).map(i=>({name:i.displayName, severity:i.severity, status:i.status, created:i.createdDateTime, url:i.incidentWebUrl}))
+        const agentIncs=incs.map(i=>({i,m:matchInfo(i)})).filter(x=>x.m)
+                            .map(({i,m})=>({name:i.displayName, severity:i.severity, status:i.status, created:i.createdDateTime, url:i.incidentWebUrl, why:m.why, strong:m.strong}))
                             .sort((a,b)=>String(b.created||"").localeCompare(String(a.created||"")));
-        const openCount=agentIncs.filter(i=>i.status!=="resolved" && i.status!=="redirected").length;
+        const isOpen=(i)=>i.status!=="resolved" && i.status!=="redirected";
+        const openCount=agentIncs.filter(i=>isOpen(i)&&i.strong).length;   // confident open agent incidents → critical
+        const openWeak=agentIncs.filter(i=>isOpen(i)&&!i.strong).length;   // bare-"agent" open matches → verify, not critical
         // oldest incident returned = how far Defender's retention actually reached this scan
         const dates=incs.map(i=>i.createdDateTime).filter(Boolean).sort();
-        incidentState={granted:true, ok:true, total:incs.length, oldest:dates[0]||null, agentIncidents:agentIncs, count:agentIncs.length, openCount};
+        incidentState={granted:true, ok:true, total:incs.length, oldest:dates[0]||null, agentIncidents:agentIncs, count:agentIncs.length, openCount, openWeak};
       }catch(e){ incidentState={granted:true, ok:false, error:(e&&e.message)||"error"}; notices.push('<div class="notice">Defender incidents could not be read — <span class="mono">'+escapeHtml((e&&e.message)||'error')+'</span>. Needs <code>SecurityIncident.Read.All</code>.</div>'); }
     }else{
       notices.push('<div class="notice">Optional scope <code>SecurityIncident.Read.All</code> not consented — <b>XDR incidents implicating agents</b> aren\'t checked.</div>');
@@ -1397,15 +1412,23 @@ function renderIncidents(inc){
   }
   const sevc=(s)=>s==="high"?"var(--crit)":s==="medium"?"var(--high)":"var(--muted)";
   const stChip=(s)=>{ const resolved=(s==="resolved"||s==="redirected"); return '<span class="flagchip'+(resolved?'':' warn')+'">'+escapeHtml(s||"active")+'</span>'; };
-  const rows=inc.agentIncidents.slice(0,20).map(i=>
-    '<tr><td><b>'+escapeHtml(i.name||"(incident)")+'</b></td><td style="color:'+sevc(i.severity)+';text-transform:capitalize">'+escapeHtml(i.severity||"")+'</td><td>'+stChip(i.status)+'</td><td class="mono" style="color:var(--dim)">'+(i.created?String(i.created).slice(0,10):"—")+'</td><td>'+(i.url?'<a href="'+escapeHtml(i.url)+'" target="_blank" rel="noopener" style="color:var(--blue-bright)">open ↗</a>':'')+'</td></tr>'
-  ).join("");
+  const rows=inc.agentIncidents.slice(0,20).map(i=>{
+    const whyTag = i.why ? '<div class="mono" style="font-size:10px;margin-top:3px;color:'+(i.strong?'var(--dim)':'var(--amber)')+'">matched on '+escapeHtml(i.why)+'</div>' : '';
+    const nameCell='<b>'+escapeHtml(i.name||"(incident)")+'</b>'+(i.strong?'':' <span class="flagchip warn" style="font-size:9px">weak match</span>')+whyTag;
+    return '<tr><td>'+nameCell+'</td><td style="color:'+sevc(i.severity)+';text-transform:capitalize">'+escapeHtml(i.severity||"")+'</td><td>'+stChip(i.status)+'</td><td class="mono" style="color:var(--dim)">'+(i.created?String(i.created).slice(0,10):"—")+'</td><td>'+(i.url?'<a href="'+escapeHtml(i.url)+'" target="_blank" rel="noopener" style="color:var(--blue-bright)">open ↗</a>':'')+'</td></tr>';
+  }).join("");
   const table='<div style="overflow-x:auto;margin-top:10px"><table><thead><tr><th>Incident</th><th>Severity</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+  const weakNote = (inc.openWeak||0)>0 ? '<div class="fd" style="color:var(--amber)"><b>Note:</b> '+inc.openWeak+' match'+(inc.openWeak===1?'':'es')+' only on the bare word “agent” (which also appears in endpoint-agent / user-agent telemetry) — verify these in the portal before treating them as agent-identity incidents.</div>' : '';
   if((inc.openCount||0)>0){
-    el.innerHTML='<div class="finding" style="--sevc:var(--crit);margin-top:0"><div class="fh"><span class="sev critical">critical</span><span class="ft">Open XDR incidents implicate agents</span><span class="fcount">'+inc.openCount+' open · '+inc.count+' total</span></div>'
+    el.innerHTML='<div class="finding" style="--sevc:var(--crit);margin-top:0"><div class="fh"><span class="sev critical">critical</span><span class="ft">Open XDR incidents implicate agents</span><span class="fcount">'+inc.openCount+' confident · '+inc.count+' total</span></div>'
       +'<div class="fd">Microsoft Defender has open incidents referencing agents / Copilot — these are live threats, investigate in the XDR portal.</div>'
-      +table
+      +weakNote+table
       +'<div class="fx"><b>Fix:</b> Triage each incident; if an agent is compromised, disable it, rotate its blueprint credentials, and hunt its activity in the AgentsInfo table.</div></div>';
+  } else if((inc.openWeak||0)>0){
+    el.innerHTML='<div class="finding" style="--sevc:var(--high);margin-top:0"><div class="fh"><span class="sev medium">verify</span><span class="ft">Possible agent XDR incidents (weak match)</span><span class="fcount">'+inc.openWeak+' to verify · '+inc.count+' total</span></div>'
+      +'<div class="fd">Open Defender incident(s) mention “agent”, but only in a generic sense that also covers endpoint / user-agent telemetry — not a confident agent-identity or Copilot signal. Confirm in the XDR portal before acting.</div>'
+      +table
+      +'<div class="fx"><b>Fix:</b> Open each in security.microsoft.com; if it genuinely involves an agent identity, triage as above — otherwise it\'s noise.</div></div>';
   } else {
     el.innerHTML='<div class="finding" style="--sevc:var(--low);margin-top:0"><div class="fh"><span class="sev low">history</span><span class="ft">Agent XDR incidents (resolved)</span><span class="fcount">'+inc.count+' historical · 0 open</span></div>'
       +'<div class="fd">No <b>open</b> agent incident right now, but Defender <b>has</b> detected agent threats before — proof that runtime protection &amp; the connectors are working.</div>'
