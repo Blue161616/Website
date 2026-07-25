@@ -1045,9 +1045,21 @@ async function analyze(){
           if(alW) return {why:"alert: "+(alW.title||alW.category)+" (“agent” — verify)", strong:false};
           return null;
         };
+        // A runtime-block / prompt-injection alert (e.g. "AI agent tool invocation blocked by Microsoft Defender")
+        // proves real-time protection + the Copilot runtime telemetry are live — check the ALERT titles, not just
+        // the (usually generic) incident title.
+        const RUNTIME=/block|invocation|runtime|prompt|inject|copilot/i;
+        const isRuntime=(i)=> RUNTIME.test(i.displayName||"") || (i.alerts||[]).some(a=>RUNTIME.test(a.title||"")||RUNTIME.test(a.category||""));
+        // Per-alert classification so we can list the AGENT-related alerts under each incident.
+        const alertObjs=(i)=>(i.alerts||[]).map(a=>{
+          const t=a.title||a.category||"";
+          const strong=rxStrong.test(a.title||"")||rxStrong.test(a.category||"");
+          const agent=strong||rxWeak.test(a.title||"")||rxWeak.test(a.category||"");
+          return {title:t, category:a.category||"", agent, strong, runtime:RUNTIME.test(a.title||"")||RUNTIME.test(a.category||"")};
+        }).filter(a=>a.title);
         // ALL agent incidents (any status) — a resolved/older one still proves Defender detected an agent threat.
         const agentIncs=incs.map(i=>({i,m:matchInfo(i)})).filter(x=>x.m)
-                            .map(({i,m})=>({name:i.displayName, severity:i.severity, status:i.status, created:i.createdDateTime, url:i.incidentWebUrl, why:m.why, strong:m.strong}))
+                            .map(({i,m})=>({name:i.displayName, severity:i.severity, status:i.status, created:i.createdDateTime, url:i.incidentWebUrl, why:m.why, strong:m.strong, runtime:isRuntime(i), alerts:alertObjs(i)}))
                             .sort((a,b)=>String(b.created||"").localeCompare(String(a.created||"")));
         const isOpen=(i)=>i.status!=="resolved" && i.status!=="redirected";
         const openCount=agentIncs.filter(i=>isOpen(i)&&i.strong).length;   // confident open agent incidents → critical
@@ -1397,7 +1409,7 @@ function renderDefenderChecks(hunt, inc){
   // A runtime/block agent incident (e.g. "AI agent tool invocation blocked by Microsoft Defender") proves
   // real-time protection is ACTIVE and the Copilot Studio connector is feeding runtime telemetry to Defender —
   // this holds even for a RESOLVED / older incident (the block still happened).
-  const runtimeSignal = incOk && (inc.agentIncidents||[]).some(i=>/block|invocation|runtime|prompt|inject|copilot/i.test(i.name||""));
+  const runtimeSignal = incOk && (inc.agentIncidents||[]).some(i=>i.runtime);
   setCheck("chk-copilot", runtimeSignal?"good":"neutral");
   setCheck("chk-realtime", runtimeSignal?"good":"neutral");
 }
@@ -1413,8 +1425,19 @@ function renderIncidents(inc){
   const sevc=(s)=>s==="high"?"var(--crit)":s==="medium"?"var(--high)":"var(--muted)";
   const stChip=(s)=>{ const resolved=(s==="resolved"||s==="redirected"); return '<span class="flagchip'+(resolved?'':' warn')+'">'+escapeHtml(s||"active")+'</span>'; };
   const rows=inc.agentIncidents.slice(0,20).map(i=>{
-    const whyTag = i.why ? '<div class="mono" style="font-size:10px;margin-top:3px;color:'+(i.strong?'var(--dim)':'var(--amber)')+'">matched on '+escapeHtml(i.why)+'</div>' : '';
-    const nameCell='<b>'+escapeHtml(i.name||"(incident)")+'</b>'+(i.strong?'':' <span class="flagchip warn" style="font-size:9px">weak match</span>')+whyTag;
+    const alerts=i.alerts||[];
+    const agentAlerts=alerts.filter(a=>a.agent);
+    const shown=agentAlerts.length?agentAlerts:alerts;   // prefer the agent-related alerts; fall back to all
+    const alertList=shown.length
+      ? '<div style="margin-top:5px;font-size:10.5px">'
+        +(agentAlerts.length?'<div class="mono" style="color:var(--dim);margin-bottom:2px">agent-related alert'+(agentAlerts.length===1?'':'s')+':</div>':'')
+        +shown.map(a=>'<div class="mono" style="color:'+(a.agent?'var(--fg)':'var(--dim)')+'">↳ '+escapeHtml(a.title)
+            +(a.agent&&a.strong?' <span class="flagchip plat" style="font-size:9px">AI agent</span>':'')
+            +(a.runtime?' <span class="flagchip" style="font-size:9px;color:var(--green);border-color:#34d39944">runtime-block · proves real-time protection</span>':'')
+          +'</div>').join("")
+        +'</div>'
+      : (i.why ? '<div class="mono" style="font-size:10px;margin-top:3px;color:'+(i.strong?'var(--dim)':'var(--amber)')+'">matched on '+escapeHtml(i.why)+'</div>' : '');
+    const nameCell='<b>'+escapeHtml(i.name||"(incident)")+'</b>'+(i.strong?'':' <span class="flagchip warn" style="font-size:9px">weak match</span>')+alertList;
     return '<tr><td>'+nameCell+'</td><td style="color:'+sevc(i.severity)+';text-transform:capitalize">'+escapeHtml(i.severity||"")+'</td><td>'+stChip(i.status)+'</td><td class="mono" style="color:var(--dim)">'+(i.created?String(i.created).slice(0,10):"—")+'</td><td>'+(i.url?'<a href="'+escapeHtml(i.url)+'" target="_blank" rel="noopener" style="color:var(--blue-bright)">open ↗</a>':'')+'</td></tr>';
   }).join("");
   const table='<div style="overflow-x:auto;margin-top:10px"><table><thead><tr><th>Incident</th><th>Severity</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>';
