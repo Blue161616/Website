@@ -183,6 +183,7 @@
   .flagchip.plat{color:var(--blue-bright); border-color:#60a5fa55; background:#60a5fa12}
   .kpi.hq-tile{cursor:pointer; transition:.15s}
   .kpi.hq-tile:hover{border-color:var(--defender); box-shadow:0 6px 18px -10px var(--defender); transform:translateY(-2px)}
+  .kpi.hq-tile.sel{border-color:var(--defender); background:#5b8def14; box-shadow:0 6px 18px -10px var(--defender)}
   .hfchip{cursor:pointer; font-family:'Consolas',monospace; font-size:11px; color:var(--defender); border:1px solid #5b8def66; background:#5b8def14; padding:5px 11px; border-radius:7px; white-space:nowrap}
   .hfchip b{color:var(--crit); margin-left:4px}
   .detail{background:#0b111c; font-size:12px}
@@ -1085,21 +1086,25 @@ async function analyze(){
           const LATEST=`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted"`;
           // array-shaped tool columns → how many agents carry each, and total refs (array_length is safe on dynamic)
           const ARR=["DeclaredTools","McpServers","Connectors","Skills","Capabilities","Plugins"].filter(c=>colSet.has(c));
-          tools.present=ARR;
+          tools.present=ARR; tools.details={};
           if(ARR.length){
             const exts=ARR.map(c=>`| extend n_${c}=array_length(${c})`).join(" ");
             const aggs=["Agents=count()"].concat(ARR.map(c=>`With_${c}=countif(n_${c}>0)`)).concat(ARR.map(c=>`Sum_${c}=sum(n_${c})`)).join(", ");
             try{ const r=await runHunting(`${LATEST} ${exts} | summarize ${aggs}`, huntTk); tools.row=(r.results||[])[0]||{}; }catch(e){ tools.err=(e&&e.message)||"error"; }
+            // Per-column DETAIL: the actual distinct item names + how many agents use each (defensive extraction —
+            // elements may be strings or objects; dynamic-indexing a string yields null, so coalesce is safe).
+            for(const c of ARR){
+              setStatus("Enumerating "+c+"…");
+              try{
+                const r=await runHunting(`${LATEST} | where array_length(${c})>0 | mv-expand _e=${c} | extend _n=coalesce(tostring(_e.name), tostring(_e.displayName), tostring(_e.title), tostring(_e.type), tostring(_e.connectorId), tostring(_e.id), tostring(_e)) | where isnotempty(_n) and _n != "" | summarize Agents=dcount(AgentId) by name=_n | top 200 by Agents`, huntTk);
+                tools.details[c]=(r.results||[]).map(x=>({name:x.name, agents:Number(x.Agents)||0}));
+              }catch(e){ tools.details[c]=null; }
+            }
           }
           // tool authentication types (unauthenticated tools = a real risk) — tostring is safe if the column exists
           if(colSet.has("ToolsAuthenticationType")){
             try{ const r=await runHunting(`${LATEST} | summarize Agents=dcount(AgentId) by Auth=tostring(ToolsAuthenticationType) | order by Agents desc`, huntTk);
               tools.auth=(r.results||[]).map(x=>({auth:(x.Auth||"").trim()||"(none/blank)", agents:Number(x.Agents)||0})); }catch{}
-          }
-          // top MCP servers by agent count — defensive name extraction (dynamic indexing of a string yields null, no error)
-          if(colSet.has("McpServers")){
-            try{ const r=await runHunting(`${LATEST} | where array_length(McpServers)>0 | mv-expand M=McpServers | extend name=coalesce(tostring(M.name), tostring(M.serverLabel), tostring(M.url), tostring(M)) | where isnotempty(name) | summarize Agents=dcount(AgentId) by name | top 15 by Agents`, huntTk);
-              tools.mcp=(r.results||[]).map(x=>({name:x.name||"(unnamed)", agents:Number(x.Agents)||0})); }catch{}
           }
           huntState.tools=tools;
         }catch(e){ huntState.tools={error:(e&&e.message)||"schema probe failed"}; }
@@ -1651,39 +1656,51 @@ function renderTools(hunt){
   const t=hunt.tools;
   if(t.error){ el.innerHTML='<div class="engine-clean" style="border-left-color:var(--amber);background:#fbbf240a">Tool-surface probe failed — <span class="mono">'+escapeHtml(t.error)+'</span>.</div>'; return; }
   let html='<div>';
-  // 1) discovered schema (the "probe" result) — collapsible chips
-  if(t.schema && t.schema.length){
-    const toolCols=new Set(["DeclaredTools","McpServers","Connectors","Skills","Capabilities","Plugins","ToolsAuthenticationType","Permissions"]);
-    const chips=t.schema.map(c=>{ const hot=toolCols.has(c.name); return '<span class="flagchip'+(hot?' plat':'')+'" title="'+escapeHtml(c.type||"")+'">'+escapeHtml(c.name)+'</span>'; }).join(" ");
-    html+='<div class="hint" style="margin:2px 0 6px"><b>'+t.schema.length+'</b> columns in <code>AgentsInfo</code> this tenant — tool-relevant ones highlighted:</div><div style="margin-bottom:12px;line-height:1.9">'+chips+'</div>';
-  }
-  // 2) tool-surface metrics for the array columns that exist
-  const r=t.row||{};
-  const labels={DeclaredTools:"tools",McpServers:"MCP servers",Connectors:"connectors",Skills:"skills",Capabilities:"capabilities",Plugins:"plugins"};
-  if(t.present && t.present.length){
-    html+='<div class="kpis" style="grid-template-columns:repeat('+Math.min(6,t.present.length)+',minmax(0,1fr))">';
-    t.present.forEach(c=>{
-      const withc=r["With_"+c], sum=r["Sum_"+c];
-      html+='<div class="kpi" title="'+escapeHtml(c)+'"><div class="k">'+escapeHtml(labels[c]||c)+'</div><div class="v">'+(withc!=null?withc:"—")+'</div>'
-          +(sum!=null?'<div class="ksub" style="color:var(--dim)">'+sum+' total refs</div>':'')+'</div>';
+  const r=t.row||{}, det=t.details||{};
+  const labels={DeclaredTools:"Tools",McpServers:"MCP servers",Connectors:"Connectors",Skills:"Skills",Capabilities:"Capabilities",Plugins:"Plugins"};
+  // Only show tiles for types that actually exist in this tenant (distinct>0 or agents carry them).
+  const present=(t.present||[]).filter(c=> (det[c]&&det[c].length) || r["With_"+c]);
+  if(present.length){
+    html+='<div class="kpis" style="grid-template-columns:repeat('+Math.min(6,present.length)+',minmax(0,1fr))">';
+    present.forEach(c=>{
+      const d=det[c], distinct=d?d.length:null, withc=r["With_"+c];
+      const clickable=(d&&d.length)?' hq-tile':'';
+      html+='<div class="kpi'+clickable+'" data-tcol="'+c+'" title="'+(d&&d.length?'Click to list the '+d.length+' distinct '+(labels[c]||c).toLowerCase():escapeHtml(c))+'">'
+          +'<div class="k">'+escapeHtml(labels[c]||c)+'</div>'
+          +'<div class="v">'+(distinct!=null?distinct:(withc!=null?withc:"—"))+'</div>'
+          +'<div class="ksub" style="color:var(--dim)">'+(distinct!=null?'distinct':'')+(withc!=null?(' · in '+withc+' agent'+(withc===1?'':'s')):'')+'</div></div>';
     });
     html+='</div>';
-    html+='<div class="hint" style="margin-top:6px;color:var(--dim)">Agents carrying each tool type (of '+(r.Agents!=null?r.Agents:"?")+' live agents). Every MCP server / connector is an external data-reach &amp; egress path — the real agent attack surface.</div>';
+    html+='<div class="hint" style="margin-top:6px;color:var(--dim)">Distinct items per type across '+(r.Agents!=null?r.Agents:'?')+' live agents — <b>click a tile</b> to list them. Every MCP server / connector is an external data-reach &amp; egress path — the real agent attack surface.</div>';
+    html+='<div id="toolsDetail" style="margin-top:14px"></div>';
   } else if(t.schema){
     html+='<div class="engine-clean" style="border-left-color:var(--dim);background:var(--panel-2)">None of the expected tool columns (<code>DeclaredTools</code>, <code>McpServers</code>, <code>Connectors</code>…) are present in this tenant\'s AgentsInfo table — tool detail isn\'t available here. The full registry (publishers, plugins) needs the Copilot registry API (AI Administrator).</div>';
   }
-  // 3) tool authentication types — unauthenticated tools are a real risk
+  // tool authentication types — but a single blank value across all agents means the column isn't populated, not risk.
   if(t.auth && t.auth.length){
-    const chips=t.auth.map(a=>{ const risky=/none|blank|anon|^$/i.test(a.auth); return '<span class="flagchip'+(risky?' warn':'')+'">'+escapeHtml(a.auth)+' · '+a.agents+'</span>'; }).join(" ");
-    html+='<div class="hint" style="margin:12px 0 4px"><b>Tool authentication types</b> (agents per type — unauthenticated = risk):</div><div style="line-height:1.9">'+chips+'</div>';
-  }
-  // 4) top MCP servers by reach
-  if(t.mcp && t.mcp.length){
-    html+='<div class="hint" style="margin:12px 0 4px"><b>Most-used MCP servers</b> (external code endpoints — verify publisher &amp; egress):</div>';
-    html+='<div style="overflow-x:auto"><table><thead><tr><th>MCP server</th><th>Agents</th></tr></thead><tbody>'
-      +t.mcp.map(m=>'<tr><td class="mono">'+escapeHtml(String(m.name).slice(0,120))+'</td><td>'+m.agents+'</td></tr>').join("")+'</tbody></table></div>';
+    const onlyBlank=t.auth.length===1 && /none\/blank|^$/i.test(t.auth[0].auth);
+    if(onlyBlank){
+      html+='<div class="hint" style="margin:14px 0 0;color:var(--dim)"><code>ToolsAuthenticationType</code> isn\'t populated for agents in this tenant, so unauthenticated-tool risk can\'t be assessed from AgentsInfo here.</div>';
+    }else{
+      const chips=t.auth.map(a=>{ const risky=/none|blank|anon/i.test(a.auth); return '<span class="flagchip'+(risky?' warn':'')+'">'+escapeHtml(a.auth)+' · '+a.agents+'</span>'; }).join(" ");
+      html+='<div class="hint" style="margin:14px 0 4px"><b>Tool authentication types</b> (agents per type — unauthenticated = risk):</div><div style="line-height:1.9">'+chips+'</div>';
+    }
   }
   el.innerHTML=html+'</div>';
+  // Click a tile → list that type's distinct items and how many agents use each.
+  const box=$("toolsDetail");
+  el.querySelectorAll('.kpi[data-tcol]').forEach(tile=>{
+    const c=tile.dataset.tcol, d=det[c]; if(!d||!d.length) return;
+    tile.addEventListener('click',()=>{
+      const active=tile.classList.contains('sel');
+      el.querySelectorAll('.kpi[data-tcol]').forEach(x=>x.classList.remove('sel'));
+      if(active){ box.innerHTML=""; return; }   // toggle off
+      tile.classList.add('sel');
+      box.innerHTML='<div class="hint" style="margin:0 0 6px"><b>'+escapeHtml(labels[c]||c)+'</b> — '+d.length+' distinct, by number of agents using each'+(d.length>=200?' (top 200)':'')+':</div>'
+        +'<div style="overflow-x:auto"><table><thead><tr><th>'+escapeHtml(labels[c]||c)+'</th><th>Agents</th></tr></thead><tbody>'
+        +d.map(x=>'<tr><td class="mono">'+escapeHtml(String(x.name).slice(0,160))+'</td><td>'+x.agents+'</td></tr>').join("")+'</tbody></table></div>';
+    });
+  });
 }
 
 let sortKey="risk", sortDir=-1;
