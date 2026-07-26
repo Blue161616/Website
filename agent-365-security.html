@@ -1309,13 +1309,14 @@ async function analyze(){
               // one query does double duty: AgentId→EntraAgentID map (for hunt-tile filtering) AND the per-agent
               // tool inventory (DeclaredTools / McpServers / Connectors / Capabilities) for the agent detail drawer.
               const toolCols=["McpServers","DeclaredTools","Connectors","Capabilities","Skills"].filter(c=>colSet.has(c));
-              const proj=["A=tostring(AgentId)","E=tostring("+eidCol+")"].concat(toolCols).join(", ");
+              const projCols=toolCols.slice(); if(colSet.has("Model")) projCols.push("Model");
+              const proj=["A=tostring(AgentId)","E=tostring("+eidCol+")"].concat(projCols).join(", ");
               const mr=await runHunting(`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where isnotempty(tostring(${eidCol})) | project ${proj}`, huntTk);
               const emap={}, agentTools={};
               (mr.results||[]).forEach(x=>{
                 if(x.A&&x.E) emap[String(x.A).toLowerCase()]=String(x.E).toLowerCase();
                 const eid=String(x.E||"").toLowerCase(); if(!eid) return;
-                agentTools[eid]={ mcp:toolNames(x.McpServers), tools:toolNames(x.DeclaredTools), connectors:toolNames(x.Connectors), capabilities:toolNames(x.Capabilities), skills:toolNames(x.Skills) };
+                agentTools[eid]={ mcp:toolNames(x.McpServers), tools:toolNames(x.DeclaredTools), connectors:toolNames(x.Connectors), capabilities:toolNames(x.Capabilities), skills:toolNames(x.Skills), model:(x.Model!=null&&String(x.Model).trim()?String(x.Model).trim():null) };
               });
               (huntState.queries||[]).forEach(q=>{ if(q.ids&&q.ids.length) q.entraIds=[...new Set(q.ids.map(a=>emap[a]).filter(Boolean))]; });
               huntState.agentTools=agentTools;
@@ -1505,7 +1506,7 @@ async function analyze(){
       let sev="low"; if(risk>=70)sev="critical"; else if(risk>=45)sev="high"; else if(risk>=20)sev="medium";
       // per-agent tool inventory from AgentsInfo (via the EntraAgentID bridge) — matched by SP id or appId.
       const tools=(huntState.agentTools && (huntState.agentTools[String(a.id).toLowerCase()] || (a.appId&&huntState.agentTools[String(a.appId).toLowerCase()]))) || null;
-      Object.assign(a,{bp,roles,dangerous,dormant,last,risk,sev,reasons,idpRisk,platform,riskDetections:dets,tools,
+      Object.assign(a,{bp,roles,dangerous,dormant,last,risk,sev,reasons,idpRisk,platform,riskDetections:dets,tools,model:(tools&&tools.model)||null,
         ownPermCount:ownPerms.length, inheritedPerms:inheritedAll, inheritedDangerCount:inheritedDanger.length, inheritedOtherCount});
     });
 
@@ -1681,6 +1682,7 @@ function filterAgentsToIds(ids, title){
   ["fltSev","fltFlag","fltBp","fltPlat"].forEach(id=>{ const e=$(id); if(e) e.value=""; });
   const s=$("fltSearch"); if(s) s.value="";
   renderTable(MODEL.agents);
+  showView('agents');
 }
 // Blueprint blast-radius: the blueprint is the security boundary — it holds the credentials and impersonates its
 // agents, so one blueprint compromise cascades to every agent under it. Animated fan-out from the worst blueprint.
@@ -2166,10 +2168,21 @@ function renderModels(hunt){
   const mapEl=$("modelsResidency"), tblEl=$("modelsTable"); if(!mapEl||!tblEl) return;
   const clean=(bc,bg,html)=>'<div class="engine-clean" style="border-left-color:'+bc+';background:'+bg+'">'+html+'</div>';
   if(!hunt || !hunt.granted){ mapEl.innerHTML=clean('var(--dim)','var(--panel-2)','Grant <b>ThreatHunting.Read.All</b> and rescan to read the AI models your agents run on (from the <code>AgentsInfo Model</code> column).'); tblEl.innerHTML=""; return; }
-  const ms=hunt.models;
-  if(!ms || !ms.ok){ mapEl.innerHTML=clean('var(--amber)','#fbbf240a','AI models couldn\'t be read — <span class="mono">'+escapeHtml((ms&&ms.error)||'error')+'</span>.'); tblEl.innerHTML=""; return; }
-  if(!ms.items.length){ mapEl.innerHTML=clean('var(--green)','#34d3990a','No <code>Model</code> values are recorded on your agents in AgentsInfo.'); tblEl.innerHTML=""; return; }
-  const rows=ms.items.map(m=>{ const info=detectModel(m.model); return Object.assign({}, m, info, {bucket:residencyBucket(info.residency)}); });
+  // Prefer the PER-AGENT model (via the EntraAgentID map) so the counts equal the agents you can click through to
+  // — exactly like the Tools view. Fall back to the aggregate dcount-by-Model when no per-agent map is available.
+  let rows=null, clickable=false;
+  if(MODEL && MODEL.agents.some(a=>a.model)){
+    const byModel={};
+    MODEL.agents.forEach(a=>{ if(!a.model) return; (byModel[a.model]=byModel[a.model]||[]).push(a.id); });
+    rows=Object.keys(byModel).map(raw=>{ const info=detectModel(raw); return Object.assign({raw, agents:byModel[raw].length, ids:byModel[raw]}, info, {bucket:residencyBucket(info.residency)}); }).sort((a,b)=>b.agents-a.agents);
+    clickable=true;
+  } else {
+    const ms=hunt.models;
+    if(!ms || !ms.ok){ mapEl.innerHTML=clean('var(--amber)','#fbbf240a','AI models couldn\'t be read — <span class="mono">'+escapeHtml((ms&&ms.error)||'error')+'</span>.'); tblEl.innerHTML=""; return; }
+    if(!ms.items.length){ mapEl.innerHTML=clean('var(--green)','#34d3990a','No <code>Model</code> values are recorded on your agents in AgentsInfo.'); tblEl.innerHTML=""; return; }
+    rows=ms.items.map(m=>{ const info=detectModel(m.model); return Object.assign({raw:m.model, agents:m.agents}, info, {bucket:residencyBucket(info.residency)}); });
+  }
+  if(!rows.length){ mapEl.innerHTML=clean('var(--green)','#34d3990a','No models are recorded on your Entra agents.'); tblEl.innerHTML=""; return; }
   const b={eu:0,local:0,outside:0,unknown:0}; rows.forEach(r=>{ b[r.bucket]=(b[r.bucket]||0)+1; });
   mapEl.innerHTML='<div class="entra-sub" style="border-left-color:var(--purview)"><div class="entra-sub-h"><span class="stag">Data residency</span> where your models process prompts (GDPR)</div>'
     +'<div id="modelsMap"></div>'
@@ -2184,9 +2197,10 @@ function renderModels(hunt){
     : r.bucket==='unknown'?'<span class="flagchip">unknown</span>'
     : r.gdprOk?'<span class="flagchip" style="color:var(--green);border-color:#34d39944">GDPR OK</span>'
     : '<span class="flagchip bad">outside EU</span>';
-  const trows=rows.map(r=>'<tr><td><b>'+escapeHtml(r.model)+'</b></td><td>'+escapeHtml(r.provider||'—')+'</td><td>'+escapeHtml(r.residency||'—')+'</td><td>'+gcell(r)+'</td><td>'+r.agents+'</td></tr>').join("");
-  tblEl.innerHTML='<div class="hint" style="margin:0 0 6px"><b>'+rows.length+' distinct model'+(rows.length===1?'':'s')+'</b> across your agents. Rows flagged <b class="hot">outside EU</b> send prompt content out of the EU data boundary — a GDPR consideration for the data those agents touch.</div>'
+  const trows=rows.map((r,i)=>'<tr'+(clickable?' class="toolrow" data-idx="'+i+'" title="Show the agents using this model"':'')+'><td><b>'+escapeHtml(r.model)+'</b></td><td>'+escapeHtml(r.provider||'—')+'</td><td>'+escapeHtml(r.residency||'—')+'</td><td>'+gcell(r)+'</td><td>'+r.agents+(clickable?' →':'')+'</td></tr>').join("");
+  tblEl.innerHTML='<div class="hint" style="margin:0 0 6px"><b>'+rows.length+' distinct model'+(rows.length===1?'':'s')+'</b> across your agents'+(clickable?' — <b>click a row</b> to filter the Agents view to the agents using that model':'')+'. Rows flagged <b class="hot">outside EU</b> send prompt content out of the EU data boundary — a GDPR consideration for the data those agents touch.</div>'
     +'<div style="overflow-x:auto"><table><thead><tr><th>Model (AgentsInfo)</th><th>Provider</th><th>Data residency</th><th>GDPR</th><th>Agents</th></tr></thead><tbody>'+trows+'</tbody></table></div>';
+  if(clickable){ tblEl.querySelectorAll('.toolrow').forEach(tr=>tr.addEventListener('click',()=>filterAgentsToIds(rows[+tr.dataset.idx].ids, 'model “'+rows[+tr.dataset.idx].raw+'”'))); }
 }
 function buildResidencyMap(rows){
   const el=document.getElementById('modelsMap'); if(!el) return;
