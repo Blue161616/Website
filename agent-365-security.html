@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Agent 365 Security Overview (Preview) | Blue16</title>
 
+<!-- Leaflet — data-residency world map on the Models page (degrades gracefully if blocked/offline) -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="anonymous">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin="anonymous"></script>
+
 <!-- MSAL pinned with Subresource Integrity (SRI). Hash is for @azure/msal-browser@3.28.1. -->
 <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.28.1/lib/msal-browser.min.js"
         integrity="sha384-B5PXeUfgiegchZiX5iMRssMrHd9NfPhFnITob1HyW1CY76udptWpBsniaDsH/+BY"
@@ -263,6 +267,18 @@
   .blast-caption{margin-top:13px; font-size:11.5px; color:var(--muted); line-height:1.55}
   @keyframes blast-pulse{0%{box-shadow:0 0 0 0 rgba(248,113,113,.32)}70%{box-shadow:0 0 0 12px rgba(248,113,113,0)}100%{box-shadow:0 0 0 0 rgba(248,113,113,0)}}
   @media (prefers-reduced-motion:reduce){ .blast-beam,.blast-bp.pulse{animation:none} }
+  /* Models — data-residency Leaflet map + legend */
+  #modelsMap{height:340px; border-radius:12px; overflow:hidden; border:1px solid var(--border); background:#0d1117}
+  .leaflet-container{background:#0d1117!important; font-family:inherit}
+  .leaflet-dark-tooltip{background:#161b22!important; border:1px solid var(--border)!important; color:var(--text)!important; font-size:11px; box-shadow:0 2px 8px rgba(0,0,0,.5)!important}
+  .leaflet-dark-tooltip:before{display:none}
+  .egress-arc{animation:egress-dash .8s linear infinite}
+  @keyframes egress-dash{to{stroke-dashoffset:-14}}
+  @keyframes map-ping{0%{box-shadow:0 0 0 0 rgba(248,81,73,.6)}70%{box-shadow:0 0 0 14px rgba(248,81,73,0)}100%{box-shadow:0 0 0 0 rgba(248,81,73,0)}}
+  .res-legend{display:flex; gap:16px; flex-wrap:wrap; justify-content:center; margin-top:12px; font-size:12px}
+  .res-legend .rl{display:inline-flex; align-items:center; gap:6px; color:var(--muted)}
+  .res-legend .dot{width:9px; height:9px; border-radius:50%; display:inline-block}
+  @media (prefers-reduced-motion:reduce){ .egress-arc{animation:none} }
 
   /* table */
   .toolbar{display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px}
@@ -464,7 +480,7 @@
       <button type="button" class="navitem" data-view="defender"><svg width="18" height="18" aria-hidden="true"><use href="#ic-defender"/></svg>Microsoft Defender</button>
       <button type="button" class="navitem" data-view="purview"><svg width="18" height="18" aria-hidden="true"><use href="#ic-purview"/></svg>Microsoft Purview</button>
       <button type="button" class="navitem" data-view="agents"><span class="ni-ic">▦</span>Agents</button>
-      <button type="button" class="navitem sub" data-view="local"><span class="ni-ic">▣</span>Local Agents</button>
+      <button type="button" class="navitem sub" data-view="models"><span class="ni-ic">◇</span>Models</button>
       <button type="button" class="navitem sub" data-view="tools"><span class="ni-ic">⛓</span>Tools &amp; MCP</button>
       <a class="navitem navlink" href="microsoft-agent-365-control-plane.html"><span class="ni-ic">↗</span>Explainer</a>
     </nav>
@@ -621,6 +637,13 @@
       <th data-key="perms">Permissions</th>
       <th>Flags</th>
     </tr></thead><tbody></tbody></table></div>
+  </div>
+
+  <div class="card" id="modelsCard" data-view="models" style="display:none">
+    <h2 style="margin-bottom:4px">AI models in use</h2>
+    <div class="hint" style="margin:0 0 14px">The underlying LLMs your agents run on — read live from the Defender <code>AgentsInfo</code> <code>Model</code> column. Each model's <b>data residency</b> decides whether prompt content leaves the EU (a <b>GDPR</b> concern): US-hosted models (OpenAI, <b>Anthropic Claude</b>, GitHub/OpenAI) process prompts outside the EU boundary. Grant <b>ThreatHunting.Read.All</b> to populate this.</div>
+    <div id="modelsResidency"></div>
+    <div id="modelsTable" style="margin-top:14px"></div>
   </div>
 
   <div class="card" id="toolsCard" data-view="tools" style="display:none">
@@ -918,6 +941,49 @@ function detectPlatform(a, bp){
   return null;
 }
 
+// ---------- AI model catalog + data-residency (GDPR) — ported from the shadow-AI tool ----------
+// Maps a model name (from the AgentsInfo Model column) → provider, residency & GDPR status.
+const APP_MODEL_MAP=[
+  {pattern:/gpt-?5|gpt5chat/i,  model:'GPT-5',            provider:'OpenAI',       residency:'USA/EU/AU+', gdprOk:true,  risk:'medium'},
+  {pattern:/gpt-?4\.1|gpt41/i,  model:'GPT-4.1',          provider:'OpenAI',       residency:'USA/EU/AU+', gdprOk:true,  risk:'medium'},
+  {pattern:/chatgpt|openai|gpt-?4o|gpt-?4/i, model:'GPT-4o', provider:'OpenAI',    residency:'USA/EU/AU+', gdprOk:true,  risk:'medium'},
+  {pattern:/sonnet\s*4[\.\-]?6|sonnet46/i, model:'Claude Sonnet 4.6', provider:'Anthropic', residency:'USA', gdprOk:false, risk:'medium'},
+  {pattern:/sonnet\s*4[\.\-]?5|sonnet4-?5|sonnet45/i, model:'Claude Sonnet 4.5', provider:'Anthropic', residency:'USA', gdprOk:false, risk:'medium'},
+  {pattern:/claude|anthropic|sonnet|opus|haiku/i, model:'Claude (Sonnet)', provider:'Anthropic', residency:'USA', gdprOk:false, risk:'medium'},
+  {pattern:/github copilot/i,   model:'GPT-4o',           provider:'GitHub/OpenAI',residency:'USA',        gdprOk:false, risk:'high'},
+  {pattern:/copilot|bing chat/i,model:'GPT-4o',           provider:'Microsoft',    residency:'EU possible',gdprOk:true,  risk:'low'},
+  {pattern:/gemini|google ai|bard|vertex/i, model:'Gemini', provider:'Google',     residency:'Global',     gdprOk:false, risk:'medium'},
+  {pattern:/mistral/i,          model:'Mistral Large',    provider:'Mistral AI',   residency:'EU',         gdprOk:true,  risk:'medium'},
+  {pattern:/deepseek/i,         model:'DeepSeek R1',      provider:'DeepSeek',     residency:'China',      gdprOk:false, risk:'critical'},
+  {pattern:/ollama|lm studio|localai|\bjan\b/i, model:'Local LLM (self-hosted)', provider:'Local runtime', residency:'Local / self-hosted', gdprOk:true, risk:'medium'},
+  {pattern:/phi-?\d|phi\b/i,    model:'Phi',              provider:'Microsoft',    residency:'EU possible',gdprOk:true,  risk:'low'},
+  {pattern:/llama/i,            model:'Llama',            provider:'Meta',         residency:'Global',     gdprOk:false, risk:'medium'},
+  {pattern:/cohere/i,           model:'Command R+',       provider:'Cohere',       residency:'USA/EU',     gdprOk:false, risk:'medium'}
+];
+function detectModel(name){
+  const e=APP_MODEL_MAP.find(x=>x.pattern.test(name||""));
+  return e || {model:(name||'Unknown'), provider:'Unknown', residency:'Unknown', gdprOk:false, risk:'medium'};
+}
+// Tenant anchor = EU (Blue16 is an EU tenant). Where each model's prompts are processed.
+const TENANT_EU=[50,10];
+function modelResidencyGeo(residency){
+  const r=(residency||'').toLowerCase();
+  if(/local|self-?hosted|on-?device/.test(r)) return null;                 // no egress
+  if(/china/.test(r)) return {lat:35,lng:105,label:'China',eu:false};
+  if(/\beu\b|europe/.test(r) && !/usa|global|\bau\b|au\+|china/.test(r)) return {lat:47.5,lng:16.5,label:'EU',eu:true};
+  if(/usa|\bus\b|united states/.test(r)) return {lat:39.5,lng:-98.35,label:'US',eu:false};
+  return {lat:39.5,lng:-98.35,label:'US / Global',eu:false};              // Global / Unknown / Varies
+}
+function residencyBucket(residency){
+  const r=(residency||'').toLowerCase();
+  if(/local|self-?hosted|on-?device/.test(r)) return 'local';
+  if(/unknown/.test(r)) return 'unknown';
+  if(/\beu\b|europe/.test(r) && !/usa|global|\bau\b|au\+|china/.test(r)) return 'eu';
+  return 'outside';
+}
+function mapCurveArc(a,b,steps){ steps=steps||28; const ctrl=[Math.max(a[0],b[0])+Math.abs(b[1]-a[1])*0.16,(a[1]+b[1])/2], pts=[];
+  for(let i=0;i<=steps;i++){ const t=i/steps; pts.push([(1-t)*(1-t)*a[0]+2*(1-t)*t*ctrl[0]+t*t*b[0], (1-t)*(1-t)*a[1]+2*(1-t)*t*ctrl[1]+t*t*b[1]]); } return pts; }
+
 // ---------- Scan ----------
 let MODEL=null;
 let HUNT_FILTER=null; // {short, ids:Set(EntraAgentId lc), count} — set by clicking an AgentsInfo query tile
@@ -928,6 +994,8 @@ function showView(v){
   CURRENT_VIEW=v;
   document.querySelectorAll('#sidenav .navitem[data-view]').forEach(b=>b.classList.toggle('active', b.dataset.view===v));
   document.querySelectorAll('.content > [data-view]').forEach(el=>{ el.style.display = (el.dataset.view===v)? '' : 'none'; });
+  // Leaflet lays out at 0px while its card is hidden — recompute once the Models view is actually shown.
+  if(v==='models' && window.__resMap){ setTimeout(()=>{ try{ window.__resMap.invalidateSize(); }catch{} },60); }
   const lay=document.querySelector('.results-layout');
   if(lay){ const y=lay.getBoundingClientRect().top+window.scrollY-70; window.scrollTo({top:Math.max(0,y), behavior:'smooth'}); }
 }
@@ -1281,6 +1349,14 @@ async function analyze(){
               tools.auth=(r.results||[]).map(x=>({auth:(x.Auth||"").trim()||"(none/blank)", agents:Number(x.Agents)||0})); }catch{}
           }
           huntState.tools=tools;
+          // AI models in use — distinct Model values + agents per model (for the Models view + residency map).
+          if(colSet.has("Model")){
+            try{
+              setStatus("Reading AI models from AgentsInfo…");
+              const r=await runHunting(`${LATEST} | where isnotempty(Model) | summarize Agents=dcount(AgentId) by Model | order by Agents desc | take 100`, huntTk);
+              huntState.models={ok:true, items:(r.results||[]).map(x=>({model:x.Model, agents:Number(x.Agents)||0}))};
+            }catch(e){ huntState.models={ok:false, error:(e&&e.message)||"error"}; }
+          } else { huntState.models={ok:false, error:"no Model column in AgentsInfo"}; }
         }catch(e){ huntState.tools={error:(e&&e.message)||"schema probe failed"}; }
       }catch(e){ huntState={granted:true, ok:false, error:e.message, status:e.status}; }
     }else{
@@ -1486,6 +1562,7 @@ async function analyze(){
     renderIDP(idpState, n);
     renderHunt(huntState);
     renderTools(huntState);
+    renderModels(huntState);
     renderDefenderFlow(incidentState);
     renderIncidents(incidentState);
     renderEntraChecks(caState, idpState, enriched);
@@ -2081,6 +2158,56 @@ function filterAgentsByTool(cat, name){
   const s=$("fltSearch"); if(s) s.value="";
   renderTable(MODEL.agents);
   showView('agents');
+}
+// AI models in use + data-residency (GDPR) map. Reads the AgentsInfo Model column, classifies each via the model
+// catalog, and draws an egress arc from your EU tenant to every US/Global-hosted model.
+function renderModels(hunt){
+  const mapEl=$("modelsResidency"), tblEl=$("modelsTable"); if(!mapEl||!tblEl) return;
+  const clean=(bc,bg,html)=>'<div class="engine-clean" style="border-left-color:'+bc+';background:'+bg+'">'+html+'</div>';
+  if(!hunt || !hunt.granted){ mapEl.innerHTML=clean('var(--dim)','var(--panel-2)','Grant <b>ThreatHunting.Read.All</b> and rescan to read the AI models your agents run on (from the <code>AgentsInfo Model</code> column).'); tblEl.innerHTML=""; return; }
+  const ms=hunt.models;
+  if(!ms || !ms.ok){ mapEl.innerHTML=clean('var(--amber)','#fbbf240a','AI models couldn\'t be read — <span class="mono">'+escapeHtml((ms&&ms.error)||'error')+'</span>.'); tblEl.innerHTML=""; return; }
+  if(!ms.items.length){ mapEl.innerHTML=clean('var(--green)','#34d3990a','No <code>Model</code> values are recorded on your agents in AgentsInfo.'); tblEl.innerHTML=""; return; }
+  const rows=ms.items.map(m=>{ const info=detectModel(m.model); return Object.assign({}, m, info, {bucket:residencyBucket(info.residency)}); });
+  const b={eu:0,local:0,outside:0,unknown:0}; rows.forEach(r=>{ b[r.bucket]=(b[r.bucket]||0)+1; });
+  mapEl.innerHTML='<div class="entra-sub" style="border-left-color:var(--purview)"><div class="entra-sub-h"><span class="stag">Data residency</span> where your models process prompts (GDPR)</div>'
+    +'<div id="modelsMap"></div>'
+    +'<div class="res-legend">'
+      +'<span class="rl"><span class="dot" style="background:#3fb950"></span>EU <b>('+b.eu+')</b></span>'
+      +'<span class="rl"><span class="dot" style="background:#58a6ff"></span>Local <b>('+b.local+')</b></span>'
+      +'<span class="rl"><span class="dot" style="background:#f85149"></span>Outside EU <b>('+b.outside+')</b></span>'
+      +'<span class="rl"><span class="dot" style="background:#8b949e"></span>Unknown <b>('+b.unknown+')</b></span>'
+    +'</div></div>';
+  buildResidencyMap(rows);
+  const gcell=r=> r.bucket==='local'?'<span class="flagchip" style="color:#58a6ff;border-color:#58a6ff55">local</span>'
+    : r.bucket==='unknown'?'<span class="flagchip">unknown</span>'
+    : r.gdprOk?'<span class="flagchip" style="color:var(--green);border-color:#34d39944">GDPR OK</span>'
+    : '<span class="flagchip bad">outside EU</span>';
+  const trows=rows.map(r=>'<tr><td><b>'+escapeHtml(r.model)+'</b></td><td>'+escapeHtml(r.provider||'—')+'</td><td>'+escapeHtml(r.residency||'—')+'</td><td>'+gcell(r)+'</td><td>'+r.agents+'</td></tr>').join("");
+  tblEl.innerHTML='<div class="hint" style="margin:0 0 6px"><b>'+rows.length+' distinct model'+(rows.length===1?'':'s')+'</b> across your agents. Rows flagged <b class="hot">outside EU</b> send prompt content out of the EU data boundary — a GDPR consideration for the data those agents touch.</div>'
+    +'<div style="overflow-x:auto"><table><thead><tr><th>Model (AgentsInfo)</th><th>Provider</th><th>Data residency</th><th>GDPR</th><th>Agents</th></tr></thead><tbody>'+trows+'</tbody></table></div>';
+}
+function buildResidencyMap(rows){
+  const el=document.getElementById('modelsMap'); if(!el) return;
+  if(typeof L==='undefined'){ el.style.display='none'; return; }   // Leaflet blocked / offline → legend + table still show
+  if(window.__resMap){ try{ window.__resMap.remove(); }catch{} window.__resMap=null; }
+  const map=L.map(el,{attributionControl:false, scrollWheelZoom:false}).setView([45,0],2);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{subdomains:'abcd',maxZoom:19}).addTo(map);
+  window.__resMap=map;
+  const bounds=[TENANT_EU];
+  L.circleMarker(TENANT_EU,{radius:7,color:'#0d1117',weight:2,fillColor:'#3fb950',fillOpacity:1}).bindTooltip('<strong>Your tenant · EU</strong><br>EU / EEA data boundary',{direction:'top',className:'leaflet-dark-tooltip',sticky:true}).addTo(map);
+  L.marker(TENANT_EU,{interactive:false,icon:L.divIcon({className:'',iconSize:[0,0],html:'<div style="transform:translate(-50%,-170%);color:#3fb950;font-weight:800;font-size:13px;white-space:nowrap;text-shadow:0 1px 5px #000">Microsoft (EU)</div>'})}).addTo(map);
+  const byGeo={};
+  rows.forEach(r=>{ const g=modelResidencyGeo(r.residency); if(!g) return; const key=g.lat+','+g.lng; (byGeo[key]=byGeo[key]||Object.assign({},g,{provs:new Set()})).provs.add(r.provider||r.model); });
+  Object.values(byGeo).forEach(g=>{
+    const col=g.eu?'#3fb950':'#f85149', pl=[...g.provs], provs=pl.slice(0,3).join(' · ')+(pl.length>3?' +'+(pl.length-3):'');
+    bounds.push([g.lat,g.lng]);
+    L.marker([g.lat,g.lng],{icon:L.divIcon({className:'',iconSize:[14,14],iconAnchor:[7,7],html:'<div style="width:13px;height:13px;border-radius:50%;background:'+col+';border:2px solid #0d1117;box-shadow:0 0 0 4px '+col+'44'+(g.eu?'':';animation:map-ping 1.8s ease-out infinite')+'"></div>'})}).bindTooltip('<strong>'+escapeHtml(provs)+'</strong><br>'+(g.eu?'inside EU data boundary':'outside EU data boundary'),{direction:'top',className:'leaflet-dark-tooltip'}).addTo(map);
+    L.marker([g.lat,g.lng],{interactive:false,icon:L.divIcon({className:'',iconSize:[0,0],html:'<div style="transform:translate(-50%,-170%);color:'+col+';font-weight:800;font-size:12px;white-space:nowrap;text-shadow:0 1px 5px #000">'+escapeHtml(provs)+' ('+escapeHtml(g.label)+')</div>'})}).addTo(map);
+    if(!g.eu){ const pts=mapCurveArc(TENANT_EU,[g.lat,g.lng]); bounds.push.apply(bounds,pts); L.polyline(pts,{color:'#f85149',weight:2,opacity:.9,dashArray:'6 8',className:'egress-arc'}).addTo(map); }
+  });
+  try{ map.fitBounds(L.latLngBounds(bounds),{padding:[30,40],maxZoom:5}); }catch{}
+  setTimeout(()=>{ try{ map.invalidateSize(); }catch{} },120);
 }
 
 let sortKey="risk", sortDir=-1;
