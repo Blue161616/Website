@@ -480,6 +480,7 @@
       <button type="button" class="navitem" data-view="defender"><svg width="18" height="18" aria-hidden="true"><use href="#ic-defender"/></svg>Microsoft Defender</button>
       <button type="button" class="navitem" data-view="purview"><svg width="18" height="18" aria-hidden="true"><use href="#ic-purview"/></svg>Microsoft Purview</button>
       <button type="button" class="navitem" data-view="agents"><span class="ni-ic">▦</span>Agents</button>
+      <button type="button" class="navitem sub" data-view="local"><span class="ni-ic">▣</span>Local Agents</button>
       <button type="button" class="navitem sub" data-view="models"><span class="ni-ic">◇</span>Models</button>
       <button type="button" class="navitem sub" data-view="tools"><span class="ni-ic">⛓</span>Tools &amp; MCP</button>
       <a class="navitem navlink" href="microsoft-agent-365-control-plane.html"><span class="ni-ic">↗</span>Explainer</a>
@@ -637,6 +638,12 @@
       <th data-key="perms">Permissions</th>
       <th>Flags</th>
     </tr></thead><tbody></tbody></table></div>
+  </div>
+
+  <div class="card" id="localAgentsCard" data-view="local" style="display:none">
+    <h2 style="margin-bottom:4px">Local agents</h2>
+    <div class="hint" style="margin:0 0 14px">Local AI agents &amp; clients running on your <b>managed devices</b> (Claude Desktop, ChatGPT, Ollama, Copilot…) — ungoverned AI that isn't an Entra Agent ID but still touches corporate data. Best-effort from Defender <code>DeviceTvmSoftwareInventory</code> (needs <b>ThreatHunting.Read.All</b>); the <a href="https://security.microsoft.com" target="_blank" rel="noopener" style="color:var(--blue-bright)">Defender portal → Assets → AI agents → Local agents ↗</a> has the authoritative, most up-to-date view (Users &amp; Risk scoring).</div>
+    <div id="localAgents"></div>
   </div>
 
   <div class="card" id="modelsCard" data-view="models" style="display:none">
@@ -1357,6 +1364,23 @@ async function analyze(){
               huntState.models={ok:true, items:(r.results||[]).map(x=>({model:x.Model, agents:Number(x.Agents)||0}))};
             }catch(e){ huntState.models={ok:false, error:(e&&e.message)||"error"}; }
           } else { huntState.models={ok:false, error:"no Model column in AgentsInfo"}; }
+          // Local agents — AI client software on managed devices (Defender for Endpoint software inventory).
+          // Best-effort: match known AI clients by name/vendor; the Defender portal (AI agents → Local agents) is authoritative.
+          try{
+            setStatus("Detecting local AI agents on devices…");
+            const LAQ=`let AiName = dynamic(["claude","chatgpt","openai","ollama","copilot","poe","opencode","openclaw","zeroclaw","lm studio","anythingllm","jan","cursor","windsurf","perplexity","gpt4all","msty","librechat","gemini","llama"]);
+let AiVendor = dynamic(["anthropic","openai","ollama","github","quora","openclaw foundation","mistral ai","perplexity","zeroclaw","anomaly"]);
+DeviceTvmSoftwareInventory
+| extend sn=tolower(SoftwareName), sv=tolower(SoftwareVendor)
+| where sn has_any (AiName) or sv has_any (AiVendor)
+| summarize Devices=dcount(DeviceId), Sample=make_set(DeviceName, 10), Version=take_any(SoftwareVersion) by SoftwareName, SoftwareVendor
+| order by Devices desc
+| take 100`;
+            const r=await runHunting(LAQ, huntTk);
+            const parseSet=v=>{ if(typeof v==="string"){ try{ v=JSON.parse(v); }catch{ return []; } } return Array.isArray(v)?v:[]; };
+            const items=(r.results||[]).map(x=>({name:x.SoftwareName||"(unknown)", vendor:x.SoftwareVendor||"—", devices:Number(x.Devices)||0, version:x.Version||"", sample:parseSet(x.Sample)}));
+            huntState.localAgents={ok:true, items};
+          }catch(e){ huntState.localAgents={ok:false, error:(e&&e.message)||"error"}; }
         }catch(e){ huntState.tools={error:(e&&e.message)||"schema probe failed"}; }
       }catch(e){ huntState={granted:true, ok:false, error:e.message, status:e.status}; }
     }else{
@@ -1562,6 +1586,7 @@ async function analyze(){
     renderIDP(idpState, n);
     renderHunt(huntState);
     renderTools(huntState);
+    renderLocalAgents(huntState);
     renderModels(huntState);
     renderDefenderFlow(incidentState);
     renderIncidents(incidentState);
@@ -2208,6 +2233,25 @@ function buildResidencyMap(rows){
   });
   try{ map.fitBounds(L.latLngBounds(bounds),{padding:[30,40],maxZoom:5}); }catch{}
   setTimeout(()=>{ try{ map.invalidateSize(); }catch{} },120);
+}
+// Local AI agents / clients on managed devices — best-effort from Defender DeviceTvmSoftwareInventory.
+function renderLocalAgents(hunt){
+  const el=$("localAgents"); if(!el) return;
+  const portal='<a href="https://security.microsoft.com" target="_blank" rel="noopener" style="color:var(--blue-bright)">Defender → Assets → AI agents → Local agents ↗</a>';
+  const clean=(bc,bg,html)=>'<div class="engine-clean" style="border-left-color:'+bc+';background:'+bg+'">'+html+'</div>';
+  if(!hunt || !hunt.granted){ el.innerHTML=clean('var(--dim)','var(--panel-2)','Grant <b>ThreatHunting.Read.All</b> and rescan to best-effort detect local AI agents from device software inventory. Authoritative: '+portal+'.'); return; }
+  const la=hunt.localAgents;
+  if(!la){ el.innerHTML=clean('var(--dim)','var(--panel-2)','Local-agent detection wasn\'t run this scan. '+portal+'.'); return; }
+  if(!la.ok){ el.innerHTML=clean('var(--amber)','#fbbf240a','Couldn\'t query device software inventory — <span class="mono">'+escapeHtml(la.error||"error")+'</span>. The <code>DeviceTvmSoftwareInventory</code> table may not be available (needs Defender for Endpoint / TVM). '+portal+'.'); return; }
+  if(!la.items.length){ el.innerHTML=clean('var(--green)','#34d3990a','No local AI clients matched in device software inventory. '+portal+' has the authoritative view.'); return; }
+  const vendors=new Set(la.items.map(i=>(i.vendor||"").trim()).filter(Boolean));
+  const rows=la.items.map(i=>'<tr><td><b>'+escapeHtml(i.name)+'</b>'+(i.version?' <span class="mono" style="color:var(--dim);font-size:10px">'+escapeHtml(i.version)+'</span>':'')+'</td><td>'+escapeHtml(i.vendor)+'</td><td>'+i.devices+'</td><td class="mono" style="color:var(--dim);font-size:10.5px">'+i.sample.slice(0,6).map(escapeHtml).join(", ")+(i.devices>i.sample.length?' …':'')+'</td></tr>').join("");
+  el.innerHTML='<div class="kpis" style="grid-template-columns:repeat(2,1fr)">'
+      +'<div class="kpi crit"><div class="k">Local AI agents</div><div class="v">'+la.items.length+'</div><div class="ksub" style="color:var(--dim)">distinct clients on devices</div></div>'
+      +'<div class="kpi"><div class="k">Publishers</div><div class="v">'+vendors.size+'</div></div>'
+    +'</div>'
+    +'<div class="hint" style="margin:10px 0 6px">Ungoverned local AI touching corporate data — a shadow-AI surface distinct from your Entra Agent IDs. Best-effort from installed-software inventory; <b>'+portal+'</b> adds Users &amp; Risk scoring and is authoritative.</div>'
+    +'<div style="overflow-x:auto"><table><thead><tr><th>Local agent</th><th>Publisher</th><th>Devices</th><th>Sample devices</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
 }
 
 let sortKey="risk", sortDir=-1;
