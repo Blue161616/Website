@@ -1013,21 +1013,28 @@ function classifyMcp(name){
   return {kind:'external', publisher:'external / third-party', firstParty:false, domain:null};
 }
 // ── Auth-mode inference (OBO / S2S / agentic-user), per microsoft/agent365-skills.
-//   OBO agents act ON A USER'S BEHALF → inherit the USER's data reach (invisible to app-role scans); WorkIQ tools
-//   run OBO or agentic-user. S2S is autonomous app-only permissions. Prefer the explicit ToolsAuthenticationType
-//   value when AgentsInfo carries it; otherwise infer (clearly flagged as inferred).
+//   Primary rule (user-authoritative): a COPILOT STUDIO agent runs OBO (on-behalf-of the user → inherits the user's
+//   data reach, invisible to app-role scans); an agent on its OWN NON-MICROSOFT blueprint runs agentic-user (its
+//   own identity). The explicit AgentsInfo ToolsAuthenticationType value wins when present; tool/permission signals
+//   are only a last-resort fallback (unresolved / no blueprint).
 function inferAuthMode(a){
-  const t=a.tools||{};
+  const t=a.tools||{}, bp=a.bp;
+  // 0) explicit AgentsInfo value → authoritative
   if(t.authType){ const v=t.authType.toLowerCase();
     if(/obo|on-?behalf|delegat/.test(v)) return {mode:'obo', inferred:false, note:'on-behalf-of a user — inherits the user\'s data reach'};
     if(/s2s|service|application|app-?only|client_?cred/.test(v)) return {mode:'s2s', inferred:false, note:'autonomous, application-only permissions'};
     if(/agentic|agent-?user|managed/.test(v)) return {mode:'agentic', inferred:false, note:'the agent\'s own M365 identity'};
     return {mode:'other', inferred:false, note:t.authType};
   }
-  const hasWorkIQ=(t.mcp||[]).some(m=>classifyMcp(m).kind==='workiq') || (t.connectors||[]).some(c=>/office\s*365|outlook|sharepoint|onedrive|teams/i.test(c));
+  // 1) blueprint type decides
+  const isCopilotStudio = (bp && bp.msManaged) || a.platform==='Copilot Studio' || (bp && /copilot\s*studio/i.test(bp.name||''));
+  if(isCopilotStudio) return {mode:'obo', inferred:true, note:'Copilot Studio agent — acts on-behalf-of the signed-in user; its real reach is the user\'s permissions, not what the app-role scan shows'};
+  if(bp && !bp.msManaged) return {mode:'agentic', inferred:true, note:'runs on its own non-Microsoft blueprint under the agent\'s own identity (agentic-user)'};
+  // 2) last-resort fallback for agents with no resolvable blueprint
+  const delegatedRx=/office\s*365|outlook|sharepoint|onedrive|teams|work\s*iq|workiq/i;
+  const hasDelegated=(t.mcp||[]).some(m=>classifyMcp(m).kind==='workiq') || [].concat(t.connectors||[], t.tools||[], t.capabilities||[]).some(x=>delegatedRx.test(x));
   const hasAppPerms=(a.dangerous&&a.dangerous.length)||(a.inheritedPerms&&a.inheritedPerms.length);
-  if(hasWorkIQ && hasAppPerms) return {mode:'mixed', inferred:true, note:'delegated WorkIQ tools AND app permissions'};
-  if(hasWorkIQ) return {mode:'obo', inferred:true, note:'reaches data via WorkIQ tools on a user\'s behalf — real reach is the user\'s, not what app-roles show'};
+  if(hasDelegated) return {mode:'obo', inferred:true, note:'reaches data via delegated tools on a user\'s behalf'};
   if(hasAppPerms) return {mode:'s2s', inferred:true, note:'holds application permissions (own or inherited)'};
   return {mode:'unknown', inferred:true, note:''};
 }
