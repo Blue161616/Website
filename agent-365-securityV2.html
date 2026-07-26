@@ -310,6 +310,7 @@
   .flagchip.bad{color:var(--crit); border-color:#f8717144; background:#f8717110}
   .flagchip.warn{color:var(--amber); border-color:#fbbf2444; background:#fbbf2410}
   .flagchip.plat{color:var(--blue-bright); border-color:#60a5fa55; background:#60a5fa12}
+  .flagchip.dim{color:var(--dim); border-color:#8b949e33}
   .kpi.hq-tile{cursor:pointer; transition:.15s}
   .kpi.hq-tile:hover{border-color:var(--defender); box-shadow:0 6px 18px -10px var(--defender); transform:translateY(-2px)}
   .kpi.hq-tile.sel{border-color:var(--defender); background:#5b8def14; box-shadow:0 6px 18px -10px var(--defender)}
@@ -1011,6 +1012,35 @@ function classifyMcp(name){
   if(/microsoft|sentinel|azure|graph|\bm365\b|office\s*365|\blearn\b/i.test(n)) return {kind:'microsoft', publisher:'Microsoft', firstParty:true, domain:wi?wi.domain:null};
   if(wi) return {kind:'microsoft', publisher:'Microsoft', firstParty:true, domain:wi.domain};
   return {kind:'external', publisher:'external / third-party', firstParty:false, domain:null};
+}
+// ── Tool action-risk: which tools an attacker can weaponize via PROMPT INJECTION.
+//   The LLM — not the user — decides when a tool fires, so any tool that can push data OUT of the tenant is a
+//   standing EXFILTRATION channel ("Send an email", "Post message", "Share/Upload a file", an outbound web call).
+//   Read tools are the *source* of sensitive data (the material an egress tool would carry out) but don't egress by
+//   themselves; write tools mutate data (integrity impact, and can stage data for later egress). Returns
+//   {level:'exfil'|'web'|'write'|'read'|'none', label, tip}. Name-based (AgentsInfo gives us the tool display name).
+const TOOL_RISK={
+  exfil:{label:'exfil ↗', cls:'bad',  tip:'Egress tool — a prompt injection can weaponise this to send sensitive data OUT of the tenant (email, message, share, upload). The LLM decides when it fires.'},
+  web:  {label:'web ↗',   cls:'warn', tip:'Public-internet reach — pulls untrusted content IN (the injection vector) and can smuggle data OUT via a crafted URL/query (covert exfil channel).'},
+  write:{label:'write',   cls:'warn', tip:'Creates / updates / deletes data — integrity impact, and can stage sensitive data for later exfiltration.'},
+  read: {label:'read',    cls:'dim',  tip:'Reads potentially sensitive data — the material an egress tool would exfiltrate.'},
+  none: {label:'',        cls:'dim',  tip:''}
+};
+function classifyToolRisk(name){
+  const s=' '+String(name||'').toLowerCase()+' ';
+  // Egress / exfiltration channel — sends or pushes data to a destination that can leave the tenant boundary.
+  if(/\b(send|reply|replyall|forward|post|publish|share|upload|invite|tweet|webhook|emailto)\b/.test(s) || /send\s+an?\s+(email|message|mail)/.test(s))
+    return Object.assign({level:'exfil'}, TOOL_RISK.exfil);
+  // Public-web reach — untrusted content in + covert exfil channel out.
+  if(/\b(web|http|https|url|uri|browse|crawl|internet)\b/.test(s) || /public_web|search_public|web_search|fetch_url/.test(s))
+    return Object.assign({level:'web'}, TOOL_RISK.web);
+  // Write / mutate.
+  if(/\b(create|update|patch|delete|remove|write|move|copy|modify|edit|upsert|add|set)\b/.test(s))
+    return Object.assign({level:'write'}, TOOL_RISK.write);
+  // Read — sensitive-data source.
+  if(/\b(get|list|read|search|find|view|fetch|retrieve|query|export|download)\b/.test(s) || /knowledge/.test(s))
+    return Object.assign({level:'read'}, TOOL_RISK.read);
+  return Object.assign({level:'none'}, TOOL_RISK.none);
 }
 // ── Auth-mode inference (OBO / S2S / agentic-user), per microsoft/agent365-skills.
 //   Primary rule (user-authoritative): a COPILOT STUDIO agent runs OBO (on-behalf-of the user → inherits the user's
@@ -2193,13 +2223,16 @@ function renderTools(hunt){
     present.forEach(c=>{
       const d=det[c], distinct=d?d.length:null, withc=r["With_"+c];
       const clickable=(d&&d.length)?' hq-tile':'';
+      // Egress-capable count for the named-action categories (not MCP) — the prompt-injection exfiltration surface.
+      let exfilN=0; if(c!=='McpServers' && d&&d.length){ d.forEach(x=>{ if(classifyToolRisk(x.name).level==='exfil')exfilN++; }); }
       html+='<div class="kpi'+clickable+'" data-tcol="'+c+'" title="'+(d&&d.length?'Click to list the '+d.length+' distinct '+(labels[c]||c).toLowerCase():escapeHtml(c))+'">'
           +'<div class="k">'+escapeHtml(labels[c]||c)+'</div>'
           +'<div class="v">'+(distinct!=null?distinct:(withc!=null?withc:"—"))+'</div>'
-          +'<div class="ksub" style="color:var(--dim)">'+(distinct!=null?'distinct':'')+(withc!=null?(' · in '+withc+' agent'+(withc===1?'':'s')):'')+'</div></div>';
+          +'<div class="ksub" style="color:var(--dim)">'+(distinct!=null?'distinct':'')+(withc!=null?(' · in '+withc+' agent'+(withc===1?'':'s')):'')
+          +(exfilN?' · <span style="color:var(--crit)">⚠ '+exfilN+' can exfiltrate</span>':'')+'</div></div>';
     });
     html+='</div>';
-    html+='<div class="hint" style="margin-top:6px;color:var(--dim)">Distinct items per type across '+(r.Agents!=null?r.Agents:'?')+' Entra-registered agents — <b>click a tile</b> to list them, then a row to see which agents. Every MCP server / connector is an external data-reach &amp; egress path — the real agent attack surface.</div>';
+    html+='<div class="hint" style="margin-top:6px;color:var(--dim)">Distinct items per type across '+(r.Agents!=null?r.Agents:'?')+' Entra-registered agents — <b>click a tile</b> to list them, then a row to see which agents. Every MCP server / connector is an external data-reach &amp; egress path — the real agent attack surface. Tools are marked by <b style="color:var(--crit)">prompt-injection risk</b>: <span class="flagchip bad">exfil ↗</span> tools (Send an email, Post message, Share/Upload) can send sensitive data out of the tenant if the agent is injected.</div>';
     html+='<div id="toolsDetail" style="margin-top:14px"></div>';
   } else if(t.schema){
     html+='<div class="engine-clean" style="border-left-color:var(--dim);background:var(--panel-2)">None of the expected tool columns (<code>DeclaredTools</code>, <code>McpServers</code>, <code>Connectors</code>…) are present in this tenant\'s AgentsInfo table — tool detail isn\'t available here. The full registry (publishers, plugins) needs the Copilot registry API (AI Administrator).</div>';
@@ -2234,9 +2267,18 @@ function renderTools(hunt){
         mcpSummary='<div class="hint" style="margin:0 0 6px;color:var(--dim)"><b>'+(wi)+'</b> Microsoft WorkIQ · <b>'+ms+'</b> Microsoft-other · <b class="'+(ext?'hot':'')+'">'+ext+'</b> external / third-party — external MCP servers are non-Microsoft code &amp; egress paths (verify publisher).</div>';
       }
       const pubCell=x=>{ const cl=classifyMcp(x.name); const chip=cl.kind==='external'?'<span class="flagchip bad">external</span>':(cl.kind==='workiq'?'<span class="flagchip plat">WorkIQ</span>':'<span class="flagchip">Microsoft</span>'); return '<td>'+chip+(cl.domain?' <span style="color:var(--dim);font-size:10.5px">'+escapeHtml(cl.domain)+'</span>':'')+'</td>'; };
-      box.innerHTML='<div class="hint" style="margin:0 0 6px"><b>'+escapeHtml(labels[c]||c)+'</b> — '+d.length+' distinct'+(d.length>=500?' (top 500)':'')+'. <span style="color:var(--dim)">Click a row to filter the Agents view to the agents using it.</span></div>'+mcpSummary
-        +'<div style="overflow-x:auto"><table><thead><tr><th>'+escapeHtml(labels[c]||c)+'</th>'+(pubCol?'<th>Publisher · domain</th>':'')+'<th>Agents</th></tr></thead><tbody>'
-        +d.map((x,i)=>'<tr class="toolrow" data-idx="'+i+'" title="Show the agents using this"><td class="mono">'+escapeHtml(String(x.name).slice(0,160))+'</td>'+(pubCol?pubCell(x):'')+'<td>'+x.agents+' →</td></tr>').join("")+'</tbody></table></div>';
+      // Action-risk (prompt-injection weaponisability) — shown for the named-action categories, not MCP (which has a publisher column).
+      const riskCol=!isMcp;
+      const riskCell=x=>{ const rk=classifyToolRisk(x.name); return '<td>'+(rk.label?'<span class="flagchip '+rk.cls+'" title="'+escapeHtml(rk.tip)+'">'+escapeHtml(rk.label)+'</span>':'')+'</td>'; };
+      let riskSummary="";
+      if(riskCol){
+        let ex=0,wb=0,wr=0; d.forEach(x=>{ const l=classifyToolRisk(x.name).level; if(l==='exfil')ex++; else if(l==='web')wb++; else if(l==='write')wr++; });
+        if(ex||wb||wr) riskSummary='<div class="hint" style="margin:0 0 6px;color:var(--dim)"><b class="'+(ex?'hot':'')+'">'+ex+'</b> egress ↗ · <b>'+wb+'</b> web ↗ · <b>'+wr+'</b> write — '
+          +(ex?'<b style="color:var(--crit)">'+ex+' tool'+(ex===1?'':'s')+' can exfiltrate data</b>: a prompt injection can weaponise '+(ex===1?'it':'them')+' to send sensitive data out of the tenant (the LLM, not the user, decides when a tool fires).':'no direct-egress tool, but web-reach and write tools can still leak or stage data.')+'</div>';
+      }
+      box.innerHTML='<div class="hint" style="margin:0 0 6px"><b>'+escapeHtml(labels[c]||c)+'</b> — '+d.length+' distinct'+(d.length>=500?' (top 500)':'')+'. <span style="color:var(--dim)">Click a row to filter the Agents view to the agents using it.</span></div>'+mcpSummary+riskSummary
+        +'<div style="overflow-x:auto"><table><thead><tr><th>'+escapeHtml(labels[c]||c)+'</th>'+(pubCol?'<th>Publisher · domain</th>':'')+(riskCol?'<th>Injection risk</th>':'')+'<th>Agents</th></tr></thead><tbody>'
+        +d.map((x,i)=>'<tr class="toolrow" data-idx="'+i+'" title="Show the agents using this"><td class="mono">'+escapeHtml(String(x.name).slice(0,160))+'</td>'+(pubCol?pubCell(x):'')+(riskCol?riskCell(x):'')+'<td>'+x.agents+' →</td></tr>').join("")+'</tbody></table></div>';
       box.querySelectorAll('.toolrow').forEach(row=>row.addEventListener('click',()=>filterAgentsByTool(catFor[c], d[+row.dataset.idx].name)));
     });
   });
@@ -2530,7 +2572,9 @@ function buildSnapshot(){
     entra:{ idpGranted:!!idp.granted, caGranted:!!ca.granted, caEnforcing:ca.coverAgents||0, caReportOnly:ca.reportOnly||0 },
     defender:{ agentsInfoOk:!!(hunt.granted&&hunt.ok), openIncidents:inc.ok?(inc.openCount||0):null },
     purview:{ labelsOk:!!labels.ok, labelCount:(labels.labels||[]).length, highSensCleartextReachable:clearLabels, auditReadable:!!MODEL.auditReadable },
-    tools:{ distinctTools:(td.DeclaredTools||[]).length, distinctMcp:(td.McpServers||[]).length, distinctConnectors:(td.Connectors||[]).length, distinctCapabilities:(td.Capabilities||[]).length },
+    tools:(()=>{ const act=[].concat(td.DeclaredTools||[],td.Connectors||[],td.Capabilities||[],td.Skills||[]);
+      let exfilTools=0, webTools=0; act.forEach(x=>{ const l=classifyToolRisk(x.name).level; if(l==='exfil')exfilTools++; else if(l==='web')webTools++; });
+      return { distinctTools:(td.DeclaredTools||[]).length, distinctMcp:(td.McpServers||[]).length, distinctConnectors:(td.Connectors||[]).length, distinctCapabilities:(td.Capabilities||[]).length, exfilTools, webTools }; })(),
     models:{ distinct:seenModel.size, residency:mb, outsideEu:[...outsideModels] },
     findings:flat
   };
@@ -2633,6 +2677,7 @@ const CMP_METRICS=[
   {k:'defender.openIncidents', label:'Open XDR incidents', goodUp:false},
   {k:'purview.highSensCleartextReachable', label:'High-sensitivity labels in cleartext', goodUp:false},
   {k:'tools.distinctMcp', label:'Distinct MCP servers', neutral:true},
+  {k:'tools.exfilTools', label:'Egress / exfil-capable tools', goodUp:false},
   {k:'models.residency.outside', label:'Models outside EU', goodUp:false}
 ];
 function gv(o,path){ return path.split('.').reduce((x,p)=>(x==null?null:x[p]), o); }
