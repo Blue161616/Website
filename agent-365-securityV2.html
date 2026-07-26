@@ -279,6 +279,17 @@
   .res-legend .rl{display:inline-flex; align-items:center; gap:6px; color:var(--muted)}
   .res-legend .dot{width:9px; height:9px; border-radius:50%; display:inline-block}
   @media (prefers-reduced-motion:reduce){ .egress-arc{animation:none} }
+  /* Compare-over-time */
+  .cmp-inputs{display:flex; gap:14px; flex-wrap:wrap; align-items:end}
+  .cmp-file{display:flex; flex-direction:column; gap:5px; font-size:12px; color:var(--muted); flex:1 1 260px}
+  .cmp-file input[type=file]{font-family:inherit; font-size:12px; color:var(--text); background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:8px 10px}
+  .cmp-when{display:flex; align-items:center; gap:14px; flex-wrap:wrap; font-size:12.5px; color:var(--muted); margin-bottom:14px}
+  .cmp-when b{color:var(--text)}
+  .cmp-arrow{color:var(--accent); font-weight:700}
+  .cmp-delta{font-family:'Consolas',monospace; font-weight:700; font-size:12px}
+  .cmp-delta.worse{color:var(--crit)} .cmp-delta.better{color:var(--green)} .cmp-delta.same{color:var(--dim)}
+  .cmp-sec{font-family:'Consolas',monospace; font-size:10px; letter-spacing:1px; text-transform:uppercase; color:var(--dim); margin:16px 0 6px}
+  .cmp-new{border-left:3px solid var(--crit)} .cmp-gone{border-left:3px solid var(--green)}
 
   /* table */
   .toolbar{display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px}
@@ -484,6 +495,7 @@
       <button type="button" class="navitem" data-view="agents"><span class="ni-ic">▦</span>Agents</button>
       <button type="button" class="navitem sub" data-view="models"><span class="ni-ic">◇</span>Models</button>
       <button type="button" class="navitem sub" data-view="tools"><span class="ni-ic">⛓</span>Tools &amp; MCP</button>
+      <button type="button" class="navitem" data-view="compare"><span class="ni-ic">⇄</span>Compare</button>
       <a class="navitem navlink" href="microsoft-agent-365-control-plane.html"><span class="ni-ic">↗</span>Explainer</a>
     </nav>
     <div class="content">
@@ -665,6 +677,17 @@
       <div class="mcpflow-note">The security-relevant part: the <b>LLM, not the user, decides when the MCP server is invoked</b> — so a prompt injection can trigger any tool the server exposes, and the server's OAuth grants define the <b>blast radius</b>. That's why publisher origin, consent type and unused permissions matter — and why the MCP servers each agent carries are listed below.</div>
     </div>
     <div id="defTools"></div>
+  </div>
+
+  <div class="card" id="compareCard" data-view="compare" style="display:none">
+    <h2 style="margin-bottom:4px">Compare over time</h2>
+    <div class="hint" style="margin:0 0 14px">Track how your Agent 365 posture <b>changed</b> between two point-in-time snapshots. Load an earlier <b>baseline</b> — either a <code>Management summary</code> HTML or a <code>Snapshot (JSON)</code> exported from this tool — and compare it against your current scan (or a second file). Snapshots are schema-versioned, so older exports stay comparable.</div>
+    <div class="cmp-inputs">
+      <label class="cmp-file"><span>Baseline snapshot <span style="color:var(--dim)">(.html / .json)</span></span><input type="file" id="cmpBase" accept=".html,.json,application/json,text/html"></label>
+      <label class="cmp-file"><span>Compare against <span style="color:var(--dim)">(leave empty = this scan)</span></span><input type="file" id="cmpCur" accept=".html,.json,application/json,text/html"></label>
+      <button id="cmpRun" style="align-self:end;padding:9px 18px">Compare ⇄</button>
+    </div>
+    <div id="compareResults" style="margin-top:16px"></div>
   </div>
 
     </div><!-- /content -->
@@ -2510,6 +2533,85 @@ function exportSummaryHtml(){
   dl(new Blob([html],{type:"text/html"}), "agent-365-management-summary-"+s.generatedAt.slice(0,10)+".html");
 }
 
+// ── Compare over time ───────────────────────────────────────────────────────
+// Pull a snapshot from an uploaded file: raw JSON parses directly; a management-summary HTML carries the snapshot
+// embedded in <script id="a365-snapshot">. This is the read side of exportSummaryHtml/exportSnapshotJson.
+function extractSnapshot(text){
+  text=String(text||"");
+  const m=text.match(/<script id="a365-snapshot"[^>]*>([\s\S]*?)<\/script>/);
+  const raw = m ? m[1].replace(/\\u003c/g,'<') : text;
+  try{ const s=JSON.parse(raw); if(s && s.schemaVersion && s.agents) return s; }catch(e){}
+  return null;
+}
+// Tracked metrics + whether "up" is good/bad, so the delta can be coloured by whether posture improved or worsened.
+const CMP_METRICS=[
+  {k:'coverage.pct', label:'Entra Agent ID coverage', suffix:'%', goodUp:true},
+  {k:'agents.total', label:'Agent identities', neutral:true},
+  {k:'agents.byRisk.critical', label:'Critical-risk agents', goodUp:false},
+  {k:'agents.byRisk.high', label:'High-risk agents', goodUp:false},
+  {k:'agents.compromised', label:'Compromised agents', goodUp:false},
+  {k:'agents.atRisk', label:'At-risk agents', goodUp:false},
+  {k:'agents.noOwnerSponsor', label:'No owner / sponsor', goodUp:false},
+  {k:'agents.ownerDeparted', label:'Owner / sponsor departed', goodUp:false},
+  {k:'agents.dormant', label:'Dormant agents', goodUp:false},
+  {k:'agents.msDisabled', label:'Disabled by Microsoft', goodUp:false},
+  {k:'blueprints.withSecrets', label:'Blueprints with client secrets', goodUp:false},
+  {k:'entra.caEnforcing', label:'CA policies enforcing', goodUp:true},
+  {k:'defender.openIncidents', label:'Open XDR incidents', goodUp:false},
+  {k:'purview.highSensCleartextReachable', label:'High-sensitivity labels in cleartext', goodUp:false},
+  {k:'tools.distinctMcp', label:'Distinct MCP servers', neutral:true},
+  {k:'models.residency.outside', label:'Models outside EU', goodUp:false}
+];
+function gv(o,path){ return path.split('.').reduce((x,p)=>(x==null?null:x[p]), o); }
+function renderCompare(base, cur){
+  const el=$("compareResults"); if(!el) return;
+  const e=escapeHtml, bd=new Date(base.generatedAt), cd=new Date(cur.generatedAt);
+  const days=Math.round((cd-bd)/864e5);
+  const schemaWarn = base.schemaVersion!==cur.schemaVersion ? '<div class="notice">Snapshots use different schema versions (v'+base.schemaVersion+' → v'+cur.schemaVersion+') — some rows may not line up.</div>' : '';
+  const rows=CMP_METRICS.map(m=>{
+    const b=gv(base,m.k), c=gv(cur,m.k);
+    if(b==null&&c==null) return '';
+    let delta='—', cls='same';
+    if(typeof b==='number' && typeof c==='number'){
+      const d=c-b;
+      if(d===0){ delta='±0'; cls='same'; }
+      else { delta=(d>0?'▲ +':'▼ ')+d; cls=m.neutral?'same':((m.goodUp?d<0:d>0)?'worse':'better'); }
+    }
+    const bn=(b==null?'n/a':b)+(m.suffix&&b!=null?m.suffix:''), cn=(c==null?'n/a':c)+(m.suffix&&c!=null?m.suffix:'');
+    return '<tr><td>'+e(m.label)+'</td><td class="mono">'+bn+'</td><td class="mono">'+cn+'</td><td><span class="cmp-delta '+cls+'">'+delta+'</span></td></tr>';
+  }).filter(Boolean).join("");
+  const key=f=>f.engine+'|'+f.title, baseF={}, curF={};
+  (base.findings||[]).forEach(f=>baseF[key(f)]=f);
+  (cur.findings||[]).forEach(f=>curF[key(f)]=f);
+  const appeared=[], resolved=[], changed=[];
+  Object.keys(curF).forEach(k=>{ if(!baseF[k]) appeared.push(curF[k]); else if(curF[k].count!==baseF[k].count) changed.push({f:curF[k], from:baseF[k].count}); });
+  Object.keys(baseF).forEach(k=>{ if(!curF[k]) resolved.push(baseF[k]); });
+  const fli=(f,extra)=>'<li style="margin-bottom:6px"><span class="sev '+e(f.severity)+'" style="margin-right:6px">'+e(f.severity)+'</span><b>'+e(f.title)+'</b> '+(extra||'')+' <span style="color:var(--dim)">('+e(f.engine)+')</span></li>';
+  const findingsHtml=
+    '<div class="cmp-sec">▲ New findings ('+appeared.length+')</div><ul>'+(appeared.length?appeared.map(f=>fli(f,'— '+f.count+' affected')).join(''):'<li style="color:var(--dim)">none</li>')+'</ul>'
+   +'<div class="cmp-sec">✓ Resolved findings ('+resolved.length+')</div><ul>'+(resolved.length?resolved.map(f=>fli(f,'<span style="color:var(--green)">no longer present</span>')).join(''):'<li style="color:var(--dim)">none</li>')+'</ul>'
+   +(changed.length?'<div class="cmp-sec">Δ Changed counts ('+changed.length+')</div><ul>'+changed.map(x=>fli(x.f,'— '+x.from+' → '+x.f.count+' affected')).join('')+'</ul>':'');
+  const dstr = days===0?'same day':(Math.abs(days)+' day'+(Math.abs(days)===1?'':'s')+(days<0?' EARLIER (baseline is newer — check file order)':''));
+  el.innerHTML=schemaWarn
+    +'<div class="cmp-when"><span><b>Baseline</b> '+e(bd.toLocaleString())+'</span><span class="cmp-arrow">→</span><span><b>Current</b> '+e(cd.toLocaleString())+'</span><span style="color:var(--dim)">('+dstr+')</span>'+(cur.tenant&&cur.tenant.name?'<span style="color:var(--dim)">· '+e(cur.tenant.name)+'</span>':'')+'</div>'
+    +'<div style="overflow-x:auto"><table><thead><tr><th>Metric</th><th>Baseline</th><th>Current</th><th>Change</th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+    +findingsHtml;
+}
+function readFileText(file){ return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=()=>rej(r.error); r.readAsText(file); }); }
+async function runCompare(){
+  const el=$("compareResults");
+  const baseFile=$("cmpBase").files[0], curFile=$("cmpCur").files[0];
+  if(!baseFile){ el.innerHTML='<div class="notice">Load a <b>baseline</b> snapshot file first (a Management summary HTML or a Snapshot JSON exported from this tool).</div>'; return; }
+  try{
+    const base=extractSnapshot(await readFileText(baseFile));
+    if(!base){ el.innerHTML='<div class="notice">Couldn\'t read a snapshot from <b>'+escapeHtml(baseFile.name)+'</b> — it must be a Management summary HTML or Snapshot JSON exported from this tool.</div>'; return; }
+    let cur;
+    if(curFile){ cur=extractSnapshot(await readFileText(curFile)); if(!cur){ el.innerHTML='<div class="notice">Couldn\'t read a snapshot from <b>'+escapeHtml(curFile.name)+'</b>.</div>'; return; } }
+    else { cur=buildSnapshot(); if(!cur){ el.innerHTML='<div class="notice">No current scan to compare against — run a scan first, or load a second file as the "Compare against".</div>'; return; } }
+    renderCompare(base, cur);
+  }catch(err){ el.innerHTML='<div class="notice">Compare failed — '+escapeHtml((err&&err.message)||'error')+'</div>'; }
+}
+
 // ---------- wire up ----------
 $("signInBtn").addEventListener("click",signIn);
 $("signOutBtn").addEventListener("click",signOut);
@@ -2525,6 +2627,7 @@ document.querySelectorAll('#sidenav .navitem[data-view]').forEach(b=>b.addEventL
 $("loadBtn").addEventListener("click",analyze);
 $("exportSummary").addEventListener("click",exportSummaryHtml);
 $("exportSnapshot").addEventListener("click",exportSnapshotJson);
+$("cmpRun").addEventListener("click",runCompare);
 $("exportCsv").addEventListener("click",exportCsv);
 $("exportJson").addEventListener("click",exportJson);
 ["fltSearch","fltSev","fltFlag","fltBp","fltPlat"].forEach(id=>$(id).addEventListener("input",()=>{ if(MODEL) renderTable(MODEL.agents); }));
