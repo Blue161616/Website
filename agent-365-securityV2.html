@@ -311,6 +311,15 @@
   .flagchip.warn{color:var(--amber); border-color:#fbbf2444; background:#fbbf2410}
   .flagchip.plat{color:var(--blue-bright); border-color:#60a5fa55; background:#60a5fa12}
   .flagchip.dim{color:var(--dim); border-color:#8b949e33}
+  /* M365 work-data reach map (OBO domain reach) */
+  .reach-map{display:flex; flex-direction:column; gap:5px}
+  .reach-row{display:grid; grid-template-columns:190px 1fr 34px; align-items:center; gap:10px; padding:5px 8px; border-radius:7px; cursor:pointer; transition:background .12s}
+  .reach-row:hover{background:var(--panel-2)}
+  .reach-dom{font-size:12.5px; font-weight:600; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .reach-bar{height:8px; border-radius:5px; background:var(--panel-2); overflow:hidden}
+  .reach-bar>span{display:block; height:100%; border-radius:5px; background:linear-gradient(90deg,#8b5cf6,#a855f7)}
+  .reach-n{font-family:'Consolas',monospace; font-size:12px; color:var(--muted); text-align:right}
+  @media(max-width:640px){ .reach-row{grid-template-columns:130px 1fr 28px} }
   .kpi.hq-tile{cursor:pointer; transition:.15s}
   .kpi.hq-tile:hover{border-color:var(--defender); box-shadow:0 6px 18px -10px var(--defender); transform:translateY(-2px)}
   .kpi.hq-tile.sel{border-color:var(--defender); background:#5b8def14; box-shadow:0 6px 18px -10px var(--defender)}
@@ -1041,6 +1050,34 @@ function classifyToolRisk(name){
   if(/\b(get|list|read|search|find|view|fetch|retrieve|query|export|download)\b/.test(s) || /knowledge/.test(s))
     return Object.assign({level:'read'}, TOOL_RISK.read);
   return Object.assign({level:'none'}, TOOL_RISK.none);
+}
+// ── M365 work-data reach (the OBO data surface). WorkIQ MCP servers AND delegated Office 365 connectors/tools all
+//   reach a user's M365 data ON THE USER'S BEHALF (OBO), so the agent inherits the OPERATING USER's access — a
+//   surface the app-permission scan can't see. Map each MCP/connector/tool name → the M365 data domain it touches.
+//   Domain labels are kept identical to the WORKIQ_MCP catalog so the two sources aggregate into one domain.
+const M365_REACH=[
+  {re:/onedrive/i,                                    domain:'OneDrive / Files'},
+  {re:/sharepoint/i,                                  domain:'SharePoint / Sites'},
+  {re:/teams/i,                                       domain:'Teams'},
+  {re:/calendar|\bevents?\b|\bmeetings?\b|schedule/i, domain:'Calendar'},
+  {re:/outlook|\bmail\b|\bemail\b|\bmessages?\b/i,     domain:'Mail'},
+  {re:/\bword\b|\bexcel\b|powerpoint|onenote|\bdocx?\b|document/i, domain:'Word / Files'},
+  {re:/dataverse|dynamics|power\s*platform/i,         domain:'Dataverse / Power Platform'},
+  {re:/\buser\b|\bpeople\b|directory|\bprofile\b/i,   domain:'Directory / Users'},
+  {re:/copilot/i,                                     domain:'Copilot'}
+];
+function toolDomain(name){ return M365_REACH.find(w=>w.re.test(String(name||'')))||null; }
+// Domain → Purview content format (only file / email / teamwork content carries sensitivity labels) — for the #3 cross.
+const DOMAIN_FMT={'Mail':'email','Teams':'teamwork','SharePoint / Sites':'file','OneDrive / Files':'file','Word / Files':'file'};
+// Every M365 data domain an agent reaches on a user's behalf (OBO): via WorkIQ MCP OR delegated O365 connectors/tools.
+// Returns Map(domain → Set of source kinds: 'WorkIQ' | 'connector' | 'tool').
+function agentM365Domains(a){
+  const t=a&&a.tools; const out=new Map(); if(!t) return out;
+  const add=(dom,src)=>{ if(!dom) return; if(!out.has(dom)) out.set(dom,new Set()); out.get(dom).add(src); };
+  (t.mcp||[]).forEach(n=>{ const c=classifyMcp(n); if(c.kind==='workiq'&&c.domain) add(c.domain,'WorkIQ'); });
+  (t.connectors||[]).forEach(n=>{ const d=toolDomain(n); if(d) add(d.domain,'connector'); });
+  (t.tools||[]).forEach(n=>{ const d=toolDomain(n); if(d) add(d.domain,'tool'); });
+  return out;
 }
 // ── Auth-mode inference (OBO / S2S / agentic-user), per microsoft/agent365-skills.
 //   Primary rule (user-authoritative): a COPILOT STUDIO agent runs OBO (on-behalf-of the user → inherits the user's
@@ -2114,6 +2151,11 @@ function renderPurviewLabels(ls, agents){
   const READ={file:['Files.Read.All','Files.ReadWrite.All','Sites.Read.All','Sites.ReadWrite.All'], email:['Mail.Read','Mail.ReadWrite','Mail.Read.Shared'], teamwork:['Chat.Read.All','ChannelMessage.Read.All']};
   const scopesOf=a=>[...(a.graphPerms||[]).map(p=>p.value), ...(a.inheritedPerms||[]).map(p=>p.value)];
   const reachOf=l=>{ const f=l.contentFormats||[]; return agents.filter(a=>{ const s=scopesOf(a); return (f.includes('file')&&s.some(x=>READ.file.includes(x)))||(f.includes('email')&&s.some(x=>READ.email.includes(x)))||(f.includes('teamwork')&&s.some(x=>READ.teamwork.includes(x))); }); };
+  // #3 — OBO reach: agents that reach this label's content domain ON A USER'S BEHALF via WorkIQ MCP / delegated M365
+  //   tools. This is a SEPARATE path from app-permissions: an OBO agent acts AS the operating user, so it inherits
+  //   the user's access to labeled content — including the ability to DECRYPT protected labels the user can open —
+  //   and none of it shows up in the app-permission (cleartext) column. contentFormats → M365 domain via DOMAIN_FMT.
+  const oboReachOf=l=>{ const f=l.contentFormats||[]; if(!f.length) return []; return agents.filter(a=>{ for(const [d] of agentM365Domains(a)){ const fmt=DOMAIN_FMT[d]; if(fmt&&f.includes(fmt)) return true; } return false; }); };
   // summary
   const highReach=labels.filter(l=>isHigh(l)&&reachOf(l).length);
   const cleartext=highReach.filter(l=>prot(l)===false);
@@ -2122,6 +2164,14 @@ function renderPurviewLabels(ls, agents){
     summary='<div class="engine-clean" style="border-left-color:var(--crit);background:#f871711a;margin:0 0 12px"><b class="hot">'+cleartext.length+' high-sensitivity label'+(cleartext.length===1?'':'s')+' can be read in cleartext by agents</b> ('+cleartext.map(l=>escapeHtml(l.name)).join(", ")+') — these labels are marking-only (no Purview encryption), so an agent with <span class="mono">Files.Read.All</span> / <span class="mono">Mail.Read</span> reads their content unencrypted. Add encryption to the label, or scope the agent permissions down.</div>';
   } else if(highReach.length){
     summary='<div class="engine-clean" style="border-left-color:var(--green);background:#34d3990a;margin:0 0 12px">'+highReach.length+' high-sensitivity label'+(highReach.length===1?' is':'s are')+' reachable by agents but <b>protected by encryption</b> — agents receive ciphertext they can\'t decrypt.</div>';
+  }
+  // #3 — WorkIQ / OBO overlap: high-sensitivity labels reachable on a USER'S behalf. Distinct from the app-permission
+  //   path above, and it defeats encryption (the agent decrypts as the user does). Count distinct agents across them.
+  const highObo=labels.filter(l=>isHigh(l)&&oboReachOf(l).length);
+  if(highObo.length){
+    const oboAgents=new Set(); highObo.forEach(l=>oboReachOf(l).forEach(a=>oboAgents.add(a.id)));
+    const encAmong=highObo.filter(l=>prot(l)===true);
+    summary+='<div class="engine-clean" style="border-left-color:var(--purview);background:#8b5cf614;margin:0 0 12px"><b class="hot">'+highObo.length+' high-sensitivity label'+(highObo.length===1?'':'s')+' '+(highObo.length===1?'is':'are')+' reachable on a user\'s behalf (OBO)</b> by <b>'+oboAgents.size+'</b> agent'+(oboAgents.size===1?'':'s')+' via WorkIQ MCP servers or delegated Office 365 tools ('+highObo.map(l=>escapeHtml(l.name)).join(", ")+'). An OBO agent acts <b>as the operating user</b>, so it inherits that user\'s access to labeled content'+(encAmong.length?' — <b>including decrypting the '+encAmong.length+' encryption-protected label'+(encAmong.length===1?'':'s')+'</b> the user is entitled to open':'')+'. This exposure is <b>invisible to the app-permission scan</b> — it depends on who the agent runs for, not on its Graph roles.</div>';
   }
   const rootLabels=labels.filter(l=>!(l.parent&&l.parent.id));
   const childrenBy={}; labels.forEach(l=>{ if(l.parent&&l.parent.id){ (childrenBy[l.parent.id]=childrenBy[l.parent.id]||[]).push(l); } });
@@ -2133,6 +2183,9 @@ function renderPurviewLabels(ls, agents){
     const hi=isHigh(l), p=prot(l);
     const protChip=p===true?'<span class="flagchip" style="color:var(--green);border-color:#34d39944">encrypted</span>':(p===false&&hi?'<span class="flagchip warn">marking-only</span>':'');
     const reach=hi?reachOf(l):[];
+    // #3 — OBO reach chip: agents reaching this label's content on a user's behalf (invisible to the app-perm path).
+    const obo=hi?oboReachOf(l):[];
+    const oboEl=(hi&&obo.length)?' <span class="flagchip" style="color:#a855f7;border-color:#8b5cf655;background:#8b5cf614" title="Reached on a user\'s behalf (OBO) by: '+escapeHtml(obo.map(a=>a.displayName).join(", "))+'">OBO: '+obo.length+' via user</span>':'';
     // High-sensitivity reachable labels get an ANIMATED flow line to the agents that can open them.
     let reachEl="";
     if(hi&&reach.length){
@@ -2142,13 +2195,13 @@ function renderPurviewLabels(ls, agents){
         : '<span class="flagchip bad lbl-pulse" title="'+tip+'">'+reach.length+' agent'+(reach.length===1?'':'s')+' read cleartext</span>';
       reachEl='<div class="lbl-flow"><span class="lbl-beam '+(enc?'ciphertext':'cleartext')+'" title="'+(enc?'agents receive ciphertext':'agents read this label in cleartext')+'"></span>'+chip+'</div>';
     } else if(hi){ reachEl='<span style="margin-left:auto"><span class="flagchip" style="color:var(--dim)">not reachable by agents</span></span>'; }
-    return '<div style="padding:8px 4px;border-bottom:1px solid var(--border)'+(hi&&reach.length?';background:#f871710a':'')+'">'
+    return '<div style="padding:8px 4px;border-bottom:1px solid var(--border)'+(hi&&(reach.length||obo.length)?';background:#f871710a':'')+'">'
       +'<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">'
       +dot+'<b>'+escapeHtml(l.name)+'</b>'
       +(sens(l)>0?' <span class="mono" style="font-size:10px;color:var(--dim)">sensitivity: '+sens(l)+'</span>':'')
       +(fmts?' <span style="font-size:11px;color:var(--muted)">'+escapeHtml(fmts)+'</span>':'')
       +(hi?' <span class="flagchip warn" style="font-size:9px">high sensitivity</span>':'')
-      +protChip+defBadge(l)
+      +protChip+defBadge(l)+oboEl
       +reachEl
       +'</div>'
       +((l.tooltip||l.description)?'<div style="font-size:11px;color:var(--dim);margin-top:2px;padding-left:16px">'+escapeHtml(String(l.tooltip||l.description).slice(0,120))+'</div>':'')
@@ -2160,7 +2213,7 @@ function renderPurviewLabels(ls, agents){
     (childrenBy[l.id]||[]).slice().sort(sortLbl).forEach(c=>{ rows+='<div style="padding-left:18px;border-left:2px solid var(--border);margin-left:10px">'+rowFor(c)+'</div>'; });
   });
   el.innerHTML=head+summary
-    +'<div class="hint" style="margin:0 0 4px"><b>Label Taxonomy ('+labels.length+')</b> · highest sensitivity first · <span class="mono" style="color:var(--dim)">'+escapeHtml(ls.src||'graph')+'</span>. The <b class="hot">read-cleartext</b> chips show <b>agents</b> (agent identities) whose data-read permissions let them open content carrying that label.</div>'
+    +'<div class="hint" style="margin:0 0 4px"><b>Label Taxonomy ('+labels.length+')</b> · highest sensitivity first · <span class="mono" style="color:var(--dim)">'+escapeHtml(ls.src||'graph')+'</span>. Two reach paths are shown per high-sensitivity label: <b class="hot">read-cleartext</b> = agents whose <b>app permissions</b> let them open the content; <span style="color:#a855f7">OBO: via user</span> = agents that reach it <b>on the operating user\'s behalf</b> (WorkIQ / delegated M365 tools) — a path that inherits the user\'s access and can decrypt what the user can, invisible to the app-permission column.</div>'
     +'<div>'+rows+'</div></div>';
 }
 function renderHunt(hunt){
@@ -2213,7 +2266,7 @@ function renderTools(hunt){
   if(!hunt.tools){ el.innerHTML='<div class="engine-clean" style="border-left-color:var(--dim);background:var(--panel-2)">Tool surface wasn\'t probed this scan.</div>'; return; }
   const t=hunt.tools;
   if(t.error){ el.innerHTML='<div class="engine-clean" style="border-left-color:var(--amber);background:#fbbf240a">Tool-surface probe failed — <span class="mono">'+escapeHtml(t.error)+'</span>.</div>'; return; }
-  let html='<div>';
+  let html='<div>', reachRows=[];
   const r=t.row||{}, det=t.details||{};
   const labels={DeclaredTools:"Tools",McpServers:"MCP servers",Connectors:"Connectors",Skills:"Skills",Capabilities:"Capabilities",Plugins:"Plugins"};
   // Only show tiles for types that actually exist in this tenant (distinct>0 or agents carry them).
@@ -2233,6 +2286,21 @@ function renderTools(hunt){
     });
     html+='</div>';
     html+='<div class="hint" style="margin-top:6px;color:var(--dim)">Distinct items per type across '+(r.Agents!=null?r.Agents:'?')+' Entra-registered agents — <b>click a tile</b> to list them, then a row to see which agents. Every MCP server / connector is an external data-reach &amp; egress path — the real agent attack surface. Tools are marked by <b style="color:var(--crit)">prompt-injection risk</b>: <span class="flagchip bad">exfil ↗</span> tools (Send an email, Post message, Share/Upload) can send sensitive data out of the tenant if the agent is injected.</div>';
+    // #1 — M365 work-data reach (OBO): which M365 data domains the fleet touches on users' behalf, and by how many agents.
+    const reach=new Map();
+    (MODEL?MODEL.agents:[]).forEach(a=>{ agentM365Domains(a).forEach((srcs,dom)=>{ let rr=reach.get(dom); if(!rr){ rr={agents:new Set(), wi:new Set()}; reach.set(dom,rr); } rr.agents.add(a.id); if(srcs.has('WorkIQ')) rr.wi.add(a.id); }); });
+    if(reach.size){
+      reachRows=[...reach.entries()].map(([dom,rr])=>({dom, n:rr.agents.size, wi:rr.wi.size, ids:[...rr.agents]})).sort((a,b)=>b.n-a.n);
+      const maxN=reachRows[0].n||1, allA=new Set(); reachRows.forEach(x=>x.ids.forEach(i=>allA.add(i)));
+      html+='<div class="entra-sub" style="border-left-color:var(--purview);margin-top:14px"><div class="entra-sub-h"><span class="stag">Work-data reach</span> the M365 data your agents touch <b>on users\' behalf</b> (OBO)</div>'
+        +'<div class="hint" style="margin:0 0 8px;color:var(--dim)"><b>'+allA.size+'</b> agent'+(allA.size===1?'':'s')+' reach M365 work data through WorkIQ MCP servers or delegated Office 365 tools. Because these run <b>on-behalf-of the signed-in user (OBO)</b>, the real data reach is the <b>user\'s own access</b> — a surface the app-permission scan cannot see. Click a domain to filter the Agents view.</div>'
+        +'<div class="reach-map">'
+        + reachRows.map((x,i)=>'<div class="reach-row" data-ridx="'+i+'" title="Show the '+x.n+' agent'+(x.n===1?'':'s')+' reaching '+escapeHtml(x.dom)+'">'
+            +'<div class="reach-dom">'+escapeHtml(x.dom)+(x.wi?' <span class="flagchip plat" style="font-size:8px;padding:1px 4px">WorkIQ</span>':'')+'</div>'
+            +'<div class="reach-bar"><span style="width:'+Math.max(5,Math.round(x.n/maxN*100))+'%"></span></div>'
+            +'<div class="reach-n">'+x.n+'</div></div>').join("")
+        +'</div></div>';
+    }
     html+='<div id="toolsDetail" style="margin-top:14px"></div>';
   } else if(t.schema){
     html+='<div class="engine-clean" style="border-left-color:var(--dim);background:var(--panel-2)">None of the expected tool columns (<code>DeclaredTools</code>, <code>McpServers</code>, <code>Connectors</code>…) are present in this tenant\'s AgentsInfo table — tool detail isn\'t available here. The full registry (publishers, plugins) needs the Copilot registry API (AI Administrator).</div>';
@@ -2248,6 +2316,8 @@ function renderTools(hunt){
     }
   }
   el.innerHTML=html+'</div>';
+  // #1 — click a work-data-reach domain → filter the Agents view to the agents reaching it (OBO).
+  el.querySelectorAll('.reach-row').forEach(row=>row.addEventListener('click',()=>{ const x=reachRows[+row.dataset.ridx]; if(x) filterAgentsToIds(x.ids, 'reaches '+x.dom+' (OBO)'); }));
   // Click a tile → list that type's distinct items; click a row → filter the Agents view to the agents using it.
   const box=$("toolsDetail");
   const catFor={DeclaredTools:"tools",McpServers:"mcp",Connectors:"connectors",Capabilities:"capabilities",Skills:"skills"};
@@ -2541,13 +2611,15 @@ function buildSnapshot(){
   A.forEach(a=>{ if(!a.model||seenModel.has(a.model))return; seenModel.add(a.model); const info=detectModel(a.model); const bk=residencyBucket(info.residency); mb[bk]=(mb[bk]||0)+1; if(bk==='outside') outsideModels.add(info.model); });
   // tools distinct counts
   const td=(hunt.tools&&hunt.tools.details)||{};
-  // high-sensitivity labels reachable in cleartext by agents
-  let clearLabels=0;
+  // high-sensitivity labels reachable in cleartext by agents (app-perm) and on a user's behalf (OBO)
+  let clearLabels=0, oboLabels=0;
   if(labels.ok && labels.labels){
     const maxS=labels.labels.reduce((m,l)=>Math.max(m,(l.sensitivity!=null?l.sensitivity:(l.priority||0))),0);
     const READ={file:['Files.Read.All','Files.ReadWrite.All','Sites.Read.All','Sites.ReadWrite.All'],email:['Mail.Read','Mail.ReadWrite','Mail.Read.Shared'],teamwork:['Chat.Read.All','ChannelMessage.Read.All']};
     const scopesOf=a=>[...(a.graphPerms||[]).map(p=>p.value),...(a.inheritedPerms||[]).map(p=>p.value)];
     clearLabels=labels.labels.filter(l=>{ const s=(l.sensitivity!=null?l.sensitivity:(l.priority||0)); if(!(s>0 && s>=maxS*0.6)) return false; if(l.hasProtection!==false) return false; const f=l.contentFormats||[]; return A.some(a=>{ const sc=scopesOf(a); return (f.includes('file')&&sc.some(x=>READ.file.includes(x)))||(f.includes('email')&&sc.some(x=>READ.email.includes(x)))||(f.includes('teamwork')&&sc.some(x=>READ.teamwork.includes(x))); }); }).length;
+    // #3 — high-sensitivity labels reachable ON A USER'S BEHALF (OBO) via WorkIQ / delegated M365 tools.
+    oboLabels=labels.labels.filter(l=>{ const s=(l.sensitivity!=null?l.sensitivity:(l.priority||0)); if(!(s>0 && s>=maxS*0.6)) return false; const f=l.contentFormats||[]; if(!f.length) return false; return A.some(a=>{ for(const [d] of agentM365Domains(a)){ const fmt=DOMAIN_FMT[d]; if(fmt&&f.includes(fmt)) return true; } return false; }); }).length;
   }
   // per-engine findings (title/severity/count) — captured from the last render
   const flat=[]; const F=MODEL.findings||{};
@@ -2571,10 +2643,12 @@ function buildSnapshot(){
     blueprints:{ total:bps.length, withSecrets:bps.filter(b=>b.secretCount>0).length, grantingInheritedPerms:bps.filter(b=>b.inheritedPerms&&b.inheritedPerms.length).length },
     entra:{ idpGranted:!!idp.granted, caGranted:!!ca.granted, caEnforcing:ca.coverAgents||0, caReportOnly:ca.reportOnly||0 },
     defender:{ agentsInfoOk:!!(hunt.granted&&hunt.ok), openIncidents:inc.ok?(inc.openCount||0):null },
-    purview:{ labelsOk:!!labels.ok, labelCount:(labels.labels||[]).length, highSensCleartextReachable:clearLabels, auditReadable:!!MODEL.auditReadable },
+    purview:{ labelsOk:!!labels.ok, labelCount:(labels.labels||[]).length, highSensCleartextReachable:clearLabels, highSensOboReachable:oboLabels, auditReadable:!!MODEL.auditReadable },
     tools:(()=>{ const act=[].concat(td.DeclaredTools||[],td.Connectors||[],td.Capabilities||[],td.Skills||[]);
       let exfilTools=0, webTools=0; act.forEach(x=>{ const l=classifyToolRisk(x.name).level; if(l==='exfil')exfilTools++; else if(l==='web')webTools++; });
-      return { distinctTools:(td.DeclaredTools||[]).length, distinctMcp:(td.McpServers||[]).length, distinctConnectors:(td.Connectors||[]).length, distinctCapabilities:(td.Capabilities||[]).length, exfilTools, webTools }; })(),
+      // WorkIQ / OBO work-data reach across the fleet: distinct M365 domains touched + agents reaching any.
+      const reach=new Map(), oboAg=new Set(); A.forEach(a=>{ const dm=agentM365Domains(a); if(dm.size)oboAg.add(a.id); dm.forEach((_,d)=>reach.set(d,(reach.get(d)||0)+1)); });
+      return { distinctTools:(td.DeclaredTools||[]).length, distinctMcp:(td.McpServers||[]).length, distinctConnectors:(td.Connectors||[]).length, distinctCapabilities:(td.Capabilities||[]).length, exfilTools, webTools, workiqDomains:reach.size, oboReachAgents:oboAg.size }; })(),
     models:{ distinct:seenModel.size, residency:mb, outsideEu:[...outsideModels] },
     findings:flat
   };
@@ -2605,7 +2679,7 @@ function exportSummaryHtml(){
   const engines=
     engRow('Microsoft Entra — ID Protection & Conditional Access for Agents', s.entra.idpGranted, 'CA: '+(s.entra.caEnforcing?(s.entra.caEnforcing+' enforcing'):(s.entra.caReportOnly?(s.entra.caReportOnly+' report-only — not blocking'):'none targeting agents')))
    +engRow('Microsoft Defender — AgentsInfo hunting & XDR incidents', s.defender.agentsInfoOk, s.defender.openIncidents==null?'incidents not read':(s.defender.openIncidents+' open agent XDR incident(s)'))
-   +engRow('Microsoft Purview — sensitivity-label reach', s.purview.labelsOk, s.purview.highSensCleartextReachable+' high-sensitivity label(s) readable in cleartext by agents');
+   +engRow('Microsoft Purview — sensitivity-label reach', s.purview.labelsOk, s.purview.highSensCleartextReachable+' high-sensitivity label(s) readable in cleartext by agents'+(s.purview.highSensOboReachable?('; '+s.purview.highSensOboReachable+' reachable on a user\'s behalf (OBO)'):''));
   const topFindings=s.findings.slice(0,10).map(f=>'<li><span class="fsev" style="background:'+sev(f.severity)+'">'+f.severity+'</span> <b>'+e(f.title)+'</b> — '+f.count+' affected <span class="feng">('+f.engine+')</span></li>').join("")
     || '<li>No findings surfaced on the signals this scan could read.</li>';
   const recs=[];
@@ -2613,6 +2687,7 @@ function exportSummaryHtml(){
   if(s.blueprints.withSecrets) recs.push('Replace client secrets on '+s.blueprints.withSecrets+' blueprint(s) with certificates / managed identity — a blueprint secret impersonates every agent under it.');
   if(s.entra.caGranted && !s.entra.caEnforcing) recs.push('Enforce Conditional Access for Agents (currently '+(s.entra.caReportOnly?'report-only':'absent')+') to block risky agent sign-ins.');
   if(s.agents.noOwnerSponsor) recs.push('Assign a sponsor (business owner) to '+s.agents.noOwnerSponsor+' agent(s) with no accountable party.');
+  if(s.purview.highSensOboReachable) recs.push('Govern OBO data reach: '+s.purview.highSensOboReachable+' high-sensitivity label(s) are reachable on a user\'s behalf via WorkIQ / delegated M365 tools — this inherits the operating user\'s access (and decryption) regardless of the agent\'s Graph roles. Constrain which users these agents run for, and apply DLP / Purview policy to the agent context.');
   if(s.models.residency.outside) recs.push('Review GDPR data residency: '+s.models.residency.outside+' model(s) process prompts outside the EU boundary ('+(s.models.outsideEu.slice(0,4).join(', '))+').');
   if(s.coverage.pct!=null && s.coverage.pct<80) recs.push('Onboard the '+((s.coverage.fullInventory||0)-s.coverage.entraAgentIds)+' agents without an Entra Agent ID so Entra can govern them.');
   if(!recs.length) recs.push('No high-priority actions from the readable signals — maintain the controls and re-snapshot regularly to track drift.');
@@ -2676,6 +2751,8 @@ const CMP_METRICS=[
   {k:'entra.caEnforcing', label:'CA policies enforcing', goodUp:true},
   {k:'defender.openIncidents', label:'Open XDR incidents', goodUp:false},
   {k:'purview.highSensCleartextReachable', label:'High-sensitivity labels in cleartext', goodUp:false},
+  {k:'purview.highSensOboReachable', label:'High-sensitivity labels reachable via OBO', goodUp:false},
+  {k:'tools.oboReachAgents', label:'Agents with M365 work-data reach (OBO)', neutral:true},
   {k:'tools.distinctMcp', label:'Distinct MCP servers', neutral:true},
   {k:'tools.exfilTools', label:'Egress / exfil-capable tools', goodUp:false},
   {k:'models.residency.outside', label:'Models outside EU', goodUp:false}
