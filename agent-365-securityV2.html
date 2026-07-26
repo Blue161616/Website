@@ -987,6 +987,47 @@ function detectModel(name){
   const e=APP_MODEL_MAP.find(x=>x.pattern.test(name||""));
   return e || {model:(name||'Unknown'), provider:'Unknown', residency:'Unknown', gdprOk:false, risk:'medium'};
 }
+// ── WorkIQ MCP catalog (from microsoft/agent365-skills) — classify an MCP server as Microsoft WorkIQ (first-party)
+//    vs Microsoft-other vs external, and map it to the M365 data domain it reaches.
+const WORKIQ_MCP=[
+  {re:/outlook\s*mail|work\s*iq[\s_-]*mail|\bmail\b/i, domain:'Mail'},
+  {re:/outlook\s*calendar|calendar/i, domain:'Calendar'},
+  {re:/teams/i, domain:'Teams'},
+  {re:/sharepoint/i, domain:'SharePoint / Sites'},
+  {re:/onedrive/i, domain:'OneDrive / Files'},
+  {re:/\bword\b/i, domain:'Word / Files'},
+  {re:/work\s*iq[\s_-]*user|\buser\b/i, domain:'Directory / Users'},
+  {re:/copilot/i, domain:'Copilot'},
+  {re:/dataverse/i, domain:'Dataverse / Power Platform'},
+  {re:/work\s*iq|workiq/i, domain:'Microsoft 365'}
+];
+function classifyMcp(name){
+  const n=String(name||'');
+  const wi=WORKIQ_MCP.find(w=>w.re.test(n));
+  if(wi && /work\s*iq|workiq|outlook|sharepoint|onedrive|teams|dataverse/i.test(n)) return {kind:'workiq', publisher:'Microsoft WorkIQ', firstParty:true, domain:wi.domain};
+  if(/microsoft|sentinel|azure|graph|\bm365\b|office\s*365|\blearn\b/i.test(n)) return {kind:'microsoft', publisher:'Microsoft', firstParty:true, domain:wi?wi.domain:null};
+  if(wi) return {kind:'microsoft', publisher:'Microsoft', firstParty:true, domain:wi.domain};
+  return {kind:'external', publisher:'external / third-party', firstParty:false, domain:null};
+}
+// ── Auth-mode inference (OBO / S2S / agentic-user), per microsoft/agent365-skills.
+//   OBO agents act ON A USER'S BEHALF → inherit the USER's data reach (invisible to app-role scans); WorkIQ tools
+//   run OBO or agentic-user. S2S is autonomous app-only permissions. Prefer the explicit ToolsAuthenticationType
+//   value when AgentsInfo carries it; otherwise infer (clearly flagged as inferred).
+function inferAuthMode(a){
+  const t=a.tools||{};
+  if(t.authType){ const v=t.authType.toLowerCase();
+    if(/obo|on-?behalf|delegat/.test(v)) return {mode:'obo', inferred:false, note:'on-behalf-of a user — inherits the user\'s data reach'};
+    if(/s2s|service|application|app-?only|client_?cred/.test(v)) return {mode:'s2s', inferred:false, note:'autonomous, application-only permissions'};
+    if(/agentic|agent-?user|managed/.test(v)) return {mode:'agentic', inferred:false, note:'the agent\'s own M365 identity'};
+    return {mode:'other', inferred:false, note:t.authType};
+  }
+  const hasWorkIQ=(t.mcp||[]).some(m=>classifyMcp(m).kind==='workiq') || (t.connectors||[]).some(c=>/office\s*365|outlook|sharepoint|onedrive|teams/i.test(c));
+  const hasAppPerms=(a.dangerous&&a.dangerous.length)||(a.inheritedPerms&&a.inheritedPerms.length);
+  if(hasWorkIQ && hasAppPerms) return {mode:'mixed', inferred:true, note:'delegated WorkIQ tools AND app permissions'};
+  if(hasWorkIQ) return {mode:'obo', inferred:true, note:'reaches data via WorkIQ tools on a user\'s behalf — real reach is the user\'s, not what app-roles show'};
+  if(hasAppPerms) return {mode:'s2s', inferred:true, note:'holds application permissions (own or inherited)'};
+  return {mode:'unknown', inferred:true, note:''};
+}
 // Tenant anchor = EU (Blue16 is an EU tenant). Where each model's prompts are processed.
 const TENANT_EU=[50,10];
 function modelResidencyGeo(residency){
@@ -1332,14 +1373,14 @@ async function analyze(){
               // one query does double duty: AgentId→EntraAgentID map (for hunt-tile filtering) AND the per-agent
               // tool inventory (DeclaredTools / McpServers / Connectors / Capabilities) for the agent detail drawer.
               const toolCols=["McpServers","DeclaredTools","Connectors","Capabilities","Skills"].filter(c=>colSet.has(c));
-              const projCols=toolCols.slice(); if(colSet.has("Model")) projCols.push("Model");
+              const projCols=toolCols.slice(); if(colSet.has("Model")) projCols.push("Model"); if(colSet.has("ToolsAuthenticationType")) projCols.push("ToolsAuthenticationType");
               const proj=["A=tostring(AgentId)","E=tostring("+eidCol+")"].concat(projCols).join(", ");
               const mr=await runHunting(`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where isnotempty(tostring(${eidCol})) | project ${proj}`, huntTk);
               const emap={}, agentTools={};
               (mr.results||[]).forEach(x=>{
                 if(x.A&&x.E) emap[String(x.A).toLowerCase()]=String(x.E).toLowerCase();
                 const eid=String(x.E||"").toLowerCase(); if(!eid) return;
-                agentTools[eid]={ mcp:toolNames(x.McpServers), tools:toolNames(x.DeclaredTools), connectors:toolNames(x.Connectors), capabilities:toolNames(x.Capabilities), skills:toolNames(x.Skills), model:(x.Model!=null&&String(x.Model).trim()?String(x.Model).trim():null) };
+                agentTools[eid]={ mcp:toolNames(x.McpServers), tools:toolNames(x.DeclaredTools), connectors:toolNames(x.Connectors), capabilities:toolNames(x.Capabilities), skills:toolNames(x.Skills), model:(x.Model!=null&&String(x.Model).trim()?String(x.Model).trim():null), authType:(x.ToolsAuthenticationType!=null&&String(x.ToolsAuthenticationType).trim()?String(x.ToolsAuthenticationType).trim():null) };
               });
               (huntState.queries||[]).forEach(q=>{ if(q.ids&&q.ids.length) q.entraIds=[...new Set(q.ids.map(a=>emap[a]).filter(Boolean))]; });
               huntState.agentTools=agentTools;
@@ -1531,6 +1572,7 @@ async function analyze(){
       const tools=(huntState.agentTools && (huntState.agentTools[String(a.id).toLowerCase()] || (a.appId&&huntState.agentTools[String(a.appId).toLowerCase()]))) || null;
       Object.assign(a,{bp,roles,dangerous,dormant,last,risk,sev,reasons,idpRisk,platform,riskDetections:dets,tools,model:(tools&&tools.model)||null,
         ownPermCount:ownPerms.length, inheritedPerms:inheritedAll, inheritedDangerCount:inheritedDanger.length, inheritedOtherCount});
+      a.authMode=inferAuthMode(a);   // OBO / S2S / agentic-user (from ToolsAuthenticationType or inferred)
     });
 
     // ---------- domain scores ----------
@@ -1787,6 +1829,9 @@ function renderEngineSections(agents, bpMap, caState, domains, idpState){
   add("entra","high","Agents whose owner / sponsor has left the org", agents.filter(a=>a.ownerDeparted),
     "Every assigned owner and sponsor is a disabled account — the accountable people left the organization but the agent keeps running with its permissions and nobody accountable.",
     "Reassign the agent to a current sponsor, or retire it if no one still needs it.");
+  add("entra","medium","Agents using on-behalf-of (OBO) access", agents.filter(a=>a.authMode&&(a.authMode.mode==='obo'||a.authMode.mode==='mixed')),
+    "These agents reach data on-behalf-of a signed-in user (WorkIQ tools / delegated access), so their real reach is the USER's permissions at runtime — invisible to the application-permission scan above. The permissions shown here understate what these agents can touch.",
+    "Govern OBO agents by scoping the users they act for and the tools they carry; pair with Conditional Access for Agents and DLP. Confirm the intended auth mode against the agent's blueprint / a365.config.json.");
   if(idpState && idpState.granted && idpState.detTotal>0){
     const detAgents=agents.filter(a=>a.riskDetections&&a.riskDetections.length);
     const typeList=Object.entries(idpState.detTypes||{}).sort((a,b)=>b[1]-a[1]).map(([t,c])=>t+" ×"+c).join(", ");
@@ -2170,9 +2215,18 @@ function renderTools(hunt){
       el.querySelectorAll('.kpi[data-tcol]').forEach(x=>x.classList.remove('sel'));
       if(active){ box.innerHTML=""; return; }   // toggle off
       tile.classList.add('sel');
-      box.innerHTML='<div class="hint" style="margin:0 0 6px"><b>'+escapeHtml(labels[c]||c)+'</b> — '+d.length+' distinct'+(d.length>=500?' (top 500)':'')+'. <span style="color:var(--dim)">Click a row to filter the Agents view to the agents using it.</span></div>'
-        +'<div style="overflow-x:auto"><table><thead><tr><th>'+escapeHtml(labels[c]||c)+'</th><th>Agents</th></tr></thead><tbody>'
-        +d.map((x,i)=>'<tr class="toolrow" data-idx="'+i+'" title="Show the agents using this"><td class="mono">'+escapeHtml(String(x.name).slice(0,160))+'</td><td>'+x.agents+' →</td></tr>').join("")+'</tbody></table></div>';
+      const isMcp=(c==='McpServers');
+      // WorkIQ-catalog classification for MCP servers: first-party (Microsoft WorkIQ / Microsoft) vs external.
+      let mcpSummary="", pubCol=false;
+      if(isMcp){
+        pubCol=true;
+        let wi=0,ms=0,ext=0; d.forEach(x=>{ const k=classifyMcp(x.name).kind; if(k==='workiq')wi++; else if(k==='microsoft')ms++; else ext++; });
+        mcpSummary='<div class="hint" style="margin:0 0 6px;color:var(--dim)"><b>'+(wi)+'</b> Microsoft WorkIQ · <b>'+ms+'</b> Microsoft-other · <b class="'+(ext?'hot':'')+'">'+ext+'</b> external / third-party — external MCP servers are non-Microsoft code &amp; egress paths (verify publisher).</div>';
+      }
+      const pubCell=x=>{ const cl=classifyMcp(x.name); const chip=cl.kind==='external'?'<span class="flagchip bad">external</span>':(cl.kind==='workiq'?'<span class="flagchip plat">WorkIQ</span>':'<span class="flagchip">Microsoft</span>'); return '<td>'+chip+(cl.domain?' <span style="color:var(--dim);font-size:10.5px">'+escapeHtml(cl.domain)+'</span>':'')+'</td>'; };
+      box.innerHTML='<div class="hint" style="margin:0 0 6px"><b>'+escapeHtml(labels[c]||c)+'</b> — '+d.length+' distinct'+(d.length>=500?' (top 500)':'')+'. <span style="color:var(--dim)">Click a row to filter the Agents view to the agents using it.</span></div>'+mcpSummary
+        +'<div style="overflow-x:auto"><table><thead><tr><th>'+escapeHtml(labels[c]||c)+'</th>'+(pubCol?'<th>Publisher · domain</th>':'')+'<th>Agents</th></tr></thead><tbody>'
+        +d.map((x,i)=>'<tr class="toolrow" data-idx="'+i+'" title="Show the agents using this"><td class="mono">'+escapeHtml(String(x.name).slice(0,160))+'</td>'+(pubCol?pubCell(x):'')+'<td>'+x.agents+' →</td></tr>').join("")+'</tbody></table></div>';
       box.querySelectorAll('.toolrow').forEach(row=>row.addEventListener('click',()=>filterAgentsByTool(catFor[c], d[+row.dataset.idx].name)));
     });
   });
@@ -2307,6 +2361,10 @@ function renderTable(agents){
     if(a.dormant)flags.push('<span class="flagchip warn">dormant</span>');
     if(!a.accountEnabled)flags.push('<span class="flagchip">disabled</span>');
     if(a.platform)flags.push('<span class="flagchip plat">'+escapeHtml(a.platform)+'</span>');
+    if(a.authMode && a.authMode.mode==='obo')flags.push('<span class="flagchip warn" title="'+escapeHtml(a.authMode.note)+(a.authMode.inferred?' (inferred)':'')+'">OBO</span>');
+    else if(a.authMode && a.authMode.mode==='mixed')flags.push('<span class="flagchip warn" title="'+escapeHtml(a.authMode.note)+'">OBO+app</span>');
+    else if(a.authMode && a.authMode.mode==='s2s')flags.push('<span class="flagchip">S2S</span>');
+    else if(a.authMode && a.authMode.mode==='agentic')flags.push('<span class="flagchip">agentic-user</span>');
     // "other" = non-Graph API grants + NON-dangerous Graph perms (own + inherited) — so an agent holding only
     // e.g. AgentIdentity.CreateAsManager doesn't misleadingly show "—".
     const otherTotal=(a.otherPermCount||0)+(a.inheritedOtherCount||0)
@@ -2369,6 +2427,11 @@ function detailHtml(a){
   h+= rs.length?'<ul>'+rs.map(r=>'<li><span class="sev '+r[0]+'" style="margin-right:6px">'+r[0]+'</span>'+escapeHtml(r[1])+'</li>').join("")+'</ul>':'<div class="hint">No risk signals — well-scoped agent.</div>';
   h+='<div class="lbl">Facts</div><ul>';
   h+='<li>Enabled: '+(a.accountEnabled?"yes":"no")+(a.disabledByMicrosoftStatus?" · disabled by Microsoft":"")+'</li>';
+  if(a.authMode && a.authMode.mode!=='unknown'){
+    const modeLbl={obo:'On-behalf-of (OBO)', s2s:'Service-to-service (S2S)', agentic:'Agentic-user', mixed:'OBO + app permissions', other:'Other'}[a.authMode.mode]||a.authMode.mode;
+    const hot=(a.authMode.mode==='obo'||a.authMode.mode==='mixed');
+    h+='<li>Access mode'+(a.authMode.inferred?' <span style="color:var(--dim)">(inferred)</span>':'')+': <b'+(hot?' style="color:var(--amber)"':'')+'>'+escapeHtml(modeLbl)+'</b>'+(a.authMode.note?' — <span style="color:var(--muted)">'+escapeHtml(a.authMode.note)+'</span>':'')+'</li>';
+  }
   const fmtParty=(o)=>escapeHtml(o.displayName||o.userPrincipalName||o.id)+(o.accountEnabled===false?" <span style='color:var(--crit)'>(disabled)</span>":"");
   h+='<li>Owners (technical): '+(a.owners.length?a.owners.map(fmtParty).join(", "):"<span style='color:var(--muted)'>none</span>")+'</li>';
   h+='<li>Sponsors (business owner): '+(a.hasSponsor?a.sponsors.map(fmtParty).join(", "):(SPONSORS_READABLE?"<span style='color:var(--crit)'>none</span>":"<span style='color:var(--muted)'>not readable (needs Global/Directory Reader role)</span>"))+(a.ownerDeparted?" <span style='color:var(--crit)'>· all accountable parties departed</span>":"")+'</li>';
@@ -2450,7 +2513,8 @@ function buildSnapshot(){
       compromised:(idp.counts&&idp.counts.compromised)||0, atRisk:(idp.counts&&idp.counts.atRisk)||0, riskyTotal:(idp.counts&&idp.counts.total)||0,
       noOwnerSponsor:A.filter(a=>!a.accountable).length, ownerDeparted:A.filter(a=>a.ownerDeparted).length,
       dormant:A.filter(a=>a.dormant).length, msDisabled:A.filter(a=>a.disabledByMicrosoftStatus).length,
-      withInheritedPerms:A.filter(a=>a.inheritedPerms&&a.inheritedPerms.length).length
+      withInheritedPerms:A.filter(a=>a.inheritedPerms&&a.inheritedPerms.length).length,
+      obo:A.filter(a=>a.authMode&&(a.authMode.mode==='obo'||a.authMode.mode==='mixed')).length
     },
     blueprints:{ total:bps.length, withSecrets:bps.filter(b=>b.secretCount>0).length, grantingInheritedPerms:bps.filter(b=>b.inheritedPerms&&b.inheritedPerms.length).length },
     entra:{ idpGranted:!!idp.granted, caGranted:!!ca.granted, caEnforcing:ca.coverAgents||0, caReportOnly:ca.reportOnly||0 },
@@ -2553,6 +2617,7 @@ const CMP_METRICS=[
   {k:'agents.ownerDeparted', label:'Owner / sponsor departed', goodUp:false},
   {k:'agents.dormant', label:'Dormant agents', goodUp:false},
   {k:'agents.msDisabled', label:'Disabled by Microsoft', goodUp:false},
+  {k:'agents.obo', label:'OBO / delegated agents', neutral:true},
   {k:'blueprints.withSecrets', label:'Blueprints with client secrets', goodUp:false},
   {k:'entra.caEnforcing', label:'CA policies enforcing', goodUp:true},
   {k:'defender.openIncidents', label:'Open XDR incidents', goodUp:false},
