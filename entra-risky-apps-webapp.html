@@ -150,6 +150,17 @@
   .rf-count { font-size: 12px; font-weight: 600; text-align: right; color: var(--text); }
   @keyframes rfgrow { to { width: var(--w); } }
   @media (prefers-reduced-motion: reduce) { .rf-bar { animation: none; width: var(--w); } }
+  /* Sankey flow view */
+  .sankey { display: block; width: 100%; overflow: visible; }
+  .sk-head { font-size: 10.5px; fill: var(--muted); font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+  .sk-label { font-size: 12px; fill: var(--text); paint-order: stroke; stroke: var(--card); stroke-width: 3px; stroke-linejoin: round; }
+  .sk-count { fill: var(--muted); font-weight: 600; }
+  .sk-ribbon { transition: fill-opacity .12s; }
+  .sk-ribbon:hover { fill-opacity: .72 !important; }
+  .sk-node { transition: opacity .12s; }
+  .sk-click { cursor: pointer; }
+  .sk-click:hover { opacity: .82; }
+  text.sk-click:hover { text-decoration: underline; }
   /* attack-path button + panel */
   button.xpath { background: var(--red-bg); color: var(--red); border: 1px solid var(--red); margin-top: 8px; padding: 4px 10px; font-size: 11px; border-radius: 4px; }
   button.xpath:hover { filter: brightness(1.05); }
@@ -283,11 +294,14 @@
 
     <div class="card" id="exposureCard">
       <h2 style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-        <span>Risk exposure — apps carrying each posture factor</span>
-        <span class="expander" id="exposureToggle">hide ▴</span>
+        <span>Risk exposure</span>
+        <span style="display:flex;gap:14px;align-items:center;font-size:12px;font-weight:400">
+          <span class="expander" id="expModeToggle" title="Switch between the flow view and the per-factor bars">▤ Factor bars</span>
+          <span class="expander" id="exposureToggle">hide ▴</span>
+        </span>
       </h2>
       <div id="exposureBody">
-        <div class="hint" style="margin:0 0 12px">Highest-impact factors first. Click a bar to scope the table.</div>
+        <div class="hint" id="exposureHint" style="margin:0 0 12px"></div>
         <div id="exposure"></div>
       </div>
     </div>
@@ -1047,7 +1061,77 @@
       });
     });
   }
+  var exposureMode = 'flow';   // 'flow' (Sankey) | 'bars' (per-factor)
   function renderExposure(){
+    el('exposureHint').innerHTML = exposureMode === 'flow'
+      ? 'Each app flows through exactly <b>one node per column</b> — Origin → Risk → Access — so nothing is double-counted (unlike the factor bars). Ribbon colour = risk level. <b>Click a node</b> to scope the table.'
+      : 'How many apps carry each posture factor — <b>one app can appear in several bars</b>. Colour = severity tier, length = app count. Click a bar to scope the table.';
+    if(exposureMode === 'flow') renderExposureFlow(); else renderExposureBars();
+  }
+  // Sankey: partitions each app into ONE node per column (Origin → Risk → Access), so ribbon widths sum exactly to
+  // the app count with no double-counting. Ribbons are coloured by the risk tier (dark red → red → orange → green).
+  function renderExposureFlow(){
+    var apps = baseSet(), host = el('exposure');
+    if(!apps.length){ host.innerHTML = '<div class="hint">No apps in the current view.</div>'; return; }
+    var RISK_FLOW = { Critical:'#8a0e14', High:'#d13438', Medium:'#e8820e', Low:'#3f9142' };
+    var COLS = [
+      { title:'Origin', order:['External','Internal','Microsoft'], node:function(r){ return r.isFirstPartyMicrosoft?'Microsoft':(r.isExternal?'External':'Internal'); } },
+      { title:'Risk level', risk:true, order:['Critical','High','Medium','Low'], node:function(r){ return RISK_LABELS[r.riskScore||1]; } },
+      { title:'Access held', order:['Application','App + delegated','Delegated','No permissions'], node:function(r){ var a=r.factors.appPerms, d=(r.delegatedDetail||[]).length>0; return a&&d?'App + delegated':a?'Application':d?'Delegated':'No permissions'; } }
+    ];
+    var NC = COLS.length, total = apps.length;
+    var fc = apps.map(function(r){ return COLS.map(function(c){ return c.node(r); }); });   // per-app node key per column
+    function buildNodes(ci){ var counts={}; fc.forEach(function(row){ counts[row[ci]]=(counts[row[ci]]||0)+1; });
+      var order = COLS[ci].order.filter(function(k){ return counts[k]; });
+      Object.keys(counts).forEach(function(k){ if(order.indexOf(k)<0) order.push(k); });
+      return order.map(function(k){ return {key:k, count:counts[k]}; }); }
+    var colNodes=[]; for(var i=0;i<NC;i++) colNodes.push(buildNodes(i));
+    // geometry — scale fits the tallest column into Hd; columns are vertically centred
+    var W=1000, nodeW=12, padL=150, padR=155, topPad=26, botPad=8, Hd=300, G=7;
+    var maxNodes = Math.max.apply(null, colNodes.map(function(n){ return n.length; }));
+    var scale = (Hd - (maxNodes-1)*G) / total;
+    var colX = COLS.map(function(_,ci){ return padL + (NC>1 ? (ci/(NC-1))*(W-padL-padR-nodeW) : 0); });
+    colNodes.forEach(function(nodes){ var contentH = nodes.reduce(function(a,n){ return a+n.count*scale; },0) + (nodes.length-1)*G;
+      var y = topPad + Math.max(0,(Hd-contentH)/2);
+      nodes.forEach(function(n){ n.y0=y; n.h=Math.max(2,n.count*scale); n.y1=y+n.h; n.cur=y; y=n.y1+G; }); });
+    var svgH = topPad + Hd + botPad;
+    // ribbons between adjacent columns (consistent source-order / target-order banding → minimal crossing)
+    var ribbons=[];
+    for(var ci=0; ci<NC-1; ci++){ var sN=colNodes[ci], tN=colNodes[ci+1], mat={};
+      fc.forEach(function(row){ var k=row[ci]+' '+row[ci+1]; mat[k]=(mat[k]||0)+1; });
+      sN.forEach(function(sn){ tN.forEach(function(tn){ var c=mat[sn.key+' '+tn.key]; if(!c) return;
+        var h=c*scale, sy0=sn.cur, ty0=tn.cur; sn.cur+=h; tn.cur+=h;
+        ribbons.push({ x0:colX[ci]+nodeW, x1:colX[ci+1], sy0:sy0, sy1:sy0+h, ty0:ty0, ty1:ty0+h, count:c,
+          color: COLS[ci].risk ? RISK_FLOW[sn.key] : (COLS[ci+1].risk ? RISK_FLOW[tn.key] : '#9aa0a6') }); }); }); }
+    function ribbonPath(rb){ var mx=(rb.x0+rb.x1)/2, f=function(v){ return v.toFixed(1); };
+      return 'M'+rb.x0+' '+f(rb.sy0)+'C'+mx+' '+f(rb.sy0)+' '+mx+' '+f(rb.ty0)+' '+rb.x1+' '+f(rb.ty0)
+           +'L'+rb.x1+' '+f(rb.ty1)+'C'+mx+' '+f(rb.ty1)+' '+mx+' '+f(rb.sy1)+' '+rb.x0+' '+f(rb.sy1)+'Z'; }
+    function nodeFilter(ci,key){
+      if(COLS[ci].risk){ var m={Critical:'4',High:'3',Medium:'2',Low:'1'}; return m[key]?'risk:'+m[key]:''; }
+      if(ci===0) return key==='External'?'ten:multi-ext':key==='Internal'?'ten:multi-int':key==='Microsoft'?'msft:yes':'';
+      if(ci===NC-1) return (key==='Application'||key==='App + delegated')?'fac:appPerms':'';
+      return ''; }
+    var p=['<svg viewBox="0 0 '+W+' '+svgH+'" width="100%" height="'+svgH+'" class="sankey" preserveAspectRatio="xMidYMid meet">'];
+    ribbons.forEach(function(rb){ p.push('<path d="'+ribbonPath(rb)+'" fill="'+rb.color+'" fill-opacity="0.4" class="sk-ribbon"><title>'+rb.count+' app'+(rb.count===1?'':'s')+'</title></path>'); });
+    COLS.forEach(function(c,ci){ p.push('<text x="'+(colX[ci]+nodeW/2).toFixed(0)+'" y="14" text-anchor="middle" class="sk-head">'+escHtml(c.title)+'</text>'); });
+    colNodes.forEach(function(nodes,ci){ var last=(ci===NC-1), x=colX[ci];
+      nodes.forEach(function(n){ var fill = COLS[ci].risk ? RISK_FLOW[n.key] : '#adb1b5';
+        var flt=nodeFilter(ci,n.key), da=flt?' data-skf="'+flt+'"':'', cc=flt?' sk-click':'';
+        p.push('<rect x="'+x.toFixed(1)+'" y="'+n.y0.toFixed(1)+'" width="'+nodeW+'" height="'+n.h.toFixed(1)+'" rx="2" fill="'+fill+'" class="sk-node'+cc+'"'+da+'><title>'+escHtml(n.key)+' — '+n.count+' app'+(n.count===1?'':'s')+'</title></rect>');
+        var ly=((n.y0+n.y1)/2+3.5).toFixed(1), lx=last?(x+nodeW+7).toFixed(1):(x-7).toFixed(1), anc=last?'start':'end';
+        p.push('<text x="'+lx+'" y="'+ly+'" text-anchor="'+anc+'" class="sk-label'+cc+'"'+da+'>'+escHtml(n.key)+' <tspan class="sk-count">'+n.count+'</tspan></text>'); }); });
+    p.push('</svg>');
+    host.innerHTML = p.join('');
+    host.querySelectorAll('[data-skf]').forEach(function(elt){ elt.addEventListener('click', function(){
+      var tok=elt.getAttribute('data-skf').split(':'); activeFactor=null; activeStat=null;
+      el('f-risk').value=''; el('f-tenancy').value=''; el('f-assign').value=''; el('f-auth').value='';
+      if(tok[0]==='risk') el('f-risk').value=tok[1];
+      else if(tok[0]==='ten') el('f-tenancy').value=tok[1];
+      else if(tok[0]==='msft') el('f-msft').value=tok[1];
+      else if(tok[0]==='fac') activeFactor=tok[1];
+      render(); }); });
+  }
+  function renderExposureBars(){
     var b = baseSet();
     var rows = EXPO.map(function(e){ return { e:e, n: b.filter(function(r){ return r.factors[e.key]; }).length }; }).filter(function(x){ return x.n > 0; });
     // Strict severity tiers (high → med → low), then by count within each tier — so bar colour and vertical
@@ -1450,6 +1534,7 @@
   el('f-auth').addEventListener('change', function(){ activeStat = null; renderTable(); });
   el('f-assign').addEventListener('change', function(){ activeStat = null; activeFactor = null; renderTable(); });
   el('exposureToggle').addEventListener('click', function(){ var hidden = el('exposureBody').classList.toggle('hidden'); el('exposureToggle').textContent = hidden ? 'show ▾' : 'hide ▴'; });
+  el('expModeToggle').addEventListener('click', function(){ exposureMode = exposureMode === 'flow' ? 'bars' : 'flow'; el('expModeToggle').textContent = exposureMode === 'flow' ? '▤ Factor bars' : '⇄ Flow view'; if(cache.results) renderExposure(); });
   document.querySelectorAll('th[data-sort]').forEach(function(th){
     th.addEventListener('click', function(){
       var key = th.getAttribute('data-sort');
