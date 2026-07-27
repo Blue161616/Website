@@ -142,6 +142,7 @@
   .rf:hover { background: var(--hover); }
   .rf.active { background: var(--hover); box-shadow: inset 0 0 0 1px var(--accent); }
   .rf-label { font-size: 12.5px; color: var(--text); }
+  .rf.rf-sub .rf-label { padding-left: 16px; color: var(--muted); font-size: 12px; }
   .rf-track { background: var(--code-bg); border-radius: 3px; height: 12px; overflow: hidden; }
   .rf-bar { height: 100%; border-radius: 3px; min-width: 2px; background: var(--red); width: 0; animation: rfgrow .55s cubic-bezier(.22,.61,.36,1) forwards; }
   .rf-bar.sev-med { opacity: .5; }
@@ -745,7 +746,12 @@
     if(f.externalAppKey){ lvl = Math.max(lvl, r.permScore >= 4 ? 4 : 3); reasons.push('Application permissions on an externally-registered app — its client credential lives in the publisher\'s tenant, so you can\'t see, rotate, or revoke the key (only pull the whole app\'s consent). A standing key into your tenant that is outside your control — the most dangerous multi-tenant case.'); }
     // Internal multi-tenant: your own registration. Broad audience, but you hold the keys — reframe, don't supply-chain it.
     if(f.multiInternal && (r.permScore >= 3 || f.appPerms)){ reasons.push('Multi-tenant app registered in YOUR tenant — broad token audience, but you own the registration and its credentials (rotate and scope them here). Not an external supply-chain exposure; treat it as an internal high-privilege app to keep least-privileged and credential-rotated.'); }
-    if(f.assignmentNotRequired && (r.permScore >= 2 || (r.delegatedDetail||[]).length)){ if(r.permScore >= 3) lvl = Math.max(lvl, 3); reasons.push('Assignment not required — any user in the tenant can obtain a token for this app (no user/group assignment gate), so its permissions are exposed to the whole directory rather than an assigned subset.'); }
+    // Assignment-not-required only exposes DELEGATED access: it gates who can SIGN IN, so it means nothing without
+    // delegated permissions (application permissions run on the app credential, not a user token, and ignore this
+    // gate entirely). Judge it on the delegated score, not the app-inclusive permScore, so app-only apps aren't
+    // falsely flagged as "any user can obtain a token".
+    var delScore = delegatedLiveScore(r);
+    if(f.assignmentNotRequired && delScore >= 2){ if(delScore >= 3) lvl = Math.max(lvl, 3); reasons.push('Assignment not required + high-impact delegated permissions — any user in the tenant can sign in and exercise them (no user/group assignment gate), so the delegated access is exposed to the whole directory rather than an assigned subset. (This gate does not affect application permissions.)'); }
     if(f.credExpired){ reasons.push('Has an expired-but-present credential — hygiene gap and possible stale trust.'); }
     if(f.allPrincipals){ reasons.push('Tenant-wide (AllPrincipals) consent — every user inherits these permissions.'); }
     if(f.unverifiedPublisher && f.multiExternal){ reasons.push('External publisher is not verified (no MPN verified publisher) — no vendor identity assurance behind an app that holds a key in your tenant.'); }
@@ -986,7 +992,7 @@
   // -------------------- Render --------------------
   var EXPO = [
     { key:'externalAppKey', label:'⚠ External app + application permissions (key you can’t rotate)', sev:'high' },
-    { key:'dangerCombo', label:'⚠ Unverified external app + application permissions', sev:'high' },
+    { key:'dangerCombo', label:'↳ …of which the publisher is also unverified (no vendor identity)', sev:'high', sub:'externalAppKey' },
     { key:'critical', label:'Critical permission', sev:'high' },
     { key:'appPerms', label:'Application permissions', sev:'high' },
     { key:'publicClient', label:'Public client / device-code', sev:'high' },
@@ -1013,14 +1019,14 @@
     var b = baseSet();
     var crit = b.filter(function(r){ return r.riskScore === 4; }).length;
     var highp = b.filter(function(r){ return (r.riskScore||1) >= 3; }).length;
-    var openAll = b.filter(function(r){ return r.factors.assignmentNotRequired; }).length;
+    var extKey = b.filter(function(r){ return r.factors.externalAppKey; }).length;
     var token = b.filter(function(r){ return r.factors.tokenTheft; }).length;
     var cred = b.filter(function(r){ return r.factors.credExpired || r.factors.credExpiring; }).length;
     el('summary').innerHTML =
         statTile('all', b.length, 'Enterprise apps', false)
       + statTile('critical', crit, 'Critical', crit > 0)
       + statTile('high', highp, 'High and above', false)
-      + statTile('openall', openAll, 'Open to all users', openAll > 0)
+      + statTile('extkey', extKey, 'External app-keys', extKey > 0)
       + statTile('token', token, 'Token-theft vectors', token > 0)
       + statTile('cred', cred, 'Credential issues', cred > 0);
     el('summary').querySelectorAll('.stat').forEach(function(tile){
@@ -1029,7 +1035,7 @@
         if(id === 'all'){ activeStat = null; }
         else if(id === 'critical'){ activeStat = id; el('f-risk').value = '4'; }
         else if(id === 'high'){ activeStat = id; el('f-risk').value = '3'; }
-        else if(id === 'openall'){ activeStat = id; activeFactor = 'assignmentNotRequired'; }
+        else if(id === 'extkey'){ activeStat = id; activeFactor = 'externalAppKey'; }
         else if(id === 'token'){ activeStat = id; el('f-auth').value = 'any'; }
         else if(id === 'cred'){ activeStat = id; activeFactor = 'credIssue'; }
         render();
@@ -1040,10 +1046,14 @@
     var b = baseSet();
     var rows = EXPO.map(function(e){ return { e:e, n: b.filter(function(r){ return r.factors[e.key]; }).length }; }).filter(function(x){ return x.n > 0; });
     rows.sort(function(a,b2){ var s = (a.e.sev==='high'?0:1) - (b2.e.sev==='high'?0:1); return s !== 0 ? s : b2.n - a.n; });
+    // Keep sub-items (e.g. dangerCombo ⊂ externalAppKey) directly under their parent so the subset relationship reads.
+    var subRows = rows.filter(function(x){ return x.e.sub; });
+    subRows.forEach(function(x){ rows.splice(rows.indexOf(x), 1); });                    // pull each sub out
+    subRows.forEach(function(x){ var pi = rows.findIndex(function(y){ return y.e.key === x.e.sub; }); if(pi !== -1) rows.splice(pi + 1, 0, x); else rows.push(x); }); // reinsert after parent
     var maxN = Math.max(1, Math.max.apply(null, rows.map(function(x){ return x.n; }).concat([1])));
     el('exposure').innerHTML = rows.length ? rows.map(function(x){
       var pct = Math.round((x.n / maxN) * 100);
-      return '<div class="rf' + (activeFactor === x.e.key ? ' active' : '') + '" data-factor="' + x.e.key + '"><div class="rf-label">' + x.e.label + '</div><div class="rf-track"><div class="rf-bar ' + (x.e.sev==='high'?'':x.e.sev==='low'?'sev-low':'sev-med') + '" style="--w:' + pct + '%"></div></div><div class="rf-count">' + x.n + '</div></div>';
+      return '<div class="rf' + (x.e.sub ? ' rf-sub' : '') + (activeFactor === x.e.key ? ' active' : '') + '" data-factor="' + x.e.key + '"><div class="rf-label">' + x.e.label + '</div><div class="rf-track"><div class="rf-bar ' + (x.e.sev==='high'?'':x.e.sev==='low'?'sev-low':'sev-med') + '" style="--w:' + pct + '%"></div></div><div class="rf-count">' + x.n + '</div></div>';
     }).join('') : '<div class="hint">No posture factors present in the current population.</div>';
     el('exposure').querySelectorAll('.rf').forEach(function(bar){
       bar.addEventListener('click', function(){ var k = bar.getAttribute('data-factor'); activeFactor = (activeFactor === k) ? null : k; activeStat = null; el('f-risk').value=''; el('f-tenancy').value=''; el('f-auth').value=''; render(); });
@@ -1107,7 +1117,7 @@
     if(r.factors.implicitGrant) f += '<span class="badge b-auth" title="Implicit grant — tokens issued from /authorize">Implicit</span>';
     if(r.factors.riskyRedirect) f += '<span class="badge b-auth" title="Wildcard or cleartext redirect URI">Risky URI</span>';
     if(r.appRoleAssignmentRequired === true) f += '<span class="badge b-single" title="Only assigned users/groups can obtain a token — safer">Assignment required</span>';
-    else if(r.factors.assignmentNotRequired && (r.permScore >= 2 || (r.delegatedDetail||[]).length || r.factors.appPerms)) f += '<span class="badge b-noowner" title="Any user in the tenant can obtain a token — no assignment gate">Open to all users</span>';
+    else if(r.factors.assignmentNotRequired && (r.delegatedDetail||[]).length) f += '<span class="badge b-noowner" title="Any user in the tenant can sign in and use this app\'s DELEGATED permissions — no assignment gate. (Does not affect application permissions, which run on the app credential.)">Open to all users</span>';
     if(r.factors.noOwner) f += '<span class="badge b-noowner" title="No owner assigned">No owner</span>';
     if(r.factors.disabled) f += '<span class="badge b-disabled" title="Service principal disabled">Disabled</span>';
     if(r.isFirstPartyMicrosoft) f += '<span class="badge b-ms">Microsoft</span>';
