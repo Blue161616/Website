@@ -512,7 +512,9 @@
       var result = await msalInstance.loginPopup({ scopes: GRAPH_SCOPES, prompt: 'select_account' });
       account = result.account; msalInstance.setActiveAccount(account);
       el('who').innerHTML = 'Signed in as <strong>' + escHtml(account.username) + '</strong>';
-      show('btn-signout'); hide('connectForm'); el('btn-signin').textContent = 'Re-run scan';
+      // Hide the sign-in button after connecting (the config card shows just "who" + Sign out). Re-running the scan
+      // is the results-toolbar "Re-run scan" (btn-refresh) — a single button, not two identical ones.
+      show('btn-signout'); hide('connectForm'); hide('btn-signin');
       setStatus('');
       await runAudit();
     } catch(e){ setStatus(''); showAuthError(e); }
@@ -521,8 +523,7 @@
     if(msalInstance && account) msalInstance.logoutPopup({ account: account }).catch(function(){});
     account = null; cache = { results: null }; writeToken = null;
     el('who').innerHTML = '<em>Not signed in</em>';
-    hide('btn-signout'); show('connectForm'); hide('results'); setStatus('Signed out.');
-    el('btn-signin').textContent = 'Sign in';
+    hide('btn-signout'); show('btn-signin'); show('connectForm'); hide('results'); setStatus('Signed out.');
   }
   async function getToken(){
     try { return (await msalInstance.acquireTokenSilent({ account: account, scopes: GRAPH_SCOPES })).accessToken; }
@@ -736,14 +737,14 @@
       reasons.push('Its ' + (r.inertPermScore === 4 ? 'tenant-takeover-class' : 'high-impact') + ' permission targets ' + rn + ' — a fully retired API with no token audience, so the grant is INERT / non-exercisable. Residual risk is a stale, over-privileged consent record inflating attack surface — revoke the grant or remove the app to clean it up.');
     }
     if(f.msDisabled){ lvl = 4; reasons.push('Microsoft has disabled this app (disabledByMicrosoftStatus) — usually flagged for malicious or abusive behaviour.'); }
-    if(f.publicClient){ lvl = Math.max(lvl, 3); reasons.push('Public client enabled — device-code / ROPC token flows with no secret (phishing vector).'); if(r.permScore >= 3) lvl = 4; }
+    if(f.publicClient){ lvl = Math.max(lvl, 3); reasons.push('Public client enabled — no client secret required, so device-code phishing or ROPC can mint tokens for this app without compromising it. A common token-theft vector (MITRE T1528); mitigate with Conditional Access (block device-code / legacy auth) and phishing-resistant MFA.'); if(r.permScore >= 3) lvl = 4; }
     if(f.implicitGrant){ lvl = Math.max(lvl, 3); reasons.push('Implicit grant enabled — tokens issued from /authorize, exposed in logs/history.'); }
     if(f.riskyRedirect){ lvl = Math.max(lvl, 3); reasons.push('Risky redirect URI (wildcard / cleartext HTTP) — auth-code interception.'); }
     if(f.consumer && delegatedLiveScore(r) >= 3){ lvl = 4; reasons.push('Accepts personal Microsoft accounts AND holds high-impact delegated permissions — a personal account can sign in and exercise them (broadest possible token audience).'); }
     else if(f.consumer && !(r.delegatedDetail||[]).length){ reasons.push('Accepts personal Microsoft accounts, but holds no delegated permissions — there is no user-delegation path today (the consumer audience is inert unless delegated scopes are added; its application permissions run on the app credential, not user tokens).'); }
     if(f.multiExternal && r.permScore >= 3){ lvl = Math.max(lvl, 3); reasons.push('Multi-tenant app registered in an EXTERNAL tenant, with high permissions — supply-chain blast radius: a compromise of the publisher reaches into your tenant.'); }
     // The worst multi-tenant case: application permissions on an externally-registered app — the key is outside your control.
-    if(f.externalAppKey){ lvl = Math.max(lvl, r.permScore >= 4 ? 4 : 3); reasons.push('Application permissions on an externally-registered app — its client credential lives in the publisher\'s tenant, so you can\'t see, rotate, or revoke the key (only pull the whole app\'s consent). A standing key into your tenant that is outside your control — the most dangerous multi-tenant case.'); }
+    if(f.externalAppKey){ lvl = Math.max(lvl, r.permScore >= 4 ? 4 : 3); reasons.push('Application permissions on an externally-registered app — its client credential lives in the publisher\'s tenant, so you can\'t see, rotate, or revoke the key (only pull the whole app\'s consent). A standing key into your tenant that is outside your control. This is the shape that OAuth "illicit consent" / admin-consent phishing produces (the classic high-volume OAuth-app abuse pattern) — confirm this is an app you deliberately consented, and if not, revoke it.'); }
     // Internal multi-tenant: your own registration. Broad audience, but you hold the keys — reframe, don't supply-chain it.
     if(f.multiInternal && (r.permScore >= 3 || f.appPerms)){ reasons.push('Multi-tenant app registered in YOUR tenant — broad token audience, but you own the registration and its credentials (rotate and scope them here). Not an external supply-chain exposure; treat it as an internal high-privilege app to keep least-privileged and credential-rotated.'); }
     // Assignment-not-required only exposes DELEGATED access: it gates who can SIGN IN, so it means nothing without
@@ -753,7 +754,7 @@
     var delScore = delegatedLiveScore(r);
     if(f.assignmentNotRequired && delScore >= 2){ if(delScore >= 3) lvl = Math.max(lvl, 3); reasons.push('Assignment not required + high-impact delegated permissions — any user in the tenant can sign in and exercise them (no user/group assignment gate), so the delegated access is exposed to the whole directory rather than an assigned subset. (This gate does not affect application permissions.)'); }
     if(f.credExpired){ reasons.push('Has an expired-but-present credential — hygiene gap and possible stale trust.'); }
-    if(f.allPrincipals){ reasons.push('Tenant-wide (AllPrincipals) consent — every user inherits these permissions.'); }
+    if(f.allPrincipals){ reasons.push('Tenant-wide (AllPrincipals) consent — an admin consented this app for every user, so all of them inherit its permissions and the app holds standing access until consent is revoked. This is the outcome an illicit-consent phishing attack aims for — verify it was an intended admin consent.'); }
     if(f.unverifiedPublisher && f.multiExternal){ reasons.push('External publisher is not verified (no MPN verified publisher) — no vendor identity assurance behind an app that holds a key in your tenant.'); }
     if(f.hasFIC){ reasons.push('Uses federated identity credentials (workload identity federation) — trust hinges on issuer/subject, review them.'); }
     if(f.noOwner){ reasons.push('No owner assigned — orphaned registration, no accountable steward.'); }
@@ -1022,8 +1023,12 @@
     var extKey = b.filter(function(r){ return r.factors.externalAppKey; }).length;
     var token = b.filter(function(r){ return r.factors.tokenTheft; }).length;
     var cred = b.filter(function(r){ return r.factors.credExpired || r.factors.credExpiring; }).length;
+    // The "Enterprise apps" count reflects the active publisher filter (default = exclude Microsoft first-party),
+    // so its label spells out the subset — otherwise it doesn't reconcile with the "N inventoried" status line.
+    var msftF = el('f-msft').value;
+    var appsLabel = msftF === 'no' ? 'Enterprise apps (non-Microsoft)' : msftF === 'yes' ? 'Enterprise apps (Microsoft first-party)' : 'Enterprise apps (all publishers)';
     el('summary').innerHTML =
-        statTile('all', b.length, 'Enterprise apps', false)
+        statTile('all', b.length, appsLabel, false)
       + statTile('critical', crit, 'Critical', crit > 0)
       + statTile('high', highp, 'High and above', false)
       + statTile('extkey', extKey, 'External app-keys', extKey > 0)
@@ -1045,7 +1050,10 @@
   function renderExposure(){
     var b = baseSet();
     var rows = EXPO.map(function(e){ return { e:e, n: b.filter(function(r){ return r.factors[e.key]; }).length }; }).filter(function(x){ return x.n > 0; });
-    rows.sort(function(a,b2){ var s = (a.e.sev==='high'?0:1) - (b2.e.sev==='high'?0:1); return s !== 0 ? s : b2.n - a.n; });
+    // Strict severity tiers (high → med → low), then by count within each tier — so bar colour and vertical
+    // position always agree and the panel reads cleanly top-to-bottom.
+    var sevRank = function(s){ return s==='high'?0 : s==='med'?1 : 2; };
+    rows.sort(function(a,b2){ var s = sevRank(a.e.sev) - sevRank(b2.e.sev); return s !== 0 ? s : b2.n - a.n; });
     // Keep sub-items (e.g. dangerCombo ⊂ externalAppKey) directly under their parent so the subset relationship reads.
     var subRows = rows.filter(function(x){ return x.e.sub; });
     subRows.forEach(function(x){ rows.splice(rows.indexOf(x), 1); });                    // pull each sub out
