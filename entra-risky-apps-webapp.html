@@ -812,7 +812,7 @@
       lvl = Math.max(lvl, 2);
       reasons.push('Its ' + (r.inertPermScore === 4 ? 'tenant-takeover-class' : 'high-impact') + ' permission targets ' + rn + ' — a fully retired API with no token audience, so the grant is INERT / non-exercisable. Residual risk is a stale, over-privileged consent record inflating attack surface — revoke the grant or remove the app to clean it up.');
     }
-    if(f.msDisabled){ lvl = 4; reasons.push('Microsoft has disabled this app (disabledByMicrosoftStatus) — usually flagged for malicious or abusive behaviour.'); }
+    if(f.msDisabled){ lvl = 4; reasons.push('Microsoft disabled this app (disabledByMicrosoftStatus) — flagged as malicious / abusive. It is neutralised now (disabled — it can\'t authenticate or act), so this is not an active exposure; but its PRESENCE means a Microsoft-flagged-malicious app was once consented in YOUR tenant. That is a Critical-priority INVESTIGATION: find out who consented it, when, and what it accessed while it was live (sign-in logs / MicrosoftGraphActivityLogs, if still retained), then remove the app and revoke its consent. "No permissions" here means nothing readable now — not that it never had access.'); }
     if(f.publicClient){ lvl = Math.max(lvl, 3); reasons.push('Public client enabled — no client secret required, so device-code phishing or ROPC can mint tokens for this app without compromising it. A common token-theft vector (MITRE T1528); mitigate with Conditional Access (block device-code / legacy auth) and phishing-resistant MFA.'); if(r.permScore >= 3) lvl = 4; }
     if(f.implicitGrant){ lvl = Math.max(lvl, 3); reasons.push('Implicit grant enabled — tokens issued from /authorize, exposed in logs/history.'); }
     if(f.riskyRedirect){ lvl = Math.max(lvl, 3); reasons.push('Risky redirect URI (wildcard / cleartext HTTP) — auth-code interception.'); }
@@ -1089,7 +1089,7 @@
     { key:'appPerms', label:'Application permissions', sev:'high' },
     { key:'publicClient', label:'Public client / device-code', sev:'high' },
     { key:'msDisabled', label:'Microsoft-disabled app', sev:'high' },
-    { key:'credExpired', label:'Expired credential present', sev:'high' },
+    { key:'credExpired', label:'Expired credential present (hygiene — inert)', sev:'low' },
     { key:'consumer', label:'Accepts consumer accounts', sev:'high' },
     { key:'assignmentNotRequired', label:'Assignment not required (open to all users)', sev:'high' },
     { key:'allPrincipals', label:'Tenant-wide (AllPrincipals) consent', sev:'med' },
@@ -1342,6 +1342,15 @@
     return '<span style="color:var(--green)">Valid</span>';
   }
   function fmtDay(d){ return d ? String(d).slice(0,10) : '—'; }
+  // A credential can only make the app authenticate if it's NOT expired. An EXPIRED secret/cert is inert (Entra
+  // rejects it — no token), so an app whose only credentials are expired is effectively CREDENTIAL-LESS: its
+  // application permissions are DORMANT, not "keys to permissions". FICs (workload-identity federation) don't expire.
+  function hasValidCred(r){
+    var pw = credState(r.passwordCreds), kc = credState(r.keyCreds);
+    var validSecrets = (r.passwordCreds||[]).length - pw.expired;
+    var validCerts = (r.keyCreds||[]).length - kc.expired;
+    return validSecrets > 0 || validCerts > 0 || (r.fic && r.fic.length > 0);
+  }
   function credDetailHtml(r){
     var out = '';
     if(r.passwordCreds && r.passwordCreds.length){
@@ -1359,7 +1368,9 @@
       r.fic.forEach(function(c){ out += '<li><b>' + escHtml(c.name || '(unnamed)') + '</b><br>issuer <code>' + escHtml(c.issuer||'') + '</code><br>subject <code>' + escHtml(c.subject||'') + '</code>' + (c.audiences && c.audiences.length ? '<br>audiences <code>' + escHtml(c.audiences.join(', ')) + '</code>' : '') + '</li>'; });
       out += '</ul>';
     }
-    if(out && (r.appPermissions||[]).some(function(p){ return p.roleName !== 'Default access'; })) out += '<div class="credlink credlink-live">These credentials let the app authenticate as itself and use its <b>application permissions</b> (see that section) with no user — treat them as keys to those permissions.</div>';
+    if(out && (r.appPermissions||[]).some(function(p){ return p.roleName !== 'Default access'; })) out += (hasValidCred(r)
+      ? '<div class="credlink credlink-live">These credentials let the app authenticate as itself and use its <b>application permissions</b> (see that section) with no user — treat them as keys to those permissions.</div>'
+      : '<div class="credlink credlink-dormant">The credential(s) above are all <b>expired</b>, so the app <b>can\'t authenticate as itself right now</b> — its application permissions are <b>dormant</b> until a valid credential is added. An expired secret is inert (Entra won\'t mint a token for it); this is a cleanup item, not an active key.</div>');
     if(!out) out = '<p class="dmuted">' + (r.localApp ? 'No credentials registered on this application.' : 'Credential details are not readable for externally-registered (multi-tenant / Microsoft) apps.') + '</p>';
     return out;
   }
@@ -1398,7 +1409,8 @@
     var note = nRedundant ? '<div class="dmuted" style="margin-top:5px;font-size:11px">Struck-through grants are <b>redundant</b> — a broader scope already held covers them. Least-privilege: remove the narrower ones (or drop the broad scope if only the narrow reads are actually needed).</div>' : '';
     var inline = credInline(r), conn;
     if(!r.localApp) conn = '<div class="credlink credlink-ext">Exercised by the app <b>authenticating as itself</b> — no user. This app is registered in another tenant, so its client credentials aren’t readable here; assume the <b>publisher can authenticate as it</b> and use every application permission above.</div>';
-    else if(inline) conn = '<div class="credlink credlink-live">Exercised by the app <b>authenticating as itself</b> — no signed-in user. Its registered client credentials make that possible: <b>' + inline + '</b>. Anyone holding one of those credentials wields <b>all</b> the application permissions above.</div>';
+    else if(hasValidCred(r)) conn = '<div class="credlink credlink-live">Exercised by the app <b>authenticating as itself</b> — no signed-in user. Its registered client credentials make that possible: <b>' + inline + '</b>. Anyone holding one of those credentials wields <b>all</b> the application permissions above.</div>';
+    else if(inline) conn = '<div class="credlink credlink-dormant">The app’s only client credential(s) are <b>expired</b> (' + inline + '), so it <b>can’t authenticate as itself</b> right now — these application permissions are <b>dormant</b> until a valid credential is added. Expired credentials are inert, not active keys.</div>';
     else conn = '<div class="credlink credlink-dormant">Exercised by the app authenticating as itself — but <b>no client credential (secret / certificate / federated credential) is registered</b>, so these application permissions are currently <b>dormant</b> (the app can’t authenticate as itself). Adding any credential activates them.</div>';
     return list + note + conn;
   }
