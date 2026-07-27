@@ -113,6 +113,7 @@
   .sc4 { color: var(--red); font-weight: 700; }
   .sc3 { color: var(--amber); font-weight: 600; }
   .sc2 { color: var(--text); }
+  .perm-redundant { color: var(--muted); text-decoration: line-through; cursor: help; }
   .cred-pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; margin: 0 3px 3px 0; background: var(--code-bg); color: var(--muted); }
   .cred-pill.expiring { background: var(--amber-bg); color: var(--amber); }
   .cred-pill.expired  { background: var(--red-bg); color: var(--red); }
@@ -662,10 +663,38 @@
   var RISK_SCORES = {
     'RoleManagement.ReadWrite.Directory':4,'RoleManagement.ReadWrite.All':4,'Directory.ReadWrite.All':4,'AppRoleAssignment.ReadWrite.All':4,'Policy.ReadWrite.All':4,'PrivilegedAccess.ReadWrite.AzureAD':4,'Exchange.ManageAsApp':4,'full_access_as_app':4,'Sites.FullControl.All':4,'EWS.AccessAsUser.All':4,
     'Mail.ReadWrite':3,'Mail.ReadWrite.All':3,'Mail.Send':3,'Mail.Send.All':3,'Files.ReadWrite.All':3,'User.ReadWrite.All':3,'Group.ReadWrite.All':3,'Application.ReadWrite.All':3,'Application.ReadWrite.OwnedBy':3,'Calendars.ReadWrite':3,'Contacts.ReadWrite':3,'MailboxSettings.ReadWrite':3,'TeamSettings.ReadWrite.All':3,'Channel.Delete.All':3,'Chat.ReadWrite.All':3,'OnlineMeetings.ReadWrite.All':3,'ServicePrincipalEndpoint.ReadWrite.All':3,'Tasks.ReadWrite.All':3,
-    'Mail.Read':2,'Mail.Read.All':2,'Files.Read.All':2,'User.Read.All':2,'Group.Read.All':2,'Directory.Read.All':2,'Contacts.Read':2,'People.Read.All':2,'AuditLog.Read.All':2,'Reports.Read.All':2,'Chat.Read.All':2,'ChannelMessage.Read.All':2,'Sites.Read.All':2,'Notes.Read.All':2,'SecurityEvents.Read.All':2,'IdentityRiskEvent.Read.All':2,'TeamMember.Read.All':2,'DeviceManagementApps.Read.All':2
+    'Directory.Read.All':3,   // full directory read (all users, groups, apps, devices) — broader than the per-object reads below
+    'Mail.Read':2,'Mail.Read.All':2,'Files.Read.All':2,'User.Read.All':2,'Group.Read.All':2,'Contacts.Read':2,'People.Read.All':2,'AuditLog.Read.All':2,'Reports.Read.All':2,'Chat.Read.All':2,'ChannelMessage.Read.All':2,'Sites.Read.All':2,'Notes.Read.All':2,'SecurityEvents.Read.All':2,'IdentityRiskEvent.Read.All':2,'TeamMember.Read.All':2,'DeviceManagementApps.Read.All':2
   };
   var RISK_LABELS = ['','Low','Medium','High','Critical'];
   function scoreScope(s){ return RISK_SCORES[s] || 1; }
+  // Scope subsumption: a broader grant makes narrower ones redundant (Directory.Read.All ⊇ Group.Read.All, User.Read.All…).
+  // Used to (a) headline the SUPERSET in the row summary — not whichever scope Graph returned first — and (b) grey the
+  // redundant narrower grants in the detail pane so least-privilege remediation writes itself. Lists are transitively
+  // complete, so a flat membership test suffices.
+  var SCOPE_SUPERSETS = {
+    'Directory.ReadWrite.All':['Directory.Read.All','User.ReadWrite.All','User.Read.All','Group.ReadWrite.All','Group.Read.All','GroupMember.ReadWrite.All','GroupMember.Read.All','Application.ReadWrite.All','Application.Read.All','Device.Read.All'],
+    'Directory.Read.All':['User.Read.All','Group.Read.All','GroupMember.Read.All','Application.Read.All','Device.Read.All'],
+    'Group.ReadWrite.All':['Group.Read.All','GroupMember.ReadWrite.All','GroupMember.Read.All'],
+    'GroupMember.ReadWrite.All':['GroupMember.Read.All'],
+    'User.ReadWrite.All':['User.Read.All'],
+    'Application.ReadWrite.All':['Application.Read.All'],
+    'RoleManagement.ReadWrite.Directory':['RoleManagement.Read.Directory','RoleManagement.Read.All'],
+    'Mail.ReadWrite.All':['Mail.Read.All','Mail.Read'],'Mail.ReadWrite':['Mail.Read'],
+    'Files.ReadWrite.All':['Files.Read.All'],
+    'Sites.FullControl.All':['Sites.ReadWrite.All','Sites.Read.All'],'Sites.ReadWrite.All':['Sites.Read.All'],
+    'Chat.ReadWrite.All':['Chat.Read.All'],'Calendars.ReadWrite':['Calendars.Read'],'Contacts.ReadWrite':['Contacts.Read']
+  };
+  // Which of the held scopes are subsumed by another held scope (→ redundant / greyable).
+  function subsumedScopes(scopes){ var held={}; (scopes||[]).forEach(function(s){ if(s) held[s]=1; }); var sub={};
+    Object.keys(held).forEach(function(x){ (SCOPE_SUPERSETS[x]||[]).forEach(function(y){ if(held[y] && y!==x) sub[y]=1; }); }); return sub; }
+  // The held scope that subsumes v (for the "redundant — covered by X" note), or null.
+  function supersetOf(v, scopes){ for(var i=0;i<(scopes||[]).length;i++){ var x=scopes[i]; if(x!==v && (SCOPE_SUPERSETS[x]||[]).indexOf(v)>=0) return x; } return null; }
+  // The scope to HEADLINE: highest severity among the non-subsumed scopes; ties broken toward the broadest (superset).
+  function dominantScope(scopes){ if(!scopes||!scopes.length) return null; var sub=subsumedScopes(scopes);
+    var cand=scopes.filter(function(s){ return !sub[s]; }); if(!cand.length) cand=scopes.slice();
+    cand.sort(function(a,b){ var d=scoreScope(b)-scoreScope(a); if(d) return d; var da=(SCOPE_SUPERSETS[a]||[]).length, db=(SCOPE_SUPERSETS[b]||[]).length; if(db!==da) return db-da; return a<b?-1:1; });
+    return cand[0]; }
   // Live permission score — grants against RETIRED resource APIs are skipped (non-exercisable, no token audience).
   function computePermScore(r){
     var max = 1;
@@ -758,7 +787,13 @@
     else if(f.consumer && !(r.delegatedDetail||[]).length){ reasons.push('Accepts personal Microsoft accounts, but holds no delegated permissions — there is no user-delegation path today (the consumer audience is inert unless delegated scopes are added; its application permissions run on the app credential, not user tokens).'); }
     if(f.multiExternal && r.permScore >= 3){ lvl = Math.max(lvl, 3); reasons.push('Multi-tenant app registered in an EXTERNAL tenant, with high permissions — supply-chain blast radius: a compromise of the publisher reaches into your tenant.'); }
     // The worst multi-tenant case: application permissions on an externally-registered app — the key is outside your control.
-    if(f.externalAppKey){ lvl = Math.max(lvl, r.permScore >= 4 ? 4 : 3); reasons.push('Application permissions on an externally-registered app — its client credential lives in the publisher\'s tenant, so you can\'t see, rotate, or revoke the key (only pull the whole app\'s consent). A standing key into your tenant that is outside your control. This is the shape that OAuth "illicit consent" / admin-consent phishing produces (the classic high-volume OAuth-app abuse pattern) — confirm this is an app you deliberately consented, and if not, revoke it.'); }
+    if(f.externalAppKey){ lvl = Math.max(lvl, r.permScore >= 4 ? 4 : 3);
+      var extBase = 'Application permissions on an externally-registered app — its client credential lives in the publisher\'s tenant, so you can\'t see, rotate, or revoke the key (only pull the whole app\'s consent). A standing key into your tenant that is outside your control.';
+      // The illicit-consent framing only earns its keep on an UNVERIFIED publisher; on a verified ISV it reads as
+      // noise (the answer to "did you deliberately consent?" is obviously yes), so soften it there.
+      reasons.push(extBase + (r.isVerifiedPublisher
+        ? ' Publisher is MPN-verified — a known vendor; treat this as a supply-chain dependency to inventory and least-privilege, not a likely compromise.'
+        : ' With an UNVERIFIED publisher this is the exact shape OAuth "illicit consent" / admin-consent phishing produces — confirm you deliberately consented this app, and if not, revoke it.')); }
     // Internal multi-tenant: your own registration. Broad audience, but you hold the keys — reframe, don't supply-chain it.
     if(f.multiInternal && (r.permScore >= 3 || f.appPerms)){ reasons.push('Multi-tenant app registered in YOUR tenant — broad token audience, but you own the registration and its credentials (rotate and scope them here). Not an external supply-chain exposure; treat it as an internal high-privilege app to keep least-privileged and credential-rotated.'); }
     // Assignment-not-required only exposes DELEGATED access: it gates who can SIGN IN, so it means nothing without
@@ -768,7 +803,7 @@
     var delScore = delegatedLiveScore(r);
     if(f.assignmentNotRequired && delScore >= 2){ if(delScore >= 3) lvl = Math.max(lvl, 3); reasons.push('Assignment not required + high-impact delegated permissions — any user in the tenant can sign in and exercise them (no user/group assignment gate), so the delegated access is exposed to the whole directory rather than an assigned subset. (This gate does not affect application permissions.)'); }
     if(f.credExpired){ reasons.push('Has an expired-but-present credential — hygiene gap and possible stale trust.'); }
-    if(f.allPrincipals){ reasons.push('Tenant-wide (AllPrincipals) consent — an admin consented this app for every user, so all of them inherit its permissions and the app holds standing access until consent is revoked. This is the outcome an illicit-consent phishing attack aims for — verify it was an intended admin consent.'); }
+    if(f.allPrincipals){ reasons.push('Tenant-wide (AllPrincipals) consent — an admin consented this app for every user, so all of them inherit its permissions and the app holds standing access until consent is revoked.' + (r.isVerifiedPublisher ? '' : ' For an unverified publisher, confirm this was an intended admin consent and not illicit-consent phishing.')); }
     if(f.unverifiedPublisher && f.multiExternal){ reasons.push('External publisher is not verified (no MPN verified publisher) — no vendor identity assurance behind an app that holds a key in your tenant.'); }
     if(f.hasFIC){ reasons.push('Uses federated identity credentials (workload identity federation) — trust hinges on issuer/subject, review them.'); }
     if(f.noOwner){ reasons.push('No owner assigned — orphaned registration, no accountable steward.'); }
@@ -1223,9 +1258,10 @@
     var delN = (r.delegatedDetail||[]).reduce(function(a,d){ return a + (d.scopes ? d.scopes.split(', ').filter(Boolean).length : 0); }, 0);
     var appN = (r.appPermissions||[]).filter(function(p){ return p.roleName !== 'Default access'; }).length;
     if(!delN && !appN) return '<span style="color:var(--muted)">none</span>';
-    // Emphasise the top LIVE scope. If the only high grants are against retired APIs, show the would-be top scope
-    // struck-through and flagged inert, so the row reads as a cleanup item rather than an exploitable one.
-    var top = '', topSev = 0; (r.liveScopes||[]).forEach(function(s){ var sc = scoreScope(s); if(sc > topSev){ topSev = sc; top = s; } });
+    // Headline the DOMINANT live scope — highest severity, and among ties the SUPERSET (Directory.Read.All over the
+    // narrower Group/User reads it covers) — not whichever scope Graph returned first. If the only high grants are
+    // against retired APIs, show the would-be top scope struck-through and flagged inert instead.
+    var top = dominantScope(r.liveScopes||[]) || '', topSev = top ? scoreScope(top) : 0;
     var cls = topSev >= 4 ? 'sc4' : topSev >= 3 ? 'sc3' : '';
     var parts = []; if(delN) parts.push(delN + ' delegated'); if(appN) parts.push(appN + ' app');
     var lead = '';
@@ -1309,16 +1345,27 @@
   function appPermsHtml(r){
     var perms = (r.appPermissions||[]).filter(function(p){ return p.roleName !== 'Default access'; });
     if(!perms.length) return '<p class="dmuted">No application permissions (app roles).</p>';
+    // Grey the scopes a broader held grant already subsumes (e.g. Group.Read.All / User.Read.All under Directory.Read.All).
+    var allVals = perms.map(function(p){ return p.roleValue || p.roleName; }), sub = subsumedScopes(allVals), nRedundant = 0;
     var byRes = {}; perms.forEach(function(p){ (byRes[p.resourceName]=byRes[p.resourceName]||[]).push(p); });
-    var list = Object.keys(byRes).map(function(rn){ var vals = byRes[rn].map(function(p){ var v=p.roleValue||p.roleName, sc=scoreScope(p.roleValue||''), cls=sc>=4?'sc4':sc>=3?'sc3':sc>=2?'sc2':''; return cls?'<span class="'+cls+'">'+escHtml(v)+'</span>':escHtml(v); }).join(', '); return '<div><span class="ptag ptag-app">App role</span><span class="res">'+escHtml(rn)+':</span> '+vals+'</div>'; }).join('');
+    var list = Object.keys(byRes).map(function(rn){ var vals = byRes[rn].map(function(p){ var v=p.roleValue||p.roleName;
+        if(sub[v]){ nRedundant++; return '<span class="perm-redundant" title="Redundant — already covered by ' + escHtml(supersetOf(v, allVals) || 'a broader grant held') + '">' + escHtml(v) + '</span>'; }
+        var sc=scoreScope(v), cls=sc>=4?'sc4':sc>=3?'sc3':sc>=2?'sc2':''; return cls?'<span class="'+cls+'">'+escHtml(v)+'</span>':escHtml(v); }).join(', ');
+      return '<div><span class="ptag ptag-app">App role</span><span class="res">'+escHtml(rn)+':</span> '+vals+'</div>'; }).join('');
+    var note = nRedundant ? '<div class="dmuted" style="margin-top:5px;font-size:11px">Struck-through grants are <b>redundant</b> — a broader scope already held covers them. Least-privilege: remove the narrower ones (or drop the broad scope if only the narrow reads are actually needed).</div>' : '';
     var inline = credInline(r), conn;
     if(!r.localApp) conn = '<div class="credlink credlink-ext">Exercised by the app <b>authenticating as itself</b> — no user. This app is registered in another tenant, so its client credentials aren’t readable here; assume the <b>publisher can authenticate as it</b> and use every application permission above.</div>';
     else if(inline) conn = '<div class="credlink credlink-live">Exercised by the app <b>authenticating as itself</b> — no signed-in user. Its registered client credentials make that possible: <b>' + inline + '</b>. Anyone holding one of those credentials wields <b>all</b> the application permissions above.</div>';
     else conn = '<div class="credlink credlink-dormant">Exercised by the app authenticating as itself — but <b>no client credential (secret / certificate / federated credential) is registered</b>, so these application permissions are currently <b>dormant</b> (the app can’t authenticate as itself). Adding any credential activates them.</div>';
-    return list + conn;
+    return list + note + conn;
   }
   // The right side of the "Delegated access" pair: WHO can sign in and trigger the delegated permissions.
   function assignedColHtml(r){
+    // No delegated permissions → there is no interactive sign-in surface at all, regardless of the assignment gate.
+    // Saying "any user can sign in and exercise the delegated permissions" next to "No delegated permissions" was a
+    // contradiction; this app runs app-only on its own credential (see Application access).
+    if(!r.delegatedDetail || !r.delegatedDetail.length)
+      return '<p class="dmuted"><b>No interactive sign-in surface</b> — this app holds no delegated permissions, so there is nothing for a user to exercise by signing in. It runs <b>app-only</b>, authenticating as itself with its own credential (see Application access). The assignment setting is moot here.</p>';
     if(r.appRoleAssignmentRequired === true)
       return '<div class="assigned-slot" data-assigned="' + escHtml(r.id) + '">' + (r._assignedTo ? renderAssigned(r._assignedTo) : '<p class="dmuted"><span class="spinner"></span> Loading assigned principals…</p>') + '</div>';
     return '<p class="dmuted"><b>Open to all users</b> — assignment is not required, so <b>any user in the tenant</b> can sign in and exercise the delegated permissions on the left. There is no assignment list to show.</p>';
