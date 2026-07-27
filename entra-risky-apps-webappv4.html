@@ -631,6 +631,14 @@
     (r.appPermissions||[]).forEach(function(p){ if(p.retired) return; max = Math.max(max, scoreScope(p.roleValue || '')); });
     return max;
   }
+  // Max DELEGATED (live) scope score — the consumer-audience risk is about who can sign in and exercise DELEGATED
+  // permissions, so it must be judged on the delegated set, not on app-only permissions (which run on the app
+  // credential, not a user token). An app-only app with no delegated grants has no user-delegation path at all.
+  function delegatedLiveScore(r){
+    var max = 1;
+    (r.delegatedDetail||[]).forEach(function(d){ if(d.retired) return; (d.scopes||'').split(', ').forEach(function(s){ if(s) max = Math.max(max, scoreScope(s)); }); });
+    return max;
+  }
   // The score the retired-API grants WOULD carry if the API were live — drives the "inert grant" hygiene signal.
   function computeInertPermScore(r){
     var max = 1;
@@ -704,7 +712,8 @@
     if(f.publicClient){ lvl = Math.max(lvl, 3); reasons.push('Public client enabled — device-code / ROPC token flows with no secret (phishing vector).'); if(r.permScore >= 3) lvl = 4; }
     if(f.implicitGrant){ lvl = Math.max(lvl, 3); reasons.push('Implicit grant enabled — tokens issued from /authorize, exposed in logs/history.'); }
     if(f.riskyRedirect){ lvl = Math.max(lvl, 3); reasons.push('Risky redirect URI (wildcard / cleartext HTTP) — auth-code interception.'); }
-    if(f.consumer && r.permScore >= 3){ lvl = 4; reasons.push('Accepts personal Microsoft accounts — broadest possible token audience.'); }
+    if(f.consumer && delegatedLiveScore(r) >= 3){ lvl = 4; reasons.push('Accepts personal Microsoft accounts AND holds high-impact delegated permissions — a personal account can sign in and exercise them (broadest possible token audience).'); }
+    else if(f.consumer && !(r.delegatedDetail||[]).length){ reasons.push('Accepts personal Microsoft accounts, but holds no delegated permissions — there is no user-delegation path today (the consumer audience is inert unless delegated scopes are added; its application permissions run on the app credential, not user tokens).'); }
     if(f.multiExternal && r.permScore >= 3){ lvl = Math.max(lvl, 3); reasons.push('Multi-tenant app registered in an EXTERNAL tenant, with high permissions — supply-chain blast radius: a compromise of the publisher reaches into your tenant.'); }
     // The worst multi-tenant case: application permissions on an externally-registered app — the key is outside your control.
     if(f.externalAppKey){ lvl = Math.max(lvl, r.permScore >= 4 ? 4 : 3); reasons.push('Application permissions on an externally-registered app — its client credential lives in the publisher\'s tenant, so you can\'t see, rotate, or revoke the key (only pull the whole app\'s consent). A standing key into your tenant that is outside your control — the most dangerous multi-tenant case.'); }
@@ -716,6 +725,11 @@
     if(f.unverifiedPublisher && f.multiExternal){ reasons.push('External publisher is not verified (no MPN verified publisher) — no vendor identity assurance behind an app that holds a key in your tenant.'); }
     if(f.hasFIC){ reasons.push('Uses federated identity credentials (workload identity federation) — trust hinges on issuer/subject, review them.'); }
     if(f.noOwner){ reasons.push('No owner assigned — orphaned registration, no accountable steward.'); }
+    // Policy: an internal multi-tenant app — registered in YOUR tenant, credential under your control — is treated one
+    // tier below the equivalent external app. Cap at High: you can rotate/revoke the key instantly and there's no
+    // blind external party, so it shouldn't sit in the Critical bucket on permissions/audience alone. Microsoft-
+    // disabled is the exception (a real active-threat signal) and keeps its level.
+    if(f.multiInternal && !f.msDisabled && lvl > 3){ lvl = 3; reasons.push('Capped at High: registered in your own tenant, so you control the credential (rotate / revoke instantly) and there is no external party — one tier below the equivalent externally-registered app.'); }
     // Microsoft first-party right-sizing: no ISV supply-chain risk and no MPN-verification gap (verification is a
     // third-party construct). A high grant here is stale-consent HYGIENE, not a Critical third-party threat — cap
     // at High. Exception: if Microsoft itself disabled the app (disabledByMicrosoftStatus), that's a real signal and
