@@ -445,7 +445,11 @@
     'c9005da2-023d-40f1-a17a-2b7d91af4ede': 'Office 365 management (Azure Monitor onboarding, West Europe)',
     '5a0aa725-4958-4b0c-80a9-34562e23f3b7': 'Windows Virtual Desktop / Azure Virtual Desktop'
   };
-  function isMsFirstParty(sp){ return !!MS_TENANTS[sp.appOwnerOrganizationId] || !!MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()]; }
+  // A VERIFIED publisher of "Microsoft Corporation" is a hard-to-fake MPN signal (unlike a display name), so it also
+  // marks first-party — catches Microsoft apps like Graph Explorer whose owner tenant isn't in the allowlist. (Only
+  // reliable once verifiedPublisher is read correctly — the ConsistencyLevel:eventual fix.)
+  function isVerifiedMicrosoft(sp){ return !!(sp.verifiedPublisher && /^\s*microsoft corporation\s*$/i.test(sp.verifiedPublisher.displayName||'')); }
+  function isMsFirstParty(sp){ return !!MS_TENANTS[sp.appOwnerOrganizationId] || !!MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()] || isVerifiedMicrosoft(sp); }
   // Retired resource APIs: a permission's real power depends on the RESOURCE it targets, not just its name. The same
   // role "Directory.ReadWrite.All" is tenant-takeover-class against Microsoft Graph (00000003-…) but INERT against
   // Azure AD Graph (00000002-…, graph.windows.net) — that API is fully retired (new apps blocked 31 Aug 2024;
@@ -710,9 +714,14 @@
     cand.sort(function(a,b){ var d=scoreScope(b)-scoreScope(a); if(d) return d; var da=(SCOPE_SUPERSETS[a]||[]).length, db=(SCOPE_SUPERSETS[b]||[]).length; if(db!==da) return db-da; return a<b?-1:1; });
     return cand[0]; }
   // Live permission score — grants against RETIRED resource APIs are skipped (non-exercisable, no token audience).
+  // DELEGATED scopes are scored ONE TIER BELOW the equivalent APPLICATION permission: delegated access is exercised
+  // on behalf of a signed-in user (effective access = intersection with that user's own privileges), needs an
+  // interactive sign-in, and grants NO standing / credential-based access — so a delegated Directory.ReadWrite.All is
+  // not the same tenant-takeover risk as the application role of the same name. (Aggravators like consumer audience /
+  // open-to-all-users are applied separately in computeRisk, judged on the RAW delegated score.)
   function computePermScore(r){
     var max = 1;
-    (r.delegatedDetail||[]).forEach(function(d){ if(d.retired) return; (d.scopes||'').split(', ').forEach(function(s){ if(s) max = Math.max(max, scoreScope(s)); }); });
+    (r.delegatedDetail||[]).forEach(function(d){ if(d.retired) return; (d.scopes||'').split(', ').forEach(function(s){ if(s) max = Math.max(max, Math.max(1, scoreScope(s) - 1)); }); });
     (r.appPermissions||[]).forEach(function(p){ if(p.retired) return; max = Math.max(max, scoreScope(p.roleValue || '')); });
     return max;
   }
@@ -786,6 +795,12 @@
     var lvl = r.permScore, f = r.factors, reasons = [];
     if(f.critical) reasons.push(r.isFirstPartyMicrosoft ? 'Holds a tenant-takeover-class permission — but this is a Microsoft first-party app, so the exposure is a stale / unnecessary privileged consent (often to a legacy or retired service), not a third-party compromise. Verify it is still needed and revoke if not.' : 'Holds a critical (tenant-takeover-class) permission.');
     else if(f.high) reasons.push(r.isFirstPartyMicrosoft ? 'Holds a high-impact permission (Microsoft first-party) — review whether this consent is still required.' : 'Holds a high-impact read/write permission.');
+    // Delegated-only app carrying a high/critical scope: explain WHY it isn't rated as an application permission would
+    // be — no standing access, gated by the signed-in user's own privileges + interactive sign-in.
+    if(!f.appPerms && delegatedLiveScore(r) >= 3){
+      var delTop = dominantScope((r.delegatedDetail||[]).reduce(function(a,d){ return d.retired ? a : a.concat((d.scopes||'').split(', ')); }, []).filter(Boolean));
+      reasons.push('Its highest permission' + (delTop ? ' (' + delTop + ')' : '') + ' is DELEGATED, not application — the app acts on behalf of a signed-in user, so effective access = the intersection of the scope and that user\'s own privileges, it needs an interactive sign-in, and there is no standing / credential-based access. Delegated grants are scored a tier below the equivalent application permission for this reason.');
+    }
     // Inert high grant: the only high/critical permission targets a RETIRED API (no live token audience). Not
     // exploitable — but a stale over-privileged consent record worth cleaning up. Surface at Medium (cleanup), not
     // Critical (exploitable). This fires for any app (first-party or not).
@@ -801,7 +816,8 @@
     if(f.publicClient){ lvl = Math.max(lvl, 3); reasons.push('Public client enabled — no client secret required, so device-code phishing or ROPC can mint tokens for this app without compromising it. A common token-theft vector (MITRE T1528); mitigate with Conditional Access (block device-code / legacy auth) and phishing-resistant MFA.'); if(r.permScore >= 3) lvl = 4; }
     if(f.implicitGrant){ lvl = Math.max(lvl, 3); reasons.push('Implicit grant enabled — tokens issued from /authorize, exposed in logs/history.'); }
     if(f.riskyRedirect){ lvl = Math.max(lvl, 3); reasons.push('Risky redirect URI (wildcard / cleartext HTTP) — auth-code interception.'); }
-    if(f.consumer && delegatedLiveScore(r) >= 3){ lvl = 4; reasons.push('Accepts personal Microsoft accounts AND holds high-impact delegated permissions — a personal account can sign in and exercise them (broadest possible token audience).'); }
+    if(f.consumer && f.assignmentNotRequired && delegatedLiveScore(r) >= 3){ lvl = 4; reasons.push('Accepts personal Microsoft accounts AND is open to all users AND holds high-impact delegated permissions — a personal account can sign in and exercise them (broadest possible token audience).'); }
+    else if(f.consumer && !f.assignmentNotRequired && delegatedLiveScore(r) >= 3){ reasons.push('Accepts personal Microsoft accounts, but assignment is REQUIRED — only assigned tenant users/groups can sign in (personal accounts can\'t be assigned), so the consumer audience is effectively gated and doesn\'t broaden who can exercise these permissions.'); }
     else if(f.consumer && !(r.delegatedDetail||[]).length){ reasons.push('Accepts personal Microsoft accounts, but holds no delegated permissions — there is no user-delegation path today (the consumer audience is inert unless delegated scopes are added; its application permissions run on the app credential, not user tokens).'); }
     if(f.multiExternal && r.permScore >= 3){ lvl = Math.max(lvl, 3); reasons.push('Multi-tenant app registered in an EXTERNAL tenant, with high permissions — supply-chain blast radius: a compromise of the publisher reaches into your tenant.'); }
     // The worst multi-tenant case: application permissions on an externally-registered app — the key is outside your control.
@@ -836,7 +852,8 @@
     // keeps its level.
     if(r.isFirstPartyMicrosoft && !f.msDisabled){
       lvl = Math.min(lvl, 3);
-      if(r.firstPartyByAppId) reasons.push('Recognised as a Microsoft first-party app by curated app-ID allowlist (its owner tenant isn\'t one of the two canonical Microsoft tenants) — unverified publisher is expected here and is not a risk signal.');
+      if(r.firstPartyByVerifiedMs) reasons.push('Recognised as Microsoft first-party via its verified publisher (Microsoft Corporation) — a hard-to-fake MPN signal (its owner tenant isn\'t in the allowlist). Third-party / supply-chain framing doesn\'t apply; capped at High.');
+      else if(r.firstPartyByAppId) reasons.push('Recognised as a Microsoft first-party app by curated app-ID allowlist (its owner tenant isn\'t one of the two canonical Microsoft tenants) — unverified publisher is expected here and is not a risk signal.');
     }
     // Brand impersonation goes to the TOP — "verify the publisher before anything else." An app whose name claims a
     // vendor but whose publisher is unverified must be identity-checked before any other conclusion is trusted.
@@ -904,7 +921,7 @@
         results.push({
           id: sp.id, appId: sp.appId, displayName: sp.displayName, publisherName: sp.publisherName,
           accountEnabled: sp.accountEnabled, appOwnerOrganizationId: sp.appOwnerOrganizationId,
-          isFirstPartyMicrosoft: isMsFirstParty(sp), firstPartyByAppId: !MS_TENANTS[sp.appOwnerOrganizationId] && !!MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()], createdDateTime: sp.createdDateTime,
+          isFirstPartyMicrosoft: isMsFirstParty(sp), firstPartyByAppId: !MS_TENANTS[sp.appOwnerOrganizationId] && !!MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()], firstPartyByVerifiedMs: !MS_TENANTS[sp.appOwnerOrganizationId] && !MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()] && isVerifiedMicrosoft(sp), createdDateTime: sp.createdDateTime,
           appRoleAssignmentRequired: sp.appRoleAssignmentRequired, _hasGrant: hasGrant,
           delegatedDetail: delegatedDetail, allScopes: allScopes, caps: computeReconCaps(allScopes),
           passwordCreds: sp.passwordCredentials || [], keyCreds: sp.keyCredentials || [], fic: [],
@@ -1463,7 +1480,7 @@
       + '<li><b>Registered in:</b> ' + (r.isExternal ? (r.isFirstPartyMicrosoft ? '<span style="color:var(--muted)">a Microsoft-owned tenant</span> <span class="mono" style="font-size:11px">' + escHtml(r.appOwnerOrganizationId||'?') + '</span> — first-party app; its registration and credentials live in Microsoft\'s tenant, not yours' : '<span style="color:var(--red)">another tenant</span> <span class="mono" style="font-size:11px">' + escHtml(r.appOwnerOrganizationId||'?') + '</span> — its app registration, credentials, redirect URIs and owners live there and aren’t readable from your tenant') : 'this tenant (registered here)') + '</li>'
       + '<li><b>signInAudience:</b> <code>' + escHtml(r.signInAudience || '(inferred)') + '</code>' + (r.isExternal ? ' <span style="color:var(--muted)">— read from the service principal; unreliable for external apps, so tenancy is treated as multi-tenant</span>' : '') + '</li>'
       + '<li><b>Publisher:</b> ' + publisherLabel(r) + '</li>'
-      + '<li><b>Verified publisher:</b> ' + (r.isFirstPartyMicrosoft ? (ICON_MS + 'Microsoft first-party <span style="color:var(--muted)">— MPN verification is a third-party ISV construct, so first-party apps show as unverified; unverified ≠ untrusted when the owner is Microsoft' + (r.firstPartyByAppId ? ' (matched via curated app-ID allowlist)' : '') + '</span>') : (r.isVerifiedPublisher ? escHtml(r.verifiedPublisherName||'verified') : (r.isExternal ? '<span style="color:var(--red)">not verified</span>' : '<span style="color:var(--muted)">n/a — your own registration (MPN verified-publisher is a signal for external ISV apps)</span>'))) + '</li>'
+      + '<li><b>Verified publisher:</b> ' + (r.isFirstPartyMicrosoft ? (r.isVerifiedPublisher ? (ICON_MS + '<span style="color:var(--green)">' + escHtml(r.verifiedPublisherName||'Microsoft Corporation') + '</span> — verified Microsoft publisher (MPN); recognised as Microsoft first-party' + (r.firstPartyByVerifiedMs ? ' via this verified publisher' : '') + '.') : (ICON_MS + 'Microsoft first-party <span style="color:var(--muted)">— MPN verification is a third-party ISV construct, so first-party apps show as unverified; unverified ≠ untrusted when the owner is Microsoft' + (r.firstPartyByAppId ? ' (matched via curated app-ID allowlist)' : '') + '</span>')) : (r.isVerifiedPublisher ? escHtml(r.verifiedPublisherName||'verified') : (r.isExternal ? '<span style="color:var(--red)">not verified</span>' : '<span style="color:var(--muted)">n/a — your own registration (MPN verified-publisher is a signal for external ISV apps)</span>'))) + '</li>'
       + '<li><b>Assignment required:</b> ' + (r.appRoleAssignmentRequired ? 'yes — only assigned users/groups can obtain a token' : '<span style="color:var(--red)">no — any tenant user can obtain a token</span>') + '</li>'
       + '<li><b>Account enabled:</b> ' + (r.accountEnabled === false ? '<span style="color:var(--red)">no (disabled)</span>' : 'yes') + '</li>'
       + (r.createdDateTime ? '<li><b>Created:</b> ' + escHtml(new Date(r.createdDateTime).toISOString().slice(0,10)) + (preAuditWindow(r) ? ' <span style="color:var(--muted)">— <b>pre-audit-window:</b> older than the ~' + AUDIT_WINDOW_DAYS + '-day directory-audit retention, so the consent event is no longer auditable. This created date is the only provenance that exists for this consent.</span>' : '') + '</li>' : '')
