@@ -114,6 +114,7 @@
   .sc3 { color: var(--amber); font-weight: 600; }
   .sc2 { color: var(--text); }
   .perm-redundant { color: var(--muted); text-decoration: line-through; cursor: help; }
+  .pre-audit { color: var(--muted); cursor: help; font-size: 12px; opacity: .7; }
   .cred-pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; margin: 0 3px 3px 0; background: var(--code-bg); color: var(--muted); }
   .cred-pill.expiring { background: var(--amber-bg); color: var(--amber); }
   .cred-pill.expired  { background: var(--red-bg); color: var(--red); }
@@ -453,6 +454,19 @@
   // hygiene item) rather than exploitable. Keyed by resource appId (lowercase).
   var RETIRED_APIS = { '00000002-0000-0000-c000-000000000000': 'Azure AD Graph (graph.windows.net)' };
   function isRetiredApi(appId){ return !!(appId && RETIRED_APIS[String(appId).toLowerCase()]); }
+  // Brand / vendor names that appear in app DISPLAY NAMES. A display name is attacker-controlled — naming a malicious
+  // app "Proofpoint …" or "Microsoft …" is a classic consent-phishing lure (name-collision / brand impersonation).
+  // The name proves nothing; only publisher VERIFICATION and the owner tenant do. So an external, UNVERIFIED app whose
+  // name claims a known vendor is a "verify the publisher FIRST" prompt — not proof of malice, but check it before trust.
+  // NOTE: only meaningful once verifiedPublisher is read correctly (the ConsistencyLevel:eventual fix) — otherwise
+  // everything reads unverified and this would fire on the genuinely-verified vendor too.
+  var VENDOR_BRAND_RX = /\b(microsoft|proofpoint|mimecast|avepoint|lookout|okta|salesforce|adobe|docusign|servicenow|workday|atlassian|crowdstrike|zscaler|netskope|splunk|sailpoint|symantec|sophos|fortinet|palo\s?alto|cisco|vmware|citrix|zoom|dropbox|google|amazon)\b/i;
+  function brandClaim(name){ var m = VENDOR_BRAND_RX.exec(String(name||'')); return m ? m[1].replace(/\b\w/g,function(c){return c.toUpperCase();}) : null; }
+  // Entra directory-audit retention tops out at ~30 days, so for a consent older than that the "who consented, when,
+  // what" audit event is gone — the CREATED date is the only provenance that survives. Flag those so a reader knows
+  // the created date is load-bearing (and that they can't audit-log their way back to the consent).
+  var AUDIT_WINDOW_DAYS = 30;
+  function preAuditWindow(r){ return r.createdDateTime ? (Date.now() - new Date(r.createdDateTime).getTime()) > AUDIT_WINDOW_DAYS*86400000 : false; }
   var ICON_MS = '<svg width="12" height="12" viewBox="0 0 23 23" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><rect x="1" y="1" width="10" height="10" fill="#F25022"/><rect x="12" y="1" width="10" height="10" fill="#7FBA00"/><rect x="1" y="12" width="10" height="10" fill="#00A4EF"/><rect x="12" y="12" width="10" height="10" fill="#FFB900"/></svg>';
   function publisherLabel(r){ return r.isFirstPartyMicrosoft ? (ICON_MS + 'Microsoft') : escHtml(r.publisherName || '—'); }
 
@@ -752,6 +766,10 @@
     f.externalAppKey = f.appPerms && f.multiExternal;
     // The dangerous combo (exposure chip): external app-key with no publisher identity assurance either.
     f.dangerCombo = f.externalAppKey && f.unverifiedPublisher;
+    // Brand impersonation / name-collision: the display name claims a known vendor, but the app is external and its
+    // publisher is UNVERIFIED — the name can't be trusted, so verify the publisher before anything else.
+    f.brand = (r.isExternal === true && !r.isFirstPartyMicrosoft && !r.isVerifiedPublisher) ? brandClaim(r.displayName) : null;
+    f.brandUnverified = !!f.brand;
     var pw = credState(r.passwordCreds), kc = credState(r.keyCreds);
     f.credExpired = (pw.expired + kc.expired) > 0;
     f.credExpiring = (pw.expiring + kc.expiring) > 0;
@@ -819,6 +837,12 @@
     if(r.isFirstPartyMicrosoft && !f.msDisabled){
       lvl = Math.min(lvl, 3);
       if(r.firstPartyByAppId) reasons.push('Recognised as a Microsoft first-party app by curated app-ID allowlist (its owner tenant isn\'t one of the two canonical Microsoft tenants) — unverified publisher is expected here and is not a risk signal.');
+    }
+    // Brand impersonation goes to the TOP — "verify the publisher before anything else." An app whose name claims a
+    // vendor but whose publisher is unverified must be identity-checked before any other conclusion is trusted.
+    if(f.brandUnverified){
+      lvl = Math.max(lvl, 3);
+      reasons.unshift('⚠ VERIFY THE PUBLISHER FIRST — the display name references “' + f.brand + '”, a known vendor, but the publisher is UNVERIFIED and the app is externally registered. A display name is attacker-controlled; naming a malicious app after a trusted vendor is the classic consent-phishing lure (name collision / brand impersonation). The name proves nothing — confirm the real publisher and owner tenant before trusting or re-consenting. (This depends on publisher metadata being read correctly; if every app shows unverified, the metadata query is the problem, not this app.)');
     }
     r.riskReasons = reasons;
     return Math.max(1, lvl);
@@ -1041,6 +1065,7 @@
 
   // -------------------- Render --------------------
   var EXPO = [
+    { key:'brandUnverified', label:'⚠ Brand name + unverified publisher (verify identity first)', sev:'high' },
     { key:'externalAppKey', label:'⚠ External app with application permissions — a standing key you can’t rotate', sev:'high' },
     { key:'dangerCombo', label:'↳ …and the publisher is unverified too — the full OAuth consent-phishing combo (= the KPI tile)', sev:'high', sub:'externalAppKey' },
     { key:'critical', label:'Critical permission', sev:'high' },
@@ -1240,6 +1265,7 @@
 
   function riskFlags(r){
     var f = '';
+    if(r.factors.brandUnverified) f += '<span class="badge b-msdisabled" title="Display name claims “' + escHtml(r.factors.brand) + '” but the publisher is UNVERIFIED and the app is external — the name can\'t be trusted. Verify the real publisher / owner tenant before trusting (possible brand impersonation / consent-phishing lure).">⚠ Unverified “' + escHtml(r.factors.brand) + '” name</span>';
     if(r.factors.msDisabled) f += '<span class="badge b-msdisabled" title="Microsoft disabled this app — usually a malicious/abuse flag">MS-disabled</span>';
     if(r.factors.inertHighGrant) f += '<span class="badge b-retired" title="Its high/critical permission targets a RETIRED API (e.g. Azure AD Graph) — inert / non-exercisable. A stale over-privileged consent record to clean up, not an exploitable path.">Retired API · inert</span>';
     if(r.factors.externalAppKey) f += '<span class="badge b-app" title="Application permissions on an EXTERNALLY-registered app — its client credential lives in the publisher\'s tenant, so you can\'t see or rotate the key, only pull consent. A standing key into your tenant that is outside your control.">External app-key</span>';
@@ -1282,7 +1308,7 @@
         + '<td>' + tenancyBadge(r) + '</td>'
         + '<td>' + creds + '</td>'
         + '<td>' + permSummary(r) + '</td>'
-        + '<td>' + escHtml(created) + '</td>'
+        + '<td>' + escHtml(created) + (preAuditWindow(r) ? ' <span class="pre-audit" title="Created before the ~' + AUDIT_WINDOW_DAYS + '-day Entra directory-audit retention — the consent event (who/when/what) is no longer in the audit log, so this created date is the only provenance that exists.">◔</span>' : '') + '</td>'
         + '</tr>'
         + '<tr class="detail-row hidden" data-detail="' + escHtml(r.id) + '"><td colspan="7"></td></tr>';
     }).join('');
@@ -1439,7 +1465,9 @@
       + '<li><b>Publisher:</b> ' + publisherLabel(r) + '</li>'
       + '<li><b>Verified publisher:</b> ' + (r.isFirstPartyMicrosoft ? (ICON_MS + 'Microsoft first-party <span style="color:var(--muted)">— MPN verification is a third-party ISV construct, so first-party apps show as unverified; unverified ≠ untrusted when the owner is Microsoft' + (r.firstPartyByAppId ? ' (matched via curated app-ID allowlist)' : '') + '</span>') : (r.isVerifiedPublisher ? escHtml(r.verifiedPublisherName||'verified') : (r.isExternal ? '<span style="color:var(--red)">not verified</span>' : '<span style="color:var(--muted)">n/a — your own registration (MPN verified-publisher is a signal for external ISV apps)</span>'))) + '</li>'
       + '<li><b>Assignment required:</b> ' + (r.appRoleAssignmentRequired ? 'yes — only assigned users/groups can obtain a token' : '<span style="color:var(--red)">no — any tenant user can obtain a token</span>') + '</li>'
-      + '<li><b>Account enabled:</b> ' + (r.accountEnabled === false ? '<span style="color:var(--red)">no (disabled)</span>' : 'yes') + '</li></ul>';
+      + '<li><b>Account enabled:</b> ' + (r.accountEnabled === false ? '<span style="color:var(--red)">no (disabled)</span>' : 'yes') + '</li>'
+      + (r.createdDateTime ? '<li><b>Created:</b> ' + escHtml(new Date(r.createdDateTime).toISOString().slice(0,10)) + (preAuditWindow(r) ? ' <span style="color:var(--muted)">— <b>pre-audit-window:</b> older than the ~' + AUDIT_WINDOW_DAYS + '-day directory-audit retention, so the consent event is no longer auditable. This created date is the only provenance that exists for this consent.</span>' : '') + '</li>' : '')
+      + '</ul>';
     var ownersHtml = (r.owners && r.owners.length) ? '<ul class="dlist">' + r.owners.map(function(o){ return '<li>' + escHtml(o.displayName||'') + (o.upn ? ' <span class="mono" style="font-size:11px">' + escHtml(o.upn) + '</span>' : '') + '</li>'; }).join('') + '</ul>' : (r.localApp ? '<p style="color:var(--red)">No owners assigned — orphaned registration, no accountable steward.</p>' : '<p class="dmuted">Owners not visible for external apps.</p>');
 
     return '<div class="dpanel">'
