@@ -286,7 +286,7 @@
     <section class="view" data-view="risk">
     <div class="card">
       <h2>3 · Risk — reach that can leave the tenant</h2>
-      <div class="lede">An agent that only <i>reads</i> is a data source; the danger is an agent that reads work data <b>and</b> holds an <b>egress</b> (send/share/post) or <b>web</b> tool — a standing exfiltration path the LLM can trigger. Containment = DLP + Conditional Access.</div>
+      <div class="lede">An agent that only <i>reads</i> is a data source; the danger is one that reads work data <b>and</b> holds an <b>egress</b> or <b>web</b> tool the LLM can trigger. <b>Containment depends on how the agent authenticates:</b> a Work IQ / Copilot Studio agent runs <b>OBO</b> — it rides the signed-in user's token, so <b>agent Conditional Access is a no-op; the user's CA + Purview DLP-for-AI govern it</b>. Only an <b>S2S</b> (autonomous, own-credential) agent is gated by agent CA.</div>
       <div class="kpis" id="riskKpis"></div>
       <table id="riskTable"><thead><tr><th data-sort="score">Risk</th><th data-sort="name">Agent</th><th>Work-IQ reach</th><th>Egress / web tools</th><th>Containment</th></tr></thead><tbody></tbody></table>
     </div>
@@ -326,6 +326,8 @@
           <div class="cnode exf"><div class="ct">Data exfiltrated</div><div class="cd">sent / shared / posted out of the tenant</div></div>
         </div>
         <div class="cmit"><b>Contain:</b> remove egress / web tools where not needed, treat all retrieved content as untrusted, require human approval for outbound actions, apply DLP to the agent context.</div>
+        <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);font-weight:600;font-size:13px;color:#fdba74">Agents completing this chain in your tenant</div>
+        <div id="exploitBody"></div>
       </div>
 
       <div class="compro-wrap p3" id="path-blueprint">
@@ -342,9 +344,6 @@
         </div>
         <div class="cmit"><b>Contain:</b> certificates / managed identity instead of client secrets, scope the blueprint's inheritable permissions to least-privilege, monitor blueprint service-principal sign-ins. <span style="color:var(--muted)">See the Blueprint Security Posture tool for the blast radius.</span></div>
       </div>
-
-      <h3 style="margin-top:20px;font-size:14px">Agents completing the prompt-injection chain in your tenant</h3>
-      <div id="exploitBody"></div>
     </div>
     </section>
 
@@ -578,7 +577,7 @@ async function scan(){
         const matched=pol.filter(p=>p.state==="enabled"&&/agent/i.test(JSON.stringify(p.conditions||{})+" "+(p.displayName||"")));
         caAgents=matched.length; caNames=matched.map(p=>p.displayName||"(unnamed policy)");
       }catch(e){ caErr=(e&&e.message)||String(e); }
-    } else notices.push('<div class="notice"><b>Conditional Access containment not evaluated</b> — grant <code>Policy.Read.All</code> to check for an enabled CA policy targeting agents (a mitigating control in the Risk table).</div>');
+    } else notices.push('<div class="notice"><b>Conditional Access for agents not evaluated</b> — grant <code>Policy.Read.All</code> to check for an enabled agent-targeting CA policy. Note: agent CA only gates <b>autonomous (S2S)</b> agents; <b>OBO / Work IQ agents ride the signed-in user\'s CA</b> (governed by the user\'s risk-based CA + Purview DLP-for-AI), which this tool does not read per user.</div>');
 
     // ---- derive per-agent WorkIQ reach + risk ----
     agents.forEach(a=>computeAgent(a,caAgents,labels));
@@ -623,7 +622,15 @@ function computeAgent(a,caAgents,labels){
     const fmts=new Set(a.domains.map(d=>DOMAIN_FMT[d]).filter(Boolean));
     a.highSensReach=labels.some(l=>(l.sensitivity||0)>=0.6*maxS && (l.formats||[]).some(f=>fmts.has(f)));
   }
-  a.caCovered=caAgents>0;
+  a.caCovered=caAgents>0;   // an enabled agent-targeting CA policy exists in the tenant
+  // Auth mode. OBO (Work IQ / Copilot Studio) — the agent rides the signed-in USER's token, so an AGENT-targeting
+  // Conditional Access policy is a NO-OP for it; the USER's CA + Purview DLP-for-AI govern the reach. S2S — the agent
+  // authenticates AS ITSELF with its own credential, which agent CA DOES gate. Reach via tools/MCP/connectors/
+  // delegated grants ⇒ OBO; reach via application permissions ⇒ S2S.
+  const srcs=new Set(); a.reachSrcs.forEach(set=>set.forEach(x=>srcs.add(x)));
+  a.obo=srcs.has("WorkIQ")||srcs.has("tool")||srcs.has("connector")||srcs.has("delegated")||/copilot\s*studio/i.test(a.displayName||"");
+  a.s2s=srcs.has("app-perm");
+  a.authMode=(a.obo&&a.s2s)?"mixed":a.obo?"obo":a.s2s?"s2s":"unknown";
   // risk score 0-100
   let s=0;
   if(a.domains.length){ s+=12+Math.min(20,a.domains.length*5); }        // breadth of work-data reach
@@ -631,7 +638,7 @@ function computeAgent(a,caAgents,labels){
   if(a.exfilTools.length) s+=30; else if(a.webTools.length) s+=18;      // the exit
   if(a.hasExit&&a.domains.length) s+=15;                                 // reach + exit = live chain
   if(a.highSensReach) s+=14;                                            // touches high-sensitivity content
-  if(!a.caCovered&&a.hasExit) s+=8;                                     // uncontained
+  if(a.s2s&&!a.caCovered&&a.hasExit) s+=8;                              // S2S agent w/ an exit and NO agent CA to gate its own sign-in (agent CA is a no-op for OBO, so no bump there)
   if(a.accountEnabled===false) s=Math.round(s*0.3);
   a.risk=Math.max(0,Math.min(100,s));
   a.sev=a.risk>=70?"crit":a.risk>=45?"high":a.risk>=20?"med":"low";
@@ -681,7 +688,7 @@ function render(){
      kpi(withExit,"Reach + an exit",withExit?"warn":"ok","exit")
     +kpi(A.filter(a=>a.exfilTools.length).length,"Hold an egress tool",A.filter(a=>a.exfilTools.length).length?"hot":"ok","egress")
     +kpi(A.filter(a=>a.webTools.length).length,"Hold a web tool","","web")
-    +kpi(A.filter(a=>a.hasExit&&!a.caCovered).length,"Uncontained (no CA)","warn","uncontained")
+    +kpi(A.filter(a=>a.obo&&a.hasExit).length,"OBO exit · agent-CA n/a","warn","oboexit")
     +kpi(highSens,"Reach high-sensitivity",highSens?"hot":"ok","highsens");
   renderRiskTable(A);
 
@@ -705,7 +712,8 @@ const KPI_FILTERS={
   hasexit:{label:"hold an egress or web tool",pred:a=>a.hasExit},
   egress:{label:"hold an egress tool",pred:a=>a.exfilTools.length>0},
   web:{label:"hold a web tool",pred:a=>a.webTools.length>0},
-  uncontained:{label:"have an exit with no CA containment",pred:a=>a.hasExit&&!a.caCovered},
+  oboexit:{label:"run OBO and hold an exit — agent CA is a no-op, so containment is the user's CA + Purview DLP-for-AI",pred:a=>a.obo&&a.hasExit},
+  s2snoca:{label:"are S2S with an exit and no agent CA",pred:a=>a.s2s&&a.hasExit&&!a.caCovered},
   highsens:{label:"reach high-sensitivity content",pred:a=>a.highSensReach},
   exploit:{label:"complete the injection chain",pred:a=>a.exploitable}
 };
@@ -748,7 +756,10 @@ function renderRiskTable(A){
   const rows=A.filter(a=>a.domains.length||a.hasExit).sort((a,b)=>b.risk-a.risk);
   $("riskTable").querySelector("tbody").innerHTML=rows.map(a=>{
     const exit=a.exfilTools.length?'<span class="chip ext">egress ↗ '+a.exfilTools.length+'</span>':(a.webTools.length?'<span class="chip ext">web ↗ '+a.webTools.length+'</span>':'<span class="chip">read-only</span>');
-    const cont=a.caCovered?'<span class="chip" style="border-color:#34d39966;color:var(--green)">CA</span>':'<span class="chip ext">none</span>';
+    let cont;
+    if(a.obo) cont='<span class="chip" title="OBO agent — it rides the signed-in user\'s token, so AGENT Conditional Access is a no-op here. Containment is the USER\'s CA + Purview DLP-for-AI (not read per-agent by this tool).">user CA + DLP</span>';
+    else if(a.s2s) cont=a.caCovered?'<span class="chip" style="border-color:#34d39966;color:var(--green)" title="S2S agent covered by an enabled agent-targeting CA policy">agent CA</span>':'<span class="chip ext" title="S2S agent — authenticates as itself, but no agent CA gates its sign-in">no agent CA</span>';
+    else cont='<span class="chip">—</span>';
     return '<tr class="rowx"><td><span class="rbadge sev-'+a.sev+'">'+a.risk+'</span></td><td>'+esc(a.displayName||a.appId)+'<div class="mono">'+esc(a.appId)+'</div></td><td>'+(a.domains.slice(0,4).map(d=>'<span class="chip dom">'+esc(d)+'</span>').join(" ")||'<span class="mono">—</span>')+(a.viaWorkIQ?' <span class="chip wiq">WorkIQ</span>':"")+'</td><td>'+exit+'</td><td>'+cont+(a.highSensReach?' <span class="chip ext">high-sens</span>':"")+'</td></tr>';
   }).join("")||'<tr><td colspan="5" class="mono">No agents with M365 work-data reach.</td></tr>';
 }
