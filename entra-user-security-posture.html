@@ -243,7 +243,9 @@
           <br><b>Optional (each degrades gracefully):</b> <code>AuditLog.Read.All</code> adds per-user MFA-method
           posture + last-sign-in staleness; <code>Policy.Read.All</code> checks whether each admin is actually
           covered by an enforcing MFA Conditional Access policy; <code>IdentityRiskyUser.Read.All</code> folds in
-          Entra ID Protection risk (P2). PIM eligibility (<code>roleEligibilityScheduleInstances</code>) needs P2.</div>
+          Entra ID Protection risk (P2). PIM eligibility (<code>roleEligibilityScheduleInstances</code>) needs P2;
+          <code>RoleManagementPolicy.Read.Directory</code> detects which eligible roles require <b>approval</b> to
+          activate (lowers the score for approval-gated eligibility).</div>
       </div>
       <div>
         <label for="tenantId">Directory (tenant) ID or domain</label>
@@ -466,6 +468,9 @@ const CA_SCOPES = ["Policy.Read.All"];
 const AUTH_SCOPES = ["Directory.Read.All", "AuditLog.Read.All"];
 // Optional — Entra ID Protection risky-user state (needs P2).
 const RISK_SCOPES = ["IdentityRiskyUser.Read.All"];
+// Optional — PIM activation policy per role: does activating an eligible role require APPROVAL? An eligible role that
+// needs approval to turn on is materially less abusable than one that self-activates, so it lowers the priv score.
+const PIMPOL_SCOPES = ["RoleManagementPolicy.Read.Directory"];
 async function optionalToken(scopes) {
   try { return (await msalInstance.acquireTokenSilent({ scopes, account })).accessToken; }
   catch { return null; }
@@ -676,20 +681,38 @@ async function analyze() {
       };
     });
 
+    // PIM activation-approval policy (optional — RoleManagementPolicy.Read.Directory). For each built-in role, does
+    // activating it from ELIGIBLE require approval? Read before role assembly so eligible roles can be tagged as
+    // approval-gated. roleManagementPolicyAssignments.roleDefinitionId is the role template GUID → matches PRIV_ROLES.
+    MODEL.approvalAvailable = false; MODEL.approvalByRole = {};
+    const pimPolToken = await optionalToken(PIMPOL_SCOPES);
+    if (pimPolToken) {
+      try {
+        setStatus("Reading PIM activation policies…", false, true);
+        const pols = await graphGetAll(base + "/policies/roleManagementPolicyAssignments?$filter=" + enc("scopeId eq '/' and scopeType eq 'DirectoryRole'") + "&$expand=" + enc("policy($expand=rules)"), pimPolToken);
+        pols.forEach((pa) => {
+          const rules = (pa.policy && pa.policy.rules) || [];
+          const appr = rules.find((r) => /ApprovalRule/i.test(r["@odata.type"] || "") || r.id === "Approval_EndUser_Assignment");
+          if (appr && appr.setting && appr.setting.isApprovalRequired) MODEL.approvalByRole[pa.roleDefinitionId] = true;
+        });
+        MODEL.approvalAvailable = true;
+      } catch (e) { MODEL.approvalError = e.message || String(e); }
+    }
+
     // 2 · Privileged directory roles held (active + PIM-eligible) → mapped to users.
     // A role holder can be a USER (direct) or a role-assignable GROUP. Entra surfaces a role granted through a group
     // as an assignment / eligibility instance whose principal is the GROUP — so if we only keep user principals, every
     // admin who holds a role via group membership (e.g. Global-Administrator-eligible through a PIM group — "My roles"
     // shows Membership: Group) looks completely role-less. Collect group grants here and fan them out to members below.
     setStatus("Fetching directory role assignments…", false, true);
-    const groupGrants = [];  // { groupId, role, kind } — held by a role-assignable group; its members inherit it
-    const applyRole = (uid, role, kind, via) => { const u = byId[uid]; if (u) u.roles.push({ name: role.name, tier: role.tier, kind: kind, via: via || "direct" }); };
+    const groupGrants = [];  // { groupId, role, kind, roleDefId } — held by a role-assignable group; members inherit it
+    const applyRole = (uid, role, kind, via, roleDefId) => { const u = byId[uid]; if (u) u.roles.push({ name: role.name, tier: role.tier, kind: kind, via: via || "direct", approval: kind === "eligible" && !!MODEL.approvalByRole[roleDefId] }); };
     const assignments = await graphGetAll(base + "/roleManagement/directory/roleAssignments?$expand=principal", at);
     assignments.forEach((a) => {
       const r = PRIV_ROLES[a.roleDefinitionId]; if (!r) return;
       const p = a.principal || {}, pt = principalType(p);
-      if (pt === "user") applyRole(p.id, r, "active", "direct");
-      else if (pt === "group" && p.id) groupGrants.push({ groupId: p.id, role: r, kind: "active" });
+      if (pt === "user") applyRole(p.id, r, "active", "direct", a.roleDefinitionId);
+      else if (pt === "group" && p.id) groupGrants.push({ groupId: p.id, role: r, kind: "active", roleDefId: a.roleDefinitionId });
     });
     setStatus("Fetching PIM-eligible assignments…", false, true);
     MODEL.pimAvailable = true;
@@ -698,8 +721,8 @@ async function analyze() {
       eligible.forEach((a) => {
         const r = PRIV_ROLES[a.roleDefinitionId]; if (!r) return;
         const p = a.principal || {}, pt = principalType(p);
-        if (pt === "user") applyRole(p.id, r, "eligible", "direct");
-        else if (pt === "group" && p.id) groupGrants.push({ groupId: p.id, role: r, kind: "eligible" });
+        if (pt === "user") applyRole(p.id, r, "eligible", "direct", a.roleDefinitionId);
+        else if (pt === "group" && p.id) groupGrants.push({ groupId: p.id, role: r, kind: "eligible", roleDefId: a.roleDefinitionId });
       });
     } catch (e) { MODEL.pimAvailable = false; }
     // Fan role-assignable GROUP grants out to their (transitive) member users — this is how PIM-group eligibility
@@ -709,7 +732,7 @@ async function analyze() {
       setStatus("Resolving group-based role assignments…", false, true);
       await mapPool(groupGrants, 6, async (g) => {
         const members = await graphGetAll(base + "/groups/" + g.groupId + "/transitiveMembers/microsoft.graph.user?$select=id&$top=999", at);
-        members.forEach((m) => applyRole(m.id, g.role, g.kind, "group"));
+        members.forEach((m) => applyRole(m.id, g.role, g.kind, "group", g.roleDefId));
       }, null);
     }
     // Dedupe roles per account (a role can arrive directly AND via one or more groups). Keep the strongest instance —
@@ -739,7 +762,8 @@ async function analyze() {
     if (riskToken) {
       try {
         setStatus("Reading Identity Protection risk state…", false, true);
-        const risky = await graphGetAll(base + "/identityProtection/riskyUsers?$select=id,riskLevel,riskState,riskDetail&$top=999", riskToken);
+        // riskyUsers caps $top at 500 (999 → HTTP 400 "Invalid page size"); graphGetAll follows @odata.nextLink anyway.
+        const risky = await graphGetAll(base + "/identityProtection/riskyUsers?$select=id,riskLevel,riskState,riskDetail&$top=500", riskToken);
         risky.forEach((r) => {
           const st = r.riskState || "";
           if (byId[r.id] && st !== "none" && st !== "remediated" && st !== "dismissed")
@@ -792,6 +816,9 @@ function computeUserFlags(u) {
   u.isTier0 = u.roles.some((r) => r.tier === 0);
   u.standingAdmin = u.roles.some((r) => r.kind === "active");
   u.topTier = u.roles.length ? Math.min.apply(null, u.roles.map((r) => r.tier)) : null;
+  // Approval-gated: the account's most-privileged access is PIM-eligible AND activating it requires approval (not
+  // standing). Only meaningful when the PIM policy was read; a self-activatable eligible role is NOT gated.
+  u.approvalGated = !u.standingAdmin && u.topTier != null && u.roles.some((r) => r.tier === u.topTier && r.kind === "eligible" && r.approval);
   if (!u.enabled) { u.stale = false; u.staleDays = null; }
   else if (!u.lastSignIn) { u.stale = true; u.staleDays = null; }       // never signed in
   else { u.staleDays = Math.floor((Date.now() - new Date(u.lastSignIn).getTime()) / 86400000); u.stale = u.staleDays > STALE_DAYS; }
@@ -819,9 +846,17 @@ function userRisk(u) {
   if (u.caCovered === "excluded") { d.mfa += 22; reasons.push({ sev: "critical", t: "Excluded from the enforcing MFA Conditional Access policy" }); }
   else if (u.caCovered === false) { d.mfa += 20; reasons.push({ sev: "critical", t: "Not covered by any enforcing MFA Conditional Access policy" }); }
   else if (u.caCovered === "reportonly") { d.mfa += 12; reasons.push({ sev: "high", t: "Only a report-only MFA policy applies — nothing enforced" }); }
-  // (2) Privileged access
-  if (u.isTier0) { d.priv += u.standingAdmin ? 30 : 18; reasons.push({ sev: "critical", t: u.standingAdmin ? "Standing Tier-0 role (permanent, not just-in-time)" : "Tier-0 role (PIM-eligible)" }); }
-  else if (u.isAdmin) { d.priv += u.standingAdmin ? 16 : 10; reasons.push({ sev: "high", t: u.standingAdmin ? "Standing privileged role (permanent)" : "Privileged role (PIM-eligible)" }); }
+  // (2) Privileged access. An eligible role whose activation requires APPROVAL is less trivially abusable than one that
+  // self-activates (an attacker with the account still needs an approver to say yes), so it scores below plain eligible.
+  if (u.isTier0) {
+    const pts = u.standingAdmin ? 30 : (u.approvalGated ? 12 : 18);
+    d.priv += pts;
+    reasons.push({ sev: u.standingAdmin ? "critical" : (u.approvalGated ? "high" : "critical"),
+      t: u.standingAdmin ? "Standing Tier-0 role (permanent, not just-in-time)" : (u.approvalGated ? "Tier-0 role (PIM-eligible — activation requires approval)" : "Tier-0 role (PIM-eligible)") });
+  } else if (u.isAdmin) {
+    d.priv += u.standingAdmin ? 16 : (u.approvalGated ? 7 : 10);
+    reasons.push({ sev: "high", t: u.standingAdmin ? "Standing privileged role (permanent)" : (u.approvalGated ? "Privileged role (PIM-eligible — activation requires approval)" : "Privileged role (PIM-eligible)") });
+  }
   if (u.roles.length > 2) { d.priv += Math.min(10, (u.roles.length - 2) * 3); reasons.push({ sev: "medium", t: u.roles.length + " privileged roles held" }); }
   // (3) Identity Protection risk
   if (u.risk) { const rl = u.risk.level; d.risk += rl === "high" ? 25 : rl === "medium" ? 14 : rl === "low" ? 6 : 8; reasons.push({ sev: rl === "high" ? "critical" : rl === "medium" ? "high" : "medium", t: "Identity Protection risk: " + rl + " (" + u.risk.state + ")" }); }
@@ -993,6 +1028,7 @@ function renderNotices() {
   else if (MODEL.caCapped) n.push('<div class="notice notice-info">Conditional Access coverage evaluated for the first 400 privileged accounts (cap).</div>');
   if (!MODEL.riskAvailable) n.push('<div class="notice notice-warn">Identity Protection risk not read — grant <code>IdentityRiskyUser.Read.All</code> (Entra ID P2) to fold each user’s risk state into the score.' + (MODEL.riskError ? ' <span class="mono">(' + escapeHtml(MODEL.riskError) + ')</span>' : "") + '</div>');
   if (MODEL.caAvailable && MODEL.legacyOpen) n.push('<div class="notice notice-warn">Legacy authentication is <b>not blocked</b> tenant-wide — password-only sign-in bypasses MFA for every account below. Block it via Conditional Access.</div>');
+  if (!MODEL.approvalAvailable) n.push('<div class="notice notice-warn">PIM activation policy not read — grant <code>RoleManagementPolicy.Read.Directory</code> to detect which eligible roles require <b>approval</b> to activate. Without it, every eligible role is scored as self-activatable (worst case).' + (MODEL.approvalError ? ' <span class="mono">(' + escapeHtml(MODEL.approvalError) + ')</span>' : "") + '</div>');
   $("notices").innerHTML = n.join("");
 }
 
@@ -1088,9 +1124,9 @@ function rolesCell(u) {
   if (!u.roles.length) return '<span class="mono" style="opacity:.6">no privileged roles</span>';
   const seen = {}, out = [];
   u.roles.slice().sort((a, b) => a.tier - b.tier).forEach((r) => { const k = r.name + r.kind; if (seen[k]) return; seen[k] = 1;
-    const grp = r.via === "group";
-    const title = (r.kind === "active" ? "Active / permanent" : "PIM-eligible (JIT)") + (grp ? " — held via role-assignable group membership" : "");
-    out.push('<span class="rolechip ' + SEV[tierToSev(r.tier)].cls + '" title="' + title + '">' + escapeHtml(r.name) + (r.kind === "eligible" ? " ·JIT" : "") + (grp ? " ·group" : "") + '</span>'); });
+    const grp = r.via === "group", appr = r.kind === "eligible" && r.approval;
+    const title = (r.kind === "active" ? "Active / permanent" : "PIM-eligible (JIT)") + (grp ? " — held via role-assignable group membership" : "") + (appr ? " — activation requires approval" : "");
+    out.push('<span class="rolechip ' + SEV[tierToSev(r.tier)].cls + '" title="' + title + '">' + escapeHtml(r.name) + (r.kind === "eligible" ? " ·JIT" : "") + (grp ? " ·group" : "") + (appr ? " ·approval" : "") + '</span>'); });
   return '<div class="rolechips">' + out.join(" ") + '</div>';
 }
 
