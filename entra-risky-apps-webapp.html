@@ -496,16 +496,39 @@
   // everything reads unverified and this would fire on the genuinely-verified vendor too.
   var VENDOR_BRAND_RX = /\b(microsoft|proofpoint|mimecast|avepoint|lookout|okta|salesforce|adobe|docusign|servicenow|workday|atlassian|crowdstrike|zscaler|netskope|splunk|sailpoint|symantec|sophos|fortinet|palo\s?alto|cisco|vmware|citrix|zoom|dropbox|google|amazon)\b/i;
   function brandClaim(name){ var m = VENDOR_BRAND_RX.exec(String(name||'')); return m ? m[1].replace(/\b\w/g,function(c){return c.toUpperCase();}) : null; }
-  // Microsoft impersonation — the highest-value case. An app CLAIMS Microsoft (name = "Microsoft …" or a Microsoft
-  // product/service) but is NOT registered in a Microsoft-owned tenant and has no verified Microsoft publisher.
+  // Microsoft impersonation — the highest-value case, but the distinction is GRAMMATICAL, not keyword-presence.
   // Genuine Microsoft apps come from Microsoft's OWN tenants — appOwnerOrganizationId is set by Entra and the app
-  // owner CANNOT fake it (nor the verified publisher). The display NAME and HOMEPAGE are attacker-controlled free text
-  // (an attacker can name their app "Office 365" and set its homepage to securescore.office.com), so they prove
-  // nothing. A competing vendor in the name (e.g. "Proofpoint Office 365 Connector") means it's a third-party app FOR
-  // Microsoft 365, not an impersonation OF Microsoft — exclude those.
-  var MS_BRAND_RX = /\b(microsoft|office\s?365|o365|office365|microsoft\s?365|m365|azure|sharepoint|onedrive|outlook|windows|defender|intune|dynamics\s?365|power\s?bi|power\s?apps|power\s?automate|exchange\s?online|entra)\b/i;
+  // owner CANNOT fake it (nor the verified publisher); the first-party allowlist / owner-tenant check runs FIRST
+  // (this rule is gated behind extUnv), so real Microsoft apps never reach here. The display NAME and HOMEPAGE are
+  // attacker-controlled free text (an attacker can name their app "Office 365"), so a Microsoft token in the name
+  // proves nothing on its own.
+  //   • LEGITIMATE integration grammar uses the Microsoft product as an OBJECT/QUALIFIER and carries its own vendor
+  //     token: "Bark for Outlook", "CamCard for Outlook", "Attach OneDrive files to Asana",
+  //     "Connect GigJam to OneDrive for Business", "AdminDroid Office 365 Reporter". → SUPPRESS.
+  //   • IMPERSONATION uses the Microsoft product as the SUBJECT with no vendor identity of its own: bare
+  //     "Office 365", "Microsoft Teams", "SharePoint Online", "Microsoft 365 Login". → FIRE.
+  // Test: strip the Microsoft product token(s) + generic filler (connectives, auth/portal lure words, "online/365/…").
+  // If any DISTINCTIVE residual token survives, the name has its own identity → integration → suppress. If nothing
+  // distinctive is left, the name IS the Microsoft product → impersonation. Errs toward suppression on purpose — a
+  // false impersonation badge discredits the tool faster than a missed one.
+  var MS_PRODUCT_RX = /\b(microsoft(?:\s?365)?|office\s?365|office365|o365|m365|azure(?:\s?ad)?|sharepoint(?:\s?online)?|onedrive(?:\s?for\s?business)?|outlook|exchange(?:\s?online)?|teams|windows|defender|intune|dynamics(?:\s?365)?|power\s?bi|power\s?apps|power\s?automate|power\s?platform|entra|active\s?directory)\b/gi;
   var OTHER_VENDOR_RX = /\b(proofpoint|mimecast|avepoint|lookout|okta|salesforce|adobe|docusign|servicenow|workday|atlassian|crowdstrike|zscaler|netskope|splunk|sailpoint|symantec|sophos|fortinet|palo\s?alto|cisco|vmware|citrix|zoom|dropbox|google|amazon)\b/i;
-  function claimsMicrosoft(name){ var n = String(name||''); return MS_BRAND_RX.test(n) && !OTHER_VENDOR_RX.test(n); }
+  // Generic tokens that DON'T give a name its own identity: connectives, articles, MS-adjacent qualifiers, and
+  // auth/portal lure words (a bare product + "login/portal/verify" is a classic consent-phishing lure → still fires).
+  var GENERIC_TOKEN_RX = /^(for|to|with|and|or|the|a|an|of|in|on|by|your|my|online|business|cloud|new|free|365|login|log|signin|sign|portal|account|accounts|verify|verification|secure|security|authentication|auth|sso|mfa|otp|password|access|app|apps|application|inc|ltd|llc|corp|co|the)$/i;
+  function claimsMicrosoft(name){
+    var n = String(name||'').toLowerCase().trim();
+    if(!n) return false;
+    MS_PRODUCT_RX.lastIndex = 0;
+    if(!MS_PRODUCT_RX.test(n)) return false;      // references no Microsoft product at all
+    if(OTHER_VENDOR_RX.test(n)) return false;     // a competing vendor is named → third-party app FOR Microsoft, not OF
+    MS_PRODUCT_RX.lastIndex = 0;
+    var residual = n.replace(MS_PRODUCT_RX,' ')   // remove the Microsoft product token(s)
+                    .replace(/[^a-z0-9]+/g,' ')
+                    .split(' ')
+                    .filter(function(t){ return t && !GENERIC_TOKEN_RX.test(t); });
+    return residual.length === 0;                 // nothing distinctive survives → the name IS the product → impersonation
+  }
   // Entra directory-audit retention tops out at ~30 days, so for a consent older than that the "who consented, when,
   // what" audit event is gone — the CREATED date is the only provenance that survives. Flag those so a reader knows
   // the created date is load-bearing (and that they can't audit-log their way back to the consent).
