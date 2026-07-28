@@ -251,6 +251,17 @@
   .rf-count { font-size: 12px; font-weight: 600; text-align: right; color: var(--text); }
   @keyframes rfgrow { to { width: var(--w); } }
   @media (prefers-reduced-motion: reduce) { .rf-bar { animation: none; width: var(--w); } }
+  /* Blast-radius Sankey (blueprint → agent identities) */
+  .sankey { display: block; width: 100%; overflow: visible; }
+  .sk-head { font-size: 10.5px; fill: var(--muted); font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+  .sk-label { font-size: 12px; fill: var(--text); paint-order: stroke; stroke: var(--card); stroke-width: 3px; stroke-linejoin: round; }
+  .sk-count { fill: var(--muted); font-weight: 600; }
+  .sk-ribbon { transition: fill-opacity .12s; }
+  .sk-ribbon:hover { fill-opacity: .72 !important; }
+  .sk-node { transition: opacity .12s; }
+  .sk-click { cursor: pointer; }
+  .sk-click:hover { opacity: .82; }
+  text.sk-click:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -341,6 +352,17 @@
       <div id="riskChartBody">
         <div class="hint" style="margin:8px 0 12px">How many blueprints carry each risk factor. Click a bar to scope the table.</div>
         <div id="riskChart"></div>
+      </div>
+    </div>
+
+    <div class="card" id="blastFlowCard">
+      <h2 style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+        <span><span data-icon="agentid"></span>Blueprint blast radius → agent identities</span>
+        <span class="expander" id="blastFlowToggle">hide ▴</span>
+      </h2>
+      <div id="blastFlowBody">
+        <div class="hint" style="margin:8px 0 12px">Every agent identity flows through exactly <b>one node per column</b> — its blueprint's <b>origin</b> → the blueprint's <b>risk band</b> → the <b>credential that can impersonate it</b>. Ribbon width = number of agent identities (the blast radius); ribbon colour = blueprint risk. <b>Click a node</b> to scope the table.</div>
+        <div id="blastFlow"></div>
       </div>
     </div>
 
@@ -1504,6 +1526,7 @@ function render(blueprints, byBlueprint, totalAgents) {
   renderNotices();
   renderSummary();
   renderRiskChart();
+  renderBlastFlow();
   renderTable();
 }
 
@@ -1589,6 +1612,77 @@ function renderRiskChart() {
     el.addEventListener("click", act);
     el.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); act(); } });
   });
+}
+
+// Blast-radius Sankey: every AGENT identity flows through one node per column — its blueprint's origin → the
+// blueprint's risk band → the credential that can impersonate it. Ribbon WIDTH = agent-identity count (the blast
+// radius, so a blueprint with 50 agents draws a fat ribbon); ribbon COLOUR = the blueprint's risk band. Nodes
+// scope the table. Weighted by agentCount(bp), not blueprint count — the whole point is where the agents concentrate.
+function renderBlastFlow() {
+  const host = $("blastFlow");
+  if (!host) return;
+  const bps = (loaded && loaded.blueprints) || [];
+  const BAND_LABEL = { act: "Act today", sprint: "This sprint", healthy: "Healthy" };
+  const RISK_FLOW  = { "Act today": "#c62828", "This sprint": "#e8820e", "Healthy": "#3f9142" };
+  const originOf = bp => bp._external ? (bp._ownerIsMicrosoft ? "Microsoft" : "External") : "Home";
+  const keyOf    = bp => { if (bp._external) return "Publisher-held"; const c = credCounts(bp); return c.secret > 0 ? "Client secret" : c.cert > 0 ? "Certificate" : c.fic > 0 ? "FIC" : "No credential"; };
+  const SEP = " ";
+  let total = 0;
+  const rows = [];   // one per blueprint that has agents: { keys:[origin, bandLabel, key], w:agentCount }
+  bps.forEach(bp => { const w = agentCount(bp); if (!w) return; total += w;
+    rows.push({ keys: [originOf(bp), BAND_LABEL[riskOf(bp).band], keyOf(bp)], w }); });
+  if (!total) { host.innerHTML = `<div class="hint">No agent identities under any blueprint — no blast radius to visualise.</div>`; return; }
+
+  const COLS = [
+    { title: "Blueprint origin",  order: ["External", "Microsoft", "Home"] },
+    { title: "Blueprint risk",    order: ["Act today", "This sprint", "Healthy"], risk: true },
+    { title: "Impersonation key", order: ["Client secret", "Certificate", "FIC", "Publisher-held", "No credential"] }
+  ];
+  const NC = COLS.length;
+  const buildNodes = ci => { const c = {}; rows.forEach(r => { c[r.keys[ci]] = (c[r.keys[ci]] || 0) + r.w; });
+    const order = COLS[ci].order.filter(k => c[k]); Object.keys(c).forEach(k => { if (order.indexOf(k) < 0) order.push(k); });
+    return order.map(k => ({ key: k, count: c[k] })); };
+  const colNodes = []; for (let i = 0; i < NC; i++) colNodes.push(buildNodes(i));
+  const W = 1000, nodeW = 12, padL = 150, padR = 175, topPad = 26, botPad = 8, Hd = 300, G = 7;
+  const maxNodes = Math.max.apply(null, colNodes.map(n => n.length));
+  const scale = (Hd - (maxNodes - 1) * G) / total;
+  const colX = COLS.map((_, ci) => padL + (NC > 1 ? (ci / (NC - 1)) * (W - padL - padR - nodeW) : 0));
+  colNodes.forEach(nodes => { const contentH = nodes.reduce((a, n) => a + n.count * scale, 0) + (nodes.length - 1) * G;
+    let y = topPad + Math.max(0, (Hd - contentH) / 2);
+    nodes.forEach(n => { n.y0 = y; n.h = Math.max(2, n.count * scale); n.y1 = y + n.h; n.cur = y; y = n.y1 + G; }); });
+  const svgH = topPad + Hd + botPad;
+  const ribbons = [];
+  for (let ci = 0; ci < NC - 1; ci++) { const sN = colNodes[ci], tN = colNodes[ci + 1], mat = {};
+    sN.forEach(n => { n.cur = n.y0; }); tN.forEach(n => { n.cur = n.y0; });
+    rows.forEach(r => { const k = r.keys[ci] + SEP + r.keys[ci + 1]; mat[k] = (mat[k] || 0) + r.w; });
+    sN.forEach(sn => tN.forEach(tn => { const c = mat[sn.key + SEP + tn.key]; if (!c) return;
+      const hh = c * scale, sy0 = sn.cur, ty0 = tn.cur; sn.cur += hh; tn.cur += hh;
+      ribbons.push({ x0: colX[ci] + nodeW, x1: colX[ci + 1], sy0, sy1: sy0 + hh, ty0, ty1: ty0 + hh, count: c,
+        color: COLS[ci].risk ? RISK_FLOW[sn.key] : (COLS[ci + 1].risk ? RISK_FLOW[tn.key] : "#9aa0a6") }); })); }
+  const ribbonPath = rb => { const mx = (rb.x0 + rb.x1) / 2, f = v => v.toFixed(1);
+    return `M${rb.x0} ${f(rb.sy0)}C${mx} ${f(rb.sy0)} ${mx} ${f(rb.ty0)} ${rb.x1} ${f(rb.ty0)}L${rb.x1} ${f(rb.ty1)}C${mx} ${f(rb.ty1)} ${mx} ${f(rb.sy1)} ${rb.x0} ${f(rb.sy1)}Z`; };
+  const nodeFilter = (ci, key) => {
+    if (COLS[ci].risk) { const m = { "Act today": "act", "This sprint": "sprint", "Healthy": "healthy" }; return m[key] ? "scope:risk:" + m[key] : ""; }
+    if (ci === 0) return key === "External" ? "scope:origin:external" : key === "Home" ? "scope:origin:home" : "";
+    if (ci === NC - 1) return key === "Client secret" ? "factor:secret" : "";
+    return "";
+  };
+  const p = [`<svg viewBox="0 0 ${W} ${svgH}" width="100%" height="${svgH}" class="sankey" preserveAspectRatio="xMidYMid meet">`];
+  ribbons.forEach(rb => p.push(`<path d="${ribbonPath(rb)}" fill="${rb.color}" fill-opacity="0.4" class="sk-ribbon"><title>${rb.count} agent identit${rb.count === 1 ? "y" : "ies"}</title></path>`));
+  COLS.forEach((c, ci) => p.push(`<text x="${(colX[ci] + nodeW / 2).toFixed(0)}" y="14" text-anchor="middle" class="sk-head">${escapeHtml(c.title)}</text>`));
+  colNodes.forEach((nodes, ci) => { const last = ci === NC - 1, x = colX[ci];
+    nodes.forEach(n => { const fill = COLS[ci].risk ? RISK_FLOW[n.key] : "#adb1b5";
+      const flt = nodeFilter(ci, n.key), da = flt ? ` data-skf="${flt}"` : "", cc = flt ? " sk-click" : "";
+      p.push(`<rect x="${x.toFixed(1)}" y="${n.y0.toFixed(1)}" width="${nodeW}" height="${n.h.toFixed(1)}" rx="2" fill="${fill}" class="sk-node${cc}"${da}><title>${escapeHtml(n.key)} — ${n.count} agent identit${n.count === 1 ? "y" : "ies"}</title></rect>`);
+      const ly = ((n.y0 + n.y1) / 2 + 3.5).toFixed(1), lx = last ? (x + nodeW + 7).toFixed(1) : (x - 7).toFixed(1), anc = last ? "start" : "end";
+      p.push(`<text x="${lx}" y="${ly}" text-anchor="${anc}" class="sk-label${cc}"${da}>${escapeHtml(n.key)} <tspan class="sk-count">${n.count}</tspan></text>`); }); });
+  p.push("</svg>");
+  host.innerHTML = p.join("");
+  host.querySelectorAll("[data-skf]").forEach(el => el.addEventListener("click", () => {
+    const t = el.getAttribute("data-skf");
+    if (t.indexOf("scope:") === 0) applyScope(t.slice(6));
+    else if (t.indexOf("factor:") === 0) applyFactor(t.slice(7));
+  }));
 }
 
 // Scope the table to one risk factor; clicking the active bar again clears it.
@@ -2688,6 +2782,18 @@ $("riskChartToggle").addEventListener("click", () => {
   const hide = !$("riskChartBody").classList.contains("hidden");
   localStorage.setItem("aib_riskchart", hide ? "hidden" : "shown");
   applyRiskChartVisibility(hide);
+});
+
+// ---- blast-radius flow: collapsible, remembered across sessions ----
+function applyBlastFlowVisibility(hidden) {
+  $("blastFlowBody").classList.toggle("hidden", hidden);
+  $("blastFlowToggle").textContent = hidden ? "show ▾" : "hide ▴";
+}
+applyBlastFlowVisibility(localStorage.getItem("aib_blastflow") === "hidden");
+$("blastFlowToggle").addEventListener("click", () => {
+  const hide = !$("blastFlowBody").classList.contains("hidden");
+  localStorage.setItem("aib_blastflow", hide ? "hidden" : "shown");
+  applyBlastFlowVisibility(hide);
 });
 
 // ---- wire up ----
