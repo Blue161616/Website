@@ -267,6 +267,17 @@
   .blast-caption{margin-top:13px; font-size:11.5px; color:var(--muted); line-height:1.55}
   @keyframes blast-pulse{0%{box-shadow:0 0 0 0 rgba(248,113,113,.32)}70%{box-shadow:0 0 0 12px rgba(248,113,113,0)}100%{box-shadow:0 0 0 0 rgba(248,113,113,0)}}
   @media (prefers-reduced-motion:reduce){ .blast-beam,.blast-bp.pulse{animation:none} }
+  /* Blueprint blast-radius Sankey: one blueprint → its agent identities, grouped by risk band */
+  .blast-sankey-wrap{margin-top:6px; overflow-x:auto}
+  .bsankey{display:block; width:100%; min-width:520px; overflow:visible}
+  .bsankey .sk-head{font-size:9px; letter-spacing:.8px; text-transform:uppercase; fill:var(--muted)}
+  .bsankey .sk-ribbon{transition:fill-opacity .15s}
+  .bsankey .sk-ribbon:hover{fill-opacity:.6}
+  .bsankey .sk-label{font-size:11px; fill:var(--text)}
+  .bsankey .sk-count{fill:var(--muted); font-size:9.5px}
+  .bsankey .sk-click{cursor:pointer}
+  .bsankey rect.sk-click:hover{filter:brightness(1.3)}
+  .bsankey text.sk-click:hover{fill:var(--blue-bright)}
   /* Models — data-residency Leaflet map + legend */
   #modelsMap{height:340px; border-radius:12px; overflow:hidden; border:1px solid var(--border); background:#0d1117}
   .leaflet-container{background:#0d1117!important; font-family:inherit}
@@ -1699,28 +1710,62 @@ function renderBlueprintBlast(agents, bpMap){
   const sel=bps.find(b=>b.id===window.__blastSel)||bps[0]; window.__blastSel=sel.id;
   const danger=sel.secrets>0 && !sel.msManaged;
   const opts=bps.map(b=>'<option value="'+escapeHtml(b.id)+'"'+(b.id===sel.id?' selected':'')+'>'+escapeHtml(b.name)+' · '+b.count+' agent'+(b.count===1?'':'s')+(b.secrets?(' · '+b.secrets+' secret'+(b.secrets===1?'':'s')):'')+'</option>').join('');
-  const SHOWN=6, shown=sel.agents.slice(0,SHOWN);
-  const beam='<div class="blast-beam'+(danger?'':' safe')+'"></div>';
-  const rays=shown.map(a=>'<div class="blast-ray">'+beam+'<span class="blast-agent" data-id="'+escapeHtml(a.id)+'" title="'+escapeHtml(a.displayName||a.id)+'">'+escapeHtml(a.displayName||a.id)+'</span></div>').join('');
-  const more=sel.count>SHOWN?'<div class="blast-ray">'+beam+'<span class="blast-more" data-bp="1">+ '+(sel.count-SHOWN)+' more agents →</span></div>':'';
   const DANGEROUS_INH=/ReadWrite|Mail\.Send|CreateAsManager|RoleManagement|AppRoleAssignment/i;
   const inh=sel.inherited.length?'<div class="blast-inh">'+sel.inherited.slice(0,6).map(v=>'<span class="flagchip'+(DANGEROUS_INH.test(v)?' warn':'')+'">'+escapeHtml(v)+'</span>').join('')+(sel.inherited.length>6?'<span class="flagchip">+'+(sel.inherited.length-6)+'</span>':'')+'</div>':'';
+  // ---- Sankey: one blueprint → its agent identities, grouped/coloured by each agent's own risk band ----
+  const SEVC={critical:'var(--crit)',high:'var(--high)',medium:'var(--med)',low:'var(--low)'};
+  const SEVL={critical:'Critical',high:'High',medium:'Medium',low:'Low'};
+  const sevRank=s=>({critical:0,high:1,medium:2,low:3}[s]??4);
+  const MAXAG=20, SEP='', trunc=(s,n)=>{s=String(s||'');return s.length>n?s.slice(0,n-1)+'…':s;};
+  let ags=sel.agents.slice().sort((a,b)=>(sevRank(a.sev)-sevRank(b.sev))||((b.risk||0)-(a.risk||0)));
+  const overflow=ags.length>MAXAG?ags.length-MAXAG:0; if(overflow) ags=ags.slice(0,MAXAG);
+  const sevById={}, nameById={}; ags.forEach(a=>{sevById[a.id]=a.sev; nameById[a.id]=a.displayName||a.id;});
+  const total=ags.length;
+  const COLS=[{title:'Blueprint',keys:[sel.name]},{title:'Risk',risk:true,keys:['critical','high','medium','low'].filter(s=>ags.some(a=>a.sev===s))},{title:'Agent identity',keys:ags.map(a=>a.id)}];
+  const rows=ags.map(a=>({keys:[sel.name,a.sev,a.id]}));
+  const NC=3, W=1000, nodeW=12, padL=162, padR=214, topPad=22, botPad=6, G=6;
+  const Hd=Math.min(332,Math.max(84,total*44));
+  const colNodes=COLS.map((c,ci)=>{const cnt={}; rows.forEach(r=>cnt[r.keys[ci]]=(cnt[r.keys[ci]]||0)+1); return c.keys.filter(k=>cnt[k]).map(k=>({key:k,count:cnt[k]}));});
+  const maxNodes=Math.max.apply(null,colNodes.map(n=>n.length));
+  const scale=(Hd-(maxNodes-1)*G)/total;
+  const colX=[padL, Math.round(padL+(W-padL-padR-nodeW)*0.46), W-padR-nodeW];
+  colNodes.forEach(nodes=>{const contentH=nodes.reduce((a,n)=>a+n.count*scale,0)+(nodes.length-1)*G; let y=topPad+Math.max(0,(Hd-contentH)/2); nodes.forEach(n=>{n.y0=y;n.h=Math.max(2,n.count*scale);n.y1=y+n.h;n.cur=y;y=n.y1+G;});});
+  const svgH=topPad+Hd+botPad, ribs=[];
+  for(let ci=0;ci<NC-1;ci++){const sN=colNodes[ci],tN=colNodes[ci+1],mat={}; sN.forEach(n=>n.cur=n.y0); tN.forEach(n=>n.cur=n.y0);
+    rows.forEach(r=>{const k=r.keys[ci]+SEP+r.keys[ci+1]; mat[k]=(mat[k]||0)+1;});
+    sN.forEach(sn=>tN.forEach(tn=>{const c=mat[sn.key+SEP+tn.key]; if(!c) return; const hh=c*scale, sy0=sn.cur, ty0=tn.cur; sn.cur+=hh; tn.cur+=hh;
+      const band=COLS[ci].risk?sn.key:(COLS[ci+1].risk?tn.key:sevById[tn.key]);
+      ribs.push({x0:colX[ci]+nodeW,x1:colX[ci+1],sy0:sy0,sy1:sy0+hh,ty0:ty0,ty1:ty0+hh,color:SEVC[band]||'var(--dim)'});}));}
+  const rp=rb=>{const mx=(rb.x0+rb.x1)/2,f=v=>v.toFixed(1);return 'M'+rb.x0+' '+f(rb.sy0)+'C'+mx+' '+f(rb.sy0)+' '+mx+' '+f(rb.ty0)+' '+rb.x1+' '+f(rb.ty0)+'L'+rb.x1+' '+f(rb.ty1)+'C'+mx+' '+f(rb.ty1)+' '+mx+' '+f(rb.sy1)+' '+rb.x0+' '+f(rb.sy1)+'Z';};
+  const P=['<svg viewBox="0 0 '+W+' '+svgH+'" width="100%" height="'+svgH+'" class="bsankey" preserveAspectRatio="xMidYMid meet">'];
+  ribs.forEach(rb=>P.push('<path d="'+rp(rb)+'" fill="'+rb.color+'" fill-opacity="0.38" class="sk-ribbon"/>'));
+  COLS.forEach((c,ci)=>{const hx=ci===NC-1?(colX[ci]+nodeW+7):(colX[ci]-7); const ha=ci===NC-1?'start':'end'; P.push('<text x="'+hx.toFixed(0)+'" y="13" text-anchor="'+ha+'" class="sk-head">'+escapeHtml(c.title)+'</text>');});
+  colNodes.forEach((nodes,ci)=>{const last=ci===NC-1; nodes.forEach(n=>{
+    let fill,label,da;
+    if(ci===0){ fill=(sel.secrets>0&&!sel.msManaged)?'var(--crit)':'var(--dim)'; label=trunc(n.key,22); da=' data-band="all"'; }
+    else if(COLS[ci].risk){ fill=SEVC[n.key]; label=SEVL[n.key]; da=' data-band="'+n.key+'"'; }
+    else { fill=SEVC[sevById[n.key]]||'var(--dim)'; label=trunc(nameById[n.key],26); da=' data-aid="'+escapeHtml(n.key)+'"'; }
+    P.push('<rect x="'+colX[ci].toFixed(1)+'" y="'+n.y0.toFixed(1)+'" width="'+nodeW+'" height="'+n.h.toFixed(1)+'" rx="2" fill="'+fill+'" class="sk-node sk-click"'+da+'><title>'+escapeHtml(String(label))+' — '+n.count+' agent'+(n.count===1?'':'s')+'</title></rect>');
+    const ly=((n.y0+n.y1)/2+3.5).toFixed(1), lx=last?(colX[ci]+nodeW+7).toFixed(1):(colX[ci]-7).toFixed(1), anc=last?'start':'end';
+    P.push('<text x="'+lx+'" y="'+ly+'" text-anchor="'+anc+'" class="sk-label sk-click"'+da+'>'+escapeHtml(String(label))+' <tspan class="sk-count">'+n.count+'</tspan></text>');
+  });}); P.push('</svg>');
   el.innerHTML='<div class="blast">'
     +'<div class="blast-head"><b>Blueprint blast-radius</b><select id="blastSel" title="Choose a blueprint">'+opts+'</select></div>'
-    +'<div class="blast-body">'
-      +'<div class="blast-bp'+(danger?' pulse':'')+'"><div class="blast-bp-tag">Blueprint · security boundary</div>'
-        +'<div class="blast-bp-name">'+escapeHtml(sel.name)+(sel.msManaged?' <span class="flagchip plat" style="font-size:9px">MS-managed</span>':'')+'</div>'
-        +'<div class="blast-bp-meta">'+(sel.secrets?('<b class="hot">'+sel.secrets+' client secret'+(sel.secrets===1?'':'s')+'</b> · '):(sel.msManaged?'Microsoft-owned boundary · ':'no tenant secret · '))+'impersonates <b>'+sel.count+'</b> agent'+(sel.count===1?'':'s')+'</div>'+inh+'</div>'
-      +'<div class="blast-fan">'+rays+more+'</div>'
+    +'<div class="blast-bp'+(danger?' pulse':'')+'" style="max-width:none">'
+      +'<div class="blast-bp-tag">Blueprint · security boundary</div>'
+      +'<div class="blast-bp-name">'+escapeHtml(sel.name)+(sel.msManaged?' <span class="flagchip plat" style="font-size:9px">MS-managed</span>':'')+'</div>'
+      +'<div class="blast-bp-meta">'+(sel.secrets?('<b class="hot">'+sel.secrets+' client secret'+(sel.secrets===1?'':'s')+'</b> · '):(sel.msManaged?'Microsoft-owned boundary · ':'no tenant secret · '))+'impersonates <b>'+sel.count+'</b> agent'+(sel.count===1?'':'s')+'</div>'+inh
     +'</div>'
+    +'<div class="blast-sankey-wrap">'+P.join('')+'</div>'
     +'<div class="blast-caption">'+(danger
-        ? 'If this blueprint\'s credential leaks, <b class="hot">all '+sel.count+' agent'+(sel.count===1?'':'s')+' can be impersonated at once</b> — and each inherits the blueprint\'s permissions at runtime. Rotate to a certificate / managed identity and scope its grants; fixing the blueprint fixes every agent under it.'
+        ? 'If this blueprint\'s credential leaks, <b class="hot">all '+sel.count+' agent'+(sel.count===1?'':'s')+' can be impersonated at once</b> — and each inherits the blueprint\'s permissions at runtime. The flow groups them by their own risk band, so you can see which impersonated agents are the most dangerous. Rotate to a certificate / managed identity and scope its grants; fixing the blueprint fixes every agent under it.'
         : 'This blueprint impersonates <b>'+sel.count+'</b> agent'+(sel.count===1?'':'s')+(sel.msManaged?' and is Microsoft-owned (no tenant secret to leak)':' with no tenant client secret')+'; its granted permissions are still inherited by all of them.')
-      +' <span style="color:var(--dim)">Click an agent to filter the table to it.</span></div>'
+      +(overflow?' <span style="color:var(--dim)">Showing the '+MAXAG+' highest-risk of '+sel.count+' agents.</span>':'')
+      +' <span style="color:var(--dim)">Click the blueprint, a risk band, or an agent to filter the table.</span></div>'
   +'</div>';
   const s=$("blastSel"); if(s) s.addEventListener('change',()=>{ window.__blastSel=s.value; renderBlueprintBlast(MODEL.agents, MODEL.bpMap); });
-  el.querySelectorAll('.blast-agent').forEach(n=>n.addEventListener('click',()=>filterAgentsToIds([n.dataset.id], sel.name+' → '+ (n.textContent||'agent'))));
-  const m=el.querySelector('.blast-more'); if(m) m.addEventListener('click',()=>filterAgentsToIds(sel.agents.map(a=>a.id), 'under '+sel.name));
+  el.querySelectorAll('.bsankey [data-aid]').forEach(n=>n.addEventListener('click',()=>filterAgentsToIds([n.getAttribute('data-aid')], sel.name+' → '+(nameById[n.getAttribute('data-aid')]||'agent'))));
+  el.querySelectorAll('.bsankey [data-band]').forEach(n=>n.addEventListener('click',()=>{const bnd=n.getAttribute('data-band'); const ids=bnd==='all'?sel.agents.map(a=>a.id):sel.agents.filter(a=>a.sev===bnd).map(a=>a.id); filterAgentsToIds(ids, bnd==='all'?('under '+sel.name):(sel.name+' → '+(SEVL[bnd]||bnd)+' agents'));}));
 }
 function setEngineScore(id, d){
   if(!d || d.val===null){ $(id).innerHTML='<div class="n" style="color:var(--dim);font-size:16px">n/a</div><div class="l">no data</div>'; return; }
