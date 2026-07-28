@@ -89,6 +89,12 @@
   .risk-2 { background: var(--amber-bg); color: var(--amber); }
   .risk-1 { background: var(--green-bg); color: var(--green); }
   .riskw { font-weight: 700; opacity: .72; font-variant-numeric: tabular-nums; }
+  .btn-mini { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent-bg, transparent); color: var(--accent-dark, var(--accent)); cursor: pointer; }
+  .btn-mini:hover { background: var(--accent); color: #fff; }
+  .btn-mini:disabled { opacity: .6; cursor: default; }
+  .mini-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  .mini-table th, .mini-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .mini-table th { color: var(--muted); font-weight: 600; }
   .b-deleg { background: var(--cert-bg); color: var(--accent-dark); }
   .b-app   { background: var(--red-bg); color: var(--red); }
   .b-ms    { background: var(--hover); color: var(--muted); }
@@ -257,6 +263,8 @@
             <br><b>Optional (graceful-degrade):</b> <code>RoleManagement.Read.Directory</code> reveals Entra <b>directory
             roles held by service principals</b> — the authorisation behind capability permissions like
             <code>Exchange.ManageAsApp</code>; without it those roles just don't appear.
+            <code>AuditLog.Read.All</code> turns on <b>usage detection</b> — whether/when each app actually authenticated
+            app-only and with which credential (needs Entra ID P1/P2 for sign-in logs).
             <code>Application.ReadWrite.All</code> — only needed to edit an app's redirect URIs from the detail drawer;
             it is requested separately at that moment, never at sign-in.</div>
         </div>
@@ -1321,10 +1329,14 @@
       if(roleToken){
         try {
           setStatus('Fetching directory role assignments…', false, true);
-          var roleAssigns = await graphGetAllPages(GBASE + '/roleManagement/directory/roleAssignments?$expand=principal,roleDefinition&$top=999', roleToken, function(n){ setStatus('Fetching directory role assignments… ' + n, false, true); });
+          // roleAssignments accepts only ONE $expand, so expand `principal` (to keep SP holders) and resolve role NAMES
+          // from a separate roleDefinitions fetch (roleDefinitionId == template GUID for built-in roles).
+          var roleDefs = await graphGetAllPages(GBASE + '/roleManagement/directory/roleDefinitions?$select=id,displayName,templateId&$top=999', roleToken).catch(function(){ return []; });
+          var defById = {}; roleDefs.forEach(function(rd){ defById[rd.id] = rd; });
+          var roleAssigns = await graphGetAllPages(GBASE + '/roleManagement/directory/roleAssignments?$expand=principal&$top=999', roleToken, function(n){ setStatus('Fetching directory role assignments… ' + n, false, true); });
           roleAssigns.forEach(function(a){
             var p = a.principal || {}; if(String(p['@odata.type']||'').indexOf('servicePrincipal') < 0) return;
-            var def = a.roleDefinition || {}, tmpl = def.templateId || a.roleDefinitionId, nm = def.displayName || tmpl || '(role)';
+            var def = defById[a.roleDefinitionId] || {}, tmpl = def.templateId || a.roleDefinitionId, nm = def.displayName || tmpl || '(role)';
             (dirRolesBySpId[p.id] = dirRolesBySpId[p.id] || []).push({ name: nm, templateId: tmpl, tier: dirRoleTier(tmpl, nm), scoped: !!(a.directoryScopeId && a.directoryScopeId !== '/') });
           });
           cache.rolesAvailable = true;
@@ -1576,7 +1588,9 @@
 
   function render(){
     el('notices').innerHTML = '<div class="notice notice-info">Read-only posture scan of <b>all enterprise applications</b> in the tenant. Every app is inventoried with its tenancy, credentials, publisher verification, Microsoft-disabled status and assignment setting; apps that are consented, credentialed, or open to all users (non-Microsoft) are deep-scanned for permissions, redirect URIs and federated credentials. Risk combines permission scope with posture. Click a tile, a bar, or a row’s <b>Attack path</b> to prioritise.</div>'
-      + (cache.rolesAvailable === false ? '<div class="notice notice-warn"><b>Directory roles held by service principals were not read</b> — grant <code>RoleManagement.Read.Directory</code> (admin consent) to this app registration to reveal Entra admin roles assigned to apps. This is the authorisation behind capability permissions like <code>Exchange.ManageAsApp</code>, which is inert without a role such as Exchange Administrator on the SP.' + (cache.rolesError ? ' <span class="mono">(' + escHtml(cache.rolesError) + ')</span>' : '') + '</div>' : '');
+      + (cache.rolesAvailable === false ? '<div class="notice notice-warn"><b>Directory roles held by service principals were not read</b> — grant <code>RoleManagement.Read.Directory</code> (admin consent) to this app registration to reveal Entra admin roles assigned to apps. This is the authorisation behind capability permissions like <code>Exchange.ManageAsApp</code>, which is inert without a role such as Exchange Administrator on the SP.' + (cache.rolesError ? ' <span class="mono">(' + escHtml(cache.rolesError) + ')</span>' : '') + '</div>' : '')
+      + (cache.auditAvailable === true ? '<div class="notice notice-info"><b>Usage detection is ON</b> — read <code>servicePrincipalSignInActivities</code>, so each app’s detail drawer shows whether/when it actually authenticated app-only, and can pull its recent service-principal sign-ins (timestamp · IP · resource · credential KeyId). Expand a row → <b>“Did they use the credential?”</b>.</div>'
+          : '<div class="notice notice-warn"><b>Usage detection is OFF</b> — a consent scan shows what an app <i>can</i> do; grant <code>AuditLog.Read.All</code> (admin consent) to also read what it <i>has</i> done (whether it authenticated app-only, and with which credential). ' + (cache.auditError ? '<span class="mono">(' + escHtml(cache.auditError) + ')</span> — may also indicate the tenant lacks Entra ID P1/P2 for sign-in logs.' : 'Without it, the detail drawer falls back to a portal deep-link.') + '</div>');
     renderSummary(); renderExposure(); renderTable();
   }
   function renderSummary(){
@@ -1931,6 +1945,32 @@
       if(slot.isConnected) slot.innerHTML = renderAssigned(principals);
     } catch(e){ r._assignedTo = []; if(slot.isConnected) slot.innerHTML = '<p class="dmuted">Could not load assigned principals — ' + escHtml(e.message || String(e)) + '</p>'; }
   }
+  // On-demand: recent service-principal (app-only) sign-ins for one app — timestamp / IP / resource / result / the
+  // credential (secret KeyId or cert thumbprint) that authenticated. Pulled only when the user asks, to avoid firing a
+  // per-app audit query for the whole tenant. Proves USAGE even for an external app whose key you cannot read.
+  async function loadSignIns(r, d, btn){
+    var slot = d ? d.querySelector('.signins-slot[data-slot="' + r.appId + '"]') : null;
+    if(!slot) return;
+    if(btn){ btn.disabled = true; btn.textContent = 'Loading…'; }
+    slot.innerHTML = '<p class="dmuted" style="margin:7px 0 0"><span class="spinner"></span> Querying service-principal sign-ins…</p>';
+    try {
+      var token = await optionalAuditToken(); if(!token) throw new Error('AuditLog.Read.All not consented');
+      var flt = "appId eq '" + r.appId + "' and (signInEventTypes/any(t: t eq 'servicePrincipal'))";
+      var resp = await graphGet('https://graph.microsoft.com/v1.0/auditLogs/signIns?$filter=' + encodeURIComponent(flt) + '&$top=25', token);
+      var rows = resp.value || [];
+      if(!rows.length){ slot.innerHTML = '<p class="dmuted" style="margin:7px 0 0">No service-principal sign-ins for this app in the retained window (~30 days) — it has not authenticated recently (or sign-in logs are not retained; needs Entra ID P1/P2).</p>'; if(btn) btn.remove(); return; }
+      var body = rows.map(function(s){
+        var when = s.createdDateTime ? escHtml(new Date(s.createdDateTime).toISOString().slice(0,16).replace('T',' ')) : '—';
+        var ok = s.status && s.status.errorCode === 0;
+        var result = ok ? '<span style="color:var(--green)">success</span>' : '<span style="color:var(--red)">' + escHtml((s.status && (s.status.failureReason || ('error ' + s.status.errorCode))) || 'failed') + '</span>';
+        var cred = s.servicePrincipalCredentialKeyId || s.servicePrincipalCredentialThumbprint || '';
+        return '<tr><td class="mono">' + when + '</td><td class="mono">' + escHtml(s.ipAddress || '—') + '</td><td>' + escHtml(s.resourceDisplayName || '—') + '</td><td>' + result + '</td><td class="mono" style="font-size:10px" title="' + escHtml(cred || '') + '">' + escHtml(cred ? String(cred).slice(0,8) + '…' : '—') + '</td></tr>';
+      }).join('');
+      slot.innerHTML = '<div style="margin-top:8px;overflow-x:auto"><table class="mini-table"><thead><tr><th>Time (UTC)</th><th>IP</th><th>Resource</th><th>Result</th><th>Credential</th></tr></thead><tbody>' + body + '</tbody></table></div>'
+        + '<p class="dmuted" style="margin:5px 0 0">Up to 25 most-recent app-only sign-ins. <b>Credential</b> = the secret KeyId / cert thumbprint that authenticated — proves <i>which</i> key acted, even for an external app whose key you can\'t read.</p>';
+      if(btn) btn.remove();
+    } catch(e){ slot.innerHTML = '<p class="dmuted" style="margin:7px 0 0">Could not load sign-ins — ' + escHtml(e.message || String(e)) + '</p>'; if(btn){ btn.disabled = false; btn.textContent = 'Retry →'; } }
+  }
   function buildDetailPanel(r){
     // Attack paths (MITRE / escalation) are built from LIVE scopes only — a grant against a retired API is inert,
     // so it must not generate exploit-path claims (it's a cleanup item, surfaced separately as "Retired API · inert").
@@ -2160,6 +2200,7 @@
   });
   el('rows').addEventListener('click', function(e){
     var mb = e.target.closest('[data-manage-appid]'); if(mb){ var r = (cache.results||[]).find(function(x){ return x.appId === mb.getAttribute('data-manage-appid'); }); if(r) openManageModal(r); return; }
+    var sb = e.target.closest('[data-signins]'); if(sb){ var parts = sb.getAttribute('data-signins').split('::'); var rs = (cache.results||[]).find(function(x){ return x.appId === parts[0]; }); if(rs) loadSignIns(rs, sb.closest('tr.detail-row'), sb); return; }
     if(e.target.closest('a')) return;   // let the portal link work without toggling
     var tr = e.target.closest('tr.main'); if(tr) toggleDetail(tr.getAttribute('data-row'));
   });
