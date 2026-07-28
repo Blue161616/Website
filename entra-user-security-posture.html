@@ -636,6 +636,9 @@ function caBlocksLegacyAuth(policies) {
 let MODEL = { paths: [], tier0Holders: [], stats: {}, pimAvailable: true, generatedAt: null };
 let sortState = { key: "risk", dir: -1 };
 let activeStat = null;
+// Exact scope set by a Sankey node click — {dim:'priv'|'mfa'|'band', val}. Kept separate from the coarse dropdowns so
+// a clicked node filters the table to EXACTLY that node's accounts (its count and the table count always agree).
+let flowScope = null;
 
 function principalType(p) {
   const t = (p && p["@odata.type"]) || "";
@@ -673,13 +676,20 @@ async function analyze() {
       };
     });
 
-    // 2 · Privileged directory roles held (active + PIM-eligible) → mapped to users
+    // 2 · Privileged directory roles held (active + PIM-eligible) → mapped to users.
+    // A role holder can be a USER (direct) or a role-assignable GROUP. Entra surfaces a role granted through a group
+    // as an assignment / eligibility instance whose principal is the GROUP — so if we only keep user principals, every
+    // admin who holds a role via group membership (e.g. Global-Administrator-eligible through a PIM group — "My roles"
+    // shows Membership: Group) looks completely role-less. Collect group grants here and fan them out to members below.
     setStatus("Fetching directory role assignments…", false, true);
+    const groupGrants = [];  // { groupId, role, kind } — held by a role-assignable group; its members inherit it
+    const applyRole = (uid, role, kind, via) => { const u = byId[uid]; if (u) u.roles.push({ name: role.name, tier: role.tier, kind: kind, via: via || "direct" }); };
     const assignments = await graphGetAll(base + "/roleManagement/directory/roleAssignments?$expand=principal", at);
     assignments.forEach((a) => {
       const r = PRIV_ROLES[a.roleDefinitionId]; if (!r) return;
-      const p = a.principal || {}; if (principalType(p) !== "user") return;
-      const u = byId[p.id]; if (u) u.roles.push({ name: r.name, tier: r.tier, kind: "active" });
+      const p = a.principal || {}, pt = principalType(p);
+      if (pt === "user") applyRole(p.id, r, "active", "direct");
+      else if (pt === "group" && p.id) groupGrants.push({ groupId: p.id, role: r, kind: "active" });
     });
     setStatus("Fetching PIM-eligible assignments…", false, true);
     MODEL.pimAvailable = true;
@@ -687,10 +697,30 @@ async function analyze() {
       const eligible = await graphGetAll(base + "/roleManagement/directory/roleEligibilityScheduleInstances?$expand=principal", at);
       eligible.forEach((a) => {
         const r = PRIV_ROLES[a.roleDefinitionId]; if (!r) return;
-        const p = a.principal || {}; if (principalType(p) !== "user") return;
-        const u = byId[p.id]; if (u) u.roles.push({ name: r.name, tier: r.tier, kind: "eligible" });
+        const p = a.principal || {}, pt = principalType(p);
+        if (pt === "user") applyRole(p.id, r, "eligible", "direct");
+        else if (pt === "group" && p.id) groupGrants.push({ groupId: p.id, role: r, kind: "eligible" });
       });
     } catch (e) { MODEL.pimAvailable = false; }
+    // Fan role-assignable GROUP grants out to their (transitive) member users — this is how PIM-group eligibility
+    // reaches an account. Directory.Read.All (already granted) covers the group-member read.
+    MODEL.groupRoleGrants = groupGrants.length;
+    if (groupGrants.length) {
+      setStatus("Resolving group-based role assignments…", false, true);
+      await mapPool(groupGrants, 6, async (g) => {
+        const members = await graphGetAll(base + "/groups/" + g.groupId + "/transitiveMembers/microsoft.graph.user?$select=id&$top=999", at);
+        members.forEach((m) => applyRole(m.id, g.role, g.kind, "group"));
+      }, null);
+    }
+    // Dedupe roles per account (a role can arrive directly AND via one or more groups). Keep the strongest instance —
+    // active outranks eligible, direct outranks group — so "standing" and the role count stay honest.
+    const KIND_RANK = { active: 0, eligible: 1 };
+    Object.values(byId).forEach((u) => {
+      u.roles.sort((a, b) => ((KIND_RANK[a.kind] || 0) - (KIND_RANK[b.kind] || 0)) || ((a.via === "direct" ? 0 : 1) - (b.via === "direct" ? 0 : 1)));
+      const seen = {}, out = [];
+      u.roles.forEach((r) => { if (!seen[r.name]) { seen[r.name] = 1; out.push(r); } });
+      u.roles = out;
+    });
 
     // 3 · MFA registration posture (optional — AuditLog.Read.All) ------------------
     MODEL.mfaAvailable = false;
@@ -930,9 +960,9 @@ function renderUserFlow() {
   const ribbonPath = rb => { const mx = (rb.x0 + rb.x1) / 2, f = v => v.toFixed(1);
     return `M${rb.x0} ${f(rb.sy0)}C${mx} ${f(rb.sy0)} ${mx} ${f(rb.ty0)} ${rb.x1} ${f(rb.ty0)}L${rb.x1} ${f(rb.ty1)}C${mx} ${f(rb.ty1)} ${mx} ${f(rb.sy1)} ${rb.x0} ${f(rb.sy1)}Z`; };
   const nodeFilter = (ci, key) => {
-    if (COLS[ci].risk) { const m = { Critical: "critical", High: "high", Medium: "medium" }; return m[key] ? "sev:" + m[key] : ""; }
-    if (ci === 0) return (key === "Global Admin" || key === "Privileged") ? "pop:admins" : key === "Member" ? "pop:nonadmin" : "";
-    if (ci === 1) { const m = { "Phishing-resistant": "phishres", "Weak MFA": "weak", "No MFA": "nomfa" }; return m[key] ? "mfa:" + m[key] : ""; }
+    if (COLS[ci].risk) { const m = { Critical: "critical", High: "high", Medium: "medium", Low: "low" }; return m[key] ? "band:" + m[key] : ""; }
+    if (ci === 0) return key === "Global Admin" ? "priv:ga" : key === "Privileged" ? "priv:priv" : key === "Member" ? "priv:member" : "";
+    if (ci === 1) { const m = { "Phishing-resistant": "phishres", "Weak MFA": "weak", "No MFA": "nomfa", "MFA unknown": "unknown" }; return m[key] ? "mfa:" + m[key] : ""; }
     return "";
   };
   const p = [`<svg viewBox="0 0 ${W} ${svgH}" width="100%" height="${svgH}" class="sankey" preserveAspectRatio="xMidYMid meet">`];
@@ -951,9 +981,7 @@ function renderUserFlow() {
     ["fltSearch", "fltSev", "fltType", "fltRel"].forEach(id => { const e = $(id); if (e) e.value = ""; });
     if ($("fltFlag")) $("fltFlag").value = "";
     activeStat = null;
-    if (t[0] === "sev") $("fltSev").value = t[1];
-    else if (t[0] === "pop") $("fltType").value = t[1];
-    else if (t[0] === "mfa") $("fltRel").value = t[1];
+    flowScope = { dim: t[0], val: t[1] };   // exact scope for this node — table count will equal the node count
     renderTable();
   }));
 }
@@ -984,6 +1012,7 @@ function renderSummary() {
   $("summary").querySelectorAll(".stat").forEach((el) => el.addEventListener("click", () => {
     const id = el.getAttribute("data-stat");
     ["fltSev", "fltType", "fltRel", "fltFlag"].forEach((f) => { const e = $(f); if (e) e.value = ""; });
+    flowScope = null;
     activeStat = (activeStat === id && id !== "all") ? null : id;
     if (id === "all") activeStat = null;
     if (id === "critical") { $("fltSev").value = "critical"; activeStat = null; }
@@ -995,6 +1024,15 @@ function filtered() {
   const q = $("fltSearch").value.toLowerCase().trim();
   const fSev = $("fltSev").value, fPop = $("fltType").value, fMfa = $("fltRel").value, fFlag = $("fltFlag") ? $("fltFlag").value : "";
   let rows = (MODEL.users || []).slice();
+  if (flowScope) {
+    const fs = flowScope, isGA = (u) => u.roles.some((r) => r.name === "Global Administrator");
+    if (fs.dim === "priv") {
+      if (fs.val === "ga") rows = rows.filter(isGA);
+      else if (fs.val === "priv") rows = rows.filter((u) => u.isAdmin && !isGA(u));
+      else if (fs.val === "member") rows = rows.filter((u) => !u.isAdmin);
+    } else if (fs.dim === "mfa") rows = rows.filter((u) => ((u.mfa && u.mfa.level) || "unknown") === fs.val);
+    else if (fs.dim === "band") rows = rows.filter((u) => u.postureTier === fs.val);
+  }
   if (activeStat === "admins") rows = rows.filter((u) => u.isAdmin);
   if (activeStat === "standing") rows = rows.filter((u) => u.isTier0 && u.standingAdmin);
   if (activeStat === "weakmfa") rows = rows.filter((u) => u.weakOrNoMfa);
@@ -1049,7 +1087,10 @@ function flagBadges(u) {
 function rolesCell(u) {
   if (!u.roles.length) return '<span class="mono" style="opacity:.6">no privileged roles</span>';
   const seen = {}, out = [];
-  u.roles.slice().sort((a, b) => a.tier - b.tier).forEach((r) => { const k = r.name + r.kind; if (seen[k]) return; seen[k] = 1; out.push('<span class="rolechip ' + SEV[tierToSev(r.tier)].cls + '" title="' + (r.kind === "active" ? "Active / permanent" : "PIM-eligible (JIT)") + '">' + escapeHtml(r.name) + (r.kind === "eligible" ? " ·JIT" : "") + '</span>'); });
+  u.roles.slice().sort((a, b) => a.tier - b.tier).forEach((r) => { const k = r.name + r.kind; if (seen[k]) return; seen[k] = 1;
+    const grp = r.via === "group";
+    const title = (r.kind === "active" ? "Active / permanent" : "PIM-eligible (JIT)") + (grp ? " — held via role-assignable group membership" : "");
+    out.push('<span class="rolechip ' + SEV[tierToSev(r.tier)].cls + '" title="' + title + '">' + escapeHtml(r.name) + (r.kind === "eligible" ? " ·JIT" : "") + (grp ? " ·group" : "") + '</span>'); });
   return '<div class="rolechips">' + out.join(" ") + '</div>';
 }
 
@@ -1140,11 +1181,9 @@ $("signOutBtn").addEventListener("click", signOut);
 $("loadBtn").addEventListener("click", analyze);
 $("exportCsv").addEventListener("click", exportCsv);
 $("exportJson").addEventListener("click", exportJson);
-$("fltSearch").addEventListener("input", renderTable);
-$("fltSev").addEventListener("change", renderTable);
-$("fltType").addEventListener("change", renderTable);
-$("fltRel").addEventListener("change", renderTable);
-$("fltFlag").addEventListener("change", renderTable);
+// Any manual filter change clears the Sankey node scope, so the two never fight over the table.
+["fltSearch", "fltSev", "fltType", "fltRel", "fltFlag"].forEach((id) =>
+  $(id).addEventListener(id === "fltSearch" ? "input" : "change", () => { flowScope = null; renderTable(); }));
 $("table").querySelectorAll("th.sortable").forEach((th) => th.addEventListener("click", () => {
   const k = th.getAttribute("data-key");
   if (sortState.key === k) sortState.dir *= -1; else { sortState.key = k; sortState.dir = k === "user" ? 1 : -1; }
