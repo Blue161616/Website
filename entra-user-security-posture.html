@@ -192,6 +192,17 @@
   .blegend { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--muted); }
   .blg { display: inline-flex; align-items: center; gap: 6px; text-transform: capitalize; }
   .blg i { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+  /* Account posture Sankey (Privilege → MFA → Risk) */
+  .sankey { display: block; width: 100%; overflow: visible; }
+  .sk-head { font-size: 10.5px; fill: var(--muted); font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+  .sk-label { font-size: 12px; fill: var(--text); paint-order: stroke; stroke: var(--card); stroke-width: 3px; stroke-linejoin: round; }
+  .sk-count { fill: var(--muted); font-weight: 600; }
+  .sk-ribbon { transition: fill-opacity .12s; }
+  .sk-ribbon:hover { fill-opacity: .72 !important; }
+  .sk-node { transition: opacity .12s; }
+  .sk-click { cursor: pointer; }
+  .sk-click:hover { opacity: .82; }
+  text.sk-click:hover { text-decoration: underline; }
   .tfindings { margin-top: 16px; display: flex; flex-direction: column; gap: 8px; }
   .tfinding { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; line-height: 1.5; }
   .tfinding .badge { min-width: 20px; text-align: center; flex-shrink: 0; }
@@ -856,11 +867,6 @@ function tfinding(status, title, html) {
 function renderTenant() {
   const s = MODEL.stats, bg = MODEL.breakGlass || {};
   if (!s || !s.total) { $("tenantPanel").style.display = "none"; return; }
-  const gradeCls = (s.tenantGrade === "A" || s.tenantGrade === "B") ? "b-low" : s.tenantGrade === "C" ? "b-med" : "b-crit";
-  const bands = [["critical", s.critical, "var(--sev-crit)"], ["high", s.high, "var(--sev-high)"], ["medium", s.medium, "var(--sev-med)"], ["low", s.low, "var(--sev-low)"]];
-  const totalB = s.total || 1;
-  const barSegs = bands.filter((b) => b[1] > 0).map((b) => '<div class="bandseg" style="width:' + (100 * b[1] / totalB) + '%;background:' + b[2] + '" title="' + b[1] + ' ' + b[0] + '"></div>').join("");
-  const legend = bands.map((b) => '<span class="blg"><i style="background:' + b[2] + '"></i>' + b[1] + ' ' + b[0] + '</span>').join("");
   const gaBad = s.globalAdmins > 5;
   const ratioPct = Math.round(s.adminRatio * 1000) / 10;
   const adminFinding = tfinding(
@@ -872,12 +878,84 @@ function renderTenant() {
   const bgFinding = tfinding(bg.status || "warn", "Emergency access (break-glass)", escapeHtml(bg.note || "")
     + (bg.candidates && bg.candidates.length ? ' <span class="mono" style="opacity:.75">' + bg.candidates.map((c) => escapeHtml(c)).join(", ") + '</span>' : ""));
   $("tenantPanel").innerHTML =
-    '<div class="thead">'
-    + '<div class="tgradewrap"><div class="tgrade ' + gradeCls + '" title="Posture score ' + s.tenantScore + ' of 100 (higher is better) — grade ' + s.tenantGrade + '. A ≥85 · B ≥70 · C ≥55 · D ≥40 · F &lt;40">' + s.tenantScore + '<span class="tgrade-max">/100</span></div><div class="tgsub">Tenant posture<br><b>Grade ' + s.tenantGrade + '</b> · A ≥85 · B ≥70 · C ≥55<br><span style="opacity:.8">admins weighted 3×</span></div></div>'
-    + '<div class="tbandwrap"><div class="tbandlbl">Account risk distribution — ' + s.total + ' member accounts</div><div class="bandbar">' + (barSegs || '<div class="bandseg" style="width:100%;background:var(--green)"></div>') + '</div><div class="blegend">' + legend + '</div></div>'
-    + '</div>'
+    '<div class="tbandlbl" style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:2px">Account posture — ' + s.total + ' member account' + (s.total === 1 ? "" : "s") + '</div>'
+    + '<div class="hint" style="margin:0 0 10px">Every account flows through exactly <b>one node per column</b> — its <b>privilege</b> → its <b>MFA posture</b> → its <b>risk band</b>. Ribbon width = number of accounts; ribbon colour = risk. <b>Click a node</b> to scope the table.</div>'
+    + '<div id="tenantFlow"></div>'
     + '<div class="tfindings">' + adminFinding + bgFinding + '</div>';
+  renderUserFlow();
   $("tenantPanel").style.display = "";
+}
+
+// Account-posture Sankey: every member account flows through Privilege → MFA → Risk band, one node per column, so
+// counts don't double-count. Ribbon colour = risk band. Nodes scope the table. (Replaces the old grade box + bar.)
+function renderUserFlow() {
+  const host = $("tenantFlow");
+  if (!host) return;
+  const users = MODEL.users || [];
+  if (!users.length) { host.innerHTML = '<div class="hint">No member accounts to visualise.</div>'; return; }
+  const RISK_FLOW = { Critical: "#8a0e14", High: "#d13438", Medium: "#e8820e", Low: "#3f9142" };
+  const BAND_LABEL = { critical: "Critical", high: "High", medium: "Medium", low: "Low" };
+  const privLabel = u => (u.roles && u.roles.some(r => r.name === "Global Administrator")) ? "Global Admin" : (u.isAdmin ? "Privileged" : "Member");
+  const mfaLabel  = u => { const l = u.mfa && u.mfa.level; return l === "phishres" ? "Phishing-resistant" : l === "weak" ? "Weak MFA" : l === "nomfa" ? "No MFA" : "MFA unknown"; };
+  const bandLabel = u => BAND_LABEL[u.postureTier] || "Low";
+  const SEP = " ";
+  const rows = users.map(u => ({ keys: [privLabel(u), mfaLabel(u), bandLabel(u)], w: 1 }));
+  const total = rows.length;
+  const COLS = [
+    { title: "Privilege",   order: ["Global Admin", "Privileged", "Member"] },
+    { title: "MFA posture",  order: ["No MFA", "Weak MFA", "MFA unknown", "Phishing-resistant"] },
+    { title: "Risk band",   order: ["Critical", "High", "Medium", "Low"], risk: true }
+  ];
+  const NC = COLS.length;
+  const buildNodes = ci => { const c = {}; rows.forEach(r => { c[r.keys[ci]] = (c[r.keys[ci]] || 0) + r.w; });
+    const order = COLS[ci].order.filter(k => c[k]); Object.keys(c).forEach(k => { if (order.indexOf(k) < 0) order.push(k); });
+    return order.map(k => ({ key: k, count: c[k] })); };
+  const colNodes = []; for (let i = 0; i < NC; i++) colNodes.push(buildNodes(i));
+  const W = 1000, nodeW = 12, padL = 165, padR = 180, topPad = 26, botPad = 8, Hd = 300, G = 7;
+  const maxNodes = Math.max.apply(null, colNodes.map(n => n.length));
+  const scale = (Hd - (maxNodes - 1) * G) / total;
+  const colX = COLS.map((_, ci) => padL + (NC > 1 ? (ci / (NC - 1)) * (W - padL - padR - nodeW) : 0));
+  colNodes.forEach(nodes => { const contentH = nodes.reduce((a, n) => a + n.count * scale, 0) + (nodes.length - 1) * G;
+    let y = topPad + Math.max(0, (Hd - contentH) / 2);
+    nodes.forEach(n => { n.y0 = y; n.h = Math.max(2, n.count * scale); n.y1 = y + n.h; n.cur = y; y = n.y1 + G; }); });
+  const svgH = topPad + Hd + botPad;
+  const ribbons = [];
+  for (let ci = 0; ci < NC - 1; ci++) { const sN = colNodes[ci], tN = colNodes[ci + 1], mat = {};
+    sN.forEach(n => { n.cur = n.y0; }); tN.forEach(n => { n.cur = n.y0; });
+    rows.forEach(r => { const k = r.keys[ci] + SEP + r.keys[ci + 1]; mat[k] = (mat[k] || 0) + r.w; });
+    sN.forEach(sn => tN.forEach(tn => { const c = mat[sn.key + SEP + tn.key]; if (!c) return;
+      const hh = c * scale, sy0 = sn.cur, ty0 = tn.cur; sn.cur += hh; tn.cur += hh;
+      ribbons.push({ x0: colX[ci] + nodeW, x1: colX[ci + 1], sy0, sy1: sy0 + hh, ty0, ty1: ty0 + hh, count: c,
+        color: COLS[ci].risk ? RISK_FLOW[sn.key] : (COLS[ci + 1].risk ? RISK_FLOW[tn.key] : "#9aa0a6") }); })); }
+  const ribbonPath = rb => { const mx = (rb.x0 + rb.x1) / 2, f = v => v.toFixed(1);
+    return `M${rb.x0} ${f(rb.sy0)}C${mx} ${f(rb.sy0)} ${mx} ${f(rb.ty0)} ${rb.x1} ${f(rb.ty0)}L${rb.x1} ${f(rb.ty1)}C${mx} ${f(rb.ty1)} ${mx} ${f(rb.sy1)} ${rb.x0} ${f(rb.sy1)}Z`; };
+  const nodeFilter = (ci, key) => {
+    if (COLS[ci].risk) { const m = { Critical: "critical", High: "high", Medium: "medium" }; return m[key] ? "sev:" + m[key] : ""; }
+    if (ci === 0) return (key === "Global Admin" || key === "Privileged") ? "pop:admins" : key === "Member" ? "pop:nonadmin" : "";
+    if (ci === 1) { const m = { "Phishing-resistant": "phishres", "Weak MFA": "weak", "No MFA": "nomfa" }; return m[key] ? "mfa:" + m[key] : ""; }
+    return "";
+  };
+  const p = [`<svg viewBox="0 0 ${W} ${svgH}" width="100%" height="${svgH}" class="sankey" preserveAspectRatio="xMidYMid meet">`];
+  ribbons.forEach(rb => p.push(`<path d="${ribbonPath(rb)}" fill="${rb.color}" fill-opacity="0.4" class="sk-ribbon"><title>${rb.count} account${rb.count === 1 ? "" : "s"}</title></path>`));
+  COLS.forEach((c, ci) => p.push(`<text x="${(colX[ci] + nodeW / 2).toFixed(0)}" y="14" text-anchor="middle" class="sk-head">${escapeHtml(c.title)}</text>`));
+  colNodes.forEach((nodes, ci) => { const last = ci === NC - 1, x = colX[ci];
+    nodes.forEach(n => { const fill = COLS[ci].risk ? RISK_FLOW[n.key] : "#adb1b5";
+      const flt = nodeFilter(ci, n.key), da = flt ? ` data-skf="${flt}"` : "", cc = flt ? " sk-click" : "";
+      p.push(`<rect x="${x.toFixed(1)}" y="${n.y0.toFixed(1)}" width="${nodeW}" height="${n.h.toFixed(1)}" rx="2" fill="${fill}" class="sk-node${cc}"${da}><title>${escapeHtml(n.key)} — ${n.count} account${n.count === 1 ? "" : "s"}</title></rect>`);
+      const ly = ((n.y0 + n.y1) / 2 + 3.5).toFixed(1), lx = last ? (x + nodeW + 7).toFixed(1) : (x - 7).toFixed(1), anc = last ? "start" : "end";
+      p.push(`<text x="${lx}" y="${ly}" text-anchor="${anc}" class="sk-label${cc}"${da}>${escapeHtml(n.key)} <tspan class="sk-count">${n.count}</tspan></text>`); }); });
+  p.push("</svg>");
+  host.innerHTML = p.join("");
+  host.querySelectorAll("[data-skf]").forEach(el => el.addEventListener("click", () => {
+    const t = el.getAttribute("data-skf").split(":");
+    ["fltSearch", "fltSev", "fltType", "fltRel"].forEach(id => { const e = $(id); if (e) e.value = ""; });
+    if ($("fltFlag")) $("fltFlag").value = "";
+    activeStat = null;
+    if (t[0] === "sev") $("fltSev").value = t[1];
+    else if (t[0] === "pop") $("fltType").value = t[1];
+    else if (t[0] === "mfa") $("fltRel").value = t[1];
+    renderTable();
+  }));
 }
 
 function renderNotices() {
