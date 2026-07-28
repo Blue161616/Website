@@ -495,6 +495,13 @@
   }
   function dirRoleNames(r){ return (r.directoryRoles||[]).map(function(x){ return x.name + (x.scoped ? ' (scoped)' : ''); }).join(', '); }
   async function optionalRoleToken(){ try { return (await msalInstance.acquireTokenSilent({ account: account, scopes: [ROLE_SCOPE] })).accessToken; } catch(e){ return null; } }
+  // Optional (graceful-degrade): USAGE detection. A consent scan shows what an app CAN do; the sign-in logs show what it
+  // HAS done. Even for a multi-tenant app whose credential lives in the publisher's tenant, the authentication happens in
+  // YOUR tenant and is logged here — so we can prove whether/when it actually authenticated app-only, and with which
+  // credential. Requested silently; if the app registration hasn't consented AuditLog.Read.All the card degrades to a
+  // portal deep-link + a "grant this scope" hint.
+  var AUDIT_SCOPE = 'https://graph.microsoft.com/AuditLog.Read.All';
+  async function optionalAuditToken(){ try { return (await msalInstance.acquireTokenSilent({ account: account, scopes: [AUDIT_SCOPE] })).accessToken; } catch(e){ return null; } }
   var MS_TENANT = 'f8cdef31-a31e-4b4a-93e4-5f571e91255a';
   // Microsoft-owned tenants that publish first-party apps. Apps owned by any of these are shown as "Microsoft".
   //   f8cdef31… = Microsoft Services, 72f988bf… = Microsoft corporate — the two canonical ones.
@@ -1324,6 +1331,22 @@
         } catch(e){ cache.rolesError = (e && e.message) || String(e); }
       }
 
+      // USAGE detection (optional — AuditLog.Read.All). servicePrincipalSignInActivities gives EVERY app's last app-only
+      // (client-credential) and delegated authentication in one call — the cheap, tenant-wide "is this app live or a
+      // stale consent" signal. The per-app recent-sign-in table (timestamp / IP / resource / credential KeyId) is pulled
+      // on demand from /auditLogs/signIns when a row is expanded, so we don't fire thousands of queries up front.
+      var signInActByAppId = {}; cache.auditAvailable = false; cache.auditError = null; cache.auditToken = null;
+      var auditToken = await optionalAuditToken();
+      if(auditToken){
+        cache.auditToken = auditToken;
+        try {
+          setStatus('Reading service-principal sign-in activity…', false, true);
+          var acts = await graphGetAllPages('https://graph.microsoft.com/beta/reports/servicePrincipalSignInActivities?$top=999', auditToken, function(n){ setStatus('Reading service-principal sign-in activity… ' + n, false, true); });
+          acts.forEach(function(a){ if(a.appId) signInActByAppId[String(a.appId).toLowerCase()] = a; });
+          cache.auditAvailable = true;
+        } catch(e){ cache.auditError = (e && e.message) || String(e); }
+      }
+
       var grantsByClient = {};
       grants.forEach(function(g){ (grantsByClient[g.clientId] = grantsByClient[g.clientId]||[]).push(g); });
       var principalByClient = {};
@@ -1358,6 +1381,7 @@
         results.push({
           id: sp.id, appId: sp.appId, displayName: sp.displayName, publisherName: sp.publisherName,
           directoryRoles: dirRolesBySpId[sp.id] || [],
+          signInActivity: signInActByAppId[(sp.appId||'').toLowerCase()] || null,
           accountEnabled: sp.accountEnabled, appOwnerOrganizationId: sp.appOwnerOrganizationId,
           isFirstPartyMicrosoft: isMsFirstParty(sp), firstPartyByAppId: !MS_TENANTS[sp.appOwnerOrganizationId] && !!MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()], firstPartyByVerifiedMs: !MS_TENANTS[sp.appOwnerOrganizationId] && !MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()] && isVerifiedMicrosoft(sp), createdDateTime: sp.createdDateTime,
           appRoleAssignmentRequired: sp.appRoleAssignmentRequired, _hasGrant: hasGrant,
@@ -1988,12 +2012,32 @@
   }
   // You can't read an external publisher's secret (it lives in their tenant), but your sign-in / activity
   // logs prove whether it authenticated against your tenant, with which credential, and what it read.
+  function fmtUtc(d){ try { return new Date(d).toISOString().slice(0,16).replace('T',' ') + ' UTC'; } catch(e){ return String(d); } }
   function signInEvidenceHtml(r){
     var url = 'https://entra.microsoft.com/#view/Microsoft_AAD_IAM/ManagedAppMenuBlade/~/SignIns/objectId/' + encodeURIComponent(r.id) + '/appId/' + encodeURIComponent(r.appId);
     var credLine = r.isExternal
       ? 'You cannot see the publisher’s secret itself — it lives in <b>their</b> tenant — but this proves <b>whether</b> it authenticated against your tenant and <b>which</b> credential (secret KeyId / certificate thumbprint) it used.'
       : 'The credential is in this tenant (see Credentials above); these logs show <b>when</b> it was actually used app-only.';
-    return '<ul class="dlist">'
+    // --- Live usage detection (self-verifying): populated from servicePrincipalSignInActivities during the scan. ---
+    var det;
+    if(cache.auditAvailable !== true){
+      det = '<div class="notice notice-warn" style="margin:0 0 9px"><b>Usage detection is OFF</b> — grant <code>AuditLog.Read.All</code> (admin consent) to this app registration to read whether apps actually authenticated. '
+          + (cache.auditError ? '<span class="mono">(' + escHtml(cache.auditError) + ')</span> — this can also mean the tenant lacks the Entra ID P1/P2 needed for sign-in logs. ' : '')
+          + 'Until then, use the portal link below.</div>';
+    } else {
+      var a = r.signInActivity;
+      var appOnly = a && a.applicationAuthenticationClientSignInActivity && a.applicationAuthenticationClientSignInActivity.lastSignInDateTime;
+      var deleg   = a && a.delegatedClientSignInActivity && a.delegatedClientSignInActivity.lastSignInDateTime;
+      var lines = [];
+      if(appOnly) lines.push('<li><span style="color:var(--green);font-weight:600">✓ Authenticated app-only</span> (client credentials) — last <b>' + escHtml(fmtUtc(appOnly)) + '</b>. This app has <b>used its key</b> in your tenant.</li>');
+      else lines.push('<li><span style="color:var(--muted)">No app-only authentication recorded</span> in the retained window — dormant, or it last ran before the window. <span class="dmuted">(Absence is not proof it never ran.)</span></li>');
+      if(deleg) lines.push('<li>Delegated sign-in (acting for a user) last <b>' + escHtml(fmtUtc(deleg)) + '</b>.</li>');
+      det = '<div class="notice notice-info" style="margin:0 0 9px"><b>Usage detection — live</b> <span class="dmuted">(from <code>servicePrincipalSignInActivities</code>, verified this scan)</span>'
+          + '<ul class="dlist" style="margin:5px 0 0">' + lines.join('') + '</ul>'
+          + '<div style="margin-top:8px"><button class="btn-mini" data-signins="' + escHtml(r.appId) + '::' + escHtml(r.id) + '">Load recent service-principal sign-ins →</button> <span class="dmuted">on-demand: timestamp · IP · resource · credential KeyId</span></div>'
+          + '<div class="signins-slot" data-slot="' + escHtml(r.appId) + '"></div></div>';
+    }
+    return det + '<ul class="dlist">'
       + '<li><a href="' + escHtml(url) + '" target="_blank" rel="noopener">Open this app’s sign-in logs in Entra ↗</a> — select the <b>Service principal sign-ins</b> tab for every app-only (client-credentials) authentication: timestamp, IP, resource, result, and the credential used.</li>'
       + '<li>' + credLine + '</li>'
       + '<li>For <b>what</b> was read: enable <code>MicrosoftGraphActivityLogs</code> (diagnostic setting → Log Analytics), then filter by AppId <code>' + escHtml(r.appId) + '</code> — <code>RequestUri</code> shows the exact Graph endpoints hit with no user. Workload reads (mail / files / Teams) appear in the Purview unified audit log.</li>'
