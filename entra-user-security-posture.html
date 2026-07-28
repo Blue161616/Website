@@ -539,8 +539,11 @@ const PRIV_ROLES = {
   "966707d0-3269-4727-9be2-8c3a10f19b9d": { name: "Password Administrator", tier: 1 },
   "9360feb5-f418-4baa-8175-e2a00bac4301": { name: "Directory Writers", tier: 1 },
   "e6d1a23a-da11-4be4-9570-befc86d067a7": { name: "Compliance Administrator", tier: 1 },
-  "f2ef992c-3afb-46b9-b7cf-a126ee74c451": { name: "Global Reader", tier: 2 },
-  "88d8e3e3-8f55-4a1e-953a-9b9898b8876b": { name: "Directory Readers", tier: 2 }
+  "f2ef992c-3afb-46b9-b7cf-a126ee74c451": { name: "Global Reader", tier: 2, ro: true },
+  "88d8e3e3-8f55-4a1e-953a-9b9898b8876b": { name: "Directory Readers", tier: 2, ro: true },
+  "5d6b6bb7-de71-4623-b4af-96380a352509": { name: "Security Reader", tier: 2, ro: true },
+  "4a5d8f65-41da-4de4-8968-e035b65339cf": { name: "Reports Reader", tier: 2, ro: true },
+  "790c1fb9-7f7d-4f88-86a1-ef1f95c05c1b": { name: "Message Center Reader", tier: 2, ro: true }
 };
 
 // Microsoft Graph application permissions (app roles) that enable privilege escalation.
@@ -812,13 +815,23 @@ async function analyze() {
 
 const STALE_DAYS = 90;
 function computeUserFlags(u) {
-  u.isAdmin = u.roles.length > 0;
-  u.isTier0 = u.roles.some((r) => r.tier === 0);
-  u.standingAdmin = u.roles.some((r) => r.kind === "active");
-  u.topTier = u.roles.length ? Math.min.apply(null, u.roles.map((r) => r.tier)) : null;
-  // Approval-gated: the account's most-privileged access is PIM-eligible AND activating it requires approval (not
+  // Split WRITE admin roles from READ-ONLY roles (Global Reader, Directory Readers, …). A standing read-only role is
+  // broad VISIBILITY, not control — far less risky than a standing write admin — so the "standing"/"admin" risk
+  // signals must key off write privilege, not "holds any active role". Otherwise a JIT-GA user with a standing Global
+  // Reader reads as "standing Tier-0", and an account whose only role is a read-only reader scores like an admin.
+  u.writeRoles = u.roles.filter((r) => !r.ro);
+  u.readRoles  = u.roles.filter((r) => r.ro);
+  u.isAdmin = u.roles.length > 0;                    // holds ANY privileged directory role (incl. read-only) — for listing
+  u.hasWriteRole = u.writeRoles.length > 0;          // holds a role that can CHANGE things — drives the heavy weighting
+  u.readOnlyAdmin = !u.hasWriteRole && u.readRoles.length > 0;   // only read-only role(s)
+  u.isTier0 = u.writeRoles.some((r) => r.tier === 0);           // Tier-0 = GA-class WRITE role (readers are never tier 0)
+  u.standingWrite = u.writeRoles.some((r) => r.kind === "active");  // a WRITE admin held permanently — the risky "standing"
+  u.standingRead  = u.readRoles.some((r) => r.kind === "active");
+  u.standingAdmin = u.standingWrite;                 // "standing" now means standing WRITE admin (used by badges/filters/stats)
+  u.topTier = u.writeRoles.length ? Math.min.apply(null, u.writeRoles.map((r) => r.tier)) : (u.readRoles.length ? 2 : null);
+  // Approval-gated: the account's most-privileged WRITE role is PIM-eligible AND activating it requires approval (not
   // standing). Only meaningful when the PIM policy was read; a self-activatable eligible role is NOT gated.
-  u.approvalGated = !u.standingAdmin && u.topTier != null && u.roles.some((r) => r.tier === u.topTier && r.kind === "eligible" && r.approval);
+  u.approvalGated = !u.standingWrite && u.hasWriteRole && u.writeRoles.some((r) => r.tier === u.topTier && r.kind === "eligible" && r.approval);
   if (!u.enabled) { u.stale = false; u.staleDays = null; }
   else if (!u.lastSignIn) { u.stale = true; u.staleDays = null; }       // never signed in
   else { u.staleDays = Math.floor((Date.now() - new Date(u.lastSignIn).getTime()) / 86400000); u.stale = u.staleDays > STALE_DAYS; }
@@ -839,8 +852,8 @@ function userRisk(u) {
   const reasons = [];
   // (1) MFA & auth posture — registration
   if (u.mfa) {
-    if (u.mfa.level === "nomfa") { d.mfa += u.isAdmin ? 30 : 18; reasons.push({ sev: "critical", t: u.isAdmin ? "Admin with no MFA registered" : "No MFA registered" }); }
-    else if (u.mfa.level === "weak") { d.mfa += u.isAdmin ? 16 : 8; reasons.push({ sev: u.isAdmin ? "high" : "medium", t: (u.isAdmin ? "Admin with " : "") + "weak MFA only — phishable" }); }
+    if (u.mfa.level === "nomfa") { d.mfa += u.hasWriteRole ? 30 : 18; reasons.push({ sev: "critical", t: u.hasWriteRole ? "Admin with no MFA registered" : "No MFA registered" }); }
+    else if (u.mfa.level === "weak") { d.mfa += u.hasWriteRole ? 16 : 8; reasons.push({ sev: u.hasWriteRole ? "high" : "medium", t: (u.hasWriteRole ? "Admin with " : "") + "weak MFA only — phishable" }); }
   }
   // (1b) MFA & auth posture — CA enforcement (privileged)
   if (u.caCovered === "excluded") { d.mfa += 22; reasons.push({ sev: "critical", t: "Excluded from the enforcing MFA Conditional Access policy" }); }
@@ -849,21 +862,28 @@ function userRisk(u) {
   // (2) Privileged access. An eligible role whose activation requires APPROVAL is less trivially abusable than one that
   // self-activates (an attacker with the account still needs an approver to say yes), so it scores below plain eligible.
   if (u.isTier0) {
-    const pts = u.standingAdmin ? 30 : (u.approvalGated ? 12 : 18);
+    const pts = u.standingWrite ? 30 : (u.approvalGated ? 12 : 18);
     d.priv += pts;
-    reasons.push({ sev: u.standingAdmin ? "critical" : (u.approvalGated ? "high" : "critical"),
-      t: u.standingAdmin ? "Standing Tier-0 role (permanent, not just-in-time)" : (u.approvalGated ? "Tier-0 role (PIM-eligible — activation requires approval)" : "Tier-0 role (PIM-eligible)") });
-  } else if (u.isAdmin) {
-    d.priv += u.standingAdmin ? 16 : (u.approvalGated ? 7 : 10);
-    reasons.push({ sev: "high", t: u.standingAdmin ? "Standing privileged role (permanent)" : (u.approvalGated ? "Privileged role (PIM-eligible — activation requires approval)" : "Privileged role (PIM-eligible)") });
+    reasons.push({ sev: u.standingWrite ? "critical" : (u.approvalGated ? "high" : "critical"),
+      t: u.standingWrite ? "Standing Tier-0 role (permanent, not just-in-time)" : (u.approvalGated ? "Tier-0 role (PIM-eligible — activation requires approval)" : "Tier-0 role (PIM-eligible)") });
+  } else if (u.hasWriteRole) {
+    d.priv += u.standingWrite ? 16 : (u.approvalGated ? 7 : 10);
+    reasons.push({ sev: "high", t: u.standingWrite ? "Standing privileged role (permanent)" : (u.approvalGated ? "Privileged role (PIM-eligible — activation requires approval)" : "Privileged role (PIM-eligible)") });
   }
-  if (u.roles.length > 2) { d.priv += Math.min(10, (u.roles.length - 2) * 3); reasons.push({ sev: "medium", t: u.roles.length + " privileged roles held" }); }
+  // Read-only directory roles (Global Reader, Directory/Security/Reports Reader): broad READ visibility, no write or
+  // control. A phished read-only account is recon, not takeover — so it scores far below a standing write admin.
+  if (u.readRoles.length) {
+    const gr = u.readRoles.some((r) => /global reader/i.test(r.name));
+    d.priv += u.standingRead ? 6 : 3;
+    reasons.push({ sev: u.standingRead ? "medium" : "low", t: (u.standingRead ? "Standing " : "PIM-eligible ") + (gr ? "Global Reader" : "read-only directory role") + " — broad read visibility, no write/control (much lower risk than a standing admin role)" });
+  }
+  if (u.writeRoles.length > 2) { d.priv += Math.min(10, (u.writeRoles.length - 2) * 3); reasons.push({ sev: "medium", t: u.writeRoles.length + " write-admin roles held" }); }
   // (3) Identity Protection risk
   if (u.risk) { const rl = u.risk.level; d.risk += rl === "high" ? 25 : rl === "medium" ? 14 : rl === "low" ? 6 : 8; reasons.push({ sev: rl === "high" ? "critical" : rl === "medium" ? "high" : "medium", t: "Identity Protection risk: " + rl + " (" + u.risk.state + ")" }); }
   // (4) Account hygiene
-  if (u.stale) { d.hygiene += u.isAdmin ? 12 : 6; reasons.push({ sev: u.isAdmin ? "high" : "medium", t: u.lastSignIn ? "Stale — no sign-in in " + u.staleDays + " days" : "Enabled but never signed in" }); }
+  if (u.stale) { d.hygiene += u.hasWriteRole ? 12 : 6; reasons.push({ sev: u.hasWriteRole ? "high" : "medium", t: u.lastSignIn ? "Stale — no sign-in in " + u.staleDays + " days" : "Enabled but never signed in" }); }
   if (u.pwdNeverExpires) { d.hygiene += 4; reasons.push({ sev: "medium", t: "Password set to never expire" }); }
-  if (u.onPrem && u.isAdmin) { d.hygiene += 4; reasons.push({ sev: "medium", t: "Privileged account is synced from on-premises (hybrid attack surface)" }); }
+  if (u.onPrem && u.hasWriteRole) { d.hygiene += 4; reasons.push({ sev: "medium", t: "Privileged account is synced from on-premises (hybrid attack surface)" }); }
   let total = d.mfa + d.priv + d.hygiene + d.risk;
   if (!u.enabled) { const k = 0.3; d.mfa = Math.round(d.mfa * k); d.priv = Math.round(d.priv * k); d.hygiene = Math.round(d.hygiene * k); d.risk = Math.round(d.risk * k); total = Math.round(total * k); reasons.push({ sev: "low", t: "Account disabled — residual risk only" }); }
   if (u.mfa && u.mfa.level === "phishres" && !reasons.length) reasons.push({ sev: "low", t: "Phishing-resistant MFA registered; no standout risk" });
@@ -1111,8 +1131,10 @@ function mfaBadge(mfa) {
 function flagBadges(u) {
   const b = [];
   if (u.isTier0) b.push('<span class="badge b-crit">Tier-0</span>');
-  else if (u.isAdmin) b.push('<span class="badge b-high">Admin</span>');
-  if (u.standingAdmin) b.push('<span class="badge b-high">Standing</span>');
+  else if (u.hasWriteRole) b.push('<span class="badge b-high">Admin</span>');
+  else if (u.readOnlyAdmin) b.push('<span class="badge b-med" title="Holds only read-only directory role(s) — broad visibility, no write or control">Reader</span>');
+  if (u.standingWrite) b.push('<span class="badge b-high" title="Holds a WRITE admin role permanently (not just-in-time) — the risky standing case">Standing</span>');
+  else if (u.standingRead) b.push('<span class="badge b-user" title="Holds a read-only role permanently — broad read visibility, not control (much lower risk than a standing admin)">Standing reader</span>');
   if (u.notCovered) b.push('<span class="badge b-crit" title="' + (u.caCovered === "excluded" ? "Excluded from MFA policy" : u.caCovered === "reportonly" ? "Report-only policy" : "No enforcing MFA policy") + '">Not MFA-covered</span>');
   if (u.risk) b.push('<span class="badge b-crit">Risk: ' + escapeHtml(u.risk.level) + '</span>');
   if (u.stale) b.push('<span class="badge b-med">' + (u.lastSignIn ? "Stale " + u.staleDays + "d" : "Never signed in") + '</span>');
@@ -1166,8 +1188,9 @@ function userDetailHtml(u) {
   const rem = [];
   if (u.weakOrNoMfa) rem.push("Register / enforce a phishing-resistant method (FIDO2 security key, Windows Hello, or passkey) for this account.");
   if (u.notCovered) rem.push("Bring this account into an enforcing Conditional Access policy requiring phishing-resistant MFA" + (u.caCovered === "excluded" ? " and remove it from the policy exclusion list." : "."));
-  if (u.isTier0 && u.standingAdmin) rem.push("Convert the standing Tier-0 assignment to PIM-eligible (just-in-time) with approval + phishing-resistant MFA on activation.");
-  else if (u.standingAdmin) rem.push("Move the permanent privileged assignment to PIM-eligible (just-in-time) where the role permits.");
+  if (u.isTier0 && u.standingWrite) rem.push("Convert the standing Tier-0 assignment to PIM-eligible (just-in-time) with approval + phishing-resistant MFA on activation.");
+  else if (u.standingWrite) rem.push("Move the permanent privileged assignment to PIM-eligible (just-in-time) where the role permits.");
+  else if (u.standingRead) rem.push("Standing read-only role (e.g. Global Reader) — lower priority, but move to PIM-eligible if the broad read access isn't needed permanently.");
   if (u.risk) rem.push("Investigate and remediate the Identity Protection risk (" + escapeHtml(u.risk.level) + " · " + escapeHtml(u.risk.state) + ") — confirm compromise or dismiss as safe.");
   if (u.stale && u.enabled) rem.push(u.lastSignIn ? "Review whether this stale account (no sign-in in " + u.staleDays + " days) should be disabled or deleted." : "Review this enabled-but-never-signed-in account — disable or delete if unused.");
   if (u.pwdNeverExpires) rem.push("Remove the DisablePasswordExpiration policy unless there is a documented reason.");

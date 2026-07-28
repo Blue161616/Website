@@ -254,8 +254,11 @@
           <input id="cfg-client" placeholder="00000000-0000-0000-0000-000000000000" spellcheck="false" autocomplete="off">
           <div class="hint">An app registration of type <b>SPA</b> with delegated, <b>read-only</b> permissions
             <code>Application.Read.All</code> and <code>DelegatedPermissionGrant.Read.All</code>. Both require admin consent.
-            <br><b>Optional:</b> <code>Application.ReadWrite.All</code> — only needed to edit an app's redirect URIs from
-            the detail drawer; it is requested separately at that moment, never at sign-in.</div>
+            <br><b>Optional (graceful-degrade):</b> <code>RoleManagement.Read.Directory</code> reveals Entra <b>directory
+            roles held by service principals</b> — the authorisation behind capability permissions like
+            <code>Exchange.ManageAsApp</code>; without it those roles just don't appear.
+            <code>Application.ReadWrite.All</code> — only needed to edit an app's redirect URIs from the detail drawer;
+            it is requested separately at that moment, never at sign-in.</div>
         </div>
         <div>
           <label for="cfg-tenant">Directory (tenant) ID or domain</label>
@@ -450,6 +453,48 @@
     'https://graph.microsoft.com/DelegatedPermissionGrant.Read.All'
   ];
   var WRITE_SCOPE = 'https://graph.microsoft.com/Application.ReadWrite.All';
+  // Optional (graceful-degrade): read Entra DIRECTORY ROLE assignments held BY service principals. A Graph app
+  // permission is only a capability — its authorisation often comes from a directory role on the app itself
+  // (Exchange.ManageAsApp does nothing without Exchange Administrator on the SP). Requested silently; if the app
+  // registration hasn't consented it, the feature just doesn't appear (a notice explains how to enable it).
+  var ROLE_SCOPE = 'https://graph.microsoft.com/RoleManagement.Read.Directory';
+  // Directory-role severity tiers: 0 = tenant-takeover class (can reach Global Admin / control identity), 1 = high
+  // service admin, 2 = other admin / broad read. Keyed by role TEMPLATE GUID; name-regex is the fallback for custom
+  // or renamed roles. This is the same privileged-role model used by the blueprint / user-posture tools.
+  var DIR_ROLE_TIER = {
+    '62e90394-69f5-4237-9190-012177145e10': 0, // Global Administrator
+    'e8611ab8-c189-46e8-94e1-60213ab1f814': 0, // Privileged Role Administrator
+    '7be44c8a-adaf-4e2a-84d6-ab2649e08a13': 0, // Privileged Authentication Administrator
+    '9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3': 0, // Application Administrator
+    '158c047a-c907-4556-b7ef-446551a6b5f7': 0, // Cloud Application Administrator
+    'd29b2b05-8046-44ba-8758-1e26182fcf32': 0, // Directory Synchronization Accounts
+    '8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2': 0, // Hybrid Identity Administrator
+    'e00e864a-17c5-4a4b-9c06-f5b95a8d5bd8': 0, // Partner Tier2 Support
+    '29232cdf-9323-42fd-ade2-1d097af3e4de': 1, // Exchange Administrator
+    'f28a1f50-f6e7-4571-818b-6a12f2af6b6c': 1, // SharePoint Administrator
+    'fe930be7-5e62-47db-91af-98c3a49a38b1': 1, // User Administrator
+    'c4e39bd9-1100-46d3-8c65-fb160da0071f': 1, // Authentication Administrator
+    '194ae4cb-b126-40b2-bd5b-6091b380977d': 1, // Security Administrator
+    '3a2c62db-5318-420d-8d74-23affee5d9d5': 1, // Intune Administrator
+    'b1be1c3e-b65d-4f19-8427-f6fa0d97feb9': 1, // Conditional Access Administrator
+    '69091246-20e8-4a56-aa4d-066075b2a7a8': 1, // Teams Administrator
+    'fdd7a751-b60b-444a-984c-02652fe8fa1c': 1, // Groups Administrator
+    '729827e3-9c14-49f7-bb1b-9608f156bbb8': 1, // Helpdesk Administrator
+    'f2ef992c-3afb-46b9-b7cf-a126ee74c451': 2, // Global Reader
+    '88d8e3e3-8f55-4a1e-953a-9b9898b8876b': 2  // Directory Readers
+  };
+  var DIR_ROLE_NAME_TIER = [
+    { rx: /global admin|company admin|privileged (role|authentication)|application admin|cloud application admin|hybrid identity|directory synchron|partner tier2/i, tier: 0 },
+    { rx: /exchange admin|sharepoint admin|user admin|security admin|intune|conditional access|authentication admin|teams admin|groups admin|helpdesk admin|password admin|billing admin/i, tier: 1 }
+  ];
+  function dirRoleTier(templateId, name){
+    var t = templateId ? DIR_ROLE_TIER[String(templateId).toLowerCase()] : undefined;
+    if(t != null) return t;
+    for(var i=0;i<DIR_ROLE_NAME_TIER.length;i++){ if(DIR_ROLE_NAME_TIER[i].rx.test(name||'')) return DIR_ROLE_NAME_TIER[i].tier; }
+    return 2; // any other directory role assigned to an app is still worth surfacing (≥ medium)
+  }
+  function dirRoleNames(r){ return (r.directoryRoles||[]).map(function(x){ return x.name + (x.scoped ? ' (scoped)' : ''); }).join(', '); }
+  async function optionalRoleToken(){ try { return (await msalInstance.acquireTokenSilent({ account: account, scopes: [ROLE_SCOPE] })).accessToken; } catch(e){ return null; } }
   var MS_TENANT = 'f8cdef31-a31e-4b4a-93e4-5f571e91255a';
   // Microsoft-owned tenants that publish first-party apps. Apps owned by any of these are shown as "Microsoft".
   //   f8cdef31… = Microsoft Services, 72f988bf… = Microsoft corporate — the two canonical ones.
@@ -855,6 +900,14 @@
     f.msDisabled = !!r.disabledByMicrosoft;
     f.disabled = r.accountEnabled === false;
     f.assignmentNotRequired = r.appRoleAssignmentRequired === false;
+    // Entra directory role assigned to the SERVICE PRINCIPAL itself (not a Graph permission). This is the real
+    // authorisation behind capabilities like Exchange.ManageAsApp — the permission is the capability, the role is
+    // the power. Tier 0 = tenant-takeover class (GA / Priv Role Admin / App Admin), 1 = high service admin, 2 = other.
+    var dr = r.directoryRoles || [];
+    f.hasDirRole = dr.length > 0;
+    f.dirRoleTier = f.hasDirRole ? Math.min.apply(null, dr.map(function(x){ return x.tier; })) : null;
+    f.dirRoleTakeover = f.dirRoleTier === 0;
+    f.dirRoleHigh = f.dirRoleTier === 1;
     return f;
   }
   function computeRisk(r){
@@ -921,6 +974,19 @@
       if(r.firstPartyByVerifiedMs) reasons.push('Recognised as Microsoft first-party via its verified publisher (Microsoft Corporation) — a hard-to-fake MPN signal (its owner tenant isn\'t in the allowlist). Third-party / supply-chain framing doesn\'t apply; capped at High.');
       else if(r.firstPartyByAppId) reasons.push('Recognised as a Microsoft first-party app by curated app-ID allowlist (its owner tenant isn\'t one of the two canonical Microsoft tenants) — unverified publisher is expected here and is not a risk signal.');
     }
+    // Directory role on the SP itself — the authorisation a Graph permission alone doesn't reveal. A tenant-takeover-
+    // class role (GA / Priv Role Admin / App Admin) makes the app effectively that admin, whoever holds its credential.
+    // Runs AFTER the first-party cap so a genuine Microsoft app that legitimately holds a role stays capped at High
+    // (surfaced, not screamed about); an unknown third-party SP with such a role goes Critical, top of the reasons.
+    if(f.dirRoleTakeover){
+      if(!r.isFirstPartyMicrosoft) lvl = 4; else lvl = Math.max(lvl, 3);
+      reasons.unshift('⚠ SERVICE PRINCIPAL HOLDS A TENANT-TAKEOVER DIRECTORY ROLE — ' + dirRoleNames(r) + '. This is an Entra admin role assigned to the APP itself, not a Graph API permission: it grants directory control (Global Administrator / Privileged Role Administrator / Application Administrator class) independent of, and usually far beyond, its listed permissions. Whoever controls this app\'s credential wields this role with no user sign-in. Confirm the assignment is intended, least-privilege, and that the app\'s credentials are tightly held' + (r.isFirstPartyMicrosoft ? ' (recognised as Microsoft first-party, so this may be by design — but verify).' : '.'));
+    } else if(f.dirRoleHigh){
+      lvl = Math.max(lvl, 3);
+      reasons.push('Service principal holds a high-privilege directory role — ' + dirRoleNames(r) + '. This is an Entra admin role on the app itself (e.g. Exchange / SharePoint / User Administrator), and it is where capability permissions get their real power: Exchange.ManageAsApp, for instance, does nothing without Exchange Administrator here. The Graph permission is the capability; this role is the authorisation. Review whether the app needs standing admin, or can use a narrower/scoped role.');
+    } else if(f.hasDirRole){
+      reasons.push('Service principal is assigned an Entra directory role — ' + dirRoleNames(r) + '. A role on the app itself (not a Graph permission); review its scope and necessity.');
+    }
     // Brand impersonation goes to the TOP — "verify the publisher before anything else." An app whose name claims a
     // vendor but whose publisher is unverified must be identity-checked before any other conclusion is trusted.
     if(f.msImpersonation){
@@ -956,6 +1022,7 @@
     if(f.noOwner) pts += 2;
     if(f.credExpired) pts += 2; else if(f.credExpiring) pts += 1;
     if(f.multiInternal) pts += 2;
+    if(f.dirRoleTakeover) pts += 22; else if(f.dirRoleHigh) pts += 12; else if(f.hasDirRole) pts += 5;  // directory role on the SP
     // Inert (retired-API-only high grant, no live app perm) is a cleanup item, not a live exploit — lower its magnitude.
     if(f.inertHighGrant && !f.appPerms) pts = Math.max(2, pts - 8);
     // Microsoft first-party right-sizing (mirrors the level cap at High): a high grant here is stale-consent hygiene.
@@ -984,6 +1051,25 @@
       var grants = await graphGetAllPages(GBASE + '/oauth2PermissionGrants?$filter=' + encodeURIComponent("consentType eq 'AllPrincipals'") + '&$top=999', token, function(n){ setStatus('Fetching tenant-wide grants… ' + n, false, true); });
       setStatus('Fetching per-user delegated grants…', false, true);
       var principalGrants = await graphGetAllPages(GBASE + '/oauth2PermissionGrants?$filter=' + encodeURIComponent("consentType eq 'Principal'") + '&$top=999', token, function(n){ setStatus('Fetching per-user grants… ' + n, false, true); });
+
+      // Directory ROLE assignments held BY service principals (optional — RoleManagement.Read.Directory). One tenant-
+      // wide call; index by principalId where the principal is a service principal. This surfaces the Entra admin role
+      // on the app itself (e.g. Exchange Administrator behind Exchange.ManageAsApp) — the authorisation a Graph app
+      // permission alone doesn't show. Degrades gracefully: no scope → feature absent + a notice.
+      var dirRolesBySpId = {}; cache.rolesAvailable = false; cache.rolesError = null;
+      var roleToken = await optionalRoleToken();
+      if(roleToken){
+        try {
+          setStatus('Fetching directory role assignments…', false, true);
+          var roleAssigns = await graphGetAllPages(GBASE + '/roleManagement/directory/roleAssignments?$expand=principal,roleDefinition&$top=999', roleToken, function(n){ setStatus('Fetching directory role assignments… ' + n, false, true); });
+          roleAssigns.forEach(function(a){
+            var p = a.principal || {}; if(String(p['@odata.type']||'').indexOf('servicePrincipal') < 0) return;
+            var def = a.roleDefinition || {}, tmpl = def.templateId || a.roleDefinitionId, nm = def.displayName || tmpl || '(role)';
+            (dirRolesBySpId[p.id] = dirRolesBySpId[p.id] || []).push({ name: nm, templateId: tmpl, tier: dirRoleTier(tmpl, nm), scoped: !!(a.directoryScopeId && a.directoryScopeId !== '/') });
+          });
+          cache.rolesAvailable = true;
+        } catch(e){ cache.rolesError = (e && e.message) || String(e); }
+      }
 
       var grantsByClient = {};
       grants.forEach(function(g){ (grantsByClient[g.clientId] = grantsByClient[g.clientId]||[]).push(g); });
@@ -1018,6 +1104,7 @@
         var vp = sp.verifiedPublisher && sp.verifiedPublisher.displayName ? sp.verifiedPublisher.displayName : null;
         results.push({
           id: sp.id, appId: sp.appId, displayName: sp.displayName, publisherName: sp.publisherName,
+          directoryRoles: dirRolesBySpId[sp.id] || [],
           accountEnabled: sp.accountEnabled, appOwnerOrganizationId: sp.appOwnerOrganizationId,
           isFirstPartyMicrosoft: isMsFirstParty(sp), firstPartyByAppId: !MS_TENANTS[sp.appOwnerOrganizationId] && !!MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()], firstPartyByVerifiedMs: !MS_TENANTS[sp.appOwnerOrganizationId] && !MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()] && isVerifiedMicrosoft(sp), createdDateTime: sp.createdDateTime,
           appRoleAssignmentRequired: sp.appRoleAssignmentRequired, _hasGrant: hasGrant,
@@ -1188,6 +1275,8 @@
   var EXPO = [
     { key:'msImpersonation', label:'⚠ Microsoft impersonation (claims MS, not from a Microsoft tenant)', sev:'high' },
     { key:'brandUnverified', label:'⚠ Brand name + unverified publisher (verify identity first)', sev:'high' },
+    { key:'dirRoleTakeover', label:'⚠ SP holds a tenant-takeover directory role (GA / Priv-Role / App Admin class)', sev:'high' },
+    { key:'hasDirRole', label:'SP holds an Entra directory role (e.g. Exchange Administrator behind ManageAsApp)', sev:'med' },
     { key:'externalAppKey', label:'⚠ External app with application permissions — a standing key you can’t rotate', sev:'high' },
     { key:'dangerCombo', label:'↳ …and the publisher is unverified too — the full OAuth consent-phishing combo (= the KPI tile)', sev:'high', sub:'externalAppKey' },
     { key:'critical', label:'Critical permission', sev:'high' },
@@ -1209,7 +1298,8 @@
   function statTile(id, n, label, crit, title){ return '<div class="stat clickable' + (activeStat === id ? ' active' : '') + '" data-stat="' + id + '"' + (title ? ' title="' + title + '"' : '') + '><div class="n' + (crit ? ' crit' : '') + '">' + n + '</div><div class="l">' + label + '</div></div>'; }
 
   function render(){
-    el('notices').innerHTML = '<div class="notice notice-info">Read-only posture scan of <b>all enterprise applications</b> in the tenant. Every app is inventoried with its tenancy, credentials, publisher verification, Microsoft-disabled status and assignment setting; apps that are consented, credentialed, or open to all users (non-Microsoft) are deep-scanned for permissions, redirect URIs and federated credentials. Risk combines permission scope with posture. Click a tile, a bar, or a row’s <b>Attack path</b> to prioritise.</div>';
+    el('notices').innerHTML = '<div class="notice notice-info">Read-only posture scan of <b>all enterprise applications</b> in the tenant. Every app is inventoried with its tenancy, credentials, publisher verification, Microsoft-disabled status and assignment setting; apps that are consented, credentialed, or open to all users (non-Microsoft) are deep-scanned for permissions, redirect URIs and federated credentials. Risk combines permission scope with posture. Click a tile, a bar, or a row’s <b>Attack path</b> to prioritise.</div>'
+      + (cache.rolesAvailable === false ? '<div class="notice notice-warn"><b>Directory roles held by service principals were not read</b> — grant <code>RoleManagement.Read.Directory</code> (admin consent) to this app registration to reveal Entra admin roles assigned to apps. This is the authorisation behind capability permissions like <code>Exchange.ManageAsApp</code>, which is inert without a role such as Exchange Administrator on the SP.' + (cache.rolesError ? ' <span class="mono">(' + escHtml(cache.rolesError) + ')</span>' : '') + '</div>' : '');
     renderSummary(); renderExposure(); renderTable();
   }
   function renderSummary(){
@@ -1385,10 +1475,22 @@
   }
   function scopeHtml(scopeStr){ return (scopeStr||'').split(', ').filter(Boolean).map(function(s){ var sc=scoreScope(s), cls=sc>=4?'sc4':sc>=3?'sc3':sc>=2?'sc2':''; return cls?'<span class="'+cls+'">'+escHtml(s)+'</span>':escHtml(s); }).join(', '); }
 
+  function dirRolesHtml(r){
+    var dr = r.directoryRoles || [];
+    if(!cache.rolesAvailable) return '<p class="dmuted">Directory-role assignments not read — grant <code>RoleManagement.Read.Directory</code> to this app registration to reveal Entra admin roles held by service principals (the authorisation behind capability permissions like <code>Exchange.ManageAsApp</code>).' + (cache.rolesError ? ' <span class="mono">(' + escHtml(cache.rolesError) + ')</span>' : '') + '</p>';
+    if(!dr.length) return '<p class="dmuted">No Entra directory role assigned to this service principal.</p>';
+    var TIER_CLS = { 0:'sc4', 1:'sc3', 2:'' }, TIER_LBL = { 0:'tenant-takeover class', 1:'high service admin', 2:'admin / broad' };
+    return '<ul class="dlist">' + dr.slice().sort(function(a,b){ return a.tier - b.tier; }).map(function(x){
+        return '<li><span class="' + (TIER_CLS[x.tier]||'') + '">' + escHtml(x.name) + '</span>' + (x.scoped ? ' <span class="badge b-single" title="Assignment is scoped to an administrative unit, not the whole tenant">AU-scoped</span>' : '') + ' <span class="dmuted" style="font-size:11px">— ' + TIER_LBL[x.tier] + '</span></li>';
+      }).join('') + '</ul>'
+      + ((r.factors.dirRoleTakeover || r.factors.dirRoleHigh) ? '<p class="dmuted" style="margin-top:6px">A directory role on the app itself is the <b>authorisation</b> behind capability permissions — e.g. <code>Exchange.ManageAsApp</code> only acts once the SP holds Exchange Administrator. Treat this app’s credential as an admin credential; right-size the role or scope it to an administrative unit.</p>' : '');
+  }
   function riskFlags(r){
     var f = '';
     if(r.factors.msImpersonation) f += '<span class="badge b-msdisabled" title="Claims to be Microsoft but is NOT registered in a Microsoft tenant and has no verified Microsoft publisher — the owner tenant is the fact an attacker can\'t fake. High-confidence impersonation of the most-abused brand; treat as malicious until the owner tenant is confirmed Microsoft.">⚠ Microsoft impersonation</span>';
     else if(r.factors.brandUnverified) f += '<span class="badge b-msdisabled" title="Display name claims “' + escHtml(r.factors.brand) + '” but the publisher is UNVERIFIED and the app is external — the name can\'t be trusted. Verify the real publisher / owner tenant before trusting (possible brand impersonation / consent-phishing lure).">⚠ Unverified “' + escHtml(r.factors.brand) + '” name</span>';
+    if(r.factors.dirRoleTakeover) f += '<span class="badge b-msdisabled" title="This service principal is assigned a TENANT-TAKEOVER-class Entra directory role (Global Administrator / Privileged Role Administrator / Application Administrator class) — a role on the app itself, independent of its Graph permissions. Whoever holds the app credential wields this role.">⚠ Directory role: ' + escHtml(dirRoleNames(r)) + '</span>';
+    else if(r.factors.hasDirRole) f += '<span class="badge b-app" title="This service principal is assigned an Entra directory role — an admin role on the app itself, not a Graph permission. This is where capabilities like Exchange.ManageAsApp get their real power (the permission is the capability; the role is the authorisation).">Directory role: ' + escHtml(dirRoleNames(r)) + '</span>';
     if(r.factors.msDisabled) f += '<span class="badge b-msdisabled" title="Microsoft disabled this app — usually a malicious/abuse flag">MS-disabled</span>';
     if(r.factors.inertHighGrant) f += '<span class="badge b-retired" title="Its high/critical permission targets a RETIRED API (e.g. Azure AD Graph) — inert / non-exercisable. A stale over-privileged consent record to clean up, not an exploitable path.">Retired API · inert</span>';
     if(r.factors.externalAppKey) f += '<span class="badge b-app" title="Application permissions on an EXTERNALLY-registered app — its client credential lives in the publisher\'s tenant, so you can\'t see or rotate the key, only pull consent. A standing key into your tenant that is outside your control.">External app-key</span>';
@@ -1616,6 +1718,7 @@
       +   '<div class="dpair-col"><div class="dhead">Application permissions</div>' + appPermsHtml(r) + '</div>'
       +   '<div class="dpair-col"><div class="dhead">Credentials</div>' + credDetailHtml(r) + '</div>'
       + '</div></div>'
+      + '<div class="dsec"><div class="dhead">Directory roles held by this app <span class="dmuted" style="font-weight:400">— the authorisation behind capability permissions (e.g. Exchange.ManageAsApp)</span></div>' + dirRolesHtml(r) + '</div>'
       + '<div class="dcols2">'
       +   '<div class="dsec"><div class="dhead">Auth configuration</div>' + authHtml + '</div>'
       +   '<div class="dsec"><div class="dhead">Tenancy &amp; publisher</div>' + tenHtml + '</div>'
@@ -1658,7 +1761,7 @@
   // -------------------- CSV --------------------
   function exportCsv(){
     var rows = filtered();
-    var cols = ['riskLevel','displayName','appId','tenancy','microsoftFirstParty','assignmentRequired','verifiedPublisher','publicClient','implicitGrant','riskyRedirect','delegatedPermissions','appPermissions','secrets','certs','fic','msDisabled','owners','riskReasons','portalUrl'];
+    var cols = ['riskLevel','riskScore','displayName','appId','tenancy','microsoftFirstParty','directoryRoles','assignmentRequired','verifiedPublisher','publicClient','implicitGrant','riskyRedirect','delegatedPermissions','appPermissions','secrets','certs','fic','msDisabled','owners','riskReasons','portalUrl'];
     var lines = [cols.join(',')];
     rows.forEach(function(r){
       var perms = (r.delegatedDetail||[]).map(function(d){ return d.consentType + ' ' + d.resourceName + ': ' + d.scopes; }).join(' | ');
@@ -1667,7 +1770,7 @@
       var certs = (r.keyCreds||[]).map(function(c){ return (c.displayName||'cert') + (c.endDateTime?' exp:'+c.endDateTime.slice(0,10):''); }).join(' | ');
       var fic = (r.fic||[]).map(function(c){ return (c.name||'') + ' iss:' + (c.issuer||'') + ' sub:' + (c.subject||''); }).join(' | ');
       var owners = (r.owners||[]).map(function(o){ return o.displayName||o.upn||'?'; }).join(' | ');
-      var row = [RISK_LABELS[r.riskScore||1], r.displayName, r.appId, r.audienceLabel, r.isFirstPartyMicrosoft, (r.appRoleAssignmentRequired === true), r.isVerifiedPublisher, r.factors.publicClient, r.factors.implicitGrant, r.factors.riskyRedirect, perms, appPerms, secrets, certs, fic, r.factors.msDisabled, owners, (r.riskReasons||[]).join(' ; '), r.portalUrl];
+      var row = [RISK_LABELS[r.riskScore||1], (r.riskWeight||0), r.displayName, r.appId, r.audienceLabel, r.isFirstPartyMicrosoft, dirRoleNames(r), (r.appRoleAssignmentRequired === true), r.isVerifiedPublisher, r.factors.publicClient, r.factors.implicitGrant, r.factors.riskyRedirect, perms, appPerms, secrets, certs, fic, r.factors.msDisabled, owners, (r.riskReasons||[]).join(' ; '), r.portalUrl];
       lines.push(row.map(function(v){ if(v==null) v=''; v=String(v).replace(/"/g,'""'); return /[,"\n]/.test(v)?'"'+v+'"':v; }).join(','));
     });
     var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([lines.join('\n')], {type:'text/csv'}));
