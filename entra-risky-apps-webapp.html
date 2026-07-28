@@ -88,6 +88,7 @@
   .risk-3 { background: var(--red-bg); color: var(--red); }
   .risk-2 { background: var(--amber-bg); color: var(--amber); }
   .risk-1 { background: var(--green-bg); color: var(--green); }
+  .riskw { font-weight: 700; opacity: .72; font-variant-numeric: tabular-nums; }
   .b-deleg { background: var(--cert-bg); color: var(--accent-dark); }
   .b-app   { background: var(--red-bg); color: var(--red); }
   .b-ms    { background: var(--hover); color: var(--muted); }
@@ -932,6 +933,35 @@
     r.riskReasons = reasons;
     return Math.max(1, lvl);
   }
+  // Weighted 0-100 risk score. The BAND (Low/Medium/High/Critical from computeRisk) is authoritative and sorts first;
+  // this number differentiates rows WITHIN a band by how much risk signal is actually present, and is shown next to the
+  // level. Band-floored on purpose so the column reads cleanly top-to-bottom — a Critical's number is always ≥ any
+  // High's — while the factor points spread rows inside their band (worst combos rank first). Same signals as the level.
+  var RW_BASE = { 1: 5, 2: 28, 3: 50, 4: 75 }, RW_SPAN = { 1: 22, 2: 21, 3: 24, 4: 25 };
+  function computeRiskWeight(r, lvl){
+    var f = r.factors, dls = delegatedLiveScore(r), pts = 0;
+    if(f.critical) pts += 12; else if(f.high) pts += 7; else if(r.permScore === 2) pts += 3;
+    if(f.appPerms) pts += 6;                                   // live application permission = standing key surface
+    if(f.externalAppKey) pts += 8;                             // app key you can't see/rotate (publisher's tenant)
+    if(f.msImpersonation) pts += 20;                           // dominate within Critical — treat as malicious
+    if(f.msDisabled) pts = Math.max(pts + 18, 22);             // Microsoft-flagged malicious → top of its band
+    if(f.brandUnverified && !f.msImpersonation) pts += 8;      // unverified brand claim — verify-first
+    if(f.allPrincipals) pts += 6;                              // tenant-wide (AllPrincipals) consent
+    if(f.assignmentNotRequired && dls >= 3) pts += 5;          // open to all users + high delegated
+    if(f.consumer && f.assignmentNotRequired && dls >= 3) pts += 6;
+    if(f.multiExternal) pts += 5;                              // external supply-chain blast radius
+    if(f.tokenTheft){ pts += 4; if(f.publicClient) pts += 3; }
+    if(f.unverifiedPublisher && f.multiExternal) pts += 3;
+    if(f.hasFIC) pts += 3;
+    if(f.noOwner) pts += 2;
+    if(f.credExpired) pts += 2; else if(f.credExpiring) pts += 1;
+    if(f.multiInternal) pts += 2;
+    // Inert (retired-API-only high grant, no live app perm) is a cleanup item, not a live exploit — lower its magnitude.
+    if(f.inertHighGrant && !f.appPerms) pts = Math.max(2, pts - 8);
+    // Microsoft first-party right-sizing (mirrors the level cap at High): a high grant here is stale-consent hygiene.
+    if(r.isFirstPartyMicrosoft && !f.msDisabled) pts = Math.round(pts * 0.6);
+    return RW_BASE[lvl] + Math.min(RW_SPAN[lvl], Math.max(0, pts));
+  }
 
   // -------------------- Audit --------------------
   async function runAudit(){
@@ -1104,6 +1134,7 @@
         r.hasRetiredGrant = (r.delegatedDetail||[]).some(function(d){ return d.retired; }) || (r.appPermissions||[]).some(function(p){ return p.retired && p.roleName !== 'Default access'; });
         r.factors = computeFactors(r);
         r.riskScore = computeRisk(r);
+        r.riskWeight = computeRiskWeight(r, r.riskScore);
       });
 
       cache.results = results;
@@ -1142,7 +1173,12 @@
     if(activeFactor) rows = rows.filter(function(r){ return r.factors && r.factors[activeFactor]; });
     rows.sort(function(a,b){
       var av = a[sortState.key], bv = b[sortState.key];
-      if(sortState.key === 'riskScore' || sortState.key === 'tenancyRank'){ av = av||0; bv = bv||0; if(av<bv) return -sortState.dir; if(av>bv) return sortState.dir; return String(a.displayName).localeCompare(String(b.displayName)); }
+      // Risk sorts by BAND first, then by the weighted score within the band, then name — so a band is always a
+      // contiguous block (colour ↔ position agree) and the worst combos rank first inside it.
+      if(sortState.key === 'riskScore'){ av = av||0; bv = bv||0; if(av!==bv) return (av<bv?-1:1) * sortState.dir;
+        var aw = a.riskWeight||0, bw = b.riskWeight||0; if(aw!==bw) return (aw<bw?-1:1) * sortState.dir;
+        return String(a.displayName).localeCompare(String(b.displayName)); }
+      if(sortState.key === 'tenancyRank'){ av = av||0; bv = bv||0; if(av<bv) return -sortState.dir; if(av>bv) return sortState.dir; return String(a.displayName).localeCompare(String(b.displayName)); }
       return String(av==null?'':av).localeCompare(String(bv==null?'':bv)) * sortState.dir;
     });
     return rows;
@@ -1390,7 +1426,7 @@
       var creds = credPills(r) || '<span style="color:var(--muted)">—</span>';
       return '<tr class="main" data-row="' + escHtml(r.id) + '" tabindex="0" aria-label="' + escHtml(r.displayName) + ' — expand for details">'
         + '<td class="chev">▸</td>'
-        + '<td><span class="badge risk-' + rs + '">' + RISK_LABELS[rs] + '</span>' + (flags ? '<div style="margin-top:4px">' + flags + '</div>' : '') + '</td>'
+        + '<td><span class="badge risk-' + rs + '" title="Risk band ' + RISK_LABELS[rs] + ' · weighted score ' + (r.riskWeight||0) + '/100 — the band sorts first, the score orders rows within the band by how much risk signal is present.">' + RISK_LABELS[rs] + ' <span class="riskw">· ' + (r.riskWeight||0) + '</span></span>' + (flags ? '<div style="margin-top:4px">' + flags + '</div>' : '') + '</td>'
         + '<td><div class="name"><a href="' + escHtml(r.portalUrl) + '" target="_blank" rel="noopener" title="Open the Enterprise application (service principal) in Entra">' + escHtml(r.displayName) + '</a></div><div class="appid">' + escHtml(r.appId) + '</div></td>'
         + '<td>' + tenancyBadge(r) + '</td>'
         + '<td>' + creds + '</td>'
@@ -1570,7 +1606,7 @@
     var ownersHtml = (r.owners && r.owners.length) ? '<ul class="dlist">' + r.owners.map(function(o){ return '<li>' + escHtml(o.displayName||'') + (o.upn ? ' <span class="mono" style="font-size:11px">' + escHtml(o.upn) + '</span>' : '') + '</li>'; }).join('') + '</ul>' : (r.localApp ? '<p style="color:var(--red)">No owners assigned — orphaned registration, no accountable steward.</p>' : '<p class="dmuted">Owners not visible for external apps.</p>');
 
     return '<div class="dpanel">'
-      + '<div class="dpanel-head">' + escHtml(r.displayName) + ' <span class="badge risk-' + r.riskScore + '">' + RISK_LABELS[r.riskScore] + '</span> <span class="xtag">' + escHtml(r.appId) + '</span></div>'
+      + '<div class="dpanel-head">' + escHtml(r.displayName) + ' <span class="badge risk-' + r.riskScore + '">' + RISK_LABELS[r.riskScore] + ' <span class="riskw">· ' + (r.riskWeight||0) + '</span></span> <span class="xtag">' + escHtml(r.appId) + '</span></div>'
       + '<div class="dsec"><div class="dhead">Why this risk level</div><ul class="dlist' + ((r.riskReasons&&r.riskReasons.length) ? ' risk' : '') + '">' + (r.riskReasons&&r.riskReasons.length ? r.riskReasons.map(function(x){ return '<li>'+x+'</li>'; }).join('') : '<li>Baseline — low-impact permissions and clean posture.</li>') + '</ul></div>'
       + '<div class="dpair"><div class="dpair-head">Delegated access — needs a user to sign in</div><div class="dpair-body">'
       +   '<div class="dpair-col"><div class="dhead">Delegated permissions</div>' + delegatedPermsHtml(r) + '</div>'
