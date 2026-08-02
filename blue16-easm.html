@@ -362,8 +362,8 @@
   <section id="view-coverage" class="view">
     <div class="tiles" id="cov-tiles"></div>
     <div class="settings">
-      <button class="primary" id="cov-azure">Reload Azure public IPs</button>
-      <button id="cov-import">Import Defender devices…</button>
+      <button class="primary" id="cov-import">Import Defender devices…</button>
+      <button id="cov-azure" title="Azure IPs load automatically after sign-in and refresh hourly">Reload Azure</button>
       <input type="file" id="cov-file" accept=".json,.csv" style="display:none"/>
       <button id="cov-clear">Clear</button>
       <select id="cov-filter">
@@ -441,8 +441,54 @@ function assetWeight(a) {
 function observationRisk(o, a) {
   if (o.remediationState === 'nonApplicable') return 0;
   const cvss = o.cvssScoreV3 || o.cvssScoreV2 || 0;
-  return (PRIORITY_WEIGHT[o.priority] ?? 0.5) * (1 + cvss / 10) * assetWeight(a);
+  // EPSS doubles the weight of something being actively exploited and leaves a
+  // theoretical vulnerability where CVSS put it.
+  const e = EPSS[cveId(o.name)];
+  const exploit = 1 + (e ? e.epss : 0);
+  return (PRIORITY_WEIGHT[o.priority] ?? 0.5) * (1 + cvss / 10) * exploit * assetWeight(a);
 }
+// ── Exploitation likelihood (EPSS) ──────────────────────────────────────────
+// CVSS says how bad a vulnerability would be; it says nothing about whether
+// anyone is exploiting it. EPSS (FIRST.org) gives the probability of
+// exploitation in the next 30 days, and it routinely inverts a CVSS ordering —
+// a 6.1 under active exploitation outranks an 8.2 nobody has weaponised.
+//
+// api.first.org sends CORS headers and accepts a comma-separated batch, so the
+// whole workspace resolves in a handful of requests. CISA's own KEV feed does
+// not send CORS headers and cannot be read from a page.
+const EPSS = {};           // CVE id -> {epss, percentile}
+const EPSS_BATCH = 100;
+const EPSS_MAX_BATCHES = 8;   // 800 CVEs; beyond that the tail is not worth the wait
+
+function cveId(name) {
+  const m = String(name || '').match(/CVE-\d{4}-\d{4,}/i);
+  return m ? m[0].toUpperCase() : '';
+}
+
+async function loadEpss(obsByAsset, onProgress) {
+  const ids = [...new Set(Object.values(obsByAsset).flat().map(o => cveId(o.name)).filter(Boolean))]
+    .filter(id => !(id in EPSS));
+  if (!ids.length) return false;
+  let loaded = 0;
+  for (let i = 0; i < ids.length && i < EPSS_BATCH * EPSS_MAX_BATCHES; i += EPSS_BATCH) {
+    const batch = ids.slice(i, i + EPSS_BATCH);
+    try {
+      const r = await fetch(`https://api.first.org/data/v1/epss?cve=${batch.join(',')}`);
+      if (!r.ok) break;
+      for (const row of ((await r.json()).data || [])) {
+        EPSS[String(row.cve).toUpperCase()] = {epss: parseFloat(row.epss) || 0,
+                                               percentile: parseFloat(row.percentile) || 0};
+        loaded++;
+      }
+      if (onProgress) onProgress(`Scoring exploitation likelihood — ${loaded} of ${ids.length} CVEs`,
+                                 loaded, ids.length);
+    } catch (e) { break; }   // enrichment is optional; never block the view
+  }
+  // Absent CVEs get a zero entry so we do not re-request them every reload.
+  for (const id of ids) if (!(id in EPSS)) EPSS[id] = {epss: 0, percentile: 0};
+  return loaded > 0;
+}
+
 // ── OWASP Top 10 (2021) categorisation ──────────────────────────────────────
 // EASM does not return a category on an observation — its portal builds the
 // OWASP dashboard from workspace-level report metrics, which say nothing about
@@ -944,6 +990,30 @@ const AZURE_ICON = `<svg class="ico" viewBox="0 0 20 20" aria-hidden="true">
   <path fill="#0f6cbd" d="M9.6 9.6 6.3 16h7.6l-1.6-4.4H9z"/>
 </svg>`;
 
+/** Every IP this asset represents. */
+function assetIps(a) {
+  const out = new Set();
+  if (a.kind === 'ipAddress' && a.name) out.add(a.name.trim());
+  for (const ip of (a.evidence && a.evidence.ips) || []) out.add(String(ip).trim());
+  return [...out];
+}
+
+/** Join an asset to the Azure and Defender data loaded on the Coverage tab.
+ *  This is the correlation EASM structurally cannot make: it knows the asset
+ *  exists, not who owns the subscription it sits in or whether an EDR sensor is
+ *  behind it. */
+function assetContext(a) {
+  const cov = getCoverage();
+  const ips = assetIps(a);
+  if (!ips.length) return {ips, azure: null, mde: null, mdeLoaded: cov.mde.length > 0};
+  return {
+    ips,
+    azure: cov.azure.find(x => ips.includes(x.ip)) || null,
+    mde: cov.mde.find(x => ips.includes(x.ip)) || null,
+    mdeLoaded: cov.mde.length > 0,
+  };
+}
+
 /** Path portion of a page URL, empty when it is just the host root. */
 function urlPath(u) {
   const rest = String(u || '').replace(/^https?:\/\//i, '');
@@ -959,6 +1029,16 @@ function findingName(name) {
   const id = m[0].toUpperCase();
   return `<a href="https://nvd.nist.gov/vuln/detail/${id}" target="_blank" rel="noopener noreferrer"
              title="Open ${id} on NVD">${esc(name)}</a>`;
+}
+
+/** EPSS as a readable cell: the probability, flagged when it is in the tail
+ *  that actually gets exploited. */
+function epssCell(name) {
+  const e = EPSS[cveId(name)];
+  if (!e || !e.epss) return '<span class="evidence">—</span>';
+  const pct = (e.epss * 100).toFixed(e.epss >= 0.1 ? 0 : 1);
+  const top = e.percentile >= 0.9;
+  return `<span class="${top ? 'err' : ''}" title="EPSS ${e.epss.toFixed(4)} — ${(e.percentile * 100).toFixed(0)}th percentile of all CVEs">${pct}%${top ? ' ▲' : ''}</span>`;
 }
 
 function riskBand(risk) {
@@ -1048,12 +1128,16 @@ function renderAssets() {
     // a deeper path (/admin, /wp-login.php) tells you something new, so reduce
     // the merged list to distinct paths and drop it when there are none.
     const paths = [...new Set(r.merged.map(urlPath).filter(Boolean))];
+    const ctx = assetContext(a);
     const chips = [
       r.counts.cve ? `<span class="badge k-cve">${r.counts.cve} CVE</span>` : '',
       r.counts.high ? `<span class="badge p-high">${r.counts.high} high</span>` : '',
       r.counts.medium ? `<span class="badge p-medium">${r.counts.medium} med</span>` : '',
       r.worstCvss ? `<span class="badge p-none">CVSS ${r.worstCvss}</span>` : '',
       paths.length ? `<span class="badge p-none" title="${esc(paths.join(', '))}">${paths.length} crawled path${paths.length > 1 ? 's' : ''}</span>` : '',
+      ctx.azure ? `<span class="badge src-azure" title="${esc(`${ctx.azure.name} · ${ctx.azure.rg} · ${ctx.azure.subscription}`)}">${AZURE_ICON}Azure</span>` : '',
+      ctx.mde ? `<span class="badge v-approve" title="${esc(`Defender device ${ctx.mde.name}`)}">EDR</span>`
+        : (ctx.mdeLoaded && ctx.ips.length ? `<span class="badge p-high" title="No Defender sensor behind ${esc(ctx.ips.join(', '))}">no EDR</span>` : ''),
     ].join('');
     // State shows as the bare tag; the explanation is the tooltip, so the fact
     // grid stays scannable instead of carrying a paragraph per row.
@@ -1068,6 +1152,9 @@ function renderAssets() {
       ['WHOIS org', e.whois_org], ['ASN', e.asn], ['Certificate', e.cert_subject],
       ['IP addresses', (e.ips || []).join(', ')],
       ['IP blocks', (e.ip_blocks || []).join(', ')], ['Technology', (e.web_components || []).join(', ')],
+      ['Azure resource', ctx.azure ? `${ctx.azure.name} · ${ctx.azure.rg} · ${ctx.azure.location} · ${ctx.azure.subscription}` : ''],
+      ['EDR coverage', ctx.mde ? `Defender device ${ctx.mde.name}${ctx.mde.onboarding ? ` (${ctx.mde.onboarding})` : ''}`
+        : (ctx.mdeLoaded && ctx.ips.length ? 'No Defender sensor behind this IP' : '')],
     ].filter(([, v]) => v);
     const byTheme = {};
     for (const o of r.observations) (byTheme[o.owasp] ||= []).push(o);
@@ -1092,12 +1179,13 @@ function renderAssets() {
           `<span class="badge p-none" style="margin-right:4px">${esc(o)}</span>`).join('')}</p>` : ''}
         ${r.observations.length ? Object.entries(byTheme).map(([theme, list]) => `
           <h4>${esc(theme)}</h4>
-          <table><thead><tr><th>Finding</th><th>Type</th><th>Priority</th><th>CVSS</th><th>Risk</th></tr></thead>
+          <table><thead><tr><th>Finding</th><th>Type</th><th>Priority</th><th>CVSS</th><th>Exploit</th><th>Risk</th></tr></thead>
           <tbody>${list.map(o => `<tr>
             <td>${findingName(o.name)}${urlPath(o.via) ? `<div class="evidence">on ${esc(urlPath(o.via))}</div>` : ''}</td>
             <td><span class="badge k-${esc(o.kind)}">${esc(o.kind)}</span></td>
             <td><span class="badge p-${esc(o.priority)}">${esc(o.priority)}</span></td>
             <td>${o.cvssScoreV3 || o.cvssScoreV2 || '—'}</td>
+            <td>${epssCell(o.name)}</td>
             <td>${o.risk.toFixed(1)}</td></tr>`).join('')}</tbody></table>`).join('')
           : '<p class="note">No open observations on this asset.</p>'}
         <div class="toolbar" style="margin:4px 0 0">
@@ -1191,8 +1279,9 @@ async function loadCurrent() {
   try {
     progress('Loading inventory…');
     DATA = await loadWorkspace(WS, progress);
+    show(current);                     // paint before enrichment
+    if (await loadEpss(DATA.obsByAsset, progress)) show(current);   // re-rank with EPSS
     progress('');
-    show(current);
   } catch (e) {
     progress('');
     show(current);
