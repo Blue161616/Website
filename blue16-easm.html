@@ -141,6 +141,14 @@
   .cause-h{display:flex;align-items:center;gap:8px}
   .cause-h b{flex:1;min-width:0}
   .cause p{margin:4px 0}
+  .conv{width:100%;max-width:560px;height:auto;margin:2px 0 8px;overflow:visible}
+  .conv-name{fill:var(--text);font-size:11px;font-family:inherit}
+  .conv-ip{fill:var(--blue);font-size:11px;font-family:ui-monospace,monospace}
+  .conv-dot{fill:var(--blue)}
+  .conv-line{fill:none;stroke:var(--blue);stroke-width:1.4;stroke-opacity:.75;
+             stroke-dasharray:5 5;animation:convflow 1.4s linear infinite}
+  @keyframes convflow{to{stroke-dashoffset:-20}}
+  @media (prefers-reduced-motion:reduce){.conv-line{animation:none}}
   .facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:2px 16px;
          margin-bottom:12px}
   .facts div{font-size:11px;color:var(--text);padding:2px 0}
@@ -340,7 +348,7 @@
         <option value="everything">Every asset</option>
       </select>
       <select id="asset-merge">
-        <option value="platform">Group identical platforms</option>
+        <option value="platform">Group by machine (shared IP)</option>
         <option value="merge">Merge pages into hosts</option>
         <option value="split">Keep EASM entities separate</option>
       </select>
@@ -552,38 +560,133 @@ function hostOfUrl(name) {
   return n.split('/')[0].split('?')[0].split(':')[0];
 }
 
-/** Collapse assets whose findings are identical.
+// Two things stop a grouping from being wrong.
+//
+// Shared infrastructure: an Azure Static Web App or Front Door answers on an
+// anycast pool, so games-dev.rubicon.nl showing six IPs and a CNAME to
+// azurestaticapps.net does not mean those addresses identify a machine. Group on
+// them and every app in the tenant collapses into one row. Those assets are left
+// alone — neither the address nor the finding set identifies a host.
+const SHARED_HOSTING = /(azurestaticapps\.net|azurewebsites\.net|azurefd\.net|azureedge\.net|trafficmanager\.net|cloudapp\.azure\.com|cloudfront\.net|akamai|fastly|cloudflare|edgekey|azure-api\.net|herokuapp\.com|netlify|vercel)/i;
+const SHARED_IP_COUNT = 3;
+
+function onSharedInfra(asset) {
+  const e = asset.evidence || {};
+  if (assetIps(asset).length >= SHARED_IP_COUNT) return true;
+  return (e.cnames || []).some(c => SHARED_HOSTING.test(c));
+}
+
+// Environment: games. and games-dev. are the same application with different
+// jobs, different data and different owners. Even when every finding matches --
+// they run the same build, so of course it does -- collapsing them hides that
+// one of them is production.
+const ENV_WORDS = ['dev', 'test', 'tst', 'staging', 'stage', 'acc', 'accept', 'uat', 'qa',
+                   'sandbox', 'sbx', 'preview', 'demo', 'prod', 'prd'];
+function envTokens(name) {
+  const parts = String(name || '').toLowerCase().split(/[.\-_]/);
+  return ENV_WORDS.filter(w => parts.includes(w)).sort().join(',');
+}
+const sameEnvironment = (a, b) => envTokens(a) === envTokens(b);
+
+/** Collapse names that are the same machine.
  *
- *  ftp.rubicon.nl and mail.rubicon.nl both scoring 80 on the same six CVEs is
- *  not two problems — it is one hosting platform answering on two names. Left
- *  apart they inflate the totals and push distinct problems down the list.
+ *  The exposure is the host, not the label pointing at it. ftp.rubicon.nl and
+ *  mail.rubicon.nl are one server answering on two names — patching it once
+ *  fixes both, and listing them separately doubles the risk of one box.
  *
- *  The fingerprint is the set of finding names. Two findings minimum, because a
- *  single shared "Missing HSTS header" is a coincidence, not a shared platform.
- *  Risk stays at one instance rather than the sum: fixing it once fixes all of
- *  them, and the host count is reported separately as the blast radius.
+ *  Two signals, strongest first:
+ *    1. A shared IP address. Direct evidence, and it is what is actually exposed.
+ *    2. An identical set of findings, for assets whose IPs EASM never resolved.
+ *       Two findings minimum, because one shared "Missing HSTS header" is a
+ *       coincidence rather than a shared platform.
+ *
+ *  A machine's findings are the union across its names, deduplicated — EASM may
+ *  have observed different things through different hostnames.
  */
 const FINGERPRINT_MIN = 2;
-function groupIdentical(rows) {
-  const groups = new Map();
-  const out = [];
-  for (const r of rows) {
-    if (r.observations.length < FINGERPRINT_MIN) { out.push(r); continue; }
-    const fp = r.observations.map(o => o.name).sort().join('|');
-    const g = groups.get(fp);
-    if (!g) { groups.set(fp, r); r.siblings = []; out.push(r); continue; }
-    // Keep the riskiest as the visible one; the rest become siblings of it.
-    if (r.risk > g.risk) {
-      g.siblings.push(g.asset.name);
-      r.siblings = g.siblings;
-      groups.set(fp, r);
-      out[out.indexOf(g)] = r;
-    } else {
-      g.siblings.push(r.asset.name);
+
+function mergeMembers(members) {
+  const primary = members.reduce((a, b) => (b.risk > a.risk ? b : a));
+  const seen = new Set();
+  const observations = [];
+  for (const m of members) {
+    for (const o of m.observations) {
+      const key = `${o.name}|${o.priority}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      observations.push(o);
     }
   }
-  return out.sort((x, y) => y.risk - x.risk || y.counts.high - x.counts.high
-                            || x.asset.name.localeCompare(y.asset.name));
+  observations.sort((x, y) => y.risk - x.risk);
+  const counts = {high: 0, medium: 0, low: 0, cve: 0};
+  for (const o of observations) {
+    if (counts[o.priority] != null) counts[o.priority]++;
+    if (o.kind === 'cve') counts.cve++;
+  }
+  return Object.assign({}, primary, {
+    observations, counts,
+    owasp: [...new Set(observations.map(o => o.owasp))].sort(),
+    risk: +observations.reduce((sum, o) => sum + o.risk, 0).toFixed(2),
+    worstCvss: observations.reduce((m, o) => Math.max(m, o.cvssScoreV3 || o.cvssScoreV2 || 0), 0),
+    merged: [...new Set(members.flatMap(m => m.merged))],
+    siblings: members.filter(m => m !== primary).map(m => m.asset.name),
+    sharedIps: [...new Set(members.flatMap(m => assetIps(m.asset)))],
+    groupedBy: members.length > 1 ? 'ip' : '',
+  });
+}
+
+function groupByMachine(rows) {
+  const ungrouped = [];
+  const machines = [];
+
+  // 1. Union by shared IP, for assets whose addresses actually identify a host.
+  const groupOf = new Map();
+  const ipGroups = [];
+  for (const r of rows) {
+    const ips = onSharedInfra(r.asset) ? [] : assetIps(r.asset);
+    if (!ips.length) { ungrouped.push(r); continue; }
+    let g = null;
+    for (const ip of ips) if (groupOf.has(ip)) { g = groupOf.get(ip); break; }
+    if (!g) { g = []; ipGroups.push(g); }
+    g.push(r);
+    for (const ip of ips) {
+      const existing = groupOf.get(ip);
+      if (existing && existing !== g) {
+        existing.forEach(m => g.push(m));
+        ipGroups.splice(ipGroups.indexOf(existing), 1);
+        existing.forEach(m => assetIps(m.asset).forEach(i => groupOf.set(i, g)));
+      }
+      groupOf.set(ip, g);
+    }
+  }
+  for (const members of ipGroups) {
+    // Even one machine can serve two environments; keep those apart.
+    const byEnv = new Map();
+    for (const m of members) {
+      const k = envTokens(m.asset.name);
+      if (!byEnv.has(k)) byEnv.set(k, []);
+      byEnv.get(k).push(m);
+    }
+    for (const group of byEnv.values())
+      group.length > 1 ? machines.push(mergeMembers(group)) : ungrouped.push(group[0]);
+  }
+
+  // 2. Identical findings, for names whose IPs differ or were never resolved.
+  //    mail. and ftp. sit on one hosting platform with an address each.
+  const byFingerprint = new Map();
+  for (const r of ungrouped) {
+    if (r.observations.length < FINGERPRINT_MIN || onSharedInfra(r.asset)) { machines.push(r); continue; }
+    const fp = envTokens(r.asset.name) + '||' + r.observations.map(o => o.name).sort().join('|');
+    const bucket = byFingerprint.get(fp);
+    if (bucket) bucket.push(r); else byFingerprint.set(fp, [r]);
+  }
+  for (const members of byFingerprint.values())
+    machines.push(members.length > 1
+      ? Object.assign(mergeMembers(members), {groupedBy: 'findings'})
+      : members[0]);
+
+  return machines.sort((x, y) => y.risk - x.risk || y.counts.high - x.counts.high
+                                 || x.asset.name.localeCompare(y.asset.name));
 }
 
 /** Per-asset rollup: risk, observations, and the themes they fall into.
@@ -972,6 +1075,22 @@ function easmIpSet() {
   return set;
 }
 
+/** One name per machine. Azure names its public-IP resource <host>-ip, so
+ *  "SRV000-ip" and the Defender device "srv000" are the same box; strip the
+ *  suffix, match case-insensitively, and prefer the Defender form because that
+ *  is the actual hostname rather than a resource label. */
+function displayNames(entries) {
+  const clean = n => String(n || '').replace(/[-_]ip$/i, '').trim();
+  const seen = new Map();
+  for (const {name, source} of entries || []) {
+    const c = clean(name);
+    if (!c) continue;
+    const key = c.toLowerCase();
+    if (!seen.has(key) || source === 'Defender') seen.set(key, c);
+  }
+  return [...seen.values()].join(' · ');
+}
+
 function renderCoverage() {
   const cov = getCoverage();
   $('#cov-kql').textContent = MDE_KQL;
@@ -985,7 +1104,7 @@ function renderCoverage() {
     let row = byIp.get(key);
     if (!row) { row = {ip: key, sources: [], names: [], where: []}; byIp.set(key, row); }
     row.sources.push(source);
-    if (entry.name) row.names.push(entry.name);
+    if (entry.name) row.names.push({name: entry.name, source});
     const where = [entry.rg, entry.location, entry.subscription, entry.onboarding].filter(Boolean).join(' · ');
     if (where) row.where.push(where);
   };
@@ -1033,7 +1152,7 @@ function renderCoverage() {
       <td style="font-family:monospace;color:${r.missing ? 'var(--red)' : 'var(--muted)'}">${esc(r.ip)}</td>
       <td>${r.sources.map(src => `<span class="badge ${src === 'Azure' ? 'src-azure' : 'src-defender'}"
         style="margin-right:4px">${src === 'Azure' ? AZURE_ICON : DEFENDER_ICON}${esc(src)}</span>`).join('')}</td>
-      <td>${esc([...new Set(r.names)].join(' · ') || '—')}</td>
+      <td>${esc(displayNames(r.names) || '—')}</td>
       <td class="evidence">${esc([...new Set(r.where)].join('  |  ') || '—')}</td></tr>`).join('')}
     </tbody></table>`
     : `<div class="note">No ${esc(mode)} entries.</div>`);
@@ -1247,6 +1366,25 @@ function matchesState(state, filter) {
   return state === filter;
 }
 
+/** Draw the names converging on the address they share. Grouping is the one
+ *  place the tool restructures what EASM reported, so it should show its
+ *  reasoning rather than assert it — the flow runs toward the IP because that is
+ *  the thing actually exposed. */
+function convergenceSvg(names, ips) {
+  const rowH = 24, h = names.length * rowH + 16, mid = h / 2;
+  return `<svg class="conv" viewBox="0 0 560 ${h}" preserveAspectRatio="xMinYMid meet"
+       role="img" aria-label="${esc(names.join(', '))} resolve to ${esc(ips.join(', '))}">
+    ${names.map((n, i) => {
+      const y = 14 + i * rowH;
+      return `<text x="0" y="${y + 4}" class="conv-name">${esc(n)}</text>
+        <path class="conv-line" style="animation-delay:${(i * 0.15).toFixed(2)}s"
+              d="M232 ${y} C 300 ${y}, 300 ${mid}, 360 ${mid}"/>`;
+    }).join('')}
+    <circle class="conv-dot" cx="366" cy="${mid}" r="4"/>
+    <text x="378" y="${mid + 4}" class="conv-ip">${esc(ips.join('  '))}</text>
+  </svg>`;
+}
+
 function renderAssets() {
   $('#cov-kql').textContent = MDE_KQL;
   const aiOn = aiEnabled();
@@ -1256,7 +1394,7 @@ function renderAssets() {
   const mode = $('#asset-merge').value;
   const merge = mode !== 'split';
   const rows = mode === 'platform'
-    ? groupIdentical(assetRows(DATA.assets, DATA.obsByAsset, {mergePages: true}))
+    ? groupByMachine(assetRows(DATA.assets, DATA.obsByAsset, {mergePages: true}))
     : assetRows(DATA.assets, DATA.obsByAsset, {mergePages: merge});
 
   // Risk numbers read red; inventory counts stay neutral, so the eye lands on
@@ -1287,7 +1425,7 @@ function renderAssets() {
   const totalRisk = Math.round(stateRows.reduce((s, r) => s + r.risk, 0));
   $('#asset-tiles').innerHTML = [
     ['Assets', stateRows.length,
-     mode === 'platform' ? 'identical platforms grouped' : merge ? 'pages merged into hosts' : 'every EASM entity',
+     mode === 'platform' ? 'names grouped into machines' : merge ? 'pages merged into hosts' : 'every EASM entity',
      '', 'all'],
     ['With findings', withFindings.length, 'carry at least one observation', '', 'findings'],
     ['Critical', critical, 'assets in the critical band', critical ? 'risk' : '', 'critical'],
@@ -1355,7 +1493,7 @@ function renderAssets() {
       ctx.azure ? `<span class="badge src-azure" title="${esc(`${ctx.azure.name} · ${ctx.azure.rg} · ${ctx.azure.subscription}`)}">${AZURE_ICON}Azure</span>` : '',
       ctx.mde ? `<span class="badge v-approve" title="${esc(`Defender device ${ctx.mde.name}`)}">EDR</span>`
         : (ctx.mdeLoaded && ctx.ips.length ? `<span class="badge p-high" title="No Defender sensor behind ${esc(ctx.ips.join(', '))}">no EDR</span>` : ''),
-      (r.siblings || []).length ? `<span class="badge p-none help" title="${esc(`Identical findings on: ${r.siblings.join(', ')} — one platform answering on several names`)}">+${r.siblings.length} identical</span>` : '',
+      (r.siblings || []).length ? `<span class="badge p-none help" title="${esc(`${[a.name, ...r.siblings].join(', ')} — ${r.groupedBy === 'ip' ? `one machine on ${(r.sharedIps || []).join(', ')}` : 'identical findings, no IP resolved'}`)}">${r.siblings.length + 1} names</span>` : '',
       svc.warning ? `<span class="badge p-medium help" title="${esc(svc.warning)}">web only</span>` : '',
       stored.causes || stored.assess ? `<span class="badge ai-tag" title="${esc(`Reviewed by AI ${new Date((stored.causes || stored.assess).at).toLocaleString()}`)}">AI</span>` : '',
     ].join('');
@@ -1390,7 +1528,11 @@ function renderAssets() {
         <span class="badge k-insight help" title="${esc((KIND_LABEL[a.kind] || ['', ''])[1])}">${esc((KIND_LABEL[a.kind] || [a.kind])[0])}</span>
         <span class="title">${esc(a.name)}${
           a.kind === 'sslCert' && e.cert_subject
-            ? ` <span class="evidence">${esc(e.cert_subject)}</span>` : ''}</span>
+            ? ` <span class="evidence">${esc(e.cert_subject)}</span>` : ''}${
+          (r.siblings || []).length
+            ? ` <span class="evidence" title="${esc(`Identical findings — one platform on ${r.siblings.length + 1} names`)}">+ ${
+                esc(r.siblings.slice(0, 2).join(', '))}${r.siblings.length > 2 ? ` +${r.siblings.length - 2} more` : ''}</span>`
+            : ''}</span>
         ${chips}
         <span class="metric"><b class="riskn">${Math.round(r.risk)}</b><small>risk</small></span>
       </div>
@@ -1398,11 +1540,17 @@ function renderAssets() {
       <div class="detail">
         <div class="facts">${facts.map(([k, v, html]) =>
           `<div><span>${esc(k)}</span>${html || esc(v)}</div>`).join('')}</div>
-        ${(r.siblings || []).length ? `<p class="note" style="margin:0 0 10px">These findings appear
-          identically on ${r.siblings.length + 1} hosts (${esc([a.name, ...r.siblings].join(', '))}),
-          so this is one platform rather than ${r.siblings.length + 1} problems. Risk is counted once;
-          fixing it resolves all of them.${(e.cnames || []).length
-            ? ` This name is a CNAME to ${esc(e.cnames.join(', '))}, which is why.` : ''}</p>` : ''}
+        ${(r.siblings || []).length && r.groupedBy === 'ip' && (r.sharedIps || []).length
+          ? convergenceSvg([a.name, ...r.siblings], r.sharedIps) : ''}
+        ${(r.siblings || []).length ? `<p class="note" style="margin:0 0 10px">
+          ${esc([a.name, ...r.siblings].join(', '))} ${r.groupedBy === 'ip'
+            ? `all resolve to ${esc((r.sharedIps || []).join(', '))} — one machine answering on
+               ${r.siblings.length + 1} names. The exposure is the host, not the labels, so the
+               findings below are its combined set and the risk is counted once.`
+            : `carry an identical set of findings, so this is one platform rather than
+               ${r.siblings.length + 1} problems — EASM never resolved an IP for them, so this is
+               inferred from the findings rather than from the address.`}${(e.cnames || []).length
+            ? ` ${esc(a.name)} is a CNAME to ${esc(e.cnames.join(', '))}.` : ''}</p>` : ''}
         ${svc.warning ? `<p class="note warn" style="margin:0 0 10px">⚠ ${esc(svc.warning)}</p>` : ''}
         ${r.owasp.length ? `<h4>Weakness themes</h4><p>${r.owasp.map(o =>
           `<span class="badge p-none" style="margin-right:4px">${esc(o)}</span>`).join('')}</p>` : ''}
