@@ -7,25 +7,21 @@
 <!--
   Single-file EASM dashboard. No backend, no build step.
 
-  The browser talks to two Microsoft APIs directly, with delegated MSAL tokens:
+  Reads Microsoft Defender EASM directly from the browser with delegated MSAL
+  tokens, then uses AI to prioritize, enrich and recommend.
 
     ARM   https://management.azure.com/user_impersonation
-          Enumerates Microsoft.Easm/workspaces so you never type coordinates.
+          Enumerates Microsoft.Easm/workspaces so nobody types coordinates.
 
     EASM  https://easm.defender.microsoft.com/AssetResource.Read.All
           https://easm.defender.microsoft.com/Workspace.Read.All
           Assets and observations, straight from the data plane.
 
-  Both are viable from a page because the EASM data plane sends
+  This works from a page because the EASM data plane sends
   `Access-Control-Allow-Origin: *` and preflights both GET and the POST
-  observation/report endpoints — verified against a live workspace.
+  observation endpoints — verified against a live workspace.
 
-  What you give up without a server, and what this file does about it:
-    * History is per-browser. Snapshots go to localStorage; use Export to move
-      them between machines or to keep them beyond a cache clear.
-    * Reads happen while the tab is open, as the signed-in user — there is no
-      unattended refresh, because a page cannot hold a client secret.
-    * The signed-in user needs their own Azure RBAC role on each workspace.
+  Read-only by design: nothing is ever written back to EASM.
 -->
 <script src="https://unpkg.com/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"
         onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js'"></script>
@@ -66,7 +62,7 @@
   .rank{font-size:11px;color:var(--dim);font-weight:700;min-width:22px}
   .badge{font-size:10px;font-weight:700;padding:2px 7px;border-radius:10px;text-transform:uppercase;
          letter-spacing:.04em;white-space:nowrap}
-  .p-high{background:rgba(248,81,73,.16);color:var(--red)}
+  .p-critical,.p-high{background:rgba(248,81,73,.16);color:var(--red)}
   .p-medium{background:rgba(210,153,34,.16);color:var(--gold)}
   .p-low{background:rgba(88,166,255,.14);color:var(--blue)}
   .p-none{background:rgba(139,148,158,.16);color:var(--muted)}
@@ -79,8 +75,11 @@
   .metric{text-align:right;min-width:120px}
   .metric b{font-size:15px} .metric small{display:block;color:var(--dim);font-size:10px}
   .bar{height:4px;background:var(--bg3)} .bar i{display:block;height:100%;background:var(--blue)}
-  .detail{display:none;padding:10px 14px 14px;border-top:1px solid var(--border);background:var(--bg3)}
+  .detail{display:none;padding:12px 14px 14px;border-top:1px solid var(--border);background:var(--bg3)}
   .card.open .detail{display:block}
+  .detail h4{margin:0 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+  .detail p{margin:0 0 12px}
+  .detail ol{margin:0 0 12px;padding-left:20px} .detail ol li{margin-bottom:4px}
   table{width:100%;border-collapse:collapse;font-size:12px}
   th{text-align:left;color:var(--muted);font-weight:600;font-size:10px;text-transform:uppercase;
      letter-spacing:.05em;padding:6px 8px;border-bottom:1px solid var(--border)}
@@ -94,10 +93,10 @@
   .warn{color:var(--gold)} .err{color:var(--red)}
   .evidence{color:var(--muted);font-size:11px}
   code{background:var(--bg);padding:1px 5px;border-radius:3px;color:var(--blue);font-size:11px}
-  /* Sign-in gate */
+  .toolbar{display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap}
   #gate{position:fixed;inset:0;z-index:999;background:#0d1117;display:flex;flex-direction:column;
         align-items:center;justify-content:center;gap:18px;text-align:center;padding:24px}
-  #gate .box{max-width:560px;width:100%;background:var(--bg2);border:1px solid var(--border);
+  #gate .box{max-width:580px;width:100%;background:var(--bg2);border:1px solid var(--border);
              border-radius:10px;padding:22px}
   #gate label{display:block;text-align:left;font-size:11px;color:var(--muted);margin:10px 0 4px;
               text-transform:uppercase;letter-spacing:.04em}
@@ -108,15 +107,13 @@
 </head>
 <body>
 
-<!-- ── Sign-in gate ──────────────────────────────────────────────────────── -->
 <div id="gate">
   <div style="font-size:22px;font-weight:800"><span style="color:#58a6ff">Blue16</span> Sightline EASM</div>
   <div class="tagline">Microsoft-sourced CTEM · external attack surface</div>
   <div class="box">
     <div style="font-size:12px;color:var(--muted);line-height:1.7;text-align:left">
-      Sign in with a Microsoft work account that has an Azure role assignment on the
-      Defender EASM workspace. The page reads the EASM data plane directly — nothing
-      is sent anywhere else.
+      Sign in with a Microsoft work account that holds an Azure role on the Defender EASM
+      workspace. This page reads the EASM data plane directly and never writes to it.
     </div>
     <label for="cid">Application (client) ID</label>
     <input id="cid" placeholder="00000000-0000-0000-0000-000000000000" autocomplete="off"/>
@@ -124,19 +121,19 @@
     <input id="tid" placeholder="00000000-0000-0000-0000-000000000000 (or 'organizations')" autocomplete="off"/>
     <div style="display:flex;gap:8px;margin-top:14px">
       <button class="primary" id="signin" style="flex:1">Sign in with Microsoft</button>
-      <button id="demo">Explore with demo data</button>
     </div>
     <div id="gate-msg" class="note" style="min-height:16px"></div>
     <details style="margin-top:8px">
       <summary style="cursor:pointer;font-size:11px;color:var(--muted)">App registration setup</summary>
       <div class="note" style="line-height:1.9">
-        <b>Authentication</b> → add a <b>Single-page application</b> platform whose redirect URI is
-        exactly this page's URL (<code id="redir"></code>). MSAL cannot use <code>file://</code>,
-        so serve this file over http(s).<br/>
-        <b>API permissions</b> → <i>APIs my organization uses</i> → <b>EASM API</b> → delegated:
-        <code>AssetResource.Read.All</code>, <code>Workspace.Read.All</code>. Then
+        <b>Authentication</b> → add a <b>Single-page application</b> platform with the redirect URI
+        <code id="redir"></code>. It must be the <i>SPA</i> platform, not <i>Web</i> — a Web
+        registration rejects the token exchange with a cross-origin redemption error, and MSAL
+        cannot use <code>file://</code>.<span id="redir-alt"></span><br/>
+        <b>API permissions</b> → <i>APIs my organization uses</i> → <b>EASM API</b> → delegated
+        <code>AssetResource.Read.All</code> and <code>Workspace.Read.All</code>, then
         <b>Azure Service Management</b> → <code>user_impersonation</code> for workspace discovery.
-        Both are user-consentable.<br/>
+        All three are user-consentable.<br/>
         <b>Azure</b> → assign the signed-in user a role on the
         <code>Microsoft.Easm/workspaces</code> resource.
       </div>
@@ -158,15 +155,28 @@
 
 <nav style="display:none">
   <button data-view="actions" class="on">Mitigation board</button>
+  <button data-view="advice">AI recommendations</button>
   <button data-view="surface">Attack surface map</button>
-  <button data-view="trend">Exposure trend</button>
   <button data-view="queue">Inventory validation</button>
 </nav>
 
 <main style="display:none">
+  <!-- Deterministic prioritization: what to fix, ranked by risk removed -->
   <section id="view-actions" class="view on">
     <div class="tiles" id="action-tiles"></div>
     <div id="action-list"></div>
+  </section>
+
+  <!-- AI layer: enrich the ranked actions into recommendations an owner can act on -->
+  <section id="view-advice" class="view">
+    <div class="toolbar">
+      <button class="primary" id="advise">Generate recommendations</button>
+      <span class="note" id="advice-note" style="margin:0"></span>
+    </div>
+    <div class="note">The board's ranking is deterministic arithmetic. This view asks the model to
+      re-read the top actions against your actual estate — what is exposed, on which assets, in what
+      state — and turn them into remediation an owner can pick up.</div>
+    <div id="advice"></div>
   </section>
 
   <section id="view-surface" class="view">
@@ -175,31 +185,13 @@
     <div id="surface"></div>
   </section>
 
-  <section id="view-trend" class="view">
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap">
-      <button class="primary" id="snap">Capture snapshot</button>
-      <button id="export">Export history</button>
-      <button id="import">Import history</button>
-      <span class="note" id="trend-note" style="margin:0"></span>
-    </div>
-    <div class="note warn">History lives in this browser's localStorage — it is not shared between
-      machines and a cache clear loses it. Export regularly.</div>
-    <div id="trend"></div>
-  </section>
-
   <section id="view-queue" class="view">
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap">
-      <select id="ai-provider">
-        <option value="heuristic">Local rules (no AI, nothing leaves the browser)</option>
-        <option value="azure_openai">Azure OpenAI (in your tenant, signed-in user)</option>
-        <option value="claude">Claude API (key stays in this tab)</option>
-      </select>
-      <input id="ai-config" placeholder="" style="flex:1;min-width:240px"/>
+    <div class="toolbar">
       <button class="primary" id="validate">Validate 25</button>
       <span class="note" id="queue-note" style="margin:0"></span>
     </div>
-    <div class="note">Verdicts are advisory and stored locally. Nothing is written back to Defender
-      EASM — approving or dismissing inventory stays a human action in the EASM portal.</div>
+    <div class="note">Verdicts are advisory and stored in this browser. Nothing is written back to
+      Defender EASM — approving or dismissing inventory stays a human action in the EASM portal.</div>
     <div id="queue"></div>
   </section>
 </main>
@@ -210,29 +202,37 @@
 'use strict';
 
 // ── constants ───────────────────────────────────────────────────────────────
+const PROD_URL = 'https://blue16.nl/blue16-easm.html';
 const ARM = 'https://management.azure.com';
 const ARM_SCOPE = ARM + '/user_impersonation';
 const EASM_HOST = 'easm.defender.microsoft.com';
-// Granular delegated scopes exposed by the "EASM API" first-party app
+// Granular delegated scopes exposed by the first-party "EASM API" app
 // (b7faa489-a4c8-4b39-bb0c-842c3de2de6a). All user-consentable.
 const EASM_SCOPES = [
   `https://${EASM_HOST}/AssetResource.Read.All`,
   `https://${EASM_HOST}/Workspace.Read.All`,
 ];
-const EASM_API = '2024-10-01-preview';       // data plane
-const EASM_CONTROL_API = '2023-04-01-preview';  // control plane (workspaces list)
+const EASM_API = '2024-10-01-preview';          // data plane
+const EASM_CONTROL_API = '2023-04-01-preview';  // control plane (workspace list)
 const SUBS_API = '2022-12-01';
+// The API rejects maxpagesize > 100 unless responseType is 'reduced'. STANDARD
+// carries the WHOIS/cert/ASN evidence the validation queue reasons over, so we
+// keep STANDARD and page at 100.
+const PAGE_SIZE = 100;
+const MAX_PAGES = 80;
 const OBS_CONCURRENCY = 8;   // parallel observation POSTs; the API is per-asset
-const LS = {cfg: 'b16_easm_cfg', snaps: 'b16_easm_snapshots', verdicts: 'b16_easm_verdicts'};
+const LS = {cfg: 'b16_easm_cfg', verdicts: 'b16_easm_verdicts', advice: 'b16_easm_advice',
+            ai: 'b16_easm_ai'};
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-let msalApp = null, account = null, WORKSPACES = [], WS = null, DATA = null, DEMO = false;
+let msalApp = null, account = null, WORKSPACES = [], WS = null, DATA = null;
 
-// ── scoring (the whole prioritization model, client-side) ──────────────────
+// ── scoring ─────────────────────────────────────────────────────────────────
+// Deterministic and legible on purpose: the AI layer reads these numbers, it
+// does not replace them. Every weight here is meant to be argued with.
 const PRIORITY_WEIGHT = {high: 10, medium: 5, low: 2, none: 0.5};
 const STATE_WEIGHT = {confirmed: 1.0, candidateInvestigate: 0.7, candidate: 0.4,
                       associatedPartner: 0.5, associatedThirdparty: 0.35, dismissed: 0};
@@ -283,12 +283,13 @@ function buildActions(assets, obsByAsset, limit = 40) {
     return e;
   }).sort((a, b) => b.risk_removed - a.risk_removed);
   return {actions: actions.slice(0, limit),
-          totals: {total_risk: +totalRisk.toFixed(2), action_count: actions.length, priority_counts: counts}};
+          totals: {total_risk: +totalRisk.toFixed(2), action_count: actions.length,
+                   priority_counts: counts}};
 }
 function parentOf(a) {
   if (['ipAddress', 'ipBlock', 'as'].includes(a.kind)) return 'IP space / ASN';
   let n = (a.name || '').trim().toLowerCase();
-  if (n.includes('//')) n = n.split('//')[1];          // page assets are URLs
+  if (n.includes('//')) n = n.split('//')[1];      // page assets are full URLs
   n = n.split('/')[0].split('?')[0].split(':')[0];
   const parts = n.split('.').filter(Boolean);
   return parts.length >= 2 ? parts.slice(-2).join('.') : (n || 'unknown');
@@ -313,12 +314,12 @@ function surfaceTree(assets, obsByAsset) {
 }
 
 // ── auth ────────────────────────────────────────────────────────────────────
-function loadCfg() { try { return JSON.parse(localStorage.getItem(LS.cfg) || '{}'); } catch { return {}; } }
-function saveCfg(c) { try { localStorage.setItem(LS.cfg, JSON.stringify(c)); } catch {} }
+const readLS = (k, d) => { try { return JSON.parse(localStorage.getItem(k) || 'null') ?? d; } catch { return d; } };
+const writeLS = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
 // MSAL keeps one "interaction.status" lock per storage. An interrupted flow can
-// leave it stuck and every later interactive call throws interaction_in_progress;
-// clearing it before we start self-heals that.
+// leave it stuck so every later interactive call throws interaction_in_progress;
+// clearing it first self-heals that.
 function clearInteractionLock() {
   for (const store of [sessionStorage, localStorage]) {
     try { Object.keys(store).forEach(k => { if (k.includes('interaction.status')) store.removeItem(k); }); }
@@ -332,8 +333,8 @@ async function token(scopes) {
     return (await msalApp.acquireTokenSilent({scopes, account})).accessToken;
   } catch (e) {
     // Silent renewal fails when the refresh token has aged out or the hidden
-    // iframe is blocked by third-party-cookie policy. A popup is the least
-    // disruptive recovery — a redirect would lose in-page state.
+    // iframe is blocked by third-party-cookie policy. A popup recovers without
+    // losing in-page state, which a redirect would.
     clearInteractionLock();
     return (await msalApp.acquireTokenPopup({scopes, account})).accessToken;
   }
@@ -342,7 +343,7 @@ async function token(scopes) {
 async function signIn() {
   const clientId = $('#cid').value.trim(), tenantId = $('#tid').value.trim() || 'organizations';
   if (!/^[0-9a-f-]{36}$/i.test(clientId)) { gateMsg('Enter the application (client) ID.', true); return; }
-  saveCfg({clientId, tenantId});
+  writeLS(LS.cfg, {clientId, tenantId});
   msalApp = new msal.PublicClientApplication({
     auth: {clientId, authority: 'https://login.microsoftonline.com/' + tenantId,
            redirectUri: location.origin + location.pathname},
@@ -356,7 +357,6 @@ async function signIn() {
     await start();
   } catch (e) { gateMsg('Sign-in failed: ' + (e.message || e), true); }
 }
-
 function gateMsg(html, isError) {
   $('#gate-msg').innerHTML = isError ? `<span class="err">${esc(html)}</span>` : esc(html);
 }
@@ -366,7 +366,6 @@ function wsBase(w) {
   return `https://${w.region}.${EASM_HOST}/subscriptions/${w.subscription_id}` +
          `/resourceGroups/${w.resource_group}/workspaces/${w.workspace_name}`;
 }
-
 async function armGet(url, params) {
   const t = await token([ARM_SCOPE]);
   const u = new URL(url);
@@ -375,7 +374,6 @@ async function armGet(url, params) {
   if (!r.ok) throw new Error(`ARM ${r.status}: ${(await r.text()).slice(0, 200)}`);
   return r.json();
 }
-
 async function discoverWorkspaces() {
   const subs = (await armGet(`${ARM}/subscriptions`, {'api-version': SUBS_API})).value || [];
   const out = [];
@@ -396,7 +394,6 @@ async function discoverWorkspaces() {
   }
   return out;
 }
-
 async function easm(w, path, {method = 'GET', params = {}, body = null} = {}) {
   const t = await token(EASM_SCOPES);
   const u = new URL(wsBase(w) + path);
@@ -407,7 +404,7 @@ async function easm(w, path, {method = 'GET', params = {}, body = null} = {}) {
   const r = await fetch(u, opts);
   if (!r.ok) {
     const code = r.headers.get('x-ms-error-code') || '';
-    throw new Error(`EASM ${r.status} ${code}: ${(await r.text()).slice(0, 200)}`);
+    throw new Error(`EASM ${r.status} ${code}: ${(await r.text()).slice(0, 240)}`);
   }
   return r.json();
 }
@@ -437,7 +434,8 @@ function normalizeAsset(raw) {
       cert_subject: firstStr('sslCerts', 'subjectCommonNames'),
       asn: firstStr('asns'),
       ip_blocks: list('ipBlocks', 'name'), parent_hosts: list('parentHosts', 'name'),
-      web_components: (inner.webComponents || []).map(c => `${c.name || ''} ${c.version || ''}`.trim()).slice(0, 6),
+      web_components: (inner.webComponents || [])
+        .map(c => `${c.name || ''} ${c.version || ''}`.trim()).filter(Boolean).slice(0, 6),
     },
   };
 }
@@ -445,23 +443,25 @@ function normalizeAsset(raw) {
 async function loadWorkspace(w, onProgress) {
   const assets = [];
   let mark = '*';
-  for (let page = 0; page < 40; page++) {           // hard stop: 40 pages x 200
-    const res = await easm(w, '/assets', {params: {maxpagesize: 200, mark, responseType: 'STANDARD'}});
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const res = await easm(w, '/assets',
+                           {params: {maxpagesize: PAGE_SIZE, mark, responseType: 'STANDARD'}});
     (res.value || []).forEach(raw => assets.push(normalizeAsset(raw)));
     onProgress(`Inventory: ${assets.length}${res.totalElements ? ' / ' + res.totalElements : ''} assets`);
     if (!res.mark || !(res.value || []).length || assets.length >= (res.totalElements || 0)) break;
     mark = res.mark;
   }
 
-  // Observations are one POST per asset — there is no bulk endpoint — so this
-  // is the slow part. Confirmed assets first, and a small worker pool so a few
-  // hundred assets take seconds rather than minutes.
-  const ranked = [...assets].sort((a, b) => (a.state === 'confirmed' ? 0 : 1) - (b.state === 'confirmed' ? 0 : 1));
+  // Observations are one POST per asset — no bulk endpoint exists at this
+  // api-version — so this is the slow part. Confirmed assets first, with a
+  // small worker pool so a few hundred assets take seconds, not minutes.
+  const ranked = [...assets].sort((a, b) =>
+    (a.state === 'confirmed' ? 0 : 1) - (b.state === 'confirmed' ? 0 : 1));
   const obsByAsset = {};
-  let done = 0;
+  let next = 0, done = 0;
   const workers = Array.from({length: OBS_CONCURRENCY}, async () => {
     for (;;) {
-      const asset = ranked[done++];
+      const asset = ranked[next++];
       if (!asset) return;
       const encoded = btoa(asset.id).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
       try {
@@ -469,67 +469,140 @@ async function loadWorkspace(w, onProgress) {
                                {method: 'POST', params: {maxpagesize: 100}});
         obsByAsset[asset.id] = res.value || [];
       } catch (e) { obsByAsset[asset.id] = []; }
-      if (done % 10 === 0) onProgress(`Observations: ${Math.min(done, ranked.length)} / ${ranked.length} assets`);
+      if (++done % 10 === 0) onProgress(`Observations: ${done} / ${ranked.length} assets`);
     }
   });
   await Promise.all(workers);
   return {assets, obsByAsset, loadedAt: new Date().toISOString()};
 }
 
-// ── demo data (no sign-in) ──────────────────────────────────────────────────
-function demoData() {
-  const owned = ['contoso.com', 'contoso.net', 'contoso-cloud.com'];
-  const foreign = [['fabrikam-hosting.net', 'Fabrikam BV'], ['c0ntoso-login.com', 'Domains By Proxy'],
-                   ['northwind-agency.io', 'Northwind Agency']];
-  const cves = [['CVE-2024-21762', 'high', 9.8], ['CVE-2024-3400', 'high', 10], ['CVE-2023-4966', 'high', 9.4],
-                ['CVE-2022-40684', 'medium', 6.8]];
-  const insights = [['RDP exposed to the internet', 'high'], ['Expired SSL certificate', 'high'],
-                    ['Login page without MFA enforcement', 'high'], ['TLS 1.0 enabled', 'medium'],
-                    ['Missing HSTS header', 'low'], ['Directory listing enabled', 'low']];
-  const subs = ['www', 'api', 'vpn', 'portal', 'legacy', 'admin', 'git', 'sso', 'remote', 'shop'];
-  let seed = 42; const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
-  const assets = [], obsByAsset = {};
-  for (let i = 0; i < 120; i++) {
-    const isForeign = i % 7 === 0;
-    const [dom, who] = isForeign ? foreign[i % foreign.length] : [owned[i % owned.length], 'Contoso Ltd'];
-    const name = `${subs[Math.floor(rnd() * subs.length)]}${i}.${dom}`;
-    const kind = rnd() < 0.75 ? 'host' : (rnd() < 0.5 ? 'page' : 'ipAddress');
-    const state = isForeign ? (rnd() < 0.5 ? 'candidate' : 'candidateInvestigate')
-                            : (rnd() < 0.7 ? 'confirmed' : 'candidate');
-    const a = {id: `${kind}$$${name}`, name, kind, state, labels: rnd() < 0.06 ? ['crown-jewel'] : [],
-               disco_group: 'Contoso seed discovery', first_seen: '2025-11-02T00:00:00Z',
-               last_seen: '2026-08-01T00:00:00Z',
-               evidence: {whois_org: who, cert_subject: 'CN=' + name, asn: 'AS8075 Microsoft',
-                          parent_hosts: [dom], web_components: ['nginx 1.18.0']}};
-    assets.push(a);
-    const obs = [];
-    if (rnd() < 0.45) { const [n, p, c] = cves[Math.floor(rnd() * cves.length)];
-                        obs.push({name: n, priority: p, types: ['cve'], cvssScoreV3: c, remediationState: 'active'}); }
-    const k = Math.floor(rnd() * 3);
-    for (let j = 0; j < k; j++) { const [n, p] = insights[Math.floor(rnd() * insights.length)];
-      obs.push({name: n, priority: p, types: ['insight'], remediationState: 'active'}); }
-    obsByAsset[a.id] = obs;
+// ── AI layer ────────────────────────────────────────────────────────────────
+const wsKey = () => (WS ? WS.key : 'unknown');
+const getVerdicts = () => readLS(LS.verdicts, {})[wsKey()] || {};
+function saveVerdicts(map) { const all = readLS(LS.verdicts, {}); all[wsKey()] = map; writeLS(LS.verdicts, all); }
+const getAdvice = () => readLS(LS.advice, {})[wsKey()] || null;
+function saveAdvice(a) { const all = readLS(LS.advice, {}); all[wsKey()] = a; writeLS(LS.advice, all); }
+const aiCfg = () => readLS(LS.ai, {provider: 'azure_openai', endpoint: '', key: ''});
+function saveAiCfg(c) { writeLS(LS.ai, c); }
+
+function orgContext() {
+  // Nothing in the API states which organization a workspace belongs to, so
+  // infer it from the most common registrant across confirmed inventory.
+  const counts = {};
+  for (const a of (DATA ? DATA.assets : [])) {
+    const o = a.evidence && a.evidence.whois_org;
+    if (o) counts[o] = (counts[o] || 0) + 1;
   }
-  return {assets, obsByAsset, loadedAt: new Date().toISOString()};
+  const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+  return top ? top[0] : (WS ? WS.workspace_name : '');
 }
 
-// ── local storage: snapshots + verdicts ─────────────────────────────────────
-const readLS = (k, d) => { try { return JSON.parse(localStorage.getItem(k) || 'null') ?? d; } catch { return d; } };
-const writeLS = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+const RECOMMEND_PROMPT = `You are a senior external-attack-surface analyst advising a security team.
 
-function snapshotRow() {
-  const {totals} = buildActions(DATA.assets, DATA.obsByAsset, 1);
-  const c = DATA.assets.reduce((m, a) => (m[a.state] = (m[a.state] || 0) + 1, m), {});
-  return {captured_at: new Date().toISOString(), total_assets: DATA.assets.length,
-          confirmed: c.confirmed || 0, unresolved: (c.candidate || 0) + (c.candidateInvestigate || 0),
-          high: totals.priority_counts.high, medium: totals.priority_counts.medium,
-          low: totals.priority_counts.low, risk_score: totals.total_risk};
+You are given the top prioritized findings from Microsoft Defender EASM for one organization, already scored and grouped: each entry is one remediation that closes the same issue across every affected asset. "risk_removed" is the deterministic score that ordering came from.
+
+For each finding produce a recommendation the owning team can act on today. Ground everything in the specific assets listed — the hostnames, their EASM state, the detected web components. Do not restate the finding name as the recommendation.
+
+For each one give:
+- title: the action, phrased as an imperative ("Patch Citrix ADC on 3 internet-facing hosts").
+- priority: critical | high | medium | low. You may disagree with the supplied order — say so in rationale when you do. Weigh internet reachability, whether the asset is confirmed inventory or unverified, known exploitation, and what the asset appears to do.
+- why_it_matters: two or three sentences on the concrete exposure, referencing these assets. No generic vulnerability description.
+- steps: 2-5 concrete remediation steps in order. Name the version, config change, port or header where you can. If a step needs information you were not given, say what to check rather than guessing.
+- verification: how the team confirms it is actually fixed from the outside.
+- effort: hours | days | weeks.
+- rationale: one sentence on why this priority, especially if it differs from risk_removed order.
+
+Be decisive and specific. Where the evidence does not support a confident recommendation, say what to investigate instead of padding with generic advice.
+
+Reply with JSON only, no prose around it:
+{"recommendations":[{"title":"","finding":"","priority":"","why_it_matters":"","steps":[""],"verification":"","effort":"","rationale":""}]}`;
+
+const VALIDATE_PROMPT = `You are validating an external attack surface inventory for a security team.
+
+Microsoft Defender EASM discovers assets by crawling outward from known seeds. That expansion is recall-oriented: it deliberately over-collects, so unresolved inventory mixes genuinely owned assets, third-party infrastructure the organization merely touches, divested estate, and look-alike domains registered by other parties.
+
+For each asset decide whether it belongs to the target organization, using only the supplied evidence:
+- "approve": evidence supports ownership.
+- "dismiss": evidence indicates it is not theirs (different registrant, shared-hosting neighbour, vendor system, typo-squat).
+- "needs_human": genuinely ambiguous, or turns on business context you were not given.
+
+WHOIS registrant is the strongest single signal, and a registrant naming a different company outweighs a matching hostname. A certificate subject matching owned domains is strong; a shared CDN certificate is not. Naming resemblance alone is weak — look-alike domains resemble the organization by design, so resemblance plus a foreign registrant is evidence against ownership. ASN and IP block tell you who hosts the asset, not who owns it.
+
+A wrong "dismiss" removes a real asset from defence, which is the costlier error — when the two are close, prefer "needs_human". Set confidence to your actual certainty, not to how strong the asset looks.
+
+Reply with JSON only: {"verdicts":[{"asset_id":"","verdict":"approve|dismiss|needs_human","confidence":0.0,"reason":"","evidence_used":[""]}]}`;
+
+function renderFindings(actions) {
+  return `Organization: ${orgContext()}
+Workspace: ${WS ? WS.workspace_name : ''}
+
+Top ${actions.length} prioritized findings:
+
+` + actions.map((a, i) => {
+    const assets = a.assets.slice(0, 12).map(x => `${x.name} [${x.kind}, ${x.state}]`).join('; ');
+    const tech = [...new Set((DATA.assets
+      .filter(as => a.assets.some(x => x.name === as.name))
+      .flatMap(as => (as.evidence && as.evidence.web_components) || [])))].slice(0, 8);
+    return [`${i + 1}. ${a.name}`,
+            `   type: ${a.kind}   easm_priority: ${a.priority}${a.cvss ? `   cvss: ${a.cvss}` : ''}`,
+            `   risk_removed: ${a.risk_removed} (${a.share}% of total)   affected_assets: ${a.asset_count}`,
+            `   assets: ${assets}`,
+            tech.length ? `   detected_tech: ${tech.join(', ')}` : ''].filter(Boolean).join('\n');
+  }).join('\n\n');
 }
-const snapKey = () => (WS ? WS.key : 'demo');
-function getSnaps() { return (readLS(LS.snaps, {})[snapKey()] || []); }
-function addSnap(row) { const all = readLS(LS.snaps, {}); (all[snapKey()] ||= []).push(row); writeLS(LS.snaps, all); }
-function getVerdicts() { return (readLS(LS.verdicts, {})[snapKey()] || {}); }
-function saveVerdicts(map) { const all = readLS(LS.verdicts, {}); all[snapKey()] = map; writeLS(LS.verdicts, all); }
+
+function renderAssetBatch(assets) {
+  return `Target organization context: ${orgContext()}
+
+Validate these ${assets.length} assets. Return exactly one verdict per asset_id.
+
+` + assets.map(a => {
+    const e = a.evidence || {};
+    return [`- asset_id: ${a.id}`, `  name: ${a.name}`, `  kind: ${a.kind}   easm_state: ${a.state}`,
+            `  first_seen: ${a.first_seen || 'unknown'}   last_seen: ${a.last_seen || 'unknown'}`,
+            e.whois_org ? `  whois_org: ${e.whois_org}` : '',
+            e.cert_subject ? `  cert_subject: ${e.cert_subject}` : '',
+            e.asn ? `  asn: ${e.asn}` : '',
+            (e.parent_hosts || []).length ? `  parent_hosts: ${e.parent_hosts.join(', ')}` : '',
+            (e.web_components || []).length ? `  web_components: ${e.web_components.join(', ')}` : '',
+           ].filter(Boolean).join('\n');
+  }).join('\n\n');
+}
+
+/** One call to whichever provider is configured. Returns parsed JSON. */
+async function askAI(system, user, maxTokens) {
+  const cfg = aiCfg();
+  if (cfg.provider === 'azure_openai') {
+    // Delegated token for the signed-in user — no key in the page. The user
+    // needs "Cognitive Services OpenAI User" on the Azure OpenAI resource.
+    if (!/^https?:\/\//.test(cfg.endpoint || ''))
+      throw new Error('Set the Azure OpenAI chat-completions URL in AI settings.');
+    const t = await token(['https://cognitiveservices.azure.com/user_impersonation']);
+    const r = await fetch(cfg.endpoint, {method: 'POST',
+      headers: {Authorization: 'Bearer ' + t, 'Content-Type': 'application/json'},
+      body: JSON.stringify({messages: [{role: 'system', content: system}, {role: 'user', content: user}],
+                            response_format: {type: 'json_object'}, max_tokens: maxTokens})});
+    if (!r.ok) throw new Error(`Azure OpenAI ${r.status}: ${(await r.text()).slice(0, 240)}`);
+    const d = await r.json();
+    return JSON.parse(d.choices[0].message.content);
+  }
+
+  // Claude. The key is held in this tab only. A page cannot keep a secret from
+  // the person using it — personal use, not a shared deployment.
+  if (!(cfg.key || '').startsWith('sk-')) throw new Error('Paste an Anthropic API key in AI settings.');
+  const r = await fetch('https://api.anthropic.com/v1/messages', {method: 'POST',
+    headers: {'x-api-key': cfg.key, 'anthropic-version': '2023-06-01',
+              'anthropic-dangerous-direct-browser-access': 'true', 'Content-Type': 'application/json'},
+    body: JSON.stringify({model: 'claude-opus-5', max_tokens: maxTokens, system,
+                          messages: [{role: 'user', content: user}]})});
+  if (!r.ok) throw new Error(`Claude ${r.status}: ${(await r.text()).slice(0, 240)}`);
+  const d = await r.json();
+  // Safety classifiers can decline a request outright: HTTP 200, empty content.
+  // Check before reading content, or this throws something unhelpful instead.
+  if (d.stop_reason === 'refusal') throw new Error('Claude declined this request.');
+  const text = (d.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+  return JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1));
+}
 
 // ── views ───────────────────────────────────────────────────────────────────
 function renderActions() {
@@ -564,6 +637,35 @@ function renderActions() {
     h.onclick = () => h.parentElement.classList.toggle('open'));
 }
 
+function renderAdvice() {
+  const advice = getAdvice();
+  if (!advice) {
+    $('#advice').innerHTML = '<div class="note">No recommendations yet.</div>';
+    $('#advice-note').textContent = '';
+    return;
+  }
+  $('#advice-note').textContent =
+    `${advice.recommendations.length} recommendations · ${advice.provider} · ${new Date(advice.at).toLocaleString()}`;
+  $('#advice').innerHTML = advice.recommendations.map((r, i) => `
+    <div class="card">
+      <div class="card-head">
+        <span class="rank">#${i + 1}</span>
+        <span class="badge p-${esc(r.priority)}">${esc(r.priority)}</span>
+        <span class="title">${esc(r.title)}</span>
+        <span class="metric"><b>${esc(r.effort || '')}</b><small>effort</small></span>
+      </div>
+      <div class="detail">
+        <h4>Why it matters</h4><p>${esc(r.why_it_matters)}</p>
+        <h4>Steps</h4><ol>${(r.steps || []).map(s => `<li>${esc(s)}</li>`).join('')}</ol>
+        <h4>Verification</h4><p>${esc(r.verification || '')}</p>
+        <h4>Rationale</h4><p class="evidence">${esc(r.rationale || '')}${
+          r.finding ? ` · finding: ${esc(r.finding)}` : ''}</p>
+      </div>
+    </div>`).join('');
+  $('#advice').querySelectorAll('.card-head').forEach(h =>
+    h.onclick = () => h.parentElement.classList.toggle('open'));
+}
+
 function riskColor(r, max) {
   if (!r) return 'var(--bg3)';
   const t = Math.min(1, r / (max || 1));
@@ -581,31 +683,6 @@ function renderSurface() {
         `<div class="cell" style="background:${riskColor(c.risk, maxCell)}"
               title="${esc(c.name)} — ${esc(c.kind)}, ${esc(c.state)}, risk ${c.risk}"></div>`).join('')}</div>
     </div>`).join('') || '<div class="note">No assets.</div>';
-}
-
-function renderTrend() {
-  const rows = getSnaps();
-  $('#trend-note').textContent = `${rows.length} snapshot${rows.length === 1 ? '' : 's'} in this browser`;
-  if (rows.length < 2) {
-    $('#trend').innerHTML = '<div class="note">Capture at least two snapshots to see a trend.</div>';
-    return;
-  }
-  const W = 900, H = 260, P = 40;
-  const maxRisk = Math.max(...rows.map(r => r.risk_score || 0), 1);
-  const maxAssets = Math.max(...rows.map(r => r.total_assets || 0), 1);
-  const x = i => P + i * (W - 2 * P) / Math.max(1, rows.length - 1);
-  const yR = v => H - P - (v / maxRisk) * (H - 2 * P);
-  const yA = v => H - P - (v / maxAssets) * (H - 2 * P);
-  const path = (fy, key) => rows.map((r, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${fy(r[key] || 0).toFixed(1)}`).join('');
-  $('#trend').innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;
-      background:var(--bg2);border:1px solid var(--border);border-radius:8px">
-    <line x1="${P}" y1="${H - P}" x2="${W - P}" y2="${H - P}" stroke="var(--border)"/>
-    <path d="${path(yR, 'risk_score')}" fill="none" stroke="var(--red)" stroke-width="2"/>
-    <path d="${path(yA, 'total_assets')}" fill="none" stroke="var(--blue)" stroke-width="1.5" stroke-dasharray="4 3"/>
-    ${rows.map((r, i) => `<circle cx="${x(i).toFixed(1)}" cy="${yR(r.risk_score || 0).toFixed(1)}" r="2.5"
-      fill="var(--red)"><title>${esc(r.captured_at)} — risk ${r.risk_score}, ${r.total_assets} assets</title></circle>`).join('')}
-    <text x="${P}" y="20" fill="var(--red)" font-size="11">risk score</text>
-    <text x="${P + 80}" y="20" fill="var(--blue)" font-size="11">assets (dashed)</text></svg>`;
 }
 
 function renderQueue() {
@@ -627,92 +704,8 @@ function renderQueue() {
         <td class="evidence">${v ? esc(v.reason) : ''}</td></tr>`; }).join('')}</tbody></table>`;
 }
 
-// ── AI validation ───────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are validating an external attack surface inventory for a security team.
-
-Microsoft Defender EASM discovers assets by crawling outward from known seeds. That expansion is recall-oriented: it deliberately over-collects, so unresolved inventory mixes genuinely owned assets, third-party infrastructure the organization merely touches, divested estate, and look-alike domains registered by other parties.
-
-For each asset decide whether it belongs to the target organization, using only the supplied evidence:
-- "approve": evidence supports ownership.
-- "dismiss": evidence indicates it is not theirs (different registrant, shared-hosting neighbour, vendor system, typo-squat).
-- "needs_human": genuinely ambiguous, or turns on business context you were not given.
-
-WHOIS registrant is the strongest single signal; a registrant naming a different company outweighs a matching hostname. Certificate subject matching owned domains is strong; a shared CDN certificate is not. Naming resemblance alone is weak — look-alike domains resemble the organization by design, so resemblance plus a foreign registrant is evidence against ownership. ASN and IP block tell you who hosts the asset, not who owns it.
-
-A wrong "dismiss" removes a real asset from defence, which is the costlier error — when close, prefer "needs_human". Set confidence to your actual certainty.
-
-Reply with JSON only: {"verdicts":[{"asset_id":"...","verdict":"approve|dismiss|needs_human","confidence":0.0,"reason":"one or two sentences","evidence_used":["..."]}]}`;
-
-function renderBatch(assets) {
-  return `Target organization context: ${WS && WS.org_context ? WS.org_context : (DEMO ? 'Contoso Ltd' : 'the tenant that owns this EASM workspace')}
-
-Validate these ${assets.length} assets. Return exactly one verdict per asset_id.
-
-` + assets.map(a => {
-    const e = a.evidence || {};
-    return [`- asset_id: ${a.id}`, `  name: ${a.name}`, `  kind: ${a.kind}   easm_state: ${a.state}`,
-            `  first_seen: ${a.first_seen || 'unknown'}   last_seen: ${a.last_seen || 'unknown'}`,
-            e.whois_org ? `  whois_org: ${e.whois_org}` : '',
-            e.cert_subject ? `  cert_subject: ${e.cert_subject}` : '',
-            e.asn ? `  asn: ${e.asn}` : '',
-            (e.parent_hosts || []).length ? `  parent_hosts: ${e.parent_hosts.join(', ')}` : '',
-            (e.web_components || []).length ? `  web_components: ${e.web_components.join(', ')}` : '',
-           ].filter(Boolean).join('\n');
-  }).join('\n\n');
-}
-
-function heuristicVerdicts(assets) {
-  const org = ((WS && WS.org_context) || (DEMO ? 'Contoso' : '')).split(/\s+/)[0].toLowerCase();
-  return assets.map(a => {
-    const e = a.evidence || {}, whois = (e.whois_org || '').toLowerCase();
-    const matches = org && whois.includes(org), foreign = whois && org && !whois.includes(org);
-    if (matches) return {asset_id: a.id, verdict: 'approve', confidence: 0.75,
-      reason: `WHOIS registrant (${e.whois_org}) matches the organization.`, evidence_used: ['whois_org']};
-    if (foreign) return {asset_id: a.id, verdict: 'dismiss', confidence: 0.6,
-      reason: `WHOIS registrant (${e.whois_org}) names a different organization.`, evidence_used: ['whois_org']};
-    return {asset_id: a.id, verdict: 'needs_human', confidence: 0.4,
-      reason: 'Insufficient registrant or certificate evidence to decide ownership.', evidence_used: ['whois_org']};
-  });
-}
-
-async function aiVerdicts(assets) {
-  const provider = $('#ai-provider').value, cfg = $('#ai-config').value.trim();
-  if (provider === 'heuristic') return heuristicVerdicts(assets);
-
-  if (provider === 'azure_openai') {
-    // Delegated token for the signed-in user — no key in the page. The user
-    // needs the "Cognitive Services OpenAI User" role on the AOAI resource.
-    if (!/^https?:\/\//.test(cfg)) throw new Error('Enter the full Azure OpenAI chat completions URL.');
-    const t = await token(['https://cognitiveservices.azure.com/user_impersonation']);
-    const r = await fetch(cfg, {method: 'POST',
-      headers: {Authorization: 'Bearer ' + t, 'Content-Type': 'application/json'},
-      body: JSON.stringify({messages: [{role: 'system', content: SYSTEM_PROMPT},
-                                       {role: 'user', content: renderBatch(assets)}],
-                            response_format: {type: 'json_object'}})});
-    if (!r.ok) throw new Error(`Azure OpenAI ${r.status}: ${(await r.text()).slice(0, 200)}`);
-    const d = await r.json();
-    return JSON.parse(d.choices[0].message.content).verdicts || [];
-  }
-
-  // Claude. The key is held in this tab only (sessionStorage) and sent with the
-  // direct-browser-access header. A page cannot keep a secret from the person
-  // using it — treat this as a personal-use path, not a shared deployment.
-  if (!cfg.startsWith('sk-')) throw new Error('Paste an Anthropic API key (sk-…).');
-  sessionStorage.setItem('b16_anthropic_key', cfg);
-  const r = await fetch('https://api.anthropic.com/v1/messages', {method: 'POST',
-    headers: {'x-api-key': cfg, 'anthropic-version': '2023-06-01',
-              'anthropic-dangerous-direct-browser-access': 'true', 'Content-Type': 'application/json'},
-    body: JSON.stringify({model: 'claude-opus-5', max_tokens: 8000, system: SYSTEM_PROMPT,
-                          messages: [{role: 'user', content: renderBatch(assets)}]})});
-  if (!r.ok) throw new Error(`Claude ${r.status}: ${(await r.text()).slice(0, 200)}`);
-  const d = await r.json();
-  if (d.stop_reason === 'refusal') throw new Error('Claude declined this batch.');
-  const text = (d.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-  return JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)).verdicts || [];
-}
-
 // ── wiring ──────────────────────────────────────────────────────────────────
-const VIEWS = {actions: renderActions, surface: renderSurface, trend: renderTrend, queue: renderQueue};
+const VIEWS = {actions: renderActions, advice: renderAdvice, surface: renderSurface, queue: renderQueue};
 let current = 'actions';
 function show(v) {
   current = v;
@@ -727,7 +720,6 @@ function progress(msg) {
 }
 
 async function loadCurrent() {
-  if (DEMO) { DATA = demoData(); show(current); return; }
   $('#reload').disabled = true;
   try {
     progress('Loading inventory…');
@@ -745,26 +737,20 @@ async function start() {
   document.querySelector('header').style.display = 'flex';
   document.querySelector('nav').style.display = 'flex';
   document.querySelector('main').style.display = 'block';
-  $('#who').textContent = DEMO ? 'demo data' : (account ? account.username : '');
+  $('#who').textContent = account ? account.username : '';
 
-  if (DEMO) {
-    WORKSPACES = [{key: 'demo', label: 'Demo workspace (no sign-in)'}];
-    WS = WORKSPACES[0];
-  } else {
-    progress('Discovering EASM workspaces…');
-    try { WORKSPACES = await discoverWorkspaces(); }
-    catch (e) { WORKSPACES = []; progress(''); }
-    progress('');
-    if (!WORKSPACES.length) {
-      $('#action-list').innerHTML = `<div class="note warn">No EASM workspaces visible to this account.
-        Check that the app registration has Azure Service Management → user_impersonation, and that
-        you hold a role on a Microsoft.Easm/workspaces resource.</div>`;
-      return;
-    }
-    WS = WORKSPACES[0];
+  progress('Discovering EASM workspaces…');
+  try { WORKSPACES = await discoverWorkspaces(); } catch (e) { WORKSPACES = []; }
+  progress('');
+  if (!WORKSPACES.length) {
+    $('#action-list').innerHTML = `<div class="note warn">No EASM workspaces visible to this account.
+      Check that the app registration has Azure Service Management → user_impersonation, and that you
+      hold a role on a Microsoft.Easm/workspaces resource.</div>`;
+    return;
   }
+  WS = WORKSPACES[0];
   $('#ws').innerHTML = WORKSPACES.map(w => `<option value="${esc(w.key)}">${esc(w.label)}</option>`).join('');
-  $('#ws-mode').textContent = DEMO ? 'demo data' : 'live EASM';
+  $('#ws-mode').textContent = 'live EASM';
   await loadCurrent();
 }
 
@@ -772,37 +758,20 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => show(b.da
 $('#ws').onchange = e => { WS = WORKSPACES.find(w => w.key === e.target.value); loadCurrent(); };
 $('#reload').onclick = loadCurrent;
 $('#signin').onclick = signIn;
-$('#demo').onclick = () => { DEMO = true; start(); };
-$('#snap').onclick = () => { addSnap(snapshotRow()); renderTrend(); };
-$('#export').onclick = () => {
-  const blob = new Blob([JSON.stringify(readLS(LS.snaps, {}), null, 2)], {type: 'application/json'});
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob); a.download = 'sightline-easm-history.json'; a.click();
-  URL.revokeObjectURL(a.href);
+
+$('#advise').onclick = async (ev) => {
+  ev.target.disabled = true; ev.target.textContent = 'Thinking…';
+  try {
+    const {actions} = buildActions(DATA.assets, DATA.obsByAsset, 12);
+    if (!actions.length) { $('#advice-note').textContent = 'No findings to advise on.'; return; }
+    const out = await askAI(RECOMMEND_PROMPT, renderFindings(actions), 16000);
+    saveAdvice({recommendations: out.recommendations || [], provider: aiCfg().provider,
+                at: new Date().toISOString()});
+    renderAdvice();
+  } catch (e) { $('#advice-note').innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+  finally { ev.target.disabled = false; ev.target.textContent = 'Generate recommendations'; }
 };
-$('#import').onclick = () => {
-  const inp = document.createElement('input');
-  inp.type = 'file'; inp.accept = 'application/json';
-  inp.onchange = async () => {
-    try {
-      const incoming = JSON.parse(await inp.files[0].text());
-      const all = readLS(LS.snaps, {});
-      for (const [k, rows] of Object.entries(incoming)) {
-        const seen = new Set((all[k] || []).map(r => r.captured_at));
-        all[k] = [...(all[k] || []), ...rows.filter(r => !seen.has(r.captured_at))]
-                 .sort((a, b) => a.captured_at.localeCompare(b.captured_at));
-      }
-      writeLS(LS.snaps, all); renderTrend();
-    } catch (e) { $('#trend-note').innerHTML = `<span class="err">Import failed: ${esc(e.message)}</span>`; }
-  };
-  inp.click();
-};
-$('#ai-provider').onchange = e => {
-  const hints = {heuristic: 'No configuration needed', claude: 'sk-ant-… (kept in this tab only)',
-                 azure_openai: 'https://<resource>.openai.azure.com/openai/deployments/<dep>/chat/completions?api-version=2024-10-21'};
-  $('#ai-config').placeholder = hints[e.target.value];
-  $('#ai-config').value = e.target.value === 'claude' ? (sessionStorage.getItem('b16_anthropic_key') || '') : '';
-};
+
 $('#validate').onclick = async (ev) => {
   ev.target.disabled = true; ev.target.textContent = 'Validating…';
   try {
@@ -810,19 +779,48 @@ $('#validate').onclick = async (ev) => {
     const todo = DATA.assets.filter(a => (['candidate', 'candidateInvestigate'].includes(a.state)
       || String(a.state).startsWith('associated')) && !verdicts[a.id]).slice(0, 25);
     if (!todo.length) { $('#queue-note').textContent = 'Nothing left to validate.'; return; }
-    for (const v of await aiVerdicts(todo)) if (v && v.asset_id) verdicts[v.asset_id] = v;
+    const out = await askAI(VALIDATE_PROMPT, renderAssetBatch(todo), 8000);
+    for (const v of (out.verdicts || [])) if (v && v.asset_id) verdicts[v.asset_id] = v;
     saveVerdicts(verdicts);
     renderQueue();
   } catch (e) { $('#queue-note').innerHTML = `<span class="err">${esc(e.message)}</span>`; }
   finally { ev.target.disabled = false; ev.target.textContent = 'Validate 25'; }
 };
 
+// AI settings live in a prompt-driven dialog rather than a panel: they are set
+// once per browser and then never touched again.
+function aiSettings() {
+  const cfg = aiCfg();
+  const provider = (window.prompt(
+    'AI provider — "azure_openai" keeps data in your tenant, "claude" sends it to Anthropic:',
+    cfg.provider) || '').trim();
+  if (!['azure_openai', 'claude'].includes(provider)) return;
+  if (provider === 'azure_openai') {
+    const endpoint = window.prompt(
+      'Azure OpenAI chat-completions URL:\nhttps://<resource>.openai.azure.com/openai/deployments/<deployment>/chat/completions?api-version=2024-10-21',
+      cfg.endpoint || '') || '';
+    saveAiCfg({provider, endpoint: endpoint.trim(), key: ''});
+  } else {
+    const key = window.prompt('Anthropic API key (stored in this browser only):', cfg.key || '') || '';
+    saveAiCfg({provider, endpoint: '', key: key.trim()});
+  }
+  $('#advice-note').textContent = `AI provider set to ${provider}`;
+}
+
 (function init() {
-  const cfg = loadCfg();
+  const cfg = readLS(LS.cfg, {});
   $('#cid').value = cfg.clientId || '';
   $('#tid').value = cfg.tenantId || '';
-  $('#redir').textContent = location.origin + location.pathname;
-  $('#ai-provider').dispatchEvent(new Event('change'));
+  $('#redir').textContent = PROD_URL;
+  const here = location.origin + location.pathname;
+  if (here !== PROD_URL && !location.href.startsWith('file://'))
+    $('#redir-alt').innerHTML = ` You are serving from <code>${esc(here)}</code>, so register that as a
+      redirect URI too (an app registration can hold several).`;
+  // A small affordance rather than a settings screen: the AI provider is a
+  // once-per-browser decision.
+  const btn = document.createElement('button');
+  btn.textContent = 'AI settings'; btn.onclick = aiSettings;
+  document.querySelector('#view-advice .toolbar').appendChild(btn);
   if (typeof msal === 'undefined')
     gateMsg('Microsoft sign-in library failed to load — check your connection and reload.', true);
 })();
