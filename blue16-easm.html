@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Blue16 Sightline EASM — Microsoft-sourced CTEM</title>
+<title>Blue16 EASM-Optimizer</title>
 <!--
   Single-file EASM dashboard. No backend, no build step.
 
@@ -103,6 +103,23 @@
   #gate input{width:100%}
   #progress{position:fixed;left:0;right:0;bottom:0;background:var(--bg2);border-top:1px solid var(--border);
             padding:6px 20px;font-size:11px;color:var(--muted);display:none}
+  /* Loading state — in the content area, where the eye already is */
+  #loading{display:none;align-items:center;gap:16px;background:var(--bg2);border:1px solid var(--border);
+           border-radius:8px;padding:18px 20px;margin-bottom:16px}
+  #loading.on{display:flex}
+  #loading-msg{font-weight:600}
+  .spinner{width:22px;height:22px;flex:0 0 22px;border:2px solid var(--border);
+           border-top-color:var(--blue);border-radius:50%;animation:spin .8s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .loadbar{height:4px;background:var(--bg3);border-radius:2px;margin-top:8px;width:min(420px,60vw)}
+  .loadbar i{display:block;height:100%;background:var(--blue);border-radius:2px;width:0;
+             transition:width .2s ease}
+  /* Inline settings row, same shape as the rest of the app's controls */
+  .settings{display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--bg2);
+            border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:12px}
+  .settings label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;
+                  font-weight:600}
+  .settings input{flex:1;min-width:260px}
   /* Setup instructions: themed steps, scannable rather than a wall of prose */
   .setup{margin-top:10px;text-align:left}
   .setup summary{cursor:pointer;font-size:11px;color:var(--muted);text-transform:uppercase;
@@ -130,8 +147,7 @@
 <body>
 
 <div id="gate">
-  <div style="font-size:22px;font-weight:800"><span style="color:#58a6ff">Blue16</span> Sightline EASM</div>
-  <div class="tagline">Microsoft-sourced CTEM · external attack surface</div>
+  <div style="font-size:22px;font-weight:800"><span style="color:#58a6ff">Blue16</span> EASM-Optimizer</div>
   <div class="box">
     <div style="font-size:12px;color:var(--muted);line-height:1.7;text-align:left">
       Sign in with a Microsoft work account that holds an Azure role on the Defender EASM
@@ -190,9 +206,8 @@
 
 <header style="display:none">
   <div>
-    <div class="brand"><span>Blue16</span> Sightline EASM</div>
-    <div class="tagline">Microsoft-sourced CTEM · external attack surface</div>
-  </div>
+    <div class="brand"><span>Blue16</span> EASM-Optimizer</div>
+    </div>
   <select id="ws"></select>
   <span id="ws-mode" class="tagline"></span>
   <div class="spacer"></div>
@@ -208,6 +223,19 @@
 </nav>
 
 <main style="display:none">
+  <!-- Loading state. A full workspace is one GET per 100 assets plus one POST
+       per asset, so a cold load runs for tens of seconds — long enough that a
+       blank panel reads as "broken" rather than "working". -->
+  <div id="loading">
+    <div class="spinner"></div>
+    <div>
+      <div id="loading-msg">Loading…</div>
+      <div id="loading-sub" class="note" style="margin:2px 0 0">
+        Observations are fetched per asset, so a first load takes a moment.</div>
+      <div class="loadbar"><i id="loading-bar"></i></div>
+    </div>
+  </div>
+
   <!-- Deterministic prioritization: what to fix, ranked by risk removed -->
   <section id="view-actions" class="view on">
     <div class="tiles" id="action-tiles"></div>
@@ -216,6 +244,16 @@
 
   <!-- AI layer: enrich the ranked actions into recommendations an owner can act on -->
   <section id="view-advice" class="view">
+    <div class="settings">
+      <label for="ai-provider">AI provider</label>
+      <select id="ai-provider">
+        <option value="azure_openai">Azure OpenAI — stays in your tenant</option>
+        <option value="claude">Claude API — sent to Anthropic</option>
+      </select>
+      <label for="ai-value" id="ai-label">Endpoint</label>
+      <input id="ai-value" autocomplete="off" spellcheck="false"/>
+      <span class="note" id="ai-hint" style="margin:0"></span>
+    </div>
     <div class="toolbar">
       <button class="primary" id="advise">Generate recommendations</button>
       <span class="note" id="advice-note" style="margin:0"></span>
@@ -335,6 +373,15 @@ function buildActions(assets, obsByAsset, limit = 40) {
 }
 function parentOf(a) {
   if (['ipAddress', 'ipBlock', 'as'].includes(a.kind)) return 'IP space / ASN';
+  // sslCert assets are named by thumbprint, which groups into one bucket per
+  // certificate. Group by the subject instead, falling back to a single bucket.
+  if (a.kind === 'sslCert') {
+    const subject = ((a.evidence && a.evidence.cert_subject) || '')
+      .replace(/^cn\s*=\s*/i, '').replace(/^\*\./, '').trim().toLowerCase();
+    if (!subject) return 'TLS certificates';
+    const p = subject.split('.').filter(Boolean);
+    return p.length >= 2 ? p.slice(-2).join('.') : subject;
+  }
   let n = (a.name || '').trim().toLowerCase();
   if (n.includes('//')) n = n.split('//')[1];      // page assets are full URLs
   n = n.split('/')[0].split('?')[0].split(':')[0];
@@ -494,7 +541,8 @@ async function loadWorkspace(w, onProgress) {
     const res = await easm(w, '/assets',
                            {params: {maxpagesize: PAGE_SIZE, mark, responseType: 'STANDARD'}});
     (res.value || []).forEach(raw => assets.push(normalizeAsset(raw)));
-    onProgress(`Inventory: ${assets.length}${res.totalElements ? ' / ' + res.totalElements : ''} assets`);
+    onProgress(`Reading inventory — ${assets.length}${res.totalElements ? ' of ' + res.totalElements : ''} assets`,
+               assets.length, res.totalElements || 0);
     if (!res.mark || !(res.value || []).length || assets.length >= (res.totalElements || 0)) break;
     mark = res.mark;
   }
@@ -516,7 +564,8 @@ async function loadWorkspace(w, onProgress) {
                                {method: 'POST', params: {maxpagesize: 100}});
         obsByAsset[asset.id] = res.value || [];
       } catch (e) { obsByAsset[asset.id] = []; }
-      if (++done % 10 === 0) onProgress(`Observations: ${done} / ${ranked.length} assets`);
+      if (++done % 5 === 0 || done === ranked.length)
+        onProgress(`Analysing observations — ${done} of ${ranked.length} assets`, done, ranked.length);
     }
   });
   await Promise.all(workers);
@@ -760,14 +809,27 @@ function show(v) {
   document.querySelectorAll('.view').forEach(s => s.classList.toggle('on', s.id === 'view-' + v));
   if (DATA) VIEWS[v]();
 }
-function progress(msg) {
-  const el = $('#progress');
-  if (!msg) { el.style.display = 'none'; return; }
-  el.style.display = 'block'; el.textContent = msg;
+/** Show progress where the user is already looking, not only in the status bar.
+ *  `done`/`total` render a determinate bar; without them the spinner alone runs. */
+function progress(msg, done, total) {
+  const panel = $('#loading'), bar = $('#loading-bar');
+  if (!msg) {
+    panel.classList.remove('on');
+    $('#progress').style.display = 'none';
+    return;
+  }
+  panel.classList.add('on');
+  $('#loading-msg').textContent = msg;
+  bar.style.width = (total ? Math.round(100 * done / total) : 0) + '%';
+  $('#progress').style.display = 'block';
+  $('#progress').textContent = msg;
 }
 
 async function loadCurrent() {
   $('#reload').disabled = true;
+  // Hide stale content while reloading — a previous workspace's board sitting
+  // under a spinner is worse than an empty panel.
+  document.querySelectorAll('.view').forEach(s => s.classList.remove('on'));
   try {
     progress('Loading inventory…');
     DATA = await loadWorkspace(WS, progress);
@@ -775,6 +837,7 @@ async function loadCurrent() {
     show(current);
   } catch (e) {
     progress('');
+    show(current);
     $('#action-list').innerHTML = `<div class="note err">${esc(e.message)}</div>`;
   } finally { $('#reload').disabled = false; }
 }
@@ -834,24 +897,27 @@ $('#validate').onclick = async (ev) => {
   finally { ev.target.disabled = false; ev.target.textContent = 'Validate 25'; }
 };
 
-// AI settings live in a prompt-driven dialog rather than a panel: they are set
-// once per browser and then never touched again.
-function aiSettings() {
-  const cfg = aiCfg();
-  const provider = (window.prompt(
-    'AI provider — "azure_openai" keeps data in your tenant, "claude" sends it to Anthropic:',
-    cfg.provider) || '').trim();
-  if (!['azure_openai', 'claude'].includes(provider)) return;
-  if (provider === 'azure_openai') {
-    const endpoint = window.prompt(
-      'Azure OpenAI chat-completions URL:\nhttps://<resource>.openai.azure.com/openai/deployments/<deployment>/chat/completions?api-version=2024-10-21',
-      cfg.endpoint || '') || '';
-    saveAiCfg({provider, endpoint: endpoint.trim(), key: ''});
-  } else {
-    const key = window.prompt('Anthropic API key (stored in this browser only):', cfg.key || '') || '';
-    saveAiCfg({provider, endpoint: '', key: key.trim()});
-  }
-  $('#advice-note').textContent = `AI provider set to ${provider}`;
+// AI settings are ordinary inline fields, persisted per browser as they change.
+const AI_HINTS = {
+  azure_openai: {label: 'Endpoint',
+    placeholder: 'https://<resource>.openai.azure.com/openai/deployments/<deployment>/chat/completions?api-version=2024-10-21',
+    hint: 'Signed in as you — no key stored. Needs Cognitive Services OpenAI User on the resource.'},
+  claude: {label: 'API key', placeholder: 'sk-ant-…',
+    hint: 'Stored in this browser only. A page cannot keep a secret from its user.'},
+};
+function renderAiSettings() {
+  const cfg = aiCfg(), meta = AI_HINTS[cfg.provider] || AI_HINTS.azure_openai;
+  $('#ai-provider').value = cfg.provider;
+  $('#ai-label').textContent = meta.label;
+  $('#ai-value').placeholder = meta.placeholder;
+  $('#ai-value').type = cfg.provider === 'claude' ? 'password' : 'text';
+  $('#ai-value').value = cfg.provider === 'claude' ? (cfg.key || '') : (cfg.endpoint || '');
+  $('#ai-hint').textContent = meta.hint;
+}
+function persistAiSettings() {
+  const provider = $('#ai-provider').value, value = $('#ai-value').value.trim();
+  saveAiCfg(provider === 'claude' ? {provider, endpoint: '', key: value}
+                                  : {provider, endpoint: value, key: ''});
 }
 
 (function init() {
@@ -863,11 +929,9 @@ function aiSettings() {
   if (here !== PROD_URL && !location.href.startsWith('file://'))
     $('#redir-alt').innerHTML = ` You are serving from <code>${esc(here)}</code>, so register that as a
       redirect URI too (an app registration can hold several).`;
-  // A small affordance rather than a settings screen: the AI provider is a
-  // once-per-browser decision.
-  const btn = document.createElement('button');
-  btn.textContent = 'AI settings'; btn.onclick = aiSettings;
-  document.querySelector('#view-advice .toolbar').appendChild(btn);
+  renderAiSettings();
+  $('#ai-provider').onchange = () => { persistAiSettings(); renderAiSettings(); };
+  $('#ai-value').onchange = persistAiSettings;
   if (typeof msal === 'undefined')
     gateMsg('Microsoft sign-in library failed to load — check your connection and reload.', true);
 })();
