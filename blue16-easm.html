@@ -132,6 +132,8 @@
   .covhead{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
            padding:10px 12px;margin-bottom:12px;font-size:12px;color:var(--muted);line-height:1.7}
   .ai-tag{background:rgba(188,140,255,.16);color:var(--purple)}
+  button .ai-tag{margin-right:2px}
+  button:disabled .ai-tag{opacity:.7}
   .ai-block{border-left:2px solid rgba(188,140,255,.5);padding:8px 0 2px 12px;margin-top:10px}
   .ai-head{display:flex;align-items:center;gap:8px;margin-bottom:6px}
   .cause{border-top:1px solid var(--border);padding:8px 0}
@@ -306,7 +308,7 @@
 
 <nav style="display:none">
   <button data-view="assets" class="on">Assets</button>
-  <button data-view="coverage">Azure Coverage Gap</button>
+  <button data-view="coverage">Coverage Gap</button>
 </nav>
 
 <main style="display:none">
@@ -338,6 +340,7 @@
         <option value="everything">Every asset</option>
       </select>
       <select id="asset-merge">
+        <option value="platform">Group identical platforms</option>
         <option value="merge">Merge pages into hosts</option>
         <option value="split">Keep EASM entities separate</option>
       </select>
@@ -357,20 +360,6 @@
       </div>
     </details>
     <details style="margin-bottom:12px">
-      <summary style="cursor:pointer;font-size:11px;color:var(--muted)">Defender EDR coverage — import internet-facing devices</summary>
-      <div class="settings" style="margin-top:6px;display:block">
-        <div class="note" style="margin:0 0 8px">Defender's device list cannot be read from a browser —
-          its advanced-hunting API sends no CORS headers. Run the query below in
-          <i>Advanced hunting</i>, export the result, and import it here; asset rows then show whether
-          a Defender sensor sits behind each IP. The Sightline scanner's own export works too.</div>
-        <button id="cov-import">Import Defender devices…</button>
-        <input type="file" id="cov-file" accept=".json,.csv" style="display:none"/>
-        <span class="note" id="mde-note" style="margin:0"></span>
-        <pre id="cov-kql" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;
-          padding:10px;font-size:11px;overflow-x:auto;color:var(--muted);margin:8px 0 0"></pre>
-      </div>
-    </details>
-    <details style="margin-bottom:12px">
       <summary style="cursor:pointer;font-size:11px;color:var(--muted)">What do the states mean?</summary>
       <div id="state-legend" class="note" style="line-height:1.9;margin-top:6px"></div>
     </details>
@@ -383,7 +372,9 @@
   <section id="view-coverage" class="view">
     <div class="tiles" id="cov-tiles"></div>
     <div class="settings">
-      <button class="primary" id="cov-azure" title="Loads automatically after sign-in and refreshes hourly">Reload Azure public IPs</button>
+      <button class="primary" id="cov-import">Import Defender devices…</button>
+      <input type="file" id="cov-file" accept=".json,.csv" style="display:none"/>
+      <button id="cov-azure" title="Loads automatically after sign-in and refreshes hourly">Reload Azure</button>
       <button id="cov-clear">Clear</button>
       <select id="cov-filter">
         <option value="missing">Missing from EASM</option>
@@ -392,8 +383,18 @@
       </select>
       <span class="note" id="cov-note" style="margin:0"></span>
     </div>
-    <div class="note">Every public IP allocated in the subscriptions you can read, checked against
-      EASM inventory. Loads automatically after sign-in.</div>
+    <div class="note">Two sources of "what we own", checked against EASM inventory. Azure public IPs
+      load automatically after sign-in. Defender's internet-facing device list cannot be read from a
+      browser — its advanced-hunting API sends no CORS headers — so run the query below in
+      <i>Advanced hunting</i>, export it, and import the JSON or CSV here. The Sightline scanner's own
+      export works too. Importing it also puts an <span class="badge v-approve">EDR</span> /
+      <span class="badge p-high">no EDR</span> badge on every asset row.</div>
+    <details style="margin-bottom:12px">
+      <summary style="cursor:pointer;font-size:11px;color:var(--muted)">Defender advanced-hunting query</summary>
+      <pre id="cov-kql" style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;
+        padding:10px;font-size:11px;overflow-x:auto;color:var(--muted)"></pre>
+      <div class="note" id="mde-note" style="margin:6px 0 0"></div>
+    </details>
     <div id="coverage"></div>
   </section>
 
@@ -549,6 +550,40 @@ function hostOfUrl(name) {
   let n = (name || '').trim().toLowerCase();
   if (n.includes('//')) n = n.split('//')[1];
   return n.split('/')[0].split('?')[0].split(':')[0];
+}
+
+/** Collapse assets whose findings are identical.
+ *
+ *  ftp.rubicon.nl and mail.rubicon.nl both scoring 80 on the same six CVEs is
+ *  not two problems — it is one hosting platform answering on two names. Left
+ *  apart they inflate the totals and push distinct problems down the list.
+ *
+ *  The fingerprint is the set of finding names. Two findings minimum, because a
+ *  single shared "Missing HSTS header" is a coincidence, not a shared platform.
+ *  Risk stays at one instance rather than the sum: fixing it once fixes all of
+ *  them, and the host count is reported separately as the blast radius.
+ */
+const FINGERPRINT_MIN = 2;
+function groupIdentical(rows) {
+  const groups = new Map();
+  const out = [];
+  for (const r of rows) {
+    if (r.observations.length < FINGERPRINT_MIN) { out.push(r); continue; }
+    const fp = r.observations.map(o => o.name).sort().join('|');
+    const g = groups.get(fp);
+    if (!g) { groups.set(fp, r); r.siblings = []; out.push(r); continue; }
+    // Keep the riskiest as the visible one; the rest become siblings of it.
+    if (r.risk > g.risk) {
+      g.siblings.push(g.asset.name);
+      r.siblings = g.siblings;
+      groups.set(fp, r);
+      out[out.indexOf(g)] = r;
+    } else {
+      g.siblings.push(r.asset.name);
+    }
+  }
+  return out.sort((x, y) => y.risk - x.risk || y.counts.high - x.counts.high
+                            || x.asset.name.localeCompare(y.asset.name));
 }
 
 /** Per-asset rollup: risk, observations, and the themes they fall into.
@@ -731,12 +766,23 @@ function normalizeAsset(raw) {
       cert_subject: firstStr('sslCerts', 'subjectCommonNames'),
       asn: firstStr('asns'),
       ip_blocks: list('ipBlocks', 'name'), parent_hosts: list('parentHosts', 'name'),
+      cnames: list('cnames', 'value'),
       // Needed by the coverage gap: a host asset covers the IPs behind it,
       // so matching only ipAddress-kind assets would overstate the gap.
       ips: (inner.ipAddresses || []).map(x => (x && (x.value || x.name || x.ipAddress)) || x)
              .filter(v => typeof v === 'string').slice(0, 12),
-      web_components: (inner.webComponents || [])
-        .map(c => `${c.name || ''} ${c.version || ''}`.trim()).filter(Boolean).slice(0, 6),
+      web_components: (inner.webComponents || []).map(c => {
+        const port = c.portNumber ?? c.port;
+        return `${c.name || ''} ${c.version || ''}`.trim() + (port ? ` :${port}` : '');
+      }).filter(t => t && t !== ':').slice(0, 8),
+      // Open ports, which is how you tell what a host actually is. EASM crawls
+      // HTTP, so a mail or FTP hostname whose only open port is 443 is being
+      // judged on a placeholder web page rather than on its real service.
+      services: (inner.services || []).map(x => ({
+        port: x.portNumber ?? x.port ?? null,
+        protocol: x.scanType || x.protocol || x.name || '',
+        recent: x.recent !== false,
+      })).filter(x => x.port).slice(0, 24),
     },
   };
 }
@@ -928,6 +974,8 @@ function easmIpSet() {
 
 function renderCoverage() {
   const cov = getCoverage();
+  $('#cov-kql').textContent = MDE_KQL;
+  $('#mde-note').textContent = cov.mde.length ? `${cov.mde.length} internet-facing devices imported` : '';
   const known = easmIpSet();
   // An IP that is both an Azure public IP and a Defender device is one address,
   // not two rows — merge by IP and keep every source that reported it.
@@ -950,6 +998,7 @@ function renderCoverage() {
   $('#cov-tiles').innerHTML = [
     ['EASM IPs', known.size, 'addresses EASM knows', ''],
     ['Azure public IPs', cov.azure.length, 'allocated and assigned', ''],
+    ['Defender devices', cov.mde.length, 'internet-facing, imported', ''],
     ['Matched', matched, 'owned IPs EASM also found', ''],
     ['Missing from EASM', missing.length, 'owned, undiscovered', missing.length ? 'risk' : ''],
   ].map(([l, n, sub, cls]) => `<div class="tile ${cls}"><div class="n">${esc(n)}</div>
@@ -1055,6 +1104,39 @@ function assetContext(a) {
     mde: cov.mde.find(x => ips.includes(x.ip)) || null,
     mdeLoaded: cov.mde.length > 0,
   };
+}
+
+// Common hostname conventions and the port that would justify them. EASM only
+// reports what it crawled, so a name promising SMTP with nothing but 443 open is
+// a signal that the findings describe a placeholder site, not the named service.
+const NAME_HINTS = [
+  [/^(mail|smtp|mx)\b/i, [25, 465, 587], 'mail'],
+  [/^(ftp|sftp)\b/i, [21, 22, 990], 'file transfer'],
+  [/^(vpn|remote|rdp)\b/i, [443, 500, 1194, 3389, 4433], 'remote access'],
+  [/^(ns\d*|dns)\b/i, [53], 'DNS'],
+  [/^(db|sql|mysql|postgres)\b/i, [1433, 3306, 5432], 'database'],
+];
+const WEB_PORTS = [80, 443, 8080, 8443];
+
+/** "443/https, 25/smtp", plus a caveat when the name implies something the open
+ *  ports do not support. */
+function serviceSummary(a) {
+  const svc = (a.evidence && a.evidence.services) || [];
+  const ports = [...new Set(svc.map(x => Number(x.port)))].sort((x, y) => x - y);
+  if (!ports.length) return {text: '', warning: ''};
+  const text = svc.map(x => `${x.port}${x.protocol ? '/' + x.protocol : ''}`)
+    .filter((v, i, arr) => arr.indexOf(v) === i).join(', ');
+  let warning = '';
+  for (const [re, expected, label] of NAME_HINTS) {
+    if (!re.test(a.name || '')) continue;
+    if (expected.some(pt => ports.includes(pt))) break;
+    if (ports.every(pt => WEB_PORTS.includes(pt)))
+      warning = `The name suggests ${label}, but only web ports are open (${ports.join(', ')}). ` +
+                `EASM crawls HTTP, so these findings describe whatever is served there — often a ` +
+                `hosting placeholder — not a ${label} service.`;
+    break;
+  }
+  return {text, warning};
 }
 
 /** Path portion of a page URL, empty when it is just the host root. */
@@ -1171,8 +1253,11 @@ function renderAssets() {
   const aiResults = getAiResults();
   const mdeCount = getCoverage().mde.length;
   $('#mde-note').textContent = mdeCount ? `${mdeCount} internet-facing devices imported` : '';
-  const merge = $('#asset-merge').value === 'merge';
-  const rows = assetRows(DATA.assets, DATA.obsByAsset, {mergePages: merge});
+  const mode = $('#asset-merge').value;
+  const merge = mode !== 'split';
+  const rows = mode === 'platform'
+    ? groupIdentical(assetRows(DATA.assets, DATA.obsByAsset, {mergePages: true}))
+    : assetRows(DATA.assets, DATA.obsByAsset, {mergePages: merge});
 
   // Risk numbers read red; inventory counts stay neutral, so the eye lands on
   // the thing that needs a decision.
@@ -1201,7 +1286,9 @@ function renderAssets() {
   const worstCvss = stateRows.reduce((m, r) => Math.max(m, r.worstCvss), 0);
   const totalRisk = Math.round(stateRows.reduce((s, r) => s + r.risk, 0));
   $('#asset-tiles').innerHTML = [
-    ['Assets', stateRows.length, merge ? 'pages merged into hosts' : 'every EASM entity', '', 'all'],
+    ['Assets', stateRows.length,
+     mode === 'platform' ? 'identical platforms grouped' : merge ? 'pages merged into hosts' : 'every EASM entity',
+     '', 'all'],
     ['With findings', withFindings.length, 'carry at least one observation', '', 'findings'],
     ['Critical', critical, 'assets in the critical band', critical ? 'risk' : '', 'critical'],
     ['Worst CVSS', worstCvss || '—', `${cvssCount} asset${cvssCount === 1 ? '' : 's'} at CVSS 9+`,
@@ -1235,7 +1322,8 @@ function renderAssets() {
     if (ASSET_FOCUS === 'critical' && riskBand(r.risk) !== 'critical') return false;
     if (ASSET_FOCUS === 'cvss9' && !(r.worstCvss >= 9)) return false;
     if (q && !r.asset.name.toLowerCase().includes(q)
-          && !r.merged.some(m => m.toLowerCase().includes(q))) return false;
+          && !r.merged.some(m => m.toLowerCase().includes(q))
+          && !(r.siblings || []).some(m => m.toLowerCase().includes(q))) return false;
     return true;
   }).slice(0, 300);
   const focusLabel = {critical: 'critical band', cvss9: 'CVSS 9+', findings: 'with findings'}[ASSET_FOCUS];
@@ -1257,6 +1345,7 @@ function renderAssets() {
     const paths = [...new Set(r.merged.map(urlPath).filter(Boolean))];
     const ctx = assetContext(a);
     const stored = aiResults[a.id] || {};
+    const svc = serviceSummary(a);
     const chips = [
       r.counts.cve ? `<span class="badge k-cve">${r.counts.cve} CVE</span>` : '',
       r.counts.high ? `<span class="badge p-high">${r.counts.high} high</span>` : '',
@@ -1266,6 +1355,8 @@ function renderAssets() {
       ctx.azure ? `<span class="badge src-azure" title="${esc(`${ctx.azure.name} · ${ctx.azure.rg} · ${ctx.azure.subscription}`)}">${AZURE_ICON}Azure</span>` : '',
       ctx.mde ? `<span class="badge v-approve" title="${esc(`Defender device ${ctx.mde.name}`)}">EDR</span>`
         : (ctx.mdeLoaded && ctx.ips.length ? `<span class="badge p-high" title="No Defender sensor behind ${esc(ctx.ips.join(', '))}">no EDR</span>` : ''),
+      (r.siblings || []).length ? `<span class="badge p-none help" title="${esc(`Identical findings on: ${r.siblings.join(', ')} — one platform answering on several names`)}">+${r.siblings.length} identical</span>` : '',
+      svc.warning ? `<span class="badge p-medium help" title="${esc(svc.warning)}">web only</span>` : '',
       stored.causes || stored.assess ? `<span class="badge ai-tag" title="${esc(`Reviewed by AI ${new Date((stored.causes || stored.assess).at).toLocaleString()}`)}">AI</span>` : '',
     ].join('');
     // State shows as the bare tag; the explanation is the tooltip, so the fact
@@ -1276,11 +1367,14 @@ function renderAssets() {
       ['Type', a.kind,
        `<span class="badge k-insight help" title="${esc((KIND_LABEL[a.kind] || ['', ''])[1])}">${esc((KIND_LABEL[a.kind] || [a.kind])[0])}</span>`],
       ['Crawled paths', paths.join('  ')],
+      ['Same findings on', (r.siblings || []).join(', ')],
       ['Discovery group', a.disco_group],
       ['First seen', (a.first_seen || '').slice(0, 10)], ['Last seen', (a.last_seen || '').slice(0, 10)],
       ['WHOIS org', e.whois_org], ['ASN', e.asn], ['Certificate', e.cert_subject],
+      ['CNAME', (e.cnames || []).join(', ')],
       ['IP addresses', (e.ips || []).join(', ')],
-      ['IP blocks', (e.ip_blocks || []).join(', ')], ['Technology', (e.web_components || []).join(', ')],
+      ['IP blocks', (e.ip_blocks || []).join(', ')],
+      ['Open ports', svc.text], ['Technology', (e.web_components || []).join(', ')],
       ['Azure resource', ctx.azure ? `${ctx.azure.name} · ${ctx.azure.rg} · ${ctx.azure.location} · ${ctx.azure.subscription}` : ''],
       ['EDR coverage', ctx.mde ? `Defender device ${ctx.mde.name}${ctx.mde.onboarding ? ` (${ctx.mde.onboarding})` : ''}`
         : (ctx.mdeLoaded && ctx.ips.length ? 'No Defender sensor behind this IP' : '')],
@@ -1304,6 +1398,12 @@ function renderAssets() {
       <div class="detail">
         <div class="facts">${facts.map(([k, v, html]) =>
           `<div><span>${esc(k)}</span>${html || esc(v)}</div>`).join('')}</div>
+        ${(r.siblings || []).length ? `<p class="note" style="margin:0 0 10px">These findings appear
+          identically on ${r.siblings.length + 1} hosts (${esc([a.name, ...r.siblings].join(', '))}),
+          so this is one platform rather than ${r.siblings.length + 1} problems. Risk is counted once;
+          fixing it resolves all of them.${(e.cnames || []).length
+            ? ` This name is a CNAME to ${esc(e.cnames.join(', '))}, which is why.` : ''}</p>` : ''}
+        ${svc.warning ? `<p class="note warn" style="margin:0 0 10px">⚠ ${esc(svc.warning)}</p>` : ''}
         ${r.owasp.length ? `<h4>Weakness themes</h4><p>${r.owasp.map(o =>
           `<span class="badge p-none" style="margin-right:4px">${esc(o)}</span>`).join('')}</p>` : ''}
         ${r.observations.length ? Object.entries(byTheme).map(([theme, list]) => `
@@ -1319,8 +1419,9 @@ function renderAssets() {
             <td>${o.risk.toFixed(1)}</td></tr>`).join('')}</tbody></table>`).join('')
           : '<p class="note">No open observations on this asset.</p>'}
         <div class="toolbar" style="margin:4px 0 0">
-          <button class="ai-asset" data-asset="${esc(a.id)}" ${aiOn ? '' : 'disabled title="Configure a provider under AI settings"'}>Ask AI about this asset</button>
-          <button class="ai-causes" data-asset="${esc(a.id)}" ${aiOn && r.observations.length > 1 ? '' : 'disabled title="Needs an AI provider and more than one finding"'}>Find root causes</button>
+          <button class="ai-asset" data-asset="${esc(a.id)}" ${aiOn ? '' : 'disabled title="Needs an AI provider — set one under AI settings"'}><span class="badge ai-tag">AI</span> <span class="lbl">Assess this asset</span></button>
+          <button class="ai-causes" data-asset="${esc(a.id)}" ${aiOn && r.observations.length > 1 ? '' : `disabled title="${aiOn ? 'Needs more than one finding to group' : 'Needs an AI provider — set one under AI settings'}"`}><span class="badge ai-tag">AI</span> <span class="lbl">Find root causes</span></button>
+          ${aiOn ? '' : '<span class="note" style="margin:0">Connect an AI provider under <b>AI settings</b> to enable these.</span>'}
           <span class="note ai-asset-out" style="margin:0"></span>
         </div>
         <div class="ai-causes-out"></div>
@@ -1361,7 +1462,7 @@ Order by how many findings each closes. Reply with JSON only:
 
 const ASSET_PROMPT = `You are a senior external-attack-surface analyst. You are given one internet-facing asset from Microsoft Defender EASM, with everything known about it.
 
-Assess this specific asset. Ground every statement in the supplied evidence — the hostname, what it appears to be, its detected technology, its findings. Do not describe the vulnerabilities generically; say what they mean for this host.
+Assess this specific asset. Open ports tell you what it really is; the hostname is only a convention and is often wrong. If the ports are web-only, say plainly that the findings describe whatever is served there rather than the service the name implies. Ground every statement in the supplied evidence — the hostname, what it appears to be, its detected technology, its findings. Do not describe the vulnerabilities generically; say what they mean for this host.
 
 Return JSON only:
 {"summary":"two or three sentences on what this asset appears to be and how exposed it is",
@@ -1418,12 +1519,14 @@ function renderClusters(container, scored, row) {
 
 async function clusterAsset(button, row) {
   const out = button.closest('.detail').querySelector('.ai-causes-out');
-  button.disabled = true; button.textContent = 'Grouping…';
+  const lbl = button.querySelector('.lbl');
+  button.disabled = true; lbl.textContent = 'Grouping…';
   try {
     const a = row.asset, e = a.evidence || {};
     const user = [
       `Asset: ${a.name}`, `Kind: ${a.kind}   EASM state: ${a.state}`,
       (e.web_components || []).length ? `Detected technology: ${e.web_components.join(', ')}` : '',
+      serviceSummary(a).text ? `Open ports: ${serviceSummary(a).text}` : '',
       e.cert_subject ? `Certificate: ${e.cert_subject}` : '',
       `Organization: ${orgContext()}`,
       '', `Open findings (${row.observations.length}):`,
@@ -1436,7 +1539,7 @@ async function clusterAsset(button, row) {
     renderClusters(out, scored, row);
     renderAssets();          // the row gains its "AI" marker
   } catch (err) { out.innerHTML = `<span class="err">${esc(err.message)}</span>`; }
-  finally { button.disabled = false; button.textContent = 'Find root causes'; }
+  finally { button.disabled = false; lbl.textContent = 'Find root causes'; }
 }
 
 async function adviseAsset(button, row) {
@@ -1450,6 +1553,7 @@ async function adviseAsset(button, row) {
       e.whois_org ? `WHOIS org: ${e.whois_org}` : '',
       e.asn ? `ASN: ${e.asn}` : '',
       e.cert_subject ? `Certificate: ${e.cert_subject}` : '',
+      serviceSummary(a).text ? `Open ports: ${serviceSummary(a).text}` : '',
       (e.web_components || []).length ? `Detected technology: ${e.web_components.join(', ')}` : '',
       (e.parent_hosts || []).length ? `Parent hosts: ${e.parent_hosts.join(', ')}` : '',
       `Organization: ${orgContext()}`,
