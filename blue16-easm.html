@@ -131,6 +131,14 @@
   .tile.warnkpi .n{color:var(--gold)}
   .covhead{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
            padding:10px 12px;margin-bottom:12px;font-size:12px;color:var(--muted);line-height:1.7}
+  .ai-tag{background:rgba(188,140,255,.16);color:var(--purple)}
+  .ai-block{border-left:2px solid rgba(188,140,255,.5);padding:8px 0 2px 12px;margin-top:10px}
+  .ai-head{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .cause{border-top:1px solid var(--border);padding:8px 0}
+  .cause:first-of-type{border-top:none}
+  .cause-h{display:flex;align-items:center;gap:8px}
+  .cause-h b{flex:1;min-width:0}
+  .cause p{margin:4px 0}
   .facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:2px 16px;
          margin-bottom:12px}
   .facts div{font-size:11px;color:var(--text);padding:2px 0}
@@ -291,6 +299,7 @@
   <select id="ws"></select>
   <span id="ws-mode" class="tagline"></span>
   <div class="spacer"></div>
+  <span id="ai-status" class="tagline"></span>
   <span id="who" class="tagline"></span>
   <button id="reload">Reload data</button>
 </header>
@@ -321,11 +330,9 @@
     <div class="settings">
       <label for="asset-search">Filter</label>
       <input id="asset-search" placeholder="hostname, IP, certificate…" autocomplete="off"/>
-      <select id="asset-state">
-        <option value="all">All states</option>
-        <option value="confirmed">Confirmed only</option>
-        <option value="unresolved">Unresolved only</option>
-      </select>
+      <!-- Filled by renderAssets with live counts. Left empty so the first render
+           falls through to the default rather than preserving a placeholder. -->
+      <select id="asset-state"></select>
       <select id="asset-scope">
         <option value="findings">With findings</option>
         <option value="everything">Every asset</option>
@@ -417,7 +424,8 @@ const SUBS_API = '2022-12-01';
 const PAGE_SIZE = 100;
 const MAX_PAGES = 80;
 const OBS_CONCURRENCY = 8;   // parallel observation POSTs; the API is per-asset
-const LS = {cfg: 'b16_easm_cfg', ai: 'b16_easm_ai', coverage: 'b16_easm_coverage'};
+const LS = {cfg: 'b16_easm_cfg', ai: 'b16_easm_ai', coverage: 'b16_easm_coverage',
+            airesults: 'b16_easm_ai_results'};
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c =>
@@ -776,6 +784,21 @@ const wsKey = () => (WS ? WS.key : 'unknown');
 const aiCfg = () => readLS(LS.ai, {provider: 'azure_openai', endpoint: '', key: ''});
 function saveAiCfg(c) { writeLS(LS.ai, c); }
 
+// AI output is kept per asset so a reopened row shows what the model already
+// said instead of spending tokens again, and so a row can advertise that it has
+// been reviewed.
+const getAiResults = () => readLS(LS.airesults, {})[wsKey()] || {};
+function saveAiResult(assetId, kind, payload) {
+  const all = readLS(LS.airesults, {});
+  const ws = all[wsKey()] || (all[wsKey()] = {});
+  (ws[assetId] || (ws[assetId] = {}))[kind] = Object.assign({at: new Date().toISOString()}, payload);
+  writeLS(LS.airesults, all);
+}
+const aiEnabled = () => {
+  const c = aiCfg();
+  return c.provider === 'claude' ? !!(c.key || '').trim() : !!(c.endpoint || '').trim();
+};
+
 function orgContext() {
   // Nothing in the API states which organization a workspace belongs to, so
   // infer it from the most common registrant across confirmed inventory.
@@ -1030,8 +1053,71 @@ function findingName(name) {
   const m = String(name || '').match(/CVE-\d{4}-\d{4,}/i);
   if (!m) return esc(name);
   const id = m[0].toUpperCase();
-  return `<a href="https://nvd.nist.gov/vuln/detail/${id}" target="_blank" rel="noopener noreferrer"
-             title="Open ${id} on NVD">${esc(name)}</a>`;
+  return `<a href="https://nvd.nist.gov/vuln/detail/${id}" target="_blank" rel="noopener noreferrer">${esc(name)}</a>`;
+}
+
+// EASM returns an observation's name and nothing else — no description field
+// exists on the API — so "Deprecated Tech - Bootstrap" is all you get. These
+// explain the common ones on hover, in terms of what the exposure actually is.
+const FINDING_HELP = [
+  [/^deprecated tech\s*-\s*(.+)$/i, m =>
+    `${m[1]} is running at a version that is end-of-life or no longer supported. Unsupported ` +
+    `components stop receiving security fixes, so any flaw found from now on stays open — and old ` +
+    `front-end libraries in particular accumulate known XSS and prototype-pollution issues. Upgrade ` +
+    `to a supported release.`],
+  [/expired ssl|expired certificate/i, () =>
+    'The certificate served on this asset is past its expiry date. Browsers show an interstitial, ' +
+    'clients that pin or validate strictly will fail outright, and it usually means the renewal ' +
+    'automation has broken rather than that the service is unused.'],
+  [/self-?signed/i, () =>
+    'The certificate is not issued by a trusted authority, so nothing verifies the endpoint is who ' +
+    'it claims. It cannot be distinguished from an attacker-supplied certificate, which makes ' +
+    'interception hard to detect.'],
+  [/tls 1\.0|tls 1\.1|ssl ?[23]/i, () =>
+    'A deprecated TLS version is still accepted. These protocols have known weaknesses (BEAST, ' +
+    'POODLE) and are prohibited by PCI DSS and most baselines. Disable them and keep TLS 1.2+.'],
+  [/weak cipher|rc4|3des/i, () =>
+    'The endpoint negotiates a cipher suite considered broken or too weak to rely on. Traffic may ' +
+    'be decryptable by an attacker who can capture it.'],
+  [/hsts/i, () =>
+    'No Strict-Transport-Security header, so a browser can still be talked into a plaintext HTTP ' +
+    'connection before the redirect happens — the window an SSL-stripping attack needs.'],
+  [/directory (listing|index)/i, () =>
+    'The web server returns a file listing where no index page exists, exposing filenames and paths ' +
+    'that were never meant to be advertised — backups, configuration, uploads.'],
+  [/debug mode|stack trace/i, () =>
+    'The application is serving debug output. Error pages of this kind leak framework versions, ' +
+    'file paths, connection strings and sometimes credentials — a free map of the internals.'],
+  [/version disclos|banner/i, () =>
+    'The server advertises its exact software version in headers or banners, which lets an attacker ' +
+    'match it to public exploits without probing.'],
+  [/mfa|multi-?factor/i, () =>
+    'A sign-in page is reachable with no evidence of multi-factor enforcement. Internet-facing ' +
+    'authentication without MFA is the single most common route to account takeover.'],
+  [/\brdp\b/i, () =>
+    'Remote Desktop is reachable from the internet. RDP is a primary ransomware entry point and ' +
+    'should sit behind a VPN or bastion, never exposed directly.'],
+  [/\bssh\b/i, () =>
+    'SSH is reachable from the internet. Workable if key-only and patched, but it is continuously ' +
+    'brute-forced — restrict by source address where possible.'],
+  [/\b(ftp|telnet|smb)\b/i, () =>
+    'A legacy plaintext protocol is exposed. Credentials and data travel unencrypted and it should ' +
+    'not be reachable from the internet at all.'],
+  [/database|sql|mongo|redis|elastic/i, () =>
+    'A database service appears to be internet-reachable. These are routinely found unauthenticated ' +
+    'and scraped within hours of exposure.'],
+];
+
+/** Hover text for a finding: a CVE points at NVD, an insight gets explained. */
+function findingHelp(name) {
+  const id = cveId(name);
+  if (id) return `Open ${id} on NVD for the full description, affected versions and references.`;
+  for (const [re, fn] of FINDING_HELP) {
+    const m = String(name || '').match(re);
+    if (m) return fn(m);
+  }
+  return 'Reported by Defender EASM. No further detail is available from the API — the observation ' +
+         'carries only its name, priority and score.';
 }
 
 /** EPSS as a readable cell: the probability, flagged when it is in the tail
@@ -1051,21 +1137,54 @@ function riskBand(risk) {
   return risk > 0 ? 'low' : 'none';
 }
 
+// "Yours" is everything you could actually act on: confirmed inventory plus the
+// candidates that may turn out to be yours. The associated* states are partner
+// and third-party infrastructure — login.microsoftonline.com is real exposure,
+// but not exposure you can patch, so it does not belong in a work list.
+const ACTIONABLE_STATES = ['confirmed', 'candidate', 'candidateInvestigate'];
+function matchesState(state, filter) {
+  if (filter === 'all') return true;
+  if (filter === 'yours') return ACTIONABLE_STATES.includes(state);
+  return state === filter;
+}
+
 function renderAssets() {
   $('#cov-kql').textContent = MDE_KQL;
+  const aiOn = aiEnabled();
+  const aiResults = getAiResults();
   const mdeCount = getCoverage().mde.length;
   $('#mde-note').textContent = mdeCount ? `${mdeCount} internet-facing devices imported` : '';
   const merge = $('#asset-merge').value === 'merge';
   const rows = assetRows(DATA.assets, DATA.obsByAsset, {mergePages: merge});
-  const withFindings = rows.filter(r => r.risk > 0);
-  const critical = rows.filter(r => riskBand(r.risk) === 'critical').length;
-  const worstCvss = rows.reduce((m, r) => Math.max(m, r.worstCvss), 0);
-  const totalRisk = Math.round(rows.reduce((s, r) => s + r.risk, 0));
+
   // Risk numbers read red; inventory counts stay neutral, so the eye lands on
   // the thing that needs a decision.
-  const cvssCount = rows.filter(r => r.worstCvss >= 9).length;
+  // The state filter is resolved first: the KPIs describe whichever population
+  // is selected, so a headline count never includes hosts the list is hiding.
+  const stateCounts = {};
+  for (const r of rows) stateCounts[r.asset.state] = (stateCounts[r.asset.state] || 0) + 1;
+  const yoursCount = rows.filter(r => matchesState(r.asset.state, 'yours')).length;
+  const sel = $('#asset-state'), keep = sel.value;
+  sel.innerHTML =
+    `<option value="confirmed">confirmed (${stateCounts.confirmed || 0})</option>` +
+    `<option value="yours">yours — confirmed + candidates (${yoursCount})</option>` +
+    `<option value="all">all states (${rows.length})</option>` +
+    Object.keys(STATE_INFO).filter(st => st !== 'confirmed' && stateCounts[st])
+      .map(st => `<option value="${st}">${st} (${stateCounts[st]})</option>`).join('');
+  sel.value = [...sel.options].some(o => o.value === keep) && keep ? keep : 'confirmed';
+
+  $('#state-legend').innerHTML = Object.entries(STATE_INFO)
+    .map(([st, desc]) => `<div><span class="badge p-none">${esc(st)}</span> ${esc(desc)}
+      ${stateCounts[st] ? `<span class="evidence">— ${stateCounts[st]} here</span>` : ''}</div>`).join('');
+
+  const stateRows = rows.filter(r => matchesState(r.asset.state, sel.value));
+  const cvssCount = stateRows.filter(r => r.worstCvss >= 9).length;
+  const withFindings = stateRows.filter(r => r.risk > 0);
+  const critical = stateRows.filter(r => riskBand(r.risk) === 'critical').length;
+  const worstCvss = stateRows.reduce((m, r) => Math.max(m, r.worstCvss), 0);
+  const totalRisk = Math.round(stateRows.reduce((s, r) => s + r.risk, 0));
   $('#asset-tiles').innerHTML = [
-    ['Assets', rows.length, merge ? 'pages merged into hosts' : 'every EASM entity', '', 'all'],
+    ['Assets', stateRows.length, merge ? 'pages merged into hosts' : 'every EASM entity', '', 'all'],
     ['With findings', withFindings.length, 'carry at least one observation', '', 'findings'],
     ['Critical', critical, 'assets in the critical band', critical ? 'risk' : '', 'critical'],
     ['Worst CVSS', worstCvss || '—', `${cvssCount} asset${cvssCount === 1 ? '' : 's'} at CVSS 9+`,
@@ -1092,35 +1211,20 @@ function renderAssets() {
     };
   });
 
-  // State filter options carry live counts, so the distribution is visible
-  // before you filter by it.
-  const stateCounts = {};
-  for (const r of rows) stateCounts[r.asset.state] = (stateCounts[r.asset.state] || 0) + 1;
-  const sel = $('#asset-state'), keep = sel.value;
-  sel.innerHTML = `<option value="all">All states (${rows.length})</option>` +
-    Object.keys(STATE_INFO).filter(st => stateCounts[st])
-      .map(st => `<option value="${st}">${st} (${stateCounts[st]})</option>`).join('');
-  sel.value = [...sel.options].some(o => o.value === keep) ? keep : 'all';
-
-  $('#state-legend').innerHTML = Object.entries(STATE_INFO)
-    .map(([st, desc]) => `<div><span class="badge p-none">${esc(st)}</span> ${esc(desc)}
-      ${stateCounts[st] ? `<span class="evidence">— ${stateCounts[st]} here</span>` : ''}</div>`).join('');
-
   const q = $('#asset-search').value.trim().toLowerCase();
-  const stateFilter = sel.value;
   const scope = $('#asset-scope').value;
-  const shown = rows.filter(r => {
+  const shown = stateRows.filter(r => {
     if (scope === 'findings' && r.risk <= 0) return false;
     if (ASSET_FOCUS === 'critical' && riskBand(r.risk) !== 'critical') return false;
     if (ASSET_FOCUS === 'cvss9' && !(r.worstCvss >= 9)) return false;
-    if (stateFilter !== 'all' && r.asset.state !== stateFilter) return false;
     if (q && !r.asset.name.toLowerCase().includes(q)
           && !r.merged.some(m => m.toLowerCase().includes(q))) return false;
     return true;
   }).slice(0, 300);
   const focusLabel = {critical: 'critical band', cvss9: 'CVSS 9+', findings: 'with findings'}[ASSET_FOCUS];
   $('#asset-note').innerHTML =
-    `${shown.length} shown of ${rows.length}` + (shown.length === 300 ? ' (capped at 300)' : '') +
+    `${shown.length} shown of ${stateRows.length}` + (shown.length === 300 ? ' (capped at 300)' : '') +
+    (sel.value !== 'all' ? ` <span class="evidence">(${rows.length - stateRows.length} hidden by state)</span>` : '') +
     (focusLabel ? ` · filtered to <b>${esc(focusLabel)}</b>
        <a href="#" id="clear-focus" style="color:var(--blue)">clear</a>` : '');
   const clear = $('#clear-focus');
@@ -1135,6 +1239,7 @@ function renderAssets() {
     // the merged list to distinct paths and drop it when there are none.
     const paths = [...new Set(r.merged.map(urlPath).filter(Boolean))];
     const ctx = assetContext(a);
+    const stored = aiResults[a.id] || {};
     const chips = [
       r.counts.cve ? `<span class="badge k-cve">${r.counts.cve} CVE</span>` : '',
       r.counts.high ? `<span class="badge p-high">${r.counts.high} high</span>` : '',
@@ -1144,6 +1249,7 @@ function renderAssets() {
       ctx.azure ? `<span class="badge src-azure" title="${esc(`${ctx.azure.name} · ${ctx.azure.rg} · ${ctx.azure.subscription}`)}">${AZURE_ICON}Azure</span>` : '',
       ctx.mde ? `<span class="badge v-approve" title="${esc(`Defender device ${ctx.mde.name}`)}">EDR</span>`
         : (ctx.mdeLoaded && ctx.ips.length ? `<span class="badge p-high" title="No Defender sensor behind ${esc(ctx.ips.join(', '))}">no EDR</span>` : ''),
+      stored.causes || stored.assess ? `<span class="badge ai-tag" title="${esc(`Reviewed by AI ${new Date((stored.causes || stored.assess).at).toLocaleString()}`)}">AI</span>` : '',
     ].join('');
     // State shows as the bare tag; the explanation is the tooltip, so the fact
     // grid stays scannable instead of carrying a paragraph per row.
@@ -1187,7 +1293,8 @@ function renderAssets() {
           <h4>${esc(theme)}</h4>
           <table><thead><tr><th>Finding</th><th>Type</th><th>Priority</th><th>CVSS</th><th>Exploit</th><th>Risk</th></tr></thead>
           <tbody>${list.map(o => `<tr>
-            <td>${findingName(o.name)}${urlPath(o.via) ? `<div class="evidence">on ${esc(urlPath(o.via))}</div>` : ''}</td>
+            <td><span class="help" title="${esc(findingHelp(o.name))}">${findingName(o.name)}</span>${
+              urlPath(o.via) ? `<div class="evidence">on ${esc(urlPath(o.via))}</div>` : ''}</td>
             <td><span class="badge k-${esc(o.kind)}">${esc(o.kind)}</span></td>
             <td><span class="badge p-${esc(o.priority)}">${esc(o.priority)}</span></td>
             <td>${o.cvssScoreV3 || o.cvssScoreV2 || '—'}</td>
@@ -1195,9 +1302,11 @@ function renderAssets() {
             <td>${o.risk.toFixed(1)}</td></tr>`).join('')}</tbody></table>`).join('')
           : '<p class="note">No open observations on this asset.</p>'}
         <div class="toolbar" style="margin:4px 0 0">
-          <button class="ai-asset" data-asset="${esc(a.id)}">Ask AI about this asset</button>
+          <button class="ai-asset" data-asset="${esc(a.id)}" ${aiOn ? '' : 'disabled title="Configure a provider under AI settings"'}>Ask AI about this asset</button>
+          <button class="ai-causes" data-asset="${esc(a.id)}" ${aiOn && r.observations.length > 1 ? '' : 'disabled title="Needs an AI provider and more than one finding"'}>Find root causes</button>
           <span class="note ai-asset-out" style="margin:0"></span>
         </div>
+        <div class="ai-causes-out"></div>
       </div>
     </div>`;
   }).join('') || '<div class="note">No assets match this filter.</div>';
@@ -1206,7 +1315,32 @@ function renderAssets() {
     h.onclick = () => h.parentElement.classList.toggle('open'));
   $('#asset-list').querySelectorAll('.ai-asset').forEach(b =>
     b.onclick = ev => adviseAsset(ev.target, rows.find(r => r.asset.id === b.dataset.asset)));
+  $('#asset-list').querySelectorAll('.ai-causes').forEach(b =>
+    b.onclick = ev => clusterAsset(ev.target, rows.find(r => r.asset.id === b.dataset.asset)));
+  // Re-render whatever the model said last time, so reopening a row costs nothing.
+  $('#asset-list').querySelectorAll('.card').forEach(card => {
+    const prev = aiResults[card.dataset.asset];
+    const row = rows.find(r => r.asset.id === card.dataset.asset);
+    if (prev && prev.causes && row)
+      renderClusters(card.querySelector('.ai-causes-out'), scoreClusters(prev.causes.result, row), row);
+  });
 }
+
+const CAUSE_PROMPT = `You are a senior vulnerability analyst. You are given one internet-facing asset and every open finding on it.
+
+Group the findings by ROOT CAUSE — the single underlying change that would close them together. A page of CVEs is usually a handful of causes: one out-of-date component, one expired certificate, one exposed service, one missing header set. Reporting 19 findings when there are 3 real causes is what makes remediation feel impossible.
+
+Use the asset's detected technology to name the cause concretely. If the findings point at a component and version, say which one and what to upgrade to. Where the evidence does not tell you the cause, say so rather than inventing one — put those findings in "unclustered".
+
+For each root cause give:
+- cause: the underlying problem, specific to this asset ("Angular 19.2.14 is several minor versions behind").
+- fix: the single change that resolves it, named concretely (a version, a config change, a port to close).
+- closes: the finding names it resolves, copied EXACTLY as given so they can be matched.
+- effort: hours | days | weeks.
+- confidence: 0.0-1.0, your actual certainty that this grouping is right.
+
+Order by how many findings each closes. Reply with JSON only:
+{"root_causes":[{"cause":"","fix":"","closes":[""],"effort":"","confidence":0.0}],"unclustered":[""],"note":""}`;
 
 const ASSET_PROMPT = `You are a senior external-attack-surface analyst. You are given one internet-facing asset from Microsoft Defender EASM, with everything known about it.
 
@@ -1218,6 +1352,75 @@ Return JSON only:
  "biggest_risk":"the single finding or combination that matters most here, and why",
  "actions":["2-4 concrete next steps, most urgent first"],
  "questions":["0-3 things to check that the evidence does not answer"]}`;
+
+
+/** Attach each cluster to the findings it claims, and price it from our own
+ *  risk numbers. The model groups; the arithmetic stays ours. */
+function scoreClusters(result, row) {
+  const byName = new Map(row.observations.map(o => [o.name.toLowerCase().trim(), o]));
+  const claimed = new Set();
+  const causes = (result.root_causes || []).map(c => {
+    const matched = (c.closes || []).map(n => byName.get(String(n).toLowerCase().trim())).filter(Boolean);
+    matched.forEach(o => claimed.add(o.name));
+    return Object.assign({}, c, {
+      matched,
+      risk: +matched.reduce((sum, o) => sum + o.risk, 0).toFixed(1),
+    });
+  }).filter(c => c.matched.length)
+    .sort((a, b) => b.risk - a.risk);
+  const leftover = row.observations.filter(o => !claimed.has(o.name));
+  return {causes, leftover, note: result.note || ''};
+}
+
+function renderClusters(container, scored, row) {
+  const total = row.observations.reduce((s, o) => s + o.risk, 0) || 1;
+  container.innerHTML = `
+    <div class="ai-block">
+      <div class="ai-head"><span class="badge ai-tag">AI</span>
+        <b>${scored.causes.length} root cause${scored.causes.length === 1 ? '' : 's'} behind
+        ${row.observations.length} finding${row.observations.length === 1 ? '' : 's'}</b></div>
+      ${scored.causes.map(c => `
+        <div class="cause">
+          <div class="cause-h">
+            <span class="badge p-${c.risk / total > 0.4 ? 'high' : c.risk / total > 0.15 ? 'medium' : 'low'}">
+              closes ${c.matched.length}</span>
+            <b>${esc(c.cause)}</b>
+            <span class="metric"><b>${Math.round(c.risk)}</b><small>risk removed</small></span>
+          </div>
+          <p><b>Fix:</b> ${esc(c.fix)} <span class="evidence">· ${esc(c.effort || '')}
+            · confidence ${Number(c.confidence || 0).toFixed(1)}</span></p>
+          <div class="evidence">${c.matched.map(o => esc(o.name)).join(' · ')}</div>
+        </div>`).join('')}
+      ${scored.leftover.length ? `<div class="cause"><div class="cause-h">
+        <span class="badge p-none">unclustered ${scored.leftover.length}</span>
+        <b>No shared cause identified</b></div>
+        <div class="evidence">${scored.leftover.map(o => esc(o.name)).join(' · ')}</div></div>` : ''}
+      ${scored.note ? `<p class="evidence">${esc(scored.note)}</p>` : ''}
+    </div>`;
+}
+
+async function clusterAsset(button, row) {
+  const out = button.closest('.detail').querySelector('.ai-causes-out');
+  button.disabled = true; button.textContent = 'Grouping…';
+  try {
+    const a = row.asset, e = a.evidence || {};
+    const user = [
+      `Asset: ${a.name}`, `Kind: ${a.kind}   EASM state: ${a.state}`,
+      (e.web_components || []).length ? `Detected technology: ${e.web_components.join(', ')}` : '',
+      e.cert_subject ? `Certificate: ${e.cert_subject}` : '',
+      `Organization: ${orgContext()}`,
+      '', `Open findings (${row.observations.length}):`,
+      ...row.observations.map(o =>
+        `- ${o.name} [${o.kind}, ${o.priority}${o.cvssScoreV3 ? `, CVSS ${o.cvssScoreV3}` : ''}, ${o.owasp}]`),
+    ].filter(Boolean).join('\n');
+    const result = await askAI(CAUSE_PROMPT, user, 8000);
+    const scored = scoreClusters(result, row);
+    saveAiResult(row.asset.id, 'causes', {result});
+    renderClusters(out, scored, row);
+    renderAssets();          // the row gains its "AI" marker
+  } catch (err) { out.innerHTML = `<span class="err">${esc(err.message)}</span>`; }
+  finally { button.disabled = false; button.textContent = 'Find root causes'; }
+}
 
 async function adviseAsset(button, row) {
   const out = button.parentElement.querySelector('.ai-asset-out');
@@ -1238,9 +1441,11 @@ async function adviseAsset(button, row) {
         `- ${o.name} [${o.kind}, ${o.priority}${o.cvssScoreV3 ? `, CVSS ${o.cvssScoreV3}` : ''}, ${o.owasp}]`),
     ].filter(Boolean).join('\n');
     const r = await askAI(ASSET_PROMPT, user, 4000);
+    saveAiResult(row.asset.id, 'assess', {result: r});
     out.innerHTML = `
-      <div style="margin-top:8px;color:var(--text)">
-        <span class="badge p-${esc(r.priority)}">${esc(r.priority)}</span>
+      <div class="ai-block" style="margin-top:8px;color:var(--text)">
+        <div class="ai-head"><span class="badge ai-tag">AI</span>
+          <span class="badge p-${esc(r.priority)}">${esc(r.priority)}</span></div>
         <p style="margin:6px 0">${esc(r.summary)}</p>
         <h4>Biggest risk</h4><p style="margin:0 0 8px">${esc(r.biggest_risk)}</p>
         <h4>Next steps</h4><ol style="margin:0 0 8px;padding-left:18px">${
@@ -1363,6 +1568,11 @@ const AI_HINTS = {
 };
 function renderAiSettings() {
   const cfg = aiCfg(), meta = AI_HINTS[cfg.provider] || AI_HINTS.azure_openai;
+  const on = aiEnabled();
+  const label = cfg.provider === 'claude' ? 'Claude' : 'Azure OpenAI';
+  $('#ai-status').innerHTML = on
+    ? `<span class="badge ai-tag" title="AI features enabled — ${esc(label)}">AI · ${esc(label)}</span>`
+    : `<span class="badge p-none" title="No AI provider configured — set one under AI settings on the Assets tab">AI off</span>`;
   $('#ai-provider').value = cfg.provider;
   $('#ai-label').textContent = meta.label;
   $('#ai-value').placeholder = meta.placeholder;
