@@ -144,6 +144,8 @@
   .conv{width:100%;max-width:560px;height:auto;margin:2px 0 8px;overflow:visible}
   .conv-name{fill:var(--muted);font-size:11px;font-family:inherit}
   .conv-self{fill:var(--text);font-weight:700}
+  .conv-related{fill:var(--dim)}
+  .conv-line.conv-related{stroke-opacity:.32;stroke-dasharray:2 6}
   .conv-ip{fill:var(--blue);font-size:11px;font-family:ui-monospace,monospace}
   .conv-dot{fill:var(--blue)}
   .conv-line{fill:none;stroke:var(--blue);stroke-width:1.4;stroke-opacity:.75;
@@ -703,7 +705,11 @@ function groupByMachine(rows) {
       produced.forEach((row, i) => {
         row.relatedNames = produced.filter((_, j) => j !== i)
           .flatMap(other => [other.asset.name, ...(other.siblings || [])]);
-        row.relatedReason = envGroupsDiffer(produced) ? 'environment' : 'vhost';
+        // The split can be environment, site, or both across a larger group; say
+        // which rather than picking one and being wrong about the rest.
+        const envDiffers = new Set(produced.map(x => envTokens(x.asset.name))).size > 1;
+        const appDiffers = new Set(produced.map(x => appFingerprint(x.asset))).size > 1;
+        row.relatedReason = envDiffers && appDiffers ? 'both' : envDiffers ? 'environment' : 'vhost';
         row.relatedIps = sharedIps;
       });
     }
@@ -1422,18 +1428,23 @@ function matchesState(state, filter) {
   return state === filter;
 }
 
-/** Draw the names converging on the address they share. Grouping is the one
- *  place the tool restructures what EASM reported, so it should show its
- *  reasoning rather than assert it — the flow runs toward the IP because that is
- *  the thing actually exposed. */
-function convergenceSvg(names, ips, self) {
-  const rowH = 24, h = names.length * rowH + 16, mid = h / 2;
-  return `<svg class="conv" viewBox="0 0 560 ${h}" preserveAspectRatio="xMinYMid meet"
-       role="img" aria-label="${esc(names.join(', '))} resolve to ${esc(ips.join(', '))}">
-    ${names.map((n, i) => {
+/** Draw every name that shares this address, in one picture.
+ *
+ *  A row can be both merged and related — ftp. and mail. are one site, and nine
+ *  other names sit on the same box — and drawing those as two diagrams made the
+ *  second a superset of the first. One diagram: the names this row covers are
+ *  drawn solid, the ones deliberately kept on their own rows are dimmed, and the
+ *  row's own name is bold.
+ */
+function convergenceSvg(entries, ips, self) {
+  const rowH = 22, h = entries.length * rowH + 16, mid = h / 2;
+  return `<svg class="conv" viewBox="0 0 560 ${h}" preserveAspectRatio="xMinYMid meet" role="img"
+       aria-label="${esc(entries.map(e => e.name).join(', '))} resolve to ${esc(ips.join(', '))}">
+    ${entries.map((e, i) => {
       const y = 14 + i * rowH;
-      return `<text x="0" y="${y + 4}" class="conv-name${self && n === self ? ' conv-self' : ''}">${esc(n)}</text>
-        <path class="conv-line" style="animation-delay:${(i * 0.15).toFixed(2)}s"
+      const cls = e.related ? ' conv-related' : '';
+      return `<text x="0" y="${y + 4}" class="conv-name${cls}${e.name === self ? ' conv-self' : ''}">${esc(e.name)}</text>
+        <path class="conv-line${cls}" style="animation-delay:${(i * 0.12).toFixed(2)}s"
               d="M232 ${y} C 300 ${y}, 300 ${mid}, 360 ${mid}"/>`;
     }).join('')}
     <circle class="conv-dot" cx="366" cy="${mid}" r="4"/>
@@ -1597,16 +1608,26 @@ function renderAssets() {
       <div class="detail">
         <div class="facts">${facts.map(([k, v, html]) =>
           `<div><span>${esc(k)}</span>${html || esc(v)}</div>`).join('')}</div>
-        ${(r.siblings || []).length && r.groupedBy === 'ip' && (r.sharedIps || []).length
-          ? convergenceSvg([a.name, ...r.siblings], r.sharedIps) : ''}
+        ${(() => {
+          const mine = [a.name, ...(r.siblings || [])].map(n => ({name: n, related: false}));
+          const others = (r.relatedNames || []).map(n => ({name: n, related: true}));
+          const showMerged = (r.siblings || []).length && r.groupedBy === 'ip' && (r.sharedIps || []).length;
+          if (!others.length) return showMerged ? convergenceSvg(mine, r.sharedIps, a.name) : '';
+          const ips = (r.relatedIps || []).length ? r.relatedIps
+                    : (r.sharedIps || []).length ? r.sharedIps : ['same platform'];
+          return convergenceSvg([...mine, ...others], ips, a.name);
+        })()}
         ${(r.relatedNames || []).length ? `
-          ${convergenceSvg([a.name, ...(r.siblings || []), ...r.relatedNames],
-                           (r.relatedIps || []).length ? r.relatedIps : ['same platform'], a.name)}
           <p class="note" style="margin:0 0 10px">Related to ${esc(r.relatedNames.join(', '))}: ${
             r.relatedReason === 'environment'
               ? `the same machine, kept on separate rows because the environment differs — a
                  development host and its production twin carry the same findings but are not the
                  same problem to sign off.`
+              : r.relatedReason === 'both'
+              ? `the same machine, kept on separate rows because these names differ by environment
+                 and by the site they serve. Infrastructure findings — open ports, TLS, server
+                 version — apply to all of them; anything about a site belongs to the name it was
+                 seen on.`
               : r.relatedReason === 'vhost'
               ? `the same machine serving a different site. One address can host many sites, chosen
                  by the Host header, so infrastructure findings — open ports, TLS, server version —
