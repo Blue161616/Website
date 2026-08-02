@@ -142,7 +142,8 @@
   .cause-h b{flex:1;min-width:0}
   .cause p{margin:4px 0}
   .conv{width:100%;max-width:560px;height:auto;margin:2px 0 8px;overflow:visible}
-  .conv-name{fill:var(--text);font-size:11px;font-family:inherit}
+  .conv-name{fill:var(--muted);font-size:11px;font-family:inherit}
+  .conv-self{fill:var(--text);font-weight:700}
   .conv-ip{fill:var(--blue);font-size:11px;font-family:ui-monospace,monospace}
   .conv-dot{fill:var(--blue)}
   .conv-line{fill:none;stroke:var(--blue);stroke-width:1.4;stroke-opacity:.75;
@@ -588,6 +589,20 @@ function envTokens(name) {
 }
 const sameEnvironment = (a, b) => envTokens(a) === envTokens(b);
 
+// One address can serve many sites — name-based virtual hosting, where the web
+// server picks the site from the Host header. rubicon.nl serves the corporate
+// site and ftp.rubicon.nl serves the hoster's VPS placeholder from the same box.
+// So a shared IP means shared infrastructure (ports, TLS, server version), not a
+// shared application: names whose detected stack differs are different sites and
+// keep their own rows, linked as related rather than merged.
+function appFingerprint(asset) {
+  const parts = [...((asset.evidence || {}).web_components || [])]
+    .map(c => String(c).replace(/\s*:\d+$/, '').toLowerCase().trim())
+    .filter(Boolean)
+    .sort();
+  return parts.join('|');
+}
+
 /** Collapse names that are the same machine.
  *
  *  The exposure is the host, not the label pointing at it. ftp.rubicon.nl and
@@ -606,7 +621,14 @@ const sameEnvironment = (a, b) => envTokens(a) === envTokens(b);
 const FINGERPRINT_MIN = 2;
 
 function mergeMembers(members) {
-  const primary = members.reduce((a, b) => (b.risk > a.risk ? b : a));
+  // Among equally risky members, pick the name a person would call the platform:
+  // the shortest one, which is the apex rather than an arbitrary subdomain.
+  const primary = members.reduce((a, b) => {
+    if (b.risk !== a.risk) return b.risk > a.risk ? b : a;
+    const an = a.asset.name || '', bn = b.asset.name || '';
+    if (an.length !== bn.length) return bn.length < an.length ? b : a;
+    return bn.localeCompare(an) < 0 ? b : a;
+  });
   const seen = new Set();
   const observations = [];
   for (const m of members) {
@@ -635,6 +657,11 @@ function mergeMembers(members) {
   });
 }
 
+/** Did the split happen because environments differ, or because the sites do? */
+function envGroupsDiffer(rows) {
+  return new Set(rows.map(r => envTokens(r.asset.name))).size > 1;
+}
+
 function groupByMachine(rows) {
   const ungrouped = [];
   const machines = [];
@@ -660,21 +687,39 @@ function groupByMachine(rows) {
     }
   }
   for (const members of ipGroups) {
-    // Even one machine can serve two environments; keep those apart.
-    const byEnv = new Map();
+    // Split a machine by environment and by application. Two names on one box
+    // are only the same thing to fix when they run the same site — and a dev
+    // twin is never the same thing to sign off.
+    const byFacet = new Map();
     for (const m of members) {
-      const k = envTokens(m.asset.name);
-      if (!byEnv.has(k)) byEnv.set(k, []);
-      byEnv.get(k).push(m);
+      const k = envTokens(m.asset.name) + '||' + appFingerprint(m.asset);
+      if (!byFacet.has(k)) byFacet.set(k, []);
+      byFacet.get(k).push(m);
     }
-    for (const group of byEnv.values())
-      group.length > 1 ? machines.push(mergeMembers(group)) : ungrouped.push(group[0]);
+    const produced = [...byFacet.values()].map(group =>
+      group.length > 1 ? mergeMembers(group) : Object.assign({}, group[0]));
+    if (produced.length > 1) {
+      const sharedIps = [...new Set(members.flatMap(m => assetIps(m.asset)))];
+      produced.forEach((row, i) => {
+        row.relatedNames = produced.filter((_, j) => j !== i)
+          .flatMap(other => [other.asset.name, ...(other.siblings || [])]);
+        row.relatedReason = envGroupsDiffer(produced) ? 'environment' : 'vhost';
+        row.relatedIps = sharedIps;
+      });
+    }
+    produced.forEach(row => (row.siblings || []).length ? machines.push(row) : ungrouped.push(row));
   }
 
   // 2. Identical findings, for names whose IPs differ or were never resolved.
   //    mail. and ftp. sit on one hosting platform with an address each.
   const byFingerprint = new Map();
+  const sharedInfra = new Map();          // fingerprint -> rows on PaaS/CDN
   for (const r of ungrouped) {
+    if (onSharedInfra(r.asset) && r.observations.length >= FINGERPRINT_MIN) {
+      const fp = r.observations.map(o => o.name).sort().join('|');
+      if (!sharedInfra.has(fp)) sharedInfra.set(fp, []);
+      sharedInfra.get(fp).push(r);
+    }
     if (r.observations.length < FINGERPRINT_MIN || onSharedInfra(r.asset)) { machines.push(r); continue; }
     const fp = envTokens(r.asset.name) + '||' + r.observations.map(o => o.name).sort().join('|');
     const bucket = byFingerprint.get(fp);
@@ -684,6 +729,17 @@ function groupByMachine(rows) {
     machines.push(members.length > 1
       ? Object.assign(mergeMembers(members), {groupedBy: 'findings'})
       : members[0]);
+
+  // Names on the same hosted platform run the same build, so identical findings
+  // are expected rather than evidence of one machine. Link them without merging.
+  for (const peers of sharedInfra.values()) {
+    if (peers.length < 2) continue;
+    for (const r of peers) {
+      r.relatedNames = peers.filter(o => o !== r).map(o => o.asset.name);
+      r.relatedReason = 'platform';
+      r.relatedIps = [...new Set(peers.flatMap(o => assetIps(o.asset)))];
+    }
+  }
 
   return machines.sort((x, y) => y.risk - x.risk || y.counts.high - x.counts.high
                                  || x.asset.name.localeCompare(y.asset.name));
@@ -1370,13 +1426,13 @@ function matchesState(state, filter) {
  *  place the tool restructures what EASM reported, so it should show its
  *  reasoning rather than assert it — the flow runs toward the IP because that is
  *  the thing actually exposed. */
-function convergenceSvg(names, ips) {
+function convergenceSvg(names, ips, self) {
   const rowH = 24, h = names.length * rowH + 16, mid = h / 2;
   return `<svg class="conv" viewBox="0 0 560 ${h}" preserveAspectRatio="xMinYMid meet"
        role="img" aria-label="${esc(names.join(', '))} resolve to ${esc(ips.join(', '))}">
     ${names.map((n, i) => {
       const y = 14 + i * rowH;
-      return `<text x="0" y="${y + 4}" class="conv-name">${esc(n)}</text>
+      return `<text x="0" y="${y + 4}" class="conv-name${self && n === self ? ' conv-self' : ''}">${esc(n)}</text>
         <path class="conv-line" style="animation-delay:${(i * 0.15).toFixed(2)}s"
               d="M232 ${y} C 300 ${y}, 300 ${mid}, 360 ${mid}"/>`;
     }).join('')}
@@ -1494,6 +1550,7 @@ function renderAssets() {
       ctx.mde ? `<span class="badge v-approve" title="${esc(`Defender device ${ctx.mde.name}`)}">EDR</span>`
         : (ctx.mdeLoaded && ctx.ips.length ? `<span class="badge p-high" title="No Defender sensor behind ${esc(ctx.ips.join(', '))}">no EDR</span>` : ''),
       (r.siblings || []).length ? `<span class="badge p-none help" title="${esc(`${[a.name, ...r.siblings].join(', ')} — ${r.groupedBy === 'ip' ? `one machine on ${(r.sharedIps || []).join(', ')}` : 'identical findings, no IP resolved'}`)}">${r.siblings.length + 1} names</span>` : '',
+      (r.relatedNames || []).length ? `<span class="badge k-cve help" title="${esc(`Same ${r.relatedReason === 'environment' ? 'machine' : 'hosted platform'} as ${r.relatedNames.join(', ')} — kept separate ${r.relatedReason === 'environment' ? 'because the environment differs' : 'because a shared platform address does not identify a host'}`)}">related</span>` : '',
       svc.warning ? `<span class="badge p-medium help" title="${esc(svc.warning)}">web only</span>` : '',
       stored.causes || stored.assess ? `<span class="badge ai-tag" title="${esc(`Reviewed by AI ${new Date((stored.causes || stored.assess).at).toLocaleString()}`)}">AI</span>` : '',
     ].join('');
@@ -1542,11 +1599,29 @@ function renderAssets() {
           `<div><span>${esc(k)}</span>${html || esc(v)}</div>`).join('')}</div>
         ${(r.siblings || []).length && r.groupedBy === 'ip' && (r.sharedIps || []).length
           ? convergenceSvg([a.name, ...r.siblings], r.sharedIps) : ''}
+        ${(r.relatedNames || []).length ? `
+          ${convergenceSvg([a.name, ...(r.siblings || []), ...r.relatedNames],
+                           (r.relatedIps || []).length ? r.relatedIps : ['same platform'], a.name)}
+          <p class="note" style="margin:0 0 10px">Related to ${esc(r.relatedNames.join(', '))}: ${
+            r.relatedReason === 'environment'
+              ? `the same machine, kept on separate rows because the environment differs — a
+                 development host and its production twin carry the same findings but are not the
+                 same problem to sign off.`
+              : r.relatedReason === 'vhost'
+              ? `the same machine serving a different site. One address can host many sites, chosen
+                 by the Host header, so infrastructure findings — open ports, TLS, server version —
+                 apply to all of these names, while anything about the site itself belongs only to
+                 the name it was seen on.`
+              : `the same hosted platform, so identical findings are expected. Its addresses are a
+                 shared pool rather than a machine, so they are not merged.`}</p>` : ''}
         ${(r.siblings || []).length ? `<p class="note" style="margin:0 0 10px">
           ${esc([a.name, ...r.siblings].join(', '))} ${r.groupedBy === 'ip'
-            ? `all resolve to ${esc((r.sharedIps || []).join(', '))} — one machine answering on
-               ${r.siblings.length + 1} names. The exposure is the host, not the labels, so the
-               findings below are its combined set and the risk is counted once.`
+            ? `all resolve to ${esc((r.sharedIps || []).join(', '))} — ${(r.sharedIps || []).length > 1
+                ? `one platform behind ${(r.sharedIps || []).length} addresses, answering on`
+                : 'one machine answering on'} ${r.siblings.length + 1} names. The exposure is the
+               host, not the labels, so the findings below are its combined set and the risk is
+               counted once. One address can serve different sites per name, so infrastructure
+               findings apply to all of them while site-level findings may belong to one.`
             : `carry an identical set of findings, so this is one platform rather than
                ${r.siblings.length + 1} problems — EASM never resolved an IP for them, so this is
                inferred from the findings rather than from the address.`}${(e.cnames || []).length
