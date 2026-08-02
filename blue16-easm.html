@@ -73,6 +73,9 @@
   .p-none{background:rgba(139,148,158,.16);color:var(--muted)}
   .k-cve{background:rgba(188,140,255,.14);color:var(--purple)}
   .k-insight{background:rgba(139,148,158,.16);color:var(--muted)}
+  .src-azure{background:rgba(0,120,212,.15);color:#4fb3ff}
+  .src-defender{background:rgba(88,166,255,.14);color:var(--blue)}
+  .badge .ico{width:11px;height:11px;vertical-align:-1px;margin-right:4px}
   .v-approve{background:rgba(63,185,80,.16);color:var(--green)}
   .v-dismiss{background:rgba(248,81,73,.16);color:var(--red)}
   .v-needs_human{background:rgba(210,153,34,.16);color:var(--gold)}
@@ -98,6 +101,8 @@
   .warn{color:var(--gold)} .err{color:var(--red)}
   .evidence{color:var(--muted);font-size:11px}
   code{background:var(--bg);padding:1px 5px;border-radius:3px;color:var(--blue);font-size:11px}
+  td a{color:var(--blue);text-decoration:none}
+  td a:hover{text-decoration:underline}
   .toolbar{display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap}
   #gate{position:fixed;inset:0;z-index:999;background:#0d1117;display:flex;flex-direction:column;
         align-items:center;justify-content:center;gap:18px;text-align:center;padding:24px}
@@ -119,12 +124,19 @@
   .loadbar{height:4px;background:var(--bg3);border-radius:2px;margin-top:8px;width:min(420px,60vw)}
   .loadbar i{display:block;height:100%;background:var(--blue);border-radius:2px;width:0;
              transition:width .2s ease}
+  .tile.clickable{cursor:pointer;transition:border-color .15s}
+  .tile.clickable:hover{border-color:var(--blue)}
+  .tile.on{border-color:var(--blue);box-shadow:inset 0 0 0 1px var(--blue)}
   .tile.risk .n{color:var(--red)}
   .tile.warnkpi .n{color:var(--gold)}
+  .covhead{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
+           padding:10px 12px;margin-bottom:12px;font-size:12px;color:var(--muted);line-height:1.7}
   .facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:2px 16px;
          margin-bottom:12px}
   .facts div{font-size:11px;color:var(--text);padding:2px 0}
   .facts span{display:inline-block;min-width:110px;color:var(--muted)}
+  .facts .badge{min-width:0;color:inherit}
+  .help{cursor:help;border-bottom:1px dotted currentColor}
   /* Inline settings row, same shape as the rest of the app's controls */
   .settings{display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--bg2);
             border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:12px}
@@ -229,8 +241,23 @@
       <div class="step">
         <div class="step-h"><span class="step-n">3</span> Azure access</div>
         <p>Delegated tokens act as the signed-in user, so <b>each user</b> needs their own role
-          assignment on the <code>Microsoft.Easm/workspaces</code> resource — API permissions alone
-          grant nothing here.</p>
+          assignment — API permissions alone grant nothing here.</p>
+        <ul>
+          <li><b>Assets</b> — a role on the <code>Microsoft.Easm/workspaces</code> resource.
+            Microsoft documents <b>Contributor</b>.</li>
+          <li><b>Coverage gap, Azure side</b> — <b>Reader</b> on each subscription whose public IPs
+            should be compared. No extra API permission: Azure Service Management already covers the
+            call. A subscription you cannot read is skipped silently, which looks like a clean
+            result rather than a missing one.</li>
+        </ul>
+      </div>
+
+      <div class="step">
+        <div class="step-h"><span class="step-n">4</span> Defender devices</div>
+        <p>Nothing to grant. Defender's APIs send no CORS headers, so a browser cannot call them
+          whatever permissions the app registration holds — that is why the internet-facing device
+          list is imported on the Coverage gap tab. Whoever runs the export needs advanced-hunting
+          access in Defender; this app registration is not involved.</p>
       </div>
     </details>
   </div>
@@ -335,10 +362,15 @@
   <section id="view-coverage" class="view">
     <div class="tiles" id="cov-tiles"></div>
     <div class="settings">
-      <button class="primary" id="cov-azure">Load Azure public IPs</button>
+      <button class="primary" id="cov-azure">Reload Azure public IPs</button>
       <button id="cov-import">Import Defender devices…</button>
       <input type="file" id="cov-file" accept=".json,.csv" style="display:none"/>
       <button id="cov-clear">Clear</button>
+      <select id="cov-filter">
+        <option value="missing">Missing from EASM</option>
+        <option value="matched">Matched</option>
+        <option value="all">All owned IPs</option>
+      </select>
       <span class="note" id="cov-note" style="margin:0"></span>
     </div>
     <div class="note">Defender's internet-facing device list cannot be read from a browser — the
@@ -387,6 +419,9 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
 let msalApp = null, account = null, WORKSPACES = [], WS = null, DATA = null;
+// Which KPI tile is acting as a filter, if any. The tiles keep describing the
+// whole estate — this only narrows the list below them.
+let ASSET_FOCUS = '';
 
 // ── scoring ─────────────────────────────────────────────────────────────────
 // Deterministic and legible on purpose: the AI layer reads these numbers, it
@@ -622,7 +657,12 @@ function normalizeAsset(raw) {
     }
     return '';
   };
-  const list = (key, field) => (inner[key] || []).map(x => x && (x[field] ?? x)).filter(Boolean).slice(0, 4);
+  const list = (key, ...fields) => (inner[key] || []).map(x => {
+    if (typeof x === 'string') return x;
+    if (!x || typeof x !== 'object') return '';
+    for (const f of [...fields, 'name', 'value', 'cidr', 'ipBlock', 'host']) if (typeof x[f] === 'string') return x[f];
+    return '';
+  }).filter(Boolean).slice(0, 4);
   return {
     id: raw.id, name: raw.name || raw.displayName || '', kind: raw.kind, state: raw.state,
     labels: raw.labels || [], disco_group: raw.discoGroupName || '',
@@ -819,8 +859,8 @@ function renderCoverage() {
   const rows = [
     ...cov.azure.map(x => Object.assign({}, x, {source: 'Azure'})),
     ...cov.mde.map(x => Object.assign({}, x, {source: 'Defender'})),
-  ];
-  const missing = rows.filter(r => !known.has(r.ip));
+  ].map(r => Object.assign(r, {missing: !known.has(r.ip)}));
+  const missing = rows.filter(r => r.missing);
   const matched = rows.length - missing.length;
 
   $('#cov-tiles').innerHTML = [
@@ -836,23 +876,91 @@ function renderCoverage() {
   $('#cov-note').textContent = cov.at ? `Loaded ${new Date(cov.at).toLocaleString()}` : '';
 
   if (!rows.length) {
-    $('#coverage').innerHTML = '<div class="note">Load Azure public IPs, or import a Defender ' +
-      'internet-facing device export, to compare against EASM inventory.</div>';
+    $('#coverage').innerHTML = '<div class="note">Azure public IPs load automatically after sign-in. ' +
+      'Import a Defender internet-facing device export to compare that side too.</div>';
     return;
   }
-  $('#coverage').innerHTML = missing.length ? `
-    <table><thead><tr><th>IP</th><th>Source</th><th>Name</th><th>Where</th></tr></thead><tbody>
-    ${missing.map(r => `<tr>
-      <td style="font-family:monospace;color:var(--red)">${esc(r.ip)}</td>
-      <td><span class="badge ${r.source === 'Azure' ? 'p-medium' : 'p-low'}">${esc(r.source)}</span></td>
+
+  const mode = $('#cov-filter').value;
+  const shown = mode === 'missing' ? missing
+              : mode === 'matched' ? rows.filter(r => !r.missing) : rows;
+
+  // The table used to show only the gap, which left "no rows" ambiguous between
+  // full coverage and nothing loaded. Say what is on screen and why.
+  const heading = missing.length
+    ? `<div class="covhead"><b class="err">${missing.length} owned public IP${missing.length > 1 ? 's are' : ' is'}
+         missing from EASM inventory</b> — discovery never found ${missing.length > 1 ? 'them' : 'it'},
+         so nothing is watching ${missing.length > 1 ? 'them' : 'it'}. ${matched} of ${rows.length} matched.</div>`
+    : `<div class="covhead"><b style="color:var(--green)">Every owned public IP loaded here is in EASM
+         inventory</b> — ${matched} of ${rows.length} matched.</div>`;
+
+  $('#coverage').innerHTML = heading + (shown.length ? `
+    <table><thead><tr><th>Status</th><th>IP</th><th>Source</th><th>Name</th><th>Where</th></tr></thead><tbody>
+    ${shown.map(r => `<tr>
+      <td><span class="badge ${r.missing ? 'p-high' : 'v-approve'}">${r.missing ? 'missing' : 'matched'}</span></td>
+      <td style="font-family:monospace;color:${r.missing ? 'var(--red)' : 'var(--muted)'}">${esc(r.ip)}</td>
+      <td><span class="badge ${r.source === 'Azure' ? 'src-azure' : 'src-defender'}">${
+        r.source === 'Azure' ? AZURE_ICON : ''}${esc(r.source)}</span></td>
       <td>${esc(r.name || '—')}</td>
       <td class="evidence">${esc([r.rg, r.location, r.subscription, r.onboarding]
         .filter(Boolean).join(' · ') || '—')}</td></tr>`).join('')}
     </tbody></table>`
-    : '<div class="note">Every owned public IP loaded here is present in EASM inventory.</div>';
+    : `<div class="note">No ${esc(mode)} entries.</div>`);
+}
+
+/** Azure public IPs are cheap to fetch next to the EASM walk, so load them with
+ *  everything else instead of hiding the gap behind a button nobody presses.
+ *  Refreshed when the cache is older than an hour. */
+async function autoLoadAzure() {
+  const cov = getCoverage();
+  const age = cov.at ? Date.now() - new Date(cov.at).getTime() : Infinity;
+  if (cov.azure.length && age < 3600e3) return;
+  try {
+    const azure = await loadAzurePublicIps();
+    saveCoverage(Object.assign({}, getCoverage(), {azure, at: new Date().toISOString()}));
+    if (current === 'coverage') renderCoverage();
+  } catch (e) { /* surfaced when the user opens the tab and reloads */ }
 }
 
 // ── views ───────────────────────────────────────────────────────────────────
+// EASM's asset kinds, named the way an operator would. Without this a sslCert
+// row is a bare SHA-1 thumbprint and reads as noise rather than a certificate.
+const KIND_LABEL = {
+  host:       ['Host', 'A DNS hostname'],
+  page:       ['Web page', 'A crawled URL on a host'],
+  domain:     ['Domain', 'A registrable domain'],
+  ipAddress:  ['IP address', 'A single public IP'],
+  ipBlock:    ['IP range', 'A CIDR block'],
+  as:         ['ASN', 'An autonomous system number'],
+  sslCert:    ['TLS certificate', 'A certificate seen on your estate — the name is its thumbprint'],
+  contact:    ['WHOIS contact', 'A registrant contact record'],
+};
+
+// Stylised Azure mark. Flat fills and no <defs>, so it can be inlined many
+// times without id collisions.
+const AZURE_ICON = `<svg class="ico" viewBox="0 0 20 20" aria-hidden="true">
+  <path fill="#0f6cbd" d="M7.6 2.2h4.2L7.3 15.4c-.1.3-.4.5-.7.5H2.9c-.4 0-.7-.4-.6-.8L6.9 2.7c.1-.3.4-.5.7-.5z"/>
+  <path fill="#50e6ff" d="M11.8 2.2h-2l4.7 13.2c.1.4-.2.8-.6.8h4.6c.4 0 .7-.4.6-.8L12.5 2.7c-.1-.3-.4-.5-.7-.5z"/>
+  <path fill="#0f6cbd" d="M9.6 9.6 6.3 16h7.6l-1.6-4.4H9z"/>
+</svg>`;
+
+/** Path portion of a page URL, empty when it is just the host root. */
+function urlPath(u) {
+  const rest = String(u || '').replace(/^https?:\/\//i, '');
+  const slash = rest.indexOf('/');
+  return slash === -1 ? '' : rest.slice(slash).replace(/\/+$/, '');
+}
+
+/** Findings named for a CVE link out to NVD. The id is re-extracted rather than
+ *  trusted from the name, so only a well-formed CVE ever reaches the href. */
+function findingName(name) {
+  const m = String(name || '').match(/CVE-\d{4}-\d{4,}/i);
+  if (!m) return esc(name);
+  const id = m[0].toUpperCase();
+  return `<a href="https://nvd.nist.gov/vuln/detail/${id}" target="_blank" rel="noopener noreferrer"
+             title="Open ${id} on NVD">${esc(name)}</a>`;
+}
+
 function riskBand(risk) {
   if (risk >= 40) return 'critical';
   if (risk >= 15) return 'high';
@@ -869,15 +977,34 @@ function renderAssets() {
   const totalRisk = Math.round(rows.reduce((s, r) => s + r.risk, 0));
   // Risk numbers read red; inventory counts stay neutral, so the eye lands on
   // the thing that needs a decision.
+  const cvssCount = rows.filter(r => r.worstCvss >= 9).length;
   $('#asset-tiles').innerHTML = [
-    ['Assets', rows.length, merge ? 'pages merged into hosts' : 'every EASM entity', ''],
-    ['With findings', withFindings.length, 'carry at least one observation', ''],
-    ['Critical', critical, 'assets in the critical band', critical ? 'risk' : ''],
-    ['Worst CVSS', worstCvss || '—', 'highest on any asset', worstCvss >= 9 ? 'risk' : (worstCvss >= 7 ? 'warnkpi' : '')],
-    ['Total risk', totalRisk, 'sum over all assets', totalRisk ? 'risk' : ''],
-  ].map(([l, n, sub, cls]) => `<div class="tile ${cls}"><div class="n">${esc(n)}</div>
+    ['Assets', rows.length, merge ? 'pages merged into hosts' : 'every EASM entity', '', 'all'],
+    ['With findings', withFindings.length, 'carry at least one observation', '', 'findings'],
+    ['Critical', critical, 'assets in the critical band', critical ? 'risk' : '', 'critical'],
+    ['Worst CVSS', worstCvss || '—', `${cvssCount} asset${cvssCount === 1 ? '' : 's'} at CVSS 9+`,
+     worstCvss >= 9 ? 'risk' : (worstCvss >= 7 ? 'warnkpi' : ''), 'cvss9'],
+    ['Total risk', totalRisk, 'sum over all assets', totalRisk ? 'risk' : '', ''],
+  ].map(([l, n, sub, cls, focus]) => `<div class="tile ${cls} ${focus ? 'clickable' : ''}
+      ${focus && focus === ASSET_FOCUS ? 'on' : ''}" ${focus ? `data-focus="${focus}"` : ''}
+      ${focus ? `title="Filter the list to these"` : ''}><div class="n">${esc(n)}</div>
       <div class="l">${esc(l)}</div>
       <div class="l" style="text-transform:none;color:var(--dim)">${esc(sub)}</div></div>`).join('');
+
+  // Re-attached every render, since the tiles are rebuilt each time.
+  $('#asset-tiles').querySelectorAll('.tile.clickable').forEach(t => {
+    t.onclick = () => {
+      const f = t.dataset.focus;
+      if (f === 'all') {                       // the Assets tile is the reset
+        ASSET_FOCUS = ''; $('#asset-search').value = '';
+        $('#asset-state').value = 'all'; $('#asset-scope').value = 'everything';
+      } else {
+        ASSET_FOCUS = ASSET_FOCUS === f ? '' : f;   // click again to clear
+        if (ASSET_FOCUS) $('#asset-scope').value = 'findings';
+      }
+      renderAssets();
+    };
+  });
 
   // State filter options carry live counts, so the distribution is visible
   // before you filter by it.
@@ -898,27 +1025,44 @@ function renderAssets() {
   const scope = $('#asset-scope').value;
   const shown = rows.filter(r => {
     if (scope === 'findings' && r.risk <= 0) return false;
+    if (ASSET_FOCUS === 'critical' && riskBand(r.risk) !== 'critical') return false;
+    if (ASSET_FOCUS === 'cvss9' && !(r.worstCvss >= 9)) return false;
     if (stateFilter !== 'all' && r.asset.state !== stateFilter) return false;
     if (q && !r.asset.name.toLowerCase().includes(q)
           && !r.merged.some(m => m.toLowerCase().includes(q))) return false;
     return true;
   }).slice(0, 300);
-  $('#asset-note').textContent =
-    `${shown.length} shown of ${rows.length}` + (shown.length === 300 ? ' (capped at 300)' : '');
+  const focusLabel = {critical: 'critical band', cvss9: 'CVSS 9+', findings: 'with findings'}[ASSET_FOCUS];
+  $('#asset-note').innerHTML =
+    `${shown.length} shown of ${rows.length}` + (shown.length === 300 ? ' (capped at 300)' : '') +
+    (focusLabel ? ` · filtered to <b>${esc(focusLabel)}</b>
+       <a href="#" id="clear-focus" style="color:var(--blue)">clear</a>` : '');
+  const clear = $('#clear-focus');
+  if (clear) clear.onclick = ev => { ev.preventDefault(); ASSET_FOCUS = ''; renderAssets(); };
 
   const max = shown.length ? shown[0].risk : 1;
   $('#asset-list').innerHTML = shown.map((r, i) => {
     const a = r.asset, e = a.evidence || {};
+    // A merged page is usually just the host with a scheme — http://x/ and
+    // https://x/ for host x — which repeats what the title already says. Only
+    // a deeper path (/admin, /wp-login.php) tells you something new, so reduce
+    // the merged list to distinct paths and drop it when there are none.
+    const paths = [...new Set(r.merged.map(urlPath).filter(Boolean))];
     const chips = [
       r.counts.cve ? `<span class="badge k-cve">${r.counts.cve} CVE</span>` : '',
       r.counts.high ? `<span class="badge p-high">${r.counts.high} high</span>` : '',
       r.counts.medium ? `<span class="badge p-medium">${r.counts.medium} med</span>` : '',
       r.worstCvss ? `<span class="badge p-none">CVSS ${r.worstCvss}</span>` : '',
-      r.merged.length ? `<span class="badge p-none" title="${esc(r.merged.join(', '))}">+${r.merged.length} page${r.merged.length > 1 ? 's' : ''}</span>` : '',
+      paths.length ? `<span class="badge p-none" title="${esc(paths.join(', '))}">${paths.length} crawled path${paths.length > 1 ? 's' : ''}</span>` : '',
     ].join('');
+    // State shows as the bare tag; the explanation is the tooltip, so the fact
+    // grid stays scannable instead of carrying a paragraph per row.
     const facts = [
-      ['State', `${a.state} — ${STATE_INFO[a.state] || ''}`], ['Kind', a.kind],
-      ['Merged pages', r.merged.join(', ')],
+      ['State', a.state,
+       `<span class="badge p-none help" title="${esc(STATE_INFO[a.state] || '')}">${esc(a.state)}</span>`],
+      ['Type', a.kind,
+       `<span class="badge k-insight help" title="${esc((KIND_LABEL[a.kind] || ['', ''])[1])}">${esc((KIND_LABEL[a.kind] || [a.kind])[0])}</span>`],
+      ['Crawled paths', paths.join('  ')],
       ['Discovery group', a.disco_group],
       ['First seen', (a.first_seen || '').slice(0, 10)], ['Last seen', (a.last_seen || '').slice(0, 10)],
       ['WHOIS org', e.whois_org], ['ASN', e.asn], ['Certificate', e.cert_subject],
@@ -932,22 +1076,25 @@ function renderAssets() {
       <div class="card-head">
         <span class="rank">#${i + 1}</span>
         <span class="badge p-${riskBand(r.risk)}">${riskBand(r.risk)}</span>
-        <span class="badge p-none" title="${esc(STATE_INFO[a.state] || '')}">${esc(a.state)}</span>
-        <span class="title">${esc(a.name)}</span>
+        <span class="badge p-none help" title="${esc(STATE_INFO[a.state] || '')}">${esc(a.state)}</span>
+        <span class="badge k-insight help" title="${esc((KIND_LABEL[a.kind] || ['', ''])[1])}">${esc((KIND_LABEL[a.kind] || [a.kind])[0])}</span>
+        <span class="title">${esc(a.name)}${
+          a.kind === 'sslCert' && e.cert_subject
+            ? ` <span class="evidence">${esc(e.cert_subject)}</span>` : ''}</span>
         ${chips}
         <span class="metric"><b class="riskn">${Math.round(r.risk)}</b><small>risk</small></span>
       </div>
       <div class="bar"><i style="width:${Math.max(2, 100 * r.risk / (max || 1))}%"></i></div>
       <div class="detail">
-        <div class="facts">${facts.map(([k, v]) =>
-          `<div><span>${esc(k)}</span>${esc(v)}</div>`).join('')}</div>
+        <div class="facts">${facts.map(([k, v, html]) =>
+          `<div><span>${esc(k)}</span>${html || esc(v)}</div>`).join('')}</div>
         ${r.owasp.length ? `<h4>Weakness themes</h4><p>${r.owasp.map(o =>
           `<span class="badge p-none" style="margin-right:4px">${esc(o)}</span>`).join('')}</p>` : ''}
         ${r.observations.length ? Object.entries(byTheme).map(([theme, list]) => `
           <h4>${esc(theme)}</h4>
           <table><thead><tr><th>Finding</th><th>Type</th><th>Priority</th><th>CVSS</th><th>Risk</th></tr></thead>
           <tbody>${list.map(o => `<tr>
-            <td>${esc(o.name)}${o.via ? `<div class="evidence">via ${esc(o.via)}</div>` : ''}</td>
+            <td>${findingName(o.name)}${urlPath(o.via) ? `<div class="evidence">on ${esc(urlPath(o.via))}</div>` : ''}</td>
             <td><span class="badge k-${esc(o.kind)}">${esc(o.kind)}</span></td>
             <td><span class="badge p-${esc(o.priority)}">${esc(o.priority)}</span></td>
             <td>${o.cvssScoreV3 || o.cvssScoreV2 || '—'}</td>
@@ -1073,6 +1220,7 @@ async function start() {
   $('#ws').innerHTML = WORKSPACES.map(w => `<option value="${esc(w.key)}">${esc(w.label)}</option>`).join('');
   $('#ws-mode').textContent = 'live EASM';
   await loadCurrent();
+  autoLoadAzure();   // background; the assets view must not wait on it
 }
 
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => show(b.dataset.view));
@@ -1091,8 +1239,9 @@ $('#cov-azure').onclick = async (ev) => {
     saveCoverage(Object.assign({}, getCoverage(), {azure, at: new Date().toISOString()}));
     renderCoverage();
   } catch (e) { $('#cov-note').innerHTML = `<span class="err">${esc(e.message)}</span>`; }
-  finally { ev.target.disabled = false; ev.target.textContent = 'Load Azure public IPs'; }
+  finally { ev.target.disabled = false; ev.target.textContent = 'Reload Azure public IPs'; }
 };
+$('#cov-filter').onchange = renderCoverage;
 $('#cov-import').onclick = () => $('#cov-file').click();
 $('#cov-file').onchange = async (ev) => {
   const file = ev.target.files[0];
