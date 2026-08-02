@@ -114,6 +114,10 @@
   .loadbar{height:4px;background:var(--bg3);border-radius:2px;margin-top:8px;width:min(420px,60vw)}
   .loadbar i{display:block;height:100%;background:var(--blue);border-radius:2px;width:0;
              transition:width .2s ease}
+  .facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:2px 16px;
+         margin-bottom:12px}
+  .facts div{font-size:11px;color:var(--text);padding:2px 0}
+  .facts span{display:inline-block;min-width:110px;color:var(--muted)}
   /* Inline settings row, same shape as the rest of the app's controls */
   .settings{display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--bg2);
             border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:12px}
@@ -216,7 +220,8 @@
 </header>
 
 <nav style="display:none">
-  <button data-view="actions" class="on">Mitigation board</button>
+  <button data-view="assets" class="on">Assets</button>
+  <button data-view="actions">Fixes</button>
   <button data-view="advice">AI recommendations</button>
   <button data-view="surface">Attack surface map</button>
   <button data-view="queue">Inventory validation</button>
@@ -236,8 +241,30 @@
     </div>
   </div>
 
-  <!-- Deterministic prioritization: what to fix, ranked by risk removed -->
-  <section id="view-actions" class="view on">
+  <!-- Asset-first: EASM's inventory is assets, and triage starts from "what is
+       this host and how bad is it", not from a CVE looking for victims. -->
+  <section id="view-assets" class="view on">
+    <div class="tiles" id="asset-tiles"></div>
+    <div class="settings">
+      <label for="asset-search">Filter</label>
+      <input id="asset-search" placeholder="hostname, IP, certificate…" autocomplete="off"/>
+      <select id="asset-state">
+        <option value="all">All states</option>
+        <option value="confirmed">Confirmed only</option>
+        <option value="unresolved">Unresolved only</option>
+      </select>
+      <select id="asset-scope">
+        <option value="findings">With findings</option>
+        <option value="everything">Every asset</option>
+      </select>
+      <span class="note" id="asset-note" style="margin:0"></span>
+    </div>
+    <div id="asset-list"></div>
+  </section>
+
+  <!-- Finding-first: the same data grouped the other way, because "one patch,
+       twelve hosts" is the question a remediation owner asks. -->
+  <section id="view-actions" class="view">
     <div class="tiles" id="action-tiles"></div>
     <div id="action-list"></div>
   </section>
@@ -371,6 +398,63 @@ function buildActions(assets, obsByAsset, limit = 40) {
           totals: {total_risk: +totalRisk.toFixed(2), action_count: actions.length,
                    priority_counts: counts}};
 }
+// ── OWASP Top 10 (2021) categorisation ──────────────────────────────────────
+// EASM does not return a category on an observation — its portal builds the
+// OWASP dashboard from workspace-level report metrics, which say nothing about
+// an individual asset. So we derive it here by matching the observation name.
+// Keyword matching, not an authoritative mapping: good enough to group a host's
+// weaknesses into themes, not a compliance artefact.
+const OWASP = [
+  [/broken access|unauthenticated|exposed admin|open (bucket|storage)|idor/i,
+   'A01 Broken Access Control'],
+  [/ssl|tls|cipher|certificate|hsts|https|encrypt|weak (key|hash)|sha-?1|md5/i,
+   'A02 Cryptographic Failures'],
+  [/injection|xss|cross-site scripting|sqli|sql inject|command inject|traversal/i,
+   'A03 Injection'],
+  [/mfa|multi-?factor|password|credential|login|authentication|session|token leak/i,
+   'A07 Identification and Authentication Failures'],
+  [/deprecated|outdated|end.of.life|unsupported|legacy version/i,
+   'A06 Vulnerable and Outdated Components'],
+  [/debug|stack trace|banner|version disclos|default (page|config)|misconfig|cors|directory (index|listing)|exposed to the internet|(rdp|ssh|telnet|ftp|smb|vnc|rpc)|exposed (port|service|database)|header/i,
+   'A05 Security Misconfiguration'],
+  [/logging|monitor|audit/i, 'A09 Security Logging and Monitoring Failures'],
+  [/ssrf|server.side request/i, 'A10 Server-Side Request Forgery'],
+  [/integrity|supply chain|unsigned|subresource/i,
+   'A08 Software and Data Integrity Failures'],
+];
+function owaspFor(o) {
+  const name = o.name || '';
+  for (const [re, label] of OWASP) if (re.test(name)) return label;
+  // A CVE with no other signal is an outdated component by definition.
+  if ((o.types || []).includes('cve')) return 'A06 Vulnerable and Outdated Components';
+  return 'Uncategorised';
+}
+
+/** Per-asset rollup: risk, its observations, and the themes they fall into. */
+function assetRows(assets, obsByAsset) {
+  return assets
+    .filter(a => a.state !== 'dismissed')
+    .map(a => {
+      const obs = (obsByAsset[a.id] || []).filter(o => o.remediationState !== 'nonApplicable');
+      const scored = obs.map(o => ({...o, risk: observationRisk(o, a), owasp: owaspFor(o),
+                                    kind: (o.types || []).includes('cve') ? 'cve' : 'insight'}))
+                        .sort((x, y) => y.risk - x.risk);
+      const counts = {high: 0, medium: 0, low: 0, cve: 0};
+      for (const o of scored) {
+        if (counts[o.priority] != null) counts[o.priority]++;
+        if (o.kind === 'cve') counts.cve++;
+      }
+      return {
+        asset: a, observations: scored, counts,
+        owasp: [...new Set(scored.map(o => o.owasp))].sort(),
+        risk: +scored.reduce((s, o) => s + o.risk, 0).toFixed(2),
+        worstCvss: scored.reduce((m, o) => Math.max(m, o.cvssScoreV3 || o.cvssScoreV2 || 0), 0),
+      };
+    })
+    .sort((x, y) => y.risk - x.risk || y.counts.high - x.counts.high
+                    || x.asset.name.localeCompare(y.asset.name));
+}
+
 function parentOf(a) {
   if (['ipAddress', 'ipBlock', 'as'].includes(a.kind)) return 'IP space / ASN';
   // sslCert assets are named by thumbprint, which groups into one bucket per
@@ -701,6 +785,140 @@ async function askAI(system, user, maxTokens) {
 }
 
 // ── views ───────────────────────────────────────────────────────────────────
+function riskBand(risk) {
+  if (risk >= 40) return 'critical';
+  if (risk >= 15) return 'high';
+  if (risk >= 5) return 'medium';
+  return risk > 0 ? 'low' : 'none';
+}
+
+function renderAssets() {
+  const rows = assetRows(DATA.assets, DATA.obsByAsset);
+  const withFindings = rows.filter(r => r.risk > 0);
+  $('#asset-tiles').innerHTML = [
+    ['Assets', DATA.assets.length, 'in inventory'],
+    ['With findings', withFindings.length, 'carry at least one observation'],
+    ['Critical', rows.filter(r => riskBand(r.risk) === 'critical').length, 'assets by risk band'],
+    ['Worst CVSS', rows.reduce((m, r) => Math.max(m, r.worstCvss), 0) || '—', 'across the estate'],
+    ['Total risk', Math.round(rows.reduce((s, r) => s + r.risk, 0)), 'sum over all assets'],
+  ].map(([l, n, s]) => `<div class="tile"><div class="n">${esc(n)}</div><div class="l">${esc(l)}</div>
+      <div class="l" style="text-transform:none;color:var(--dim)">${esc(s)}</div></div>`).join('');
+
+  const q = $('#asset-search').value.trim().toLowerCase();
+  const stateFilter = $('#asset-state').value;
+  const scope = $('#asset-scope').value;
+  const shown = rows.filter(r => {
+    if (scope === 'findings' && r.risk <= 0) return false;
+    if (stateFilter === 'confirmed' && r.asset.state !== 'confirmed') return false;
+    if (stateFilter === 'unresolved' && r.asset.state === 'confirmed') return false;
+    if (q && !r.asset.name.toLowerCase().includes(q)) return false;
+    return true;
+  }).slice(0, 300);
+  $('#asset-note').textContent =
+    `${shown.length} shown of ${rows.length} assets` + (shown.length === 300 ? ' (capped at 300)' : '');
+
+  const max = shown.length ? shown[0].risk : 1;
+  $('#asset-list').innerHTML = shown.map((r, i) => {
+    const a = r.asset, e = a.evidence || {};
+    const chips = [
+      r.counts.cve ? `<span class="badge k-cve">${r.counts.cve} CVE</span>` : '',
+      r.counts.high ? `<span class="badge p-high">${r.counts.high} high</span>` : '',
+      r.counts.medium ? `<span class="badge p-medium">${r.counts.medium} med</span>` : '',
+      r.worstCvss ? `<span class="badge p-none">CVSS ${r.worstCvss}</span>` : '',
+    ].join('');
+    const facts = [
+      ['State', a.state], ['Kind', a.kind], ['Discovery group', a.disco_group],
+      ['First seen', (a.first_seen || '').slice(0, 10)], ['Last seen', (a.last_seen || '').slice(0, 10)],
+      ['WHOIS org', e.whois_org], ['ASN', e.asn], ['Certificate', e.cert_subject],
+      ['IP blocks', (e.ip_blocks || []).join(', ')], ['Technology', (e.web_components || []).join(', ')],
+    ].filter(([, v]) => v);
+    // Group the asset's own weaknesses by theme — the thing EASM's per-asset
+    // page does not do.
+    const byTheme = {};
+    for (const o of r.observations) (byTheme[o.owasp] ||= []).push(o);
+    return `
+    <div class="card" data-asset="${esc(a.id)}">
+      <div class="card-head">
+        <span class="rank">#${i + 1}</span>
+        <span class="badge p-${riskBand(r.risk)}">${riskBand(r.risk)}</span>
+        <span class="title">${esc(a.name)}</span>
+        ${chips}
+        <span class="metric"><b>${Math.round(r.risk)}</b><small>risk</small></span>
+      </div>
+      <div class="bar"><i style="width:${Math.max(2, 100 * r.risk / (max || 1))}%"></i></div>
+      <div class="detail">
+        <div class="facts">${facts.map(([k, v]) =>
+          `<div><span>${esc(k)}</span>${esc(v)}</div>`).join('')}</div>
+        ${r.owasp.length ? `<h4>Weakness themes</h4><p>${r.owasp.map(o =>
+          `<span class="badge p-none" style="margin-right:4px">${esc(o)}</span>`).join('')}</p>` : ''}
+        ${r.observations.length ? Object.entries(byTheme).map(([theme, list]) => `
+          <h4>${esc(theme)}</h4>
+          <table><thead><tr><th>Finding</th><th>Type</th><th>Priority</th><th>CVSS</th><th>Risk</th></tr></thead>
+          <tbody>${list.map(o => `<tr>
+            <td>${esc(o.name)}</td>
+            <td><span class="badge k-${esc(o.kind)}">${esc(o.kind)}</span></td>
+            <td><span class="badge p-${esc(o.priority)}">${esc(o.priority)}</span></td>
+            <td>${o.cvssScoreV3 || o.cvssScoreV2 || '—'}</td>
+            <td>${o.risk.toFixed(1)}</td></tr>`).join('')}</tbody></table>`).join('')
+          : '<p class="note">No open observations on this asset.</p>'}
+        <div class="toolbar" style="margin:4px 0 0">
+          <button class="ai-asset" data-asset="${esc(a.id)}">Ask AI about this asset</button>
+          <span class="note ai-asset-out" style="margin:0"></span>
+        </div>
+      </div>
+    </div>`;
+  }).join('') || '<div class="note">No assets match this filter.</div>';
+
+  $('#asset-list').querySelectorAll('.card-head').forEach(h =>
+    h.onclick = () => h.parentElement.classList.toggle('open'));
+  $('#asset-list').querySelectorAll('.ai-asset').forEach(b =>
+    b.onclick = ev => adviseAsset(ev.target, rows.find(r => r.asset.id === b.dataset.asset)));
+}
+
+const ASSET_PROMPT = `You are a senior external-attack-surface analyst. You are given one internet-facing asset from Microsoft Defender EASM, with everything known about it.
+
+Assess this specific asset. Ground every statement in the supplied evidence — the hostname, what it appears to be, its detected technology, its findings. Do not describe the vulnerabilities generically; say what they mean for this host.
+
+Return JSON only:
+{"summary":"two or three sentences on what this asset appears to be and how exposed it is",
+ "priority":"critical|high|medium|low",
+ "biggest_risk":"the single finding or combination that matters most here, and why",
+ "actions":["2-4 concrete next steps, most urgent first"],
+ "questions":["0-3 things to check that the evidence does not answer"]}`;
+
+async function adviseAsset(button, row) {
+  const out = button.parentElement.querySelector('.ai-asset-out');
+  button.disabled = true; out.textContent = 'Thinking…';
+  try {
+    const a = row.asset, e = a.evidence || {};
+    const user = [
+      `Asset: ${a.name}`, `Kind: ${a.kind}   EASM state: ${a.state}`,
+      `First seen: ${a.first_seen || 'unknown'}   Last seen: ${a.last_seen || 'unknown'}`,
+      e.whois_org ? `WHOIS org: ${e.whois_org}` : '',
+      e.asn ? `ASN: ${e.asn}` : '',
+      e.cert_subject ? `Certificate: ${e.cert_subject}` : '',
+      (e.web_components || []).length ? `Detected technology: ${e.web_components.join(', ')}` : '',
+      (e.parent_hosts || []).length ? `Parent hosts: ${e.parent_hosts.join(', ')}` : '',
+      `Organization: ${orgContext()}`,
+      '', `Findings (${row.observations.length}):`,
+      ...row.observations.map(o =>
+        `- ${o.name} [${o.kind}, ${o.priority}${o.cvssScoreV3 ? `, CVSS ${o.cvssScoreV3}` : ''}, ${o.owasp}]`),
+    ].filter(Boolean).join('\n');
+    const r = await askAI(ASSET_PROMPT, user, 4000);
+    out.innerHTML = `
+      <div style="margin-top:8px;color:var(--text)">
+        <span class="badge p-${esc(r.priority)}">${esc(r.priority)}</span>
+        <p style="margin:6px 0">${esc(r.summary)}</p>
+        <h4>Biggest risk</h4><p style="margin:0 0 8px">${esc(r.biggest_risk)}</p>
+        <h4>Next steps</h4><ol style="margin:0 0 8px;padding-left:18px">${
+          (r.actions || []).map(s => `<li>${esc(s)}</li>`).join('')}</ol>
+        ${(r.questions || []).length ? `<h4>Worth checking</h4><ul style="margin:0;padding-left:18px">${
+          r.questions.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
+      </div>`;
+  } catch (e) { out.innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+  finally { button.disabled = false; }
+}
+
 function renderActions() {
   const {actions, totals} = buildActions(DATA.assets, DATA.obsByAsset);
   const observed = Object.keys(DATA.obsByAsset).length;
@@ -801,8 +1019,9 @@ function renderQueue() {
 }
 
 // ── wiring ──────────────────────────────────────────────────────────────────
-const VIEWS = {actions: renderActions, advice: renderAdvice, surface: renderSurface, queue: renderQueue};
-let current = 'actions';
+const VIEWS = {assets: renderAssets, actions: renderActions, advice: renderAdvice,
+               surface: renderSurface, queue: renderQueue};
+let current = 'assets';
 function show(v) {
   current = v;
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.view === v));
@@ -838,7 +1057,7 @@ async function loadCurrent() {
   } catch (e) {
     progress('');
     show(current);
-    $('#action-list').innerHTML = `<div class="note err">${esc(e.message)}</div>`;
+    $('#asset-list').innerHTML = `<div class="note err">${esc(e.message)}</div>`;
   } finally { $('#reload').disabled = false; }
 }
 
@@ -853,7 +1072,7 @@ async function start() {
   try { WORKSPACES = await discoverWorkspaces(); } catch (e) { WORKSPACES = []; }
   progress('');
   if (!WORKSPACES.length) {
-    $('#action-list').innerHTML = `<div class="note warn">No EASM workspaces visible to this account.
+    $('#asset-list').innerHTML = `<div class="note warn">No EASM workspaces visible to this account.
       Check that the app registration has Azure Service Management → user_impersonation, and that you
       hold a role on a Microsoft.Easm/workspaces resource.</div>`;
     return;
@@ -867,6 +1086,10 @@ async function start() {
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => show(b.dataset.view));
 $('#ws').onchange = e => { WS = WORKSPACES.find(w => w.key === e.target.value); loadCurrent(); };
 $('#reload').onclick = loadCurrent;
+['#asset-search', '#asset-state', '#asset-scope'].forEach(sel => {
+  const el = $(sel);
+  el.oninput = el.onchange = () => { if (DATA) renderAssets(); };
+});
 $('#signin').onclick = signIn;
 
 $('#advise').onclick = async (ev) => {
