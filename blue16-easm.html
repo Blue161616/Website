@@ -143,6 +143,41 @@
   .cause-h{display:flex;align-items:center;gap:8px}
   .cause-h b{flex:1;min-width:0}
   .cause p{margin:4px 0}
+  .alert{background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.45);border-radius:8px;
+         padding:12px 14px;margin-bottom:16px}
+  .alert-h{display:flex;align-items:center;gap:8px;font-size:12px}
+  .takeover{display:block}
+  .tk-node rect{fill:var(--bg);stroke:var(--border)}
+  .tk-ours rect{stroke:var(--blue)}
+  .tk-gone rect{stroke:var(--dim);stroke-dasharray:4 3}
+  .tk-theirs rect{stroke:var(--red);fill:rgba(248,81,73,.08)}
+  .tk-pulse{fill:none;stroke:var(--red);opacity:.9;animation:tkpulse 2s ease-out infinite}
+  @keyframes tkpulse{0%{opacity:.9;transform:scale(1)}70%,100%{opacity:0;transform:scale(1.06)}}
+  .tk-label{fill:var(--text);font-size:11px;font-weight:600;text-anchor:middle}
+  .tk-theirs .tk-label{fill:var(--red)}
+  .tk-ours .tk-label{fill:var(--blue)}
+  .tk-sub{fill:var(--dim);font-size:9px;text-anchor:middle}
+  .tk-caption{fill:var(--muted);font-size:10px}
+  .tk-line{stroke:var(--red);stroke-width:1.5;stroke-opacity:.85;stroke-dasharray:5 4;
+           animation:chainflow 1s linear infinite}
+  .tk-packet{fill:var(--red)}
+  @media (prefers-reduced-motion:reduce){.tk-line,.tk-pulse{animation:none}}
+  .chain-wrap{overflow-x:auto;margin:0 0 10px;padding-bottom:2px}
+  .chain{display:block}
+  .chain-node rect{fill:var(--bg);stroke:var(--border);stroke-width:1}
+  .chain-self rect{stroke:var(--blue);fill:rgba(88,166,255,.08)}
+  .chain-seed rect{stroke-dasharray:3 3}
+  .chain-end rect{stroke:var(--gold)}
+  .chain-p-high rect,.chain-p-critical rect{stroke:var(--red)}
+  .chain-label{fill:var(--text);font-size:11px;text-anchor:middle;font-weight:600}
+  .chain-self .chain-label{fill:var(--blue)}
+  .chain-end .chain-label{fill:var(--gold)}
+  .chain-p-high .chain-label,.chain-p-critical .chain-label{fill:var(--red)}
+  .chain-sub{fill:var(--dim);font-size:9px;text-anchor:middle}
+  .chain-line{stroke:var(--blue);stroke-width:1.4;stroke-opacity:.8;stroke-dasharray:4 4;
+              animation:chainflow 1.1s linear infinite}
+  @keyframes chainflow{to{stroke-dashoffset:-16}}
+  @media (prefers-reduced-motion:reduce){.chain-line{animation:none}}
   .conv{width:100%;max-width:560px;height:auto;margin:2px 0 8px;overflow:visible}
   .conv-name{fill:var(--muted);font-size:11px;font-family:inherit}
   .conv-self{fill:var(--text);font-weight:700}
@@ -341,6 +376,7 @@
   <!-- Asset-first: EASM's inventory is assets, and triage starts from "what is
        this host and how bad is it", not from a CVE looking for victims. -->
   <section id="view-assets" class="view on">
+    <div id="dangling-alert"></div>
     <div class="tiles" id="asset-tiles"></div>
     <div class="settings">
       <label for="asset-search">Filter</label>
@@ -1594,6 +1630,124 @@ async function verifyWithShodan(button, row) {
   finally { button.disabled = false; lbl.textContent = 'Verify with Shodan'; }
 }
 
+/** The chain from how an asset was found to what is exposed on it.
+ *
+ *  EASM shows a discovery chain (seed → domain → host) and, elsewhere, the
+ *  findings. Drawing them as one line answers the question people actually ask
+ *  about an unfamiliar asset: where did this come from, and what does it end in.
+ *
+ *  Each link is only drawn when the data supports it, so the chain is short for a
+ *  bare IP and long for a name discovered through a CNAME on a hosted platform.
+ *  The flow runs left to right, toward the exposure.
+ */
+function chainSvg(asset, row) {
+  const e = asset.evidence || {};
+  const worst = row.observations[0];
+  const nodes = [];
+  if (asset.disco_group) nodes.push({label: asset.disco_group, sub: 'discovery seed', kind: 'seed'});
+  const parent = (e.parent_hosts || [])[0];
+  if (parent && parent !== asset.name) nodes.push({label: parent, sub: 'parent', kind: 'step'});
+  const cname = (e.cnames || [])[0];
+  if (cname && cname !== asset.name && cname !== parent)
+    nodes.push({label: cname, sub: 'CNAME', kind: 'step'});
+  nodes.push({label: asset.name, sub: KIND_LABEL[asset.kind] ? KIND_LABEL[asset.kind][0] : asset.kind,
+              kind: 'self'});
+  const ips = assetIps(asset);
+  if (ips.length) {
+    const ports = ((e.services || []).map(x => x.port).filter(Boolean));
+    nodes.push({label: ips[0] + (ips.length > 1 ? ` +${ips.length - 1}` : ''),
+                sub: ports.length ? `ports ${ports.slice(0, 4).join(', ')}${ports.length > 4 ? '…' : ''}` : 'address',
+                kind: 'step'});
+  }
+  if (worst) {
+    const ep = EPSS[cveId(worst.name)];
+    nodes.push({label: worst.name,
+                sub: `${worst.priority}${ep && ep.epss ? ` · ${(ep.epss * 100).toFixed(0)}% exploited` : ''}`,
+                kind: 'end', priority: worst.priority});
+  }
+  if (nodes.length < 2) return '';
+
+  const pad = 10, gap = 26, h = 56;
+  const width = t => Math.max(66, Math.min(190, String(t).length * 6.4 + pad * 2));
+  let x = 2;
+  const placed = nodes.map(n => {
+    const w = Math.max(width(n.label), width(n.sub));
+    const node = {...n, x, w};
+    x += w + gap;
+    return node;
+  });
+  const total = x;
+  return `<div class="chain-wrap"><svg class="chain" viewBox="0 0 ${total} ${h}" width="${total}" height="${h}"
+       role="img" aria-label="${esc(nodes.map(n => n.label).join(' then '))}">
+    <defs><marker id="chev" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6"
+        orient="auto"><path d="M0 0 L7 4 L0 8" fill="none" stroke="var(--blue)" stroke-width="1.4"/></marker></defs>
+    ${placed.slice(0, -1).map((n, i) => {
+      const from = n.x + n.w, to = placed[i + 1].x;
+      return `<line class="chain-line" x1="${from + 3}" y1="${h / 2}" x2="${to - 5}" y2="${h / 2}"
+                marker-end="url(#chev)" style="animation-delay:${(i * 0.18).toFixed(2)}s"/>`;
+    }).join('')}
+    ${placed.map(n => `
+      <g class="chain-node chain-${n.kind}${n.priority ? ' chain-p-' + n.priority : ''}">
+        <rect x="${n.x}" y="8" width="${n.w}" height="${h - 16}" rx="7"/>
+        <text x="${n.x + n.w / 2}" y="${h / 2 - 1}" class="chain-label">${esc(n.label)}</text>
+        <text x="${n.x + n.w / 2}" y="${h / 2 + 12}" class="chain-sub">${esc(n.sub)}</text>
+      </g>`).join('')}
+  </svg></div>`;
+}
+
+// ── Subdomain takeover ──────────────────────────────────────────────────────
+// https://learn.microsoft.com/azure/security/fundamentals/subdomain-takeover
+//
+// The failure is mundane and the consequence is not. A cloud resource is
+// deleted, its public address returns to the provider's pool, and the DNS record
+// that pointed at it is left behind. Whoever allocates that address next can
+// answer for the name: serve content as you, pass HTTP-01 validation and hold a
+// valid certificate for your domain, and collect anything sent to it.
+//
+// It is only visible by comparing two things nobody usually holds together —
+// what DNS says, and what the tenant actually owns. This app has both.
+function takeoverSvg(asset, ips) {
+  const shodan = getShodan();
+  const seen = ips.flatMap(ip => ((shodan[ip] || {}).data || {}).hostnames || [])
+                  .filter(h => registrable(h) !== registrable(asset.name));
+  const claimant = seen.length ? seen[0] : 'another tenant';
+  const nodes = [
+    {label: asset.name, sub: 'your DNS record', kind: 'ours'},
+    {label: ips.join(', '), sub: 'address released back to the pool', kind: 'gone'},
+    {label: claimant, sub: seen.length ? 'answering there now' : 'whoever allocates it next', kind: 'theirs'},
+  ];
+  const pad = 12, gap = 46, h = 96, y = 34;
+  const width = t => Math.max(120, Math.min(230, String(t).length * 6.6 + pad * 2));
+  let x = 4;
+  const placed = nodes.map(n => { const w = Math.max(width(n.label), width(n.sub));
+    const node = {...n, x, w}; x += w + gap; return node; });
+  const total = x;
+  const path = `M${placed[0].x + placed[0].w} ${y + 14} H${placed[2].x}`;
+  return `<div class="chain-wrap"><svg class="takeover" viewBox="0 0 ${total} ${h}" width="${total}" height="${h}"
+       role="img" aria-label="${esc(asset.name)} points at ${esc(ips.join(', '))}, now answered by ${esc(claimant)}">
+    <defs><marker id="tkchev" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="7" markerHeight="7"
+      orient="auto"><path d="M0 0 L7 4 L0 8" fill="none" stroke="var(--red)" stroke-width="1.5"/></marker></defs>
+    ${placed.slice(0, -1).map((n, i) => `<line class="tk-line" x1="${n.x + n.w + 3}" y1="${y + 14}"
+        x2="${placed[i + 1].x - 6}" y2="${y + 14}" marker-end="url(#tkchev)"
+        style="animation-delay:${(i * 0.2).toFixed(2)}s"/>`).join('')}
+    <circle class="tk-packet" r="3.5">
+      <animateMotion dur="2.6s" repeatCount="indefinite" path="${path}"/>
+    </circle>
+    ${placed.map(n => `<g class="tk-node tk-${n.kind}">
+        <rect x="${n.x}" y="${y}" width="${n.w}" height="30" rx="7"/>
+        ${n.kind === 'theirs' ? `<rect class="tk-pulse" x="${n.x}" y="${y}" width="${n.w}" height="30" rx="7"/>` : ''}
+        <text x="${n.x + n.w / 2}" y="${y + 13}" class="tk-label">${esc(n.label)}</text>
+        <text x="${n.x + n.w / 2}" y="${y + 25}" class="tk-sub">${esc(n.sub)}</text>
+      </g>`).join('')}
+    <text x="4" y="14" class="tk-caption">Traffic for your name arrives at an address you no longer control</text>
+  </svg></div>`;
+}
+
+/** The consequences, stated once and reused. */
+const TAKEOVER_CONSEQUENCES = `Whoever holds the address can serve content as this name, pass
+  HTTP-01 domain validation to obtain a genuine certificate for it, and receive anything sent there —
+  links, form posts, and cookies scoped to the parent domain.`;
+
 function renderAssets() {
   $('#cov-kql').textContent = MDE_KQL;
   const aiOn = aiEnabled();
@@ -1628,6 +1782,7 @@ function renderAssets() {
 
   const stateRows = rows.filter(r => matchesState(r.asset.state, sel.value));
   const cvssCount = stateRows.filter(r => r.worstCvss >= 9).length;
+  const dangling = stateRows.filter(r => danglingWarning(r.asset));
   const withFindings = stateRows.filter(r => r.risk > 0);
   const critical = stateRows.filter(r => riskBand(r.risk) === 'critical').length;
   const worstCvss = stateRows.reduce((m, r) => Math.max(m, r.worstCvss), 0);
@@ -1641,7 +1796,9 @@ function renderAssets() {
     ['Worst CVSS', worstCvss || '—', `${cvssCount} asset${cvssCount === 1 ? '' : 's'} at CVSS 9+`,
      worstCvss >= 9 ? 'risk' : (worstCvss >= 7 ? 'warnkpi' : ''), 'cvss9', cvssCount],
     ['Total risk', totalRisk, 'sum over all assets', totalRisk ? 'risk' : '', '', 0],
-  ].map(([l, n, sub, cls, focus, count]) => {
+  ].concat(dangling.length
+    ? [['Takeover risk', dangling.length, 'names on addresses you do not own', 'risk', 'dangling', dangling.length]]
+    : []).map(([l, n, sub, cls, focus, count]) => {
     // Clicking a tile that matches nothing lands on an empty list that looks
     // broken. Only offer the filter when it would actually select something.
     const live = focus === 'all' || (focus && count > 0);
@@ -1673,12 +1830,32 @@ function renderAssets() {
     if (scope === 'findings' && r.risk <= 0) return false;
     if (ASSET_FOCUS === 'critical' && riskBand(r.risk) !== 'critical') return false;
     if (ASSET_FOCUS === 'cvss9' && !(r.worstCvss >= 9)) return false;
+    if (ASSET_FOCUS === 'dangling' && !danglingWarning(r.asset)) return false;
     if (q && !r.asset.name.toLowerCase().includes(q)
           && !r.merged.some(m => m.toLowerCase().includes(q))
           && !(r.siblings || []).some(m => m.toLowerCase().includes(q))) return false;
     return true;
   }).slice(0, 300);
-  const focusLabel = {critical: 'critical band', cvss9: 'CVSS 9+', findings: 'with findings'}[ASSET_FOCUS];
+  // Surfaced above everything: this is the one finding here that is exploitable
+  // by a stranger with no access to anything of yours.
+  $('#dangling-alert').innerHTML = dangling.length ? `
+    <div class="alert">
+      <div class="alert-h"><span class="badge p-high">Subdomain takeover risk</span>
+        <b>${dangling.length} name${dangling.length > 1 ? 's point' : ' points'} at a cloud address
+        that is not in your subscriptions</b></div>
+      <p class="note" style="margin:6px 0">${TAKEOVER_CONSEQUENCES}</p>
+      ${takeoverSvg(dangling[0].asset, assetIps(dangling[0].asset))}
+      <p class="note" style="margin:0">
+        ${dangling.map(r => `<b>${esc(r.asset.name)}</b> → ${esc(assetIps(r.asset).join(', '))}`).join(' · ')}
+        · <a href="#" id="show-dangling" style="color:var(--blue)">show ${dangling.length > 1 ? 'them' : 'it'}</a>
+        · <a href="https://learn.microsoft.com/en-us/azure/security/fundamentals/subdomain-takeover"
+             target="_blank" rel="noopener noreferrer" style="color:var(--blue)">Microsoft's guidance</a></p>
+    </div>` : '';
+  const showDangling = $('#show-dangling');
+  if (showDangling) showDangling.onclick = ev => { ev.preventDefault(); ASSET_FOCUS = 'dangling'; renderAssets(); };
+
+  const focusLabel = {critical: 'critical band', cvss9: 'CVSS 9+', findings: 'with findings',
+                      dangling: 'takeover risk'}[ASSET_FOCUS];
   $('#asset-note').innerHTML =
     `${shown.length} shown of ${stateRows.length}` + (shown.length === 300 ? ' (capped at 300)' : '') +
     (sel.value !== 'all' ? ` <span class="evidence">(${rows.length - stateRows.length} hidden by state)</span>` : '') +
@@ -1698,7 +1875,7 @@ function renderAssets() {
     const ctx = assetContext(a);
     const stored = aiResults[a.id] || {};
     const svc = serviceSummary(a);
-    const dangling = danglingWarning(a);
+    const danglingHere = danglingWarning(a);
     const chips = [
       r.counts.cve ? `<span class="badge k-cve">${r.counts.cve} CVE</span>` : '',
       r.counts.high ? `<span class="badge p-high">${r.counts.high} high</span>` : '',
@@ -1710,7 +1887,7 @@ function renderAssets() {
         : (ctx.mdeLoaded && ctx.ips.length ? `<span class="badge p-high" title="No Defender sensor behind ${esc(ctx.ips.join(', '))}">no EDR</span>` : ''),
       (r.siblings || []).length ? `<span class="badge p-none help" title="${esc(`${[a.name, ...r.siblings].join(', ')} — ${r.groupedBy === 'ip' ? `one machine on ${(r.sharedIps || []).join(', ')}` : 'identical findings, no IP resolved'}`)}">${r.siblings.length + 1} names</span>` : '',
       (r.relatedNames || []).length ? `<span class="badge k-cve help" title="${esc(`Same ${r.relatedReason === 'environment' ? 'machine' : 'hosted platform'} as ${r.relatedNames.join(', ')} — kept separate ${r.relatedReason === 'environment' ? 'because the environment differs' : 'because a shared platform address does not identify a host'}`)}">related</span>` : '',
-      dangling ? `<span class="badge p-high help" title="${esc(dangling)}">dangling DNS?</span>` : '',
+      danglingHere ? `<span class="badge p-high help" title="${esc(danglingHere)}">takeover risk</span>` : '',
       svc.warning ? `<span class="badge p-medium help" title="${esc(svc.warning)}">web only</span>` : '',
       stored.causes || stored.assess ? `<span class="badge ai-tag" title="${esc(`Reviewed by AI ${new Date((stored.causes || stored.assess).at).toLocaleString()}`)}">AI</span>` : '',
     ].join('');
@@ -1755,6 +1932,7 @@ function renderAssets() {
       </div>
       <div class="bar"><i style="width:${Math.max(2, 100 * r.risk / (max || 1))}%"></i></div>
       <div class="detail">
+        ${chainSvg(a, r)}
         <div class="facts">${facts.map(([k, v, html]) =>
           `<div><span>${esc(k)}</span>${html || esc(v)}</div>`).join('')}</div>
         ${(() => {
@@ -1796,7 +1974,13 @@ function renderAssets() {
                ${r.siblings.length + 1} problems — EASM never resolved an IP for them, so this is
                inferred from the findings rather than from the address.`}${(e.cnames || []).length
             ? ` ${esc(a.name)} is a CNAME to ${esc(e.cnames.join(', '))}.` : ''}</p>` : ''}
-        ${dangling ? `<p class="note err" style="margin:0 0 10px">⚠ ${dangling}</p>` : ''}
+        ${danglingHere ? `<div class="alert" style="margin:0 0 10px">
+          <div class="alert-h"><span class="badge p-high">Subdomain takeover risk</span></div>
+          ${takeoverSvg(a, assetIps(a))}
+          <p class="note" style="margin:0">${danglingHere} ${TAKEOVER_CONSEQUENCES}
+            <a href="https://learn.microsoft.com/en-us/azure/security/fundamentals/subdomain-takeover"
+               target="_blank" rel="noopener noreferrer" style="color:var(--blue)">Microsoft's guidance</a></p>
+        </div>` : ''}
         ${svc.warning ? `<p class="note warn" style="margin:0 0 10px">⚠ ${esc(svc.warning)}</p>` : ''}
         ${r.owasp.length ? `<h4>Weakness themes</h4><p>${r.owasp.map(o =>
           `<span class="badge p-none" style="margin-right:4px">${esc(o)}</span>`).join('')}</p>` : ''}
