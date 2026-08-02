@@ -132,6 +132,8 @@
   .covhead{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
            padding:10px 12px;margin-bottom:12px;font-size:12px;color:var(--muted);line-height:1.7}
   .ai-tag{background:rgba(188,140,255,.16);color:var(--purple)}
+  .shodan-tag{background:rgba(239,68,68,.14);color:#ff6b6b}
+  .shodan-block{border-left-color:rgba(239,68,68,.45)}
   button .ai-tag{margin-right:2px}
   button:disabled .ai-tag{opacity:.7}
   .ai-block{border-left:2px solid rgba(188,140,255,.5);padding:8px 0 2px 12px;margin-top:10px}
@@ -437,7 +439,7 @@ const PAGE_SIZE = 100;
 const MAX_PAGES = 80;
 const OBS_CONCURRENCY = 8;   // parallel observation POSTs; the API is per-asset
 const LS = {cfg: 'b16_easm_cfg', ai: 'b16_easm_ai', coverage: 'b16_easm_coverage',
-            airesults: 'b16_easm_ai_results'};
+            airesults: 'b16_easm_ai_results', shodan: 'b16_easm_shodan'};
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c =>
@@ -1452,6 +1454,146 @@ function convergenceSvg(entries, ips, self) {
   </svg>`;
 }
 
+// Dangling DNS in a cloud tenant.
+//
+// support.rubicongroup.nl resolved to 104.46.61.116, an Azure address that now
+// answers as hackathon.oriflame.com. Cloud public IPs are recycled: release the
+// resource and the address goes back in the pool for another tenant. A DNS
+// record left pointing at it means someone else's server answers for your name —
+// they can serve content as you, and often obtain a certificate for you.
+//
+// The Coverage Gap tab already loaded every public IP in the subscriptions this
+// account can read, which is exactly the baseline needed: a cloud-hosted asset
+// whose addresses are all absent from that list is not running on your cloud.
+//
+// The findings on such an asset are the other tenant's, so its score is wrong in
+// both directions — inflated by their exposure, silent about yours.
+const CLOUD_ASN = /(microsoft|azure|amazon|aws\b|google|digitalocean|hetzner|ovh|8075|8068|16509|15169|14061)/i;
+
+function danglingWarning(asset) {
+  const cov = getCoverage();
+  if (!cov.azure.length) return '';                 // no baseline loaded yet
+  const asn = (asset.evidence || {}).asn || '';
+  if (!CLOUD_ASN.test(asn)) return '';
+  const ips = assetIps(asset);
+  if (!ips.length) return '';
+  const mine = new Set(cov.azure.map(x => x.ip));
+  if (ips.some(ip => mine.has(ip))) return '';      // at least one address is ours
+  return `This name points at ${ips.join(', ')} — a ${esc(asn.split(' ').slice(1).join(' ') || 'cloud')} ` +
+         `address that is not among the public IPs of any subscription this account can read. Cloud ` +
+         `addresses are reassigned when a resource is released, so a record left pointing at one ends ` +
+         `up aimed at another tenant's server: they can answer for this name, and often obtain a ` +
+         `certificate for it. Any findings listed here are theirs, not yours. Confirm the address is ` +
+         `still allocated to you; if it is not, remove or repoint the DNS record.`;
+}
+
+// ── Shodan InternetDB ───────────────────────────────────────────────────────
+// Free, keyless, CORS-enabled: https://internetdb.shodan.io/<ip>. It returns
+// what Shodan last saw on an address — hostnames, open ports, CPEs and CVEs.
+//
+// The hostnames field is the valuable one. EASM tells you a name points at an
+// address; Shodan tells you what that address calls itself. When those disagree
+// — support.rubicongroup.nl pointing at an IP whose only hostname is
+// hackathon.oriflame.com — the record is aimed at somebody else's server, which
+// is the verification step a human would otherwise do by hand.
+//
+// This is third-party observation, not EASM data, and it is labelled as such.
+const SHODAN_TTL = 7 * 24 * 3600e3;
+
+const getShodan = () => readLS(LS.shodan, {});
+function saveShodan(ip, data) {
+  const all = getShodan();
+  all[ip] = {at: Date.now(), data};
+  writeLS(LS.shodan, all);
+}
+
+async function shodanLookup(ips) {
+  const cache = getShodan();
+  const out = [];
+  for (const ip of ips.slice(0, 6)) {
+    const hit = cache[ip];
+    if (hit && Date.now() - hit.at < SHODAN_TTL) { out.push(hit.data); continue; }
+    try {
+      const r = await fetch(`https://internetdb.shodan.io/${encodeURIComponent(ip)}`);
+      if (r.status === 404) { const empty = {ip, notFound: true}; saveShodan(ip, empty); out.push(empty); continue; }
+      if (!r.ok) throw new Error(`Shodan ${r.status}`);
+      const data = await r.json();
+      saveShodan(ip, data);
+      out.push(data);
+    } catch (e) { out.push({ip, error: e.message}); }
+  }
+  return out;
+}
+
+/** Registrable-ish domain, for comparing who a name and an address belong to. */
+function registrable(name) {
+  const parts = String(name || '').toLowerCase().replace(/\.$/, '').split('.').filter(Boolean);
+  return parts.length >= 2 ? parts.slice(-2).join('.') : parts.join('.');
+}
+
+// A hosted address almost always has the provider's own reverse DNS on it —
+// vps-145114-2848.hosted.at.hostnet.nl is what hostnet calls the box, not
+// evidence that the box belongs to someone else. Treating those as foreign made
+// every hosted site look like a takeover. A genuine mismatch is a hostname that
+// belongs to neither us nor the provider: hackathon.oriflame.com.
+const PROVIDER_PTR = /(hosted\.at\.|^vps-|^ip-|^host\d|static|dedicated|colo|\.compute\.amazonaws\.com$|\.cloudapp\.azure\.com$|bc\.googleusercontent\.com$|\.your-server\.de$|\.ovh\.net$|\.hetzner\.|\.linode\.com$|\.digitalocean\.com$|\.contabo\.|\.leaseweb\.)/i;
+
+/** Does this hostname look like the hosting provider naming its own address? */
+function isProviderPtr(hostname, asn) {
+  if (PROVIDER_PTR.test(hostname)) return true;
+  // Or the reverse DNS simply matches whoever owns the ASN.
+  const owner = String(asn || '').toLowerCase().replace(/^as\d+\s*/, '').split(/[\s.]/)[0];
+  return !!owner && owner.length > 3 && registrable(hostname).includes(owner);
+}
+
+function renderShodan(container, results, asset) {
+  const ours = new Set([registrable(asset.name),
+                        ...((asset.evidence || {}).cnames || []).map(registrable)]);
+  const asn = (asset.evidence || {}).asn || '';
+  container.innerHTML = results.map(d => {
+    if (d.error) return `<div class="note err">${esc(d.ip)}: ${esc(d.error)}</div>`;
+    if (d.notFound) return `<div class="note">${esc(d.ip)}: Shodan has no record of this address.</div>`;
+    const hostnames = d.hostnames || [];
+    const ptrs = hostnames.filter(h => isProviderPtr(h, asn));
+    const foreign = hostnames.filter(h => !ours.has(registrable(h)) && !isProviderPtr(h, asn));
+    const mismatch = foreign.length > 0;
+    const row = (k, v) => v ? `<div><span>${esc(k)}</span>${v}</div>` : '';
+    return `
+      <div class="ai-block shodan-block">
+        <div class="ai-head"><span class="badge shodan-tag">Shodan</span>
+          <b>${esc(d.ip)}</b><span class="evidence">independent observation, not EASM</span></div>
+        ${mismatch ? `<p class="note err" style="margin:0 0 8px">⚠ Shodan sees this address calling
+          itself ${esc(foreign.join(', '))} — a different organisation to ${esc(asset.name)}. The
+          address is not, or is no longer, yours: the record pointing at it should be removed or
+          repointed before someone else answers for this name.</p>`
+          : ptrs.length ? `<p class="note" style="margin:0 0 8px">The address's reverse DNS is the
+            hosting provider's own (${esc(ptrs.join(', '))}), which is normal for hosted
+            infrastructure and says nothing about ownership either way.</p>` : ''}
+        <div class="facts">
+          ${row('Hostnames', hostnames.length
+            ? hostnames.map(h => `<span class="${foreign.includes(h) ? 'err' : ''}">${esc(h)}</span>`).join(', ')
+            : '<span class="evidence">none</span>')}
+          ${row('Open ports', (d.ports || []).join(', '))}
+          ${row('Software', (d.cpes || []).map(c => esc(c.replace(/^cpe:\/[aoh]:/, ''))).join(', '))}
+          ${row('Shodan CVEs', (d.vulns || []).length ? esc((d.vulns || []).join(', ')) : '<span class="evidence">none listed</span>')}
+          ${row('Tags', (d.tags || []).join(', '))}
+        </div>
+      </div>`;
+  }).join('') || '<div class="note">No addresses to check.</div>';
+}
+
+async function verifyWithShodan(button, row) {
+  const out = button.closest('.detail').querySelector('.shodan-out');
+  const ips = assetIps(row.asset);
+  if (!ips.length) { out.innerHTML = '<div class="note">EASM resolved no IP for this asset.</div>'; return; }
+  button.disabled = true;
+  const lbl = button.querySelector('.lbl');
+  lbl.textContent = 'Checking…';
+  try { renderShodan(out, await shodanLookup(ips), row.asset); }
+  catch (e) { out.innerHTML = `<div class="note err">${esc(e.message)}</div>`; }
+  finally { button.disabled = false; lbl.textContent = 'Verify with Shodan'; }
+}
+
 function renderAssets() {
   $('#cov-kql').textContent = MDE_KQL;
   const aiOn = aiEnabled();
@@ -1493,17 +1635,22 @@ function renderAssets() {
   $('#asset-tiles').innerHTML = [
     ['Assets', stateRows.length,
      mode === 'platform' ? 'names grouped into machines' : merge ? 'pages merged into hosts' : 'every EASM entity',
-     '', 'all'],
-    ['With findings', withFindings.length, 'carry at least one observation', '', 'findings'],
-    ['Critical', critical, 'assets in the critical band', critical ? 'risk' : '', 'critical'],
+     '', 'all', stateRows.length],
+    ['With findings', withFindings.length, 'carry at least one observation', '', 'findings', withFindings.length],
+    ['Critical', critical, 'assets in the critical band', critical ? 'risk' : '', 'critical', critical],
     ['Worst CVSS', worstCvss || '—', `${cvssCount} asset${cvssCount === 1 ? '' : 's'} at CVSS 9+`,
-     worstCvss >= 9 ? 'risk' : (worstCvss >= 7 ? 'warnkpi' : ''), 'cvss9'],
-    ['Total risk', totalRisk, 'sum over all assets', totalRisk ? 'risk' : '', ''],
-  ].map(([l, n, sub, cls, focus]) => `<div class="tile ${cls} ${focus ? 'clickable' : ''}
-      ${focus && focus === ASSET_FOCUS ? 'on' : ''}" ${focus ? `data-focus="${focus}"` : ''}
-      ${focus ? `title="Filter the list to these"` : ''}><div class="n">${esc(n)}</div>
+     worstCvss >= 9 ? 'risk' : (worstCvss >= 7 ? 'warnkpi' : ''), 'cvss9', cvssCount],
+    ['Total risk', totalRisk, 'sum over all assets', totalRisk ? 'risk' : '', '', 0],
+  ].map(([l, n, sub, cls, focus, count]) => {
+    // Clicking a tile that matches nothing lands on an empty list that looks
+    // broken. Only offer the filter when it would actually select something.
+    const live = focus === 'all' || (focus && count > 0);
+    return `<div class="tile ${cls} ${live ? 'clickable' : ''}
+      ${focus && focus === ASSET_FOCUS ? 'on' : ''}" ${live ? `data-focus="${focus}"` : ''}
+      title="${live ? 'Filter the list to these' : 'Nothing in the current selection matches this'}"><div class="n">${esc(n)}</div>
       <div class="l">${esc(l)}</div>
-      <div class="l" style="text-transform:none;color:var(--dim)">${esc(sub)}</div></div>`).join('');
+      <div class="l" style="text-transform:none;color:var(--dim)">${esc(sub)}</div></div>`;
+  }).join('');
 
   // Re-attached every render, since the tiles are rebuilt each time.
   $('#asset-tiles').querySelectorAll('.tile.clickable').forEach(t => {
@@ -1551,6 +1698,7 @@ function renderAssets() {
     const ctx = assetContext(a);
     const stored = aiResults[a.id] || {};
     const svc = serviceSummary(a);
+    const dangling = danglingWarning(a);
     const chips = [
       r.counts.cve ? `<span class="badge k-cve">${r.counts.cve} CVE</span>` : '',
       r.counts.high ? `<span class="badge p-high">${r.counts.high} high</span>` : '',
@@ -1562,6 +1710,7 @@ function renderAssets() {
         : (ctx.mdeLoaded && ctx.ips.length ? `<span class="badge p-high" title="No Defender sensor behind ${esc(ctx.ips.join(', '))}">no EDR</span>` : ''),
       (r.siblings || []).length ? `<span class="badge p-none help" title="${esc(`${[a.name, ...r.siblings].join(', ')} — ${r.groupedBy === 'ip' ? `one machine on ${(r.sharedIps || []).join(', ')}` : 'identical findings, no IP resolved'}`)}">${r.siblings.length + 1} names</span>` : '',
       (r.relatedNames || []).length ? `<span class="badge k-cve help" title="${esc(`Same ${r.relatedReason === 'environment' ? 'machine' : 'hosted platform'} as ${r.relatedNames.join(', ')} — kept separate ${r.relatedReason === 'environment' ? 'because the environment differs' : 'because a shared platform address does not identify a host'}`)}">related</span>` : '',
+      dangling ? `<span class="badge p-high help" title="${esc(dangling)}">dangling DNS?</span>` : '',
       svc.warning ? `<span class="badge p-medium help" title="${esc(svc.warning)}">web only</span>` : '',
       stored.causes || stored.assess ? `<span class="badge ai-tag" title="${esc(`Reviewed by AI ${new Date((stored.causes || stored.assess).at).toLocaleString()}`)}">AI</span>` : '',
     ].join('');
@@ -1647,6 +1796,7 @@ function renderAssets() {
                ${r.siblings.length + 1} problems — EASM never resolved an IP for them, so this is
                inferred from the findings rather than from the address.`}${(e.cnames || []).length
             ? ` ${esc(a.name)} is a CNAME to ${esc(e.cnames.join(', '))}.` : ''}</p>` : ''}
+        ${dangling ? `<p class="note err" style="margin:0 0 10px">⚠ ${dangling}</p>` : ''}
         ${svc.warning ? `<p class="note warn" style="margin:0 0 10px">⚠ ${esc(svc.warning)}</p>` : ''}
         ${r.owasp.length ? `<h4>Weakness themes</h4><p>${r.owasp.map(o =>
           `<span class="badge p-none" style="margin-right:4px">${esc(o)}</span>`).join('')}</p>` : ''}
@@ -1665,13 +1815,30 @@ function renderAssets() {
         <div class="toolbar" style="margin:4px 0 0">
           <button class="ai-asset" data-asset="${esc(a.id)}" ${aiOn ? '' : 'disabled title="Needs an AI provider — set one under AI settings"'}><span class="badge ai-tag">AI</span> <span class="lbl">Assess this asset</span></button>
           <button class="ai-causes" data-asset="${esc(a.id)}" ${aiOn && r.observations.length > 1 ? '' : `disabled title="${aiOn ? 'Needs more than one finding to group' : 'Needs an AI provider — set one under AI settings'}"`}><span class="badge ai-tag">AI</span> <span class="lbl">Find root causes</span></button>
+          <button class="shodan-btn" data-asset="${esc(a.id)}"><span class="badge shodan-tag">Shodan</span> <span class="lbl">Verify with Shodan</span></button>
           ${aiOn ? '' : '<span class="note" style="margin:0">Connect an AI provider under <b>AI settings</b> to enable these.</span>'}
           <span class="note ai-asset-out" style="margin:0"></span>
         </div>
+        <div class="shodan-out"></div>
         <div class="ai-causes-out"></div>
       </div>
     </div>`;
-  }).join('') || '<div class="note">No assets match this filter.</div>';
+  }).join('') || (() => {
+    const active = [
+      sel.value !== 'all' ? `state <b>${esc(sel.value)}</b>` : '',
+      focusLabel ? `<b>${esc(focusLabel)}</b>` : '',
+      scope === 'findings' ? 'assets with findings' : '',
+      q ? `search <b>${esc(q)}</b>` : '',
+    ].filter(Boolean);
+    return `<div class="note">Nothing matches ${active.join(' + ')}.
+      ${rows.length - stateRows.length ? `${rows.length - stateRows.length} assets are hidden by the
+        state filter — <a href="#" id="show-all-states" style="color:var(--blue)">show all states</a>.` : ''}
+      ${ASSET_FOCUS ? ` <a href="#" id="clear-focus-2" style="color:var(--blue)">Clear the KPI filter.</a>` : ''}</div>`;
+  })();
+  const showAll = $('#show-all-states');
+  if (showAll) showAll.onclick = ev => { ev.preventDefault(); sel.value = 'all'; renderAssets(); };
+  const clear2 = $('#clear-focus-2');
+  if (clear2) clear2.onclick = ev => { ev.preventDefault(); ASSET_FOCUS = ''; renderAssets(); };
 
   $('#asset-list').querySelectorAll('.card-head').forEach(h =>
     h.onclick = () => h.parentElement.classList.toggle('open'));
@@ -1679,6 +1846,8 @@ function renderAssets() {
     b.onclick = ev => adviseAsset(ev.target, rows.find(r => r.asset.id === b.dataset.asset)));
   $('#asset-list').querySelectorAll('.ai-causes').forEach(b =>
     b.onclick = ev => clusterAsset(ev.target, rows.find(r => r.asset.id === b.dataset.asset)));
+  $('#asset-list').querySelectorAll('.shodan-btn').forEach(b =>
+    b.onclick = () => verifyWithShodan(b, rows.find(r => r.asset.id === b.dataset.asset)));
   // Re-render whatever the model said last time, so reopening a row costs nothing.
   $('#asset-list').querySelectorAll('.card').forEach(card => {
     const prev = aiResults[card.dataset.asset];
@@ -1771,6 +1940,9 @@ async function clusterAsset(button, row) {
       `Asset: ${a.name}`, `Kind: ${a.kind}   EASM state: ${a.state}`,
       (e.web_components || []).length ? `Detected technology: ${e.web_components.join(', ')}` : '',
       serviceSummary(a).text ? `Open ports: ${serviceSummary(a).text}` : '',
+      danglingWarning(a) ? 'WARNING: this name points at a cloud address that is not in the '
+        + 'organization\'s subscriptions — likely a released and reassigned IP, so the findings '
+        + 'below may belong to another tenant.' : '',
       e.cert_subject ? `Certificate: ${e.cert_subject}` : '',
       `Organization: ${orgContext()}`,
       '', `Open findings (${row.observations.length}):`,
@@ -1798,6 +1970,9 @@ async function adviseAsset(button, row) {
       e.asn ? `ASN: ${e.asn}` : '',
       e.cert_subject ? `Certificate: ${e.cert_subject}` : '',
       serviceSummary(a).text ? `Open ports: ${serviceSummary(a).text}` : '',
+      danglingWarning(a) ? 'WARNING: this name points at a cloud address that is not in the '
+        + 'organization\'s subscriptions — likely a released and reassigned IP, so the findings '
+        + 'below may belong to another tenant.' : '',
       (e.web_components || []).length ? `Detected technology: ${e.web_components.join(', ')}` : '',
       (e.parent_hosts || []).length ? `Parent hosts: ${e.parent_hosts.join(', ')}` : '',
       `Organization: ${orgContext()}`,
