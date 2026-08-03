@@ -1217,7 +1217,7 @@ function b64urlUtf8(s) {
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-async function loadWorkspace(w, onProgress) {
+async function loadWorkspace(w, onProgress, onPartial) {
   const assets = [];
   let mark = '*';
   for (let page = 0; page < MAX_PAGES; page++) {
@@ -1231,44 +1231,63 @@ async function loadWorkspace(w, onProgress) {
   }
 
   // Observations are one POST per asset — no bulk endpoint exists at this
-  // api-version — so this is the slow part. Confirmed assets first, with a
-  // small worker pool so a few hundred assets take seconds, not minutes.
-  const ranked = [...assets].sort((a, b) =>
-    (a.state === 'confirmed' ? 0 : 1) - (b.state === 'confirmed' ? 0 : 1));
+  // api-version — so this is the slow part, and on a large workspace it is
+  // minutes. Almost none of that time is spent on assets anybody is waiting for:
+  // the default view is `yours`, which on a 4,236-asset workspace was 272 of
+  // them. So the actionable states are fetched first and the board is painted the
+  // moment they are done, while the remaining thousands keep loading behind it.
+  const actionable = assets.filter(a => matchesState(a.state, 'yours'));
+  const rest = assets.filter(a => !matchesState(a.state, 'yours'));
   const obsByAsset = {};
   const failed = [];
-  let next = 0, done = 0, interrupted = null;
+  let interrupted = null;
   const started = Date.now();
-  const workers = Array.from({length: OBS_CONCURRENCY}, async () => {
-    for (;;) {
-      if (interrupted) return;             // sign-in expired: drain, do not stall
-      const asset = ranked[next++];
-      if (!asset) return;
-      // Nothing in here may throw. One asset's problem used to reject the whole
-      // Promise.all, which discarded an inventory that had already cost minutes
-      // to read — an internationalised name at position 1760 of 4236 emptied the
-      // entire board.
-      try {
-        const res = await easm(w, `/assets/${b64urlUtf8(asset.id)}:getObservations`,
-                               {method: 'POST', params: {maxpagesize: 100}, interactive: false});
-        obsByAsset[asset.id] = res.value || [];
-      } catch (e) {
-        obsByAsset[asset.id] = [];
-        if (e instanceof InteractionRequired) { interrupted = e; return; }
-        failed.push({name: asset.name, why: e.message || String(e)});
+  const snapshot = () => ({assets, obsByAsset, failed, interrupted: !!interrupted,
+                           pending: 0, loadedAt: new Date().toISOString()});
+
+  /** Run the worker pool over one batch. Returns how many were left unread. */
+  async function fetchObservations(batch, label, offset, total) {
+    let next = 0, done = 0;
+    const workers = Array.from({length: OBS_CONCURRENCY}, async () => {
+      for (;;) {
+        if (interrupted) return;           // sign-in expired: drain, do not stall
+        const asset = batch[next++];
+        if (!asset) return;
+        // Nothing in here may throw. One asset's problem used to reject the whole
+        // Promise.all, which discarded an inventory that had already cost minutes
+        // to read — an internationalised name at position 1760 of 4236 emptied
+        // the entire board.
+        try {
+          const res = await easm(w, `/assets/${b64urlUtf8(asset.id)}:getObservations`,
+                                 {method: 'POST', params: {maxpagesize: 100}, interactive: false});
+          obsByAsset[asset.id] = res.value || [];
+        } catch (e) {
+          obsByAsset[asset.id] = [];
+          if (e instanceof InteractionRequired) { interrupted = e; return; }
+          failed.push({name: asset.name, why: e.message || String(e)});
+        }
+        // Rate is reported because it is the difference between "slow" and
+        // "stopped", and a bare counter cannot tell you which you are watching.
+        if (++done % 5 === 0 || done === batch.length) {
+          const rate = (offset + done) / Math.max(1, (Date.now() - started) / 1000);
+          onProgress(`${label} — ${offset + done} of ${total} assets · ${rate.toFixed(1)}/s`,
+                     offset + done, total);
+        }
       }
-      // Rate is reported because it is the difference between "slow" and
-      // "stopped", and a bare counter cannot tell you which one you are watching.
-      if (++done % 5 === 0 || done === ranked.length) {
-        const rate = done / Math.max(1, (Date.now() - started) / 1000);
-        onProgress(`Analysing observations — ${done} of ${ranked.length} assets` +
-                   ` · ${rate.toFixed(1)}/s`, done, ranked.length);
-      }
-    }
-  });
-  await Promise.all(workers);
-  return {assets, obsByAsset, failed, interrupted: !!interrupted,
-          pending: interrupted ? ranked.length - done : 0, loadedAt: new Date().toISOString()};
+    });
+    await Promise.all(workers);
+    return batch.length - done;
+  }
+
+  const total = assets.length;
+  const leftOver = await fetchObservations(actionable, 'Analysing your assets', 0, total);
+  // The board is usable now. Everything after this point is enrichment, and the
+  // user can read, filter and open assets while it happens.
+  if (!interrupted && onPartial) await onPartial(snapshot());
+  const leftOver2 = interrupted ? rest.length
+    : await fetchObservations(rest, 'Analysing the rest', actionable.length, total);
+
+  return Object.assign(snapshot(), {pending: interrupted ? leftOver + leftOver2 : 0});
 }
 
 // ── AI layer ────────────────────────────────────────────────────────────────
@@ -2770,7 +2789,13 @@ async function loadCurrent() {
   document.querySelectorAll('.view').forEach(s => s.classList.remove('on'));
   try {
     progress('Loading inventory…');
-    DATA = await loadWorkspace(WS, progress);
+    DATA = await loadWorkspace(WS, progress, async partial => {
+      // The assets in the default view are ready: paint, score them properly,
+      // and let the rest arrive underneath.
+      DATA = partial;
+      show(current);
+      if (await loadEpss(DATA.obsByAsset, progress)) show(current);
+    });
     show(current);                     // paint before enrichment
     if (await loadEpss(DATA.obsByAsset, progress)) show(current);   // re-rank with EPSS
     progress('');
