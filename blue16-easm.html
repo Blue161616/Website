@@ -1050,7 +1050,13 @@ async function discoverWorkspaces() {
         const parts = (w.id || '').split('/');
         const rg = parts[parts.indexOf('resourceGroups') + 1];
         if (!rg) continue;
-        out.push({key: w.name, label: `${w.name} (${w.location})`, subscription_id: s.subscriptionId,
+        // ARM providers vary in where they put the creation time, and an older
+        // resource may carry none at all — so probe, and say nothing rather than
+        // guess when it is absent.
+        const created = (w.systemData && (w.systemData.createdAt || w.systemData.CreatedAt)) ||
+                        (w.properties && (w.properties.createdAt || w.properties.creationDate)) || '';
+        out.push({key: w.name, name: w.name, location: w.location || '', created,
+                  label: `${w.name} (${w.location})`, subscription_id: s.subscriptionId,
                   resource_group: rg, workspace_name: w.name,
                   region: (w.location || '').replace(/\s/g, '').toLowerCase()});
       }
@@ -1058,6 +1064,40 @@ async function discoverWorkspaces() {
   }
   return out;
 }
+// ── How long has this workspace been running? ───────────────────────────────
+// A Defender EASM workspace bills per day once its first 30 days are up, and the
+// meter starts when the workspace is created rather than when anyone looks at it.
+// Somebody carrying several customer workspaces cannot hold four creation dates
+// in their head, and a forgotten proof-of-concept bills quietly for months. So
+// the age is on the picker itself, where the choice is made.
+const FREE_DAYS = 30;
+
+function trialInfo(created) {
+  const t = Date.parse(created || '');
+  if (!Number.isFinite(t)) return null;                 // no creation time: say nothing
+  const days = Math.max(0, Math.floor((Date.now() - t) / 86400000));
+  return {days, left: Math.max(0, FREE_DAYS - days), free: days < FREE_DAYS,
+          since: new Date(t).toISOString().slice(0, 10)};
+}
+
+const trialShort = w => {
+  const i = trialInfo(w.created);
+  if (!i) return '';
+  return i.free ? `${i.left} free day${i.left === 1 ? '' : 's'} left` : `day ${i.days}`;
+};
+
+const trialLong = w => {
+  const i = trialInfo(w.created);
+  if (!i) return 'Created date not reported by ARM for this workspace.';
+  return i.free
+    ? `Created ${i.since} — day ${i.days} of the ${FREE_DAYS} free days, ${i.left} remaining. ` +
+      `Billing starts after that whether or not anyone opens it.`
+    : `Created ${i.since} — day ${i.days}. The ${FREE_DAYS} free days ended ` +
+      `${i.days === FREE_DAYS ? 'today' :
+         `${i.days - FREE_DAYS} day${i.days - FREE_DAYS === 1 ? '' : 's'} ago`}, ` +
+      `so this workspace is billing.`;
+};
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const REQ_TIMEOUT_MS = 30000;
 const MAX_RETRIES = 3;
@@ -2758,14 +2798,32 @@ async function start() {
     return;
   }
   WS = WORKSPACES[0];
-  $('#ws').innerHTML = WORKSPACES.map(w => `<option value="${esc(w.key)}">${esc(w.label)}</option>`).join('');
-  $('#ws-mode').textContent = 'live EASM';
+  $('#ws').innerHTML = WORKSPACES.map(w => {
+    const t = trialShort(w);
+    return `<option value="${esc(w.key)}">${esc(w.label)}${t ? ` · ${esc(t)}` : ''}</option>`;
+  }).join('');
+  showTrial();
   await loadCurrent();
   autoLoadAzure();   // background; the assets view must not wait on it
 }
 
+/** The selected workspace's age, beside the picker. Amber once it is billing —
+ *  not an error, but the thing you would want to notice without asking. */
+function showTrial() {
+  const i = WS ? trialInfo(WS.created) : null;
+  const el = $('#ws-mode');
+  el.className = 'tagline' + (i && !i.free ? ' warn' : '');
+  el.textContent = i ? (i.free ? `live EASM · ${i.left} free days left` : `live EASM · day ${i.days}`)
+                     : 'live EASM';
+  el.title = WS ? trialLong(WS) : '';
+}
+
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => show(b.dataset.view));
-$('#ws').onchange = e => { WS = WORKSPACES.find(w => w.key === e.target.value); loadCurrent(); };
+$('#ws').onchange = e => {
+  WS = WORKSPACES.find(w => w.key === e.target.value);
+  showTrial();
+  loadCurrent();
+};
 $('#reload').onclick = loadCurrent;
 ['#asset-search', '#asset-state', '#asset-scope', '#asset-merge'].forEach(sel => {
   const el = $(sel);
