@@ -147,6 +147,11 @@
   .alert{background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.45);border-radius:8px;
          padding:12px 14px;margin-bottom:16px}
   .alert-h{display:flex;align-items:center;gap:8px;font-size:12px}
+  .listbox{margin-top:8px}
+  .listbox summary{cursor:pointer;font-size:11px;color:var(--muted);
+                   text-transform:uppercase;letter-spacing:.05em;font-weight:700}
+  .listbox summary:hover{color:var(--text)}
+  .listbox table{margin-top:8px;display:block;max-height:260px;overflow-y:auto}
   .takeover{display:block}
   .tk-node rect{fill:var(--bg);stroke:var(--border)}
   .tk-ours rect{stroke:var(--blue)}
@@ -961,9 +966,17 @@ function normalizeAsset(raw) {
     for (const f of [...fields, 'name', 'value', 'cidr', 'ipBlock', 'host']) if (typeof x[f] === 'string') return x[f];
     return '';
   }).filter(Boolean).slice(0, 4);
+  // Why an asset is in inventory at all. EASM records the chain it walked to
+  // reach it — a seed, a domain, a certificate, an IP block — on the resource
+  // itself. Without this an ipAddress row with no hostname is unexplainable.
+  const audit = (raw.auditTrail || []).map(t => {
+    if (typeof t === 'string') return {name: t, kind: ''};
+    return {name: t.name || t.value || '', kind: t.kind || t.type || '', reason: t.reason || ''};
+  }).filter(t => t.name);
   return {
     id: raw.id, name: raw.name || raw.displayName || '', kind: raw.kind, state: raw.state,
     labels: raw.labels || [], disco_group: raw.discoGroupName || '',
+    audit_trail: audit, reason: raw.reason || '',
     first_seen: inner.firstSeen || '', last_seen: inner.lastSeen || '',
     evidence: {
       whois_org: firstStr('whoisOrganizations', 'registrantOrg'),
@@ -1506,22 +1519,36 @@ function convergenceSvg(entries, ips, self) {
 // The findings on such an asset are the other tenant's, so its score is wrong in
 // both directions — inflated by their exposure, silent about yours.
 const CLOUD_ASN = /(microsoft|azure|amazon|aws\b|google|digitalocean|hetzner|ovh|8075|8068|16509|15169|14061)/i;
+const SAAS_TARGET = /(outlook\.com|office\.com|office365\.com|microsoftonline\.com|msappproxy\.net|azurewebsites\.net|azurestaticapps\.net|azurefd\.net|azureedge\.net|trafficmanager\.net|sharepoint\.com|lync\.com|teams\.microsoft\.com|azure-api\.net|msecnd\.net|\.windows\.net|cloudapp\.azure\.com|akadns\.net|akamaiedge\.net)/i;
+const SAAS_NAME = /^(autodiscover|enterpriseregistration|enterpriseenrollment|lyncdiscover|sip|msoid|webmail|owa|mail|clientconfig|selector\d*\._domainkey)\./i;
 
+// Pointing at a Microsoft address you do not own is normal across most of a
+// tenant: autodiscover, enterpriseregistration, sip and lyncdiscover are meant to
+// resolve into Microsoft's service ranges, and an Azure Static Web App or Front
+// Door answers on an anycast pool shared with every other customer. None of those
+// addresses can be claimed by a stranger, so none of them is a takeover risk.
+//
+// The risk needs a *dedicated* address that was allocated to you and released.
+// So: exactly one address, on a cloud ASN, absent from your subscriptions, and
+// not a published service endpoint by name or by CNAME target.
 function danglingWarning(asset) {
   const cov = getCoverage();
-  if (!cov.azure.length) return '';                 // no baseline loaded yet
-  const asn = (asset.evidence || {}).asn || '';
+  if (!cov.azure.length) return '';                  // no baseline loaded yet
+  const e = asset.evidence || {};
+  const asn = e.asn || '';
   if (!CLOUD_ASN.test(asn)) return '';
+  if (SAAS_NAME.test(asset.name || '')) return '';
+  if ((e.cnames || []).some(c => SAAS_TARGET.test(c))) return '';
+  if (onSharedInfra(asset)) return '';               // anycast / load-balanced pool
   const ips = assetIps(asset);
-  if (!ips.length) return '';
+  if (ips.length !== 1) return '';                   // one dedicated address only
   const mine = new Set(cov.azure.map(x => x.ip));
-  if (ips.some(ip => mine.has(ip))) return '';      // at least one address is ours
-  return `This name points at ${ips.join(', ')} — a ${esc(asn.split(' ').slice(1).join(' ') || 'cloud')} ` +
-         `address that is not among the public IPs of any subscription this account can read. Cloud ` +
-         `addresses are reassigned when a resource is released, so a record left pointing at one ends ` +
-         `up aimed at another tenant's server: they can answer for this name, and often obtain a ` +
-         `certificate for it. Any findings listed here are theirs, not yours. Confirm the address is ` +
-         `still allocated to you; if it is not, remove or repoint the DNS record.`;
+  if (mine.has(ips[0])) return '';
+  return `This name points at ${ips[0]} — a ${esc(asn.split(' ').slice(1).join(' ') || 'cloud')} ` +
+         `address that is not among the public IPs of any subscription this account can read, and ` +
+         `not a published service endpoint. Cloud addresses are reassigned once a resource is ` +
+         `released, so a record left pointing at one ends up aimed at another tenant's server. ` +
+         `Confirm the address is still allocated to you; if it is not, remove or repoint the record.`;
 }
 
 // ── Shodan InternetDB ───────────────────────────────────────────────────────
@@ -1646,14 +1673,19 @@ function chainSvg(asset, row) {
   const worst = row.observations[0];
   const nodes = [];
   if (asset.disco_group) nodes.push({label: asset.disco_group, sub: 'discovery seed', kind: 'seed'});
-  const parent = (e.parent_hosts || [])[0];
+  // EASM's own audit trail beats anything inferred from parent hosts.
+  for (const step of (asset.audit_trail || []).slice(0, 3))
+    if (step.name !== asset.name)
+      nodes.push({label: step.name, sub: step.kind || 'discovery step', kind: 'step'});
+  const parent = (asset.audit_trail || []).length ? '' : (e.parent_hosts || [])[0];
   if (parent && parent !== asset.name) nodes.push({label: parent, sub: 'parent', kind: 'step'});
   const cname = (e.cnames || [])[0];
   if (cname && cname !== asset.name && cname !== parent)
     nodes.push({label: cname, sub: 'CNAME', kind: 'step'});
   nodes.push({label: asset.name, sub: KIND_LABEL[asset.kind] ? KIND_LABEL[asset.kind][0] : asset.kind,
               kind: 'self'});
-  const ips = assetIps(asset);
+  // An ipAddress asset is its own address; drawing both repeats the node.
+  const ips = assetIps(asset).filter(ip => ip !== asset.name);
   if (ips.length) {
     const ports = ((e.services || []).map(x => x.port).filter(Boolean));
     nodes.push({label: ips[0] + (ips.length > 1 ? ` +${ips.length - 1}` : ''),
@@ -1714,7 +1746,8 @@ function takeoverSvg(asset, ips) {
   const claimant = seen.length ? seen[0] : 'another tenant';
   const nodes = [
     {label: asset.name, sub: 'your DNS record', kind: 'ours'},
-    {label: ips.join(', '), sub: 'address released back to the pool', kind: 'gone'},
+    {label: ips[0] + (ips.length > 1 ? ` +${ips.length - 1} more` : ''),
+     sub: 'address released back to the pool', kind: 'gone'},
     {label: claimant, sub: seen.length ? 'answering there now' : 'whoever allocates it next', kind: 'theirs'},
   ];
   const pad = 12, gap = 46, h = 96, y = 34;
@@ -1776,10 +1809,17 @@ function ipAssociationBlock(asset) {
   const ip = asset.name;
   const {inventory, external} = namesUsingIp(ip, asset.name);
   if (!inventory.length && !external.length) {
+    const trail = (asset.audit_trail || []).map(t => t.name).join(' → ');
+    const blocks = (asset.evidence || {}).ip_blocks || [];
     return `<p class="note" style="margin:0 0 10px">No name in this workspace resolves to
-      ${esc(ip)}, and Shodan has not been consulted for it. Use <b>Verify with Shodan</b> to see what
-      the address calls itself — an address in inventory with nothing pointing at it is usually a
-      leftover from a discovery run rather than something you publish.</p>`;
+      ${esc(ip)}. ${trail
+        ? `EASM reached it via ${esc(trail)}${asset.reason ? ` (${esc(asset.reason)})` : ''}.`
+        : blocks.length
+        ? `It most likely arrived as part of the IP block ${esc(blocks.join(', '))} rather than from a
+           name — discovery expands blocks and ASNs, which is also why it is marked
+           ${esc(asset.state)}.`
+        : `EASM recorded no discovery trail for it.`}
+      Use <b>Verify with Shodan</b> to see what the address calls itself.</p>`;
   }
   const entries = [...inventory.map(n => ({name: n, related: false})),
                    ...external.map(n => ({name: n, related: true}))];
@@ -1893,13 +1933,19 @@ function renderAssets() {
   $('#dangling-alert').innerHTML = dangling.length ? `
     <div class="alert">
       <div class="alert-h"><span class="badge p-high">Subdomain takeover risk</span>
-        <b>${dangling.length} name${dangling.length > 1 ? 's point' : ' points'} at a cloud address
-        that is not in your subscriptions</b></div>
-      <p class="note" style="margin:6px 0">${TAKEOVER_CONSEQUENCES}</p>
+        <b>${dangling.length} name${dangling.length > 1 ? 's point' : ' points'} at a dedicated cloud
+        address that is not in your subscriptions</b></div>
+      <p class="note" style="margin:6px 0 10px">${TAKEOVER_CONSEQUENCES}</p>
       ${takeoverSvg(dangling[0].asset, assetIps(dangling[0].asset))}
-      <p class="note" style="margin:0">
-        ${dangling.map(r => `<b>${esc(r.asset.name)}</b> → ${esc(assetIps(r.asset).join(', '))}`).join(' · ')}
-        · <a href="#" id="show-dangling" style="color:var(--blue)">show ${dangling.length > 1 ? 'them' : 'it'}</a>
+      <details class="listbox">
+        <summary>${dangling.length === 1 ? 'The record' : `All ${dangling.length} records`}</summary>
+        <table><thead><tr><th>DNS name</th><th>Address</th></tr></thead><tbody>
+          ${dangling.map(r => `<tr><td>${esc(r.asset.name)}</td>
+            <td style="font-family:ui-monospace,monospace;color:var(--red)">${esc(assetIps(r.asset).join(', '))}</td></tr>`).join('')}
+        </tbody></table>
+      </details>
+      <p class="note" style="margin:8px 0 0">
+        <a href="#" id="show-dangling" style="color:var(--blue)">Filter the list to ${dangling.length > 1 ? 'them' : 'it'}</a>
         · <a href="https://learn.microsoft.com/en-us/azure/security/fundamentals/subdomain-takeover"
              target="_blank" rel="noopener noreferrer" style="color:var(--blue)">Microsoft's guidance</a></p>
     </div>` : '';
@@ -1953,6 +1999,8 @@ function renderAssets() {
       ['Crawled paths', paths.join('  ')],
       ['Same findings on', (r.siblings || []).join(', ')],
       ['Discovery group', a.disco_group],
+      ['Found via', (a.audit_trail || []).map(t => t.kind ? `${t.name} (${t.kind})` : t.name).join(' → ')],
+      ['Discovery reason', a.reason],
       ['First seen', (a.first_seen || '').slice(0, 10)], ['Last seen', (a.last_seen || '').slice(0, 10)],
       ['WHOIS org', e.whois_org], ['ASN', e.asn], ['Certificate', e.cert_subject],
       ['CNAME', (e.cnames || []).join(', ')],
