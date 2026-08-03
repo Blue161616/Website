@@ -225,6 +225,12 @@
   .ovc-link{stroke:var(--dim);stroke-width:1;stroke-opacity:.7}
   .ovc-packet{fill:var(--blue)}
   @media (prefers-reduced-motion:reduce){.ovc-pulse{animation:none}}
+  .aiset{background:var(--bg2);border:1px solid var(--border);border-radius:10px;
+         padding:12px 14px;margin:0 0 14px}
+  .aiset.is-off{border-color:rgba(188,140,255,.55);background:rgba(188,140,255,.06)}
+  .aiset summary{cursor:pointer;font-size:12px;color:var(--muted);list-style:none}
+  .aiset summary::-webkit-details-marker{display:none}
+  .aiset summary b{color:var(--text)}
   .ovlist{display:flex;flex-direction:column;gap:8px}
   .ovrow{display:grid;grid-template-columns:56px 1fr 24px;align-items:center;gap:14px;
          background:var(--bg2);border:1px solid var(--border);border-left:3px solid var(--red);
@@ -522,19 +528,6 @@
       <span class="note" id="asset-note" style="margin:0"></span>
     </div>
     <details style="margin-bottom:12px">
-      <summary style="cursor:pointer;font-size:11px;color:var(--muted)">AI settings — powers "Ask AI about this asset"</summary>
-      <div class="settings" style="margin-top:6px">
-        <label for="ai-provider">Provider</label>
-        <select id="ai-provider">
-          <option value="azure_openai">Azure OpenAI — stays in your tenant</option>
-          <option value="claude">Claude API — sent to Anthropic</option>
-        </select>
-        <label for="ai-value" id="ai-label">Endpoint</label>
-        <input id="ai-value" autocomplete="off" spellcheck="false"/>
-        <span class="note" id="ai-hint" style="margin:0"></span>
-      </div>
-    </details>
-    <details style="margin-bottom:12px">
       <summary style="cursor:pointer;font-size:11px;color:var(--muted)">What do the states mean?</summary>
       <div id="state-legend" class="note" style="line-height:1.9;margin-top:6px"></div>
     </details>
@@ -559,6 +552,23 @@
        hold and links through to the one it came from — a summary, never a second
        source of truth, and never a score somebody invented. -->
   <section id="view-overview" class="view">
+    <details id="ai-setup" class="aiset">
+      <summary id="ai-setup-sum"></summary>
+      <div class="settings" style="margin-top:8px">
+        <label for="ai-provider">Provider</label>
+        <select id="ai-provider">
+          <option value="azure_openai">Azure OpenAI — stays in your tenant</option>
+          <option value="claude">Claude API — sent to Anthropic</option>
+        </select>
+        <label for="ai-value" id="ai-label">Endpoint</label>
+        <input id="ai-value" autocomplete="off" spellcheck="false"/>
+        <span class="note" id="ai-hint" style="margin:0"></span>
+      </div>
+      <p class="note" style="margin:8px 0 0">Powers <b>Triage this</b> on Entry Points,
+        <b>Write the board brief</b> here, <b>Assess this asset</b> and <b>Find root causes</b> on
+        Assets, and <b>What mattered here</b> on Changes. Nothing is sent anywhere until you press
+        one of them.</p>
+    </details>
     <div id="ov-head"></div>
     <div id="ov-chain"></div>
     <div class="tiles" id="ov-tiles"></div>
@@ -1639,32 +1649,74 @@ function orgContext() {
   return top ? top[0] : (WS ? WS.workspace_name : '');
 }
 
-async function askAI(system, user, maxTokens) {
+// A model endpoint is a third-party service under load, and 529 Overloaded is a
+// "come back in a moment", not a failure to report. Neither provider call had a
+// retry or a deadline — the same omission that let EPSS hang the whole load,
+// surfacing here as a raw JSON error blob in front of the user.
+const AI_RETRY_STATUS = new Set([408, 409, 429, 500, 502, 503, 504, 529]);
+const AI_MAX_RETRIES = 4;
+const AI_TIMEOUT_MS = 120000;          // generous: a long answer is not a hang
+
+/** Human words for the handful of failures worth distinguishing. */
+function aiErrorText(provider, status, body) {
+  if (status === 529 || status === 503)
+    return `${provider} is overloaded right now. It was retried ${AI_MAX_RETRIES} times — give it a minute and press the button again.`;
+  if (status === 429)
+    return `${provider} rate limit reached. Wait a moment, or lower how many assets you ask about at once.`;
+  if (status === 401 || status === 403)
+    return `${provider} rejected the credential. Check the key or endpoint on the Overview tab.`;
+  if (status === 400 && /credit|balance/i.test(body))
+    return `${provider} reports no available credit on this account.`;
+  return `${provider} ${status}: ${String(body).slice(0, 200)}`;
+}
+
+/** POST to a model endpoint, retrying the statuses that mean "later". */
+async function aiFetch(provider, url, opts, onWait) {
+  for (let attempt = 0; ; attempt++) {
+    let r;
+    try {
+      r = await fetchWithTimeout(url, AI_TIMEOUT_MS, opts);
+    } catch (e) {
+      if (attempt < AI_MAX_RETRIES) { await sleep(backoff(attempt)); continue; }
+      throw new Error(`${provider} did not respond within ${AI_TIMEOUT_MS / 1000}s.`);
+    }
+    if (r.ok) return r;
+    const body = await r.text();
+    if (AI_RETRY_STATUS.has(r.status) && attempt < AI_MAX_RETRIES) {
+      const ra = Number(r.headers.get('retry-after'));
+      const wait = Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 20000) : backoff(attempt) + 800;
+      if (onWait) onWait(attempt + 1, Math.round(wait / 1000), r.status);
+      await sleep(wait);
+      continue;
+    }
+    throw new Error(aiErrorText(provider, r.status, body));
+  }
+}
+
+async function askAI(system, user, maxTokens, onWait) {
   const cfg = aiCfg();
   if (cfg.provider === 'azure_openai') {
     // Delegated token for the signed-in user — no key in the page. The user
     // needs "Cognitive Services OpenAI User" on the Azure OpenAI resource.
     if (!/^https?:\/\//.test(cfg.endpoint || ''))
-      throw new Error('Set the Azure OpenAI chat-completions URL in AI settings.');
+      throw new Error('Set the Azure OpenAI chat-completions URL on the Overview tab.');
     const t = await token(['https://cognitiveservices.azure.com/user_impersonation']);
-    const r = await fetch(cfg.endpoint, {method: 'POST',
+    const r = await aiFetch('Azure OpenAI', cfg.endpoint, {method: 'POST',
       headers: {Authorization: 'Bearer ' + t, 'Content-Type': 'application/json'},
       body: JSON.stringify({messages: [{role: 'system', content: system}, {role: 'user', content: user}],
-                            response_format: {type: 'json_object'}, max_tokens: maxTokens})});
-    if (!r.ok) throw new Error(`Azure OpenAI ${r.status}: ${(await r.text()).slice(0, 240)}`);
+                            response_format: {type: 'json_object'}, max_tokens: maxTokens})}, onWait);
     const d = await r.json();
     return JSON.parse(d.choices[0].message.content);
   }
 
   // Claude. The key is held in this tab only. A page cannot keep a secret from
   // the person using it — personal use, not a shared deployment.
-  if (!(cfg.key || '').startsWith('sk-')) throw new Error('Paste an Anthropic API key in AI settings.');
-  const r = await fetch('https://api.anthropic.com/v1/messages', {method: 'POST',
+  if (!(cfg.key || '').startsWith('sk-')) throw new Error('Paste an Anthropic API key on the Overview tab.');
+  const r = await aiFetch('Claude', 'https://api.anthropic.com/v1/messages', {method: 'POST',
     headers: {'x-api-key': cfg.key, 'anthropic-version': '2023-06-01',
               'anthropic-dangerous-direct-browser-access': 'true', 'Content-Type': 'application/json'},
     body: JSON.stringify({model: 'claude-opus-5', max_tokens: maxTokens, system,
-                          messages: [{role: 'user', content: user}]})});
-  if (!r.ok) throw new Error(`Claude ${r.status}: ${(await r.text()).slice(0, 240)}`);
+                          messages: [{role: 'user', content: user}]})}, onWait);
   const d = await r.json();
   // Safety classifiers can decline a request outright: HTTP 200, empty content.
   // Check before reading content, or this throws something unhelpful instead.
@@ -2145,6 +2197,7 @@ function overviewChainSvg(st) {
 
 function renderOverview() {
   if (!DATA) return;
+  paintAiSetup();
   const rows = assetRows(DATA.assets, DATA.obsByAsset, {mergePages: true})
     .filter(r => !excludedBy(r.asset) && matchesState(r.asset.state, 'yours'));
 
@@ -4544,10 +4597,10 @@ establishes nothing — scored at a quarter weight.' : ' Scored at half weight u
             <td>${o.risk.toFixed(1)}</td></tr>`).join('')}</tbody></table>`).join('')
           : '<p class="note">No open observations on this asset.</p>'}
         <div class="toolbar" style="margin:4px 0 0">
-          <button class="ai-asset" data-asset="${esc(a.id)}" ${aiOn ? '' : 'disabled title="Needs an AI provider — set one under AI settings"'}><span class="badge ai-tag">AI</span> <span class="lbl">Assess this asset</span></button>
-          <button class="ai-causes" data-asset="${esc(a.id)}" ${aiOn && r.observations.length > 1 ? '' : `disabled title="${aiOn ? 'Needs more than one finding to group' : 'Needs an AI provider — set one under AI settings'}"`}><span class="badge ai-tag">AI</span> <span class="lbl">Find root causes</span></button>
+          <button class="ai-asset" data-asset="${esc(a.id)}" ${aiOn ? '' : 'disabled title="Needs an AI provider — set one on the Overview tab"'}><span class="badge ai-tag">AI</span> <span class="lbl">Assess this asset</span></button>
+          <button class="ai-causes" data-asset="${esc(a.id)}" ${aiOn && r.observations.length > 1 ? '' : `disabled title="${aiOn ? 'Needs more than one finding to group' : 'Needs an AI provider — set one on the Overview tab'}"`}><span class="badge ai-tag">AI</span> <span class="lbl">Find root causes</span></button>
           <button class="shodan-btn" data-asset="${esc(a.id)}"><span class="badge shodan-tag">Shodan</span> <span class="lbl">Verify with Shodan</span></button>
-          ${aiOn ? '' : '<span class="note" style="margin:0">Connect an AI provider under <b>AI settings</b> to enable these.</span>'}
+          ${aiOn ? '' : '<span class="note" style="margin:0">Connect an AI provider on the <b>Overview</b> tab to enable these.</span>'}
           <span class="note ai-asset-out" style="margin:0"></span>
         </div>
         <div class="shodan-out"></div>
@@ -4754,7 +4807,11 @@ async function aiPanel(button, out, {system, user, tokens = 3000, cacheKey, rend
   lbl.textContent = 'Thinking…';
   out.innerHTML = '';
   try {
-    const r = await askAI(system, user, tokens);
+    const r = await askAI(system, user, tokens, (n, secs, status) => {
+      lbl.textContent = `Busy — retry ${n}/${AI_MAX_RETRIES}`;
+      out.innerHTML = `<p class="note" style="margin:8px 0 0">The model returned
+        ${status === 529 ? 'overloaded' : String(status)} — waiting ${secs}s and trying again.</p>`;
+    });
     if (cacheKey) saveAiResult(cacheKey, 'panel', {result: r});
     out.innerHTML = render(r);
   } catch (e) {
@@ -4765,7 +4822,7 @@ async function aiPanel(button, out, {system, user, tokens = 3000, cacheKey, rend
 /** The button, disabled with a reason when no provider is configured. */
 const aiButton = (cls, label, extra = '') =>
   `<button class="${cls}" ${extra} ${aiEnabled() ? ''
-    : 'disabled title="Needs an AI provider — set one under AI settings on the Assets tab"'}>
+    : 'disabled title="Needs an AI provider — set one on the Overview tab"'}>
     <span class="badge ai-tag">AI</span> <span class="lbl">${esc(label)}</span></button>`;
 
 const VERDICT_CLASS = {'act now': 'p-high', schedule: 'p-medium', 'verify ownership': 'p-medium',
@@ -4993,6 +5050,7 @@ $('#cov-azure').onclick = async (ev) => {
   finally { ev.target.disabled = false; ev.target.textContent = 'Reload Azure public IPs'; }
 };
 $('#cov-filter').onchange = renderCoverage;
+$('#ai-setup').addEventListener('toggle', () => { $('#ai-setup').dataset.touched = '1'; });
 $('#cost-per').onchange = renderCost;
 $('#cost-rate').oninput = () => {
   writeLS(LS.costrate, $('#cost-rate').value.trim().replace(',', '.'));
@@ -5038,6 +5096,24 @@ $('#cov-file').onchange = async (ev) => {
 };
 $('#cov-clear').onclick = () => { saveCoverage({azure: [], mde: [], at: null}); renderCoverage(); };
 
+/** The AI panel states its own status, because a disabled button somewhere else
+ *  is a poor place to learn that nothing is connected. Open and highlighted while
+ *  it is off; collapsed and quiet once it is on. */
+function paintAiSetup() {
+  const box = $('#ai-setup');
+  if (!box) return;
+  const on = aiEnabled();
+  const label = aiCfg().provider === 'claude' ? 'Claude' : 'Azure OpenAI';
+  box.classList.toggle('is-off', !on);
+  if (!box.dataset.touched) box.open = !on;      // never fight a deliberate toggle
+  $('#ai-setup-sum').innerHTML = on
+    ? `<span class="badge ai-tag">AI</span> <b>Connected — ${esc(label)}</b>
+       <span class="evidence" style="margin-left:6px">five actions available across four views</span>`
+    : `<span class="badge ai-tag">AI</span> <b>Not connected</b>
+       <span class="evidence" style="margin-left:6px">connect a provider to get triage, remediation
+       and a board brief without leaving the page</span>`;
+}
+
 // AI settings are ordinary inline fields, persisted per browser as they change.
 const AI_HINTS = {
   azure_openai: {label: 'Endpoint',
@@ -5052,7 +5128,7 @@ function renderAiSettings() {
   const label = cfg.provider === 'claude' ? 'Claude' : 'Azure OpenAI';
   $('#ai-status').innerHTML = on
     ? `<span class="badge ai-tag" title="AI features enabled — ${esc(label)}">AI · ${esc(label)}</span>`
-    : `<span class="badge p-none" title="No AI provider configured — set one under AI settings on the Assets tab">AI off</span>`;
+    : `<span class="badge p-none" title="No AI provider configured — set one on the Overview tab">AI off</span>`;
   $('#ai-provider').value = cfg.provider;
   $('#ai-label').textContent = meta.label;
   $('#ai-value').placeholder = meta.placeholder;
