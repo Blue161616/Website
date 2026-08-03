@@ -103,6 +103,12 @@
   .alert.amber{background:rgba(210,153,34,.07);border-color:rgba(210,153,34,.45)}
   .az-tag{background:rgba(88,166,255,.14);color:var(--blue)}
   .sc-tag{background:rgba(188,140,255,.16);color:var(--purple)}
+  .conf-observed{background:rgba(63,185,80,.14);color:var(--green)}
+  .conf-verified{background:rgba(63,185,80,.2);color:var(--green)}
+  .conf-inferred{background:rgba(139,148,158,.16);color:var(--muted)}
+  .conf-refuted{background:rgba(139,148,158,.1);color:var(--dim);text-decoration:line-through}
+  .verdicts{font-size:10px;color:var(--dim);margin-top:3px}
+  .verdicts a{color:var(--dim)} .verdicts a:hover{color:var(--blue)}
   button .az-tag{margin-right:2px}
   .fixlist{margin:8px 0 0;padding-left:18px;font-size:12px;color:var(--muted);line-height:1.55}
   .fixlist li{margin-bottom:6px} .fixlist b{color:var(--text)}
@@ -394,6 +400,8 @@
 
 <nav style="display:none">
   <button data-view="assets" class="on">Assets</button>
+  <button data-view="changes">Changes</button>
+  <button data-view="entry">Entry Points</button>
   <button data-view="findings" >Findings</button>
   <button data-view="coverage">Coverage Gap</button>
   <button data-view="cost">Cost Indicator</button>
@@ -464,6 +472,41 @@
       <div id="state-legend" class="note" style="line-height:1.9;margin-top:6px"></div>
     </details>
     <div id="asset-list"></div>
+  </section>
+
+  <!-- Changes: the delta against the last reviewed baseline. A snapshot tells
+       you the state; only a diff tells you the event, and a newly appeared asset
+       is the highest-signal thing an external attack surface produces. -->
+  <section id="view-changes" class="view">
+    <div class="tiles" id="chg-tiles"></div>
+    <div class="settings">
+      <button class="primary" id="chg-ack">Mark reviewed — baseline to now</button>
+      <span class="note" id="chg-note" style="margin:0"></span>
+    </div>
+    <div id="chg-body"></div>
+  </section>
+
+  <!-- Entry points: how somebody actually gets in. EASM reports the open ports
+       and we used to render them as a string. A management plane or a database
+       on the public internet is a first-hop candidate whether or not it carries a
+       single CVE, and the appliances at the edge are the class that gets mass
+       exploited the week a bug drops. -->
+  <section id="view-entry" class="view">
+    <div class="tiles" id="entry-tiles"></div>
+    <div class="settings">
+      <label for="entry-search">Filter</label>
+      <input id="entry-search" placeholder="hostname, IP, port, vendor…" autocomplete="off" spellcheck="false"/>
+      <select id="entry-plane">
+        <option value="">every entry point</option>
+      </select>
+      <select id="entry-state">
+        <option value="yours">assets that are yours</option>
+        <option value="confirmed">confirmed assets</option>
+        <option value="all">every asset</option>
+      </select>
+      <span class="note" id="entry-note" style="margin:0"></span>
+    </div>
+    <div id="entry-list"></div>
   </section>
 
   <!-- Findings: the asset view turned inside out. One row per CVE, ranked by the
@@ -567,7 +610,8 @@ const OBS_CONCURRENCY = 8;   // parallel observation POSTs; the API is per-asset
 const LS = {cfg: 'b16_easm_cfg', ai: 'b16_easm_ai', coverage: 'b16_easm_coverage',
             airesults: 'b16_easm_ai_results', shodan: 'b16_easm_shodan',
             ownership: 'b16_easm_ownership', excluded: 'b16_easm_excluded',
-            costs: 'b16_easm_costs', costrate: 'b16_easm_costrate'};
+            costs: 'b16_easm_costs', costrate: 'b16_easm_costrate',
+            verdicts: 'b16_easm_verdicts', baseline: 'b16_easm_baseline'};
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c =>
@@ -593,6 +637,57 @@ function assetWeight(a) {
   if ((a.labels || []).some(l => CRITICAL_LABELS.includes(String(l).toLowerCase()))) w *= 1.6;
   return w;
 }
+// ── How much to believe a finding ───────────────────────────────────────────
+// EASM derives most CVEs from a version fingerprint: this responds like nginx
+// 1.18.0, therefore it carries nginx 1.18.0's CVEs. That reasoning breaks on
+// every distribution that backports security fixes without changing the version
+// string, which is most of them — so a large share of the CVE list is arguable
+// while the configuration findings beside it are not.
+//
+// Treating both as equally true wastes the time of whoever chases them and costs
+// credibility the first time an escalation turns out to be a ghost. A finding the
+// scanner *tested* — an expired certificate, a directory listing, an accepted TLS
+// version — is a different kind of claim from one it inferred.
+const CONFIDENCE = {
+  observed: {w: 1, label: 'observed', why:
+    'The scanner tested this condition directly rather than deducing it from a version number.'},
+  inferred: {w: 0.6, label: 'version-inferred', why:
+    'Matched from a detected product version, not by testing the flaw. Distributions routinely ' +
+    'backport fixes without changing the version string, so a patched host still looks vulnerable ' +
+    'here. Confirm before escalating.'},
+  verified: {w: 1, label: 'verified', why: 'You confirmed this one holds on the asset.'},
+  refuted:  {w: 0, label: 'not applicable', why:
+    'You ruled this one out, so it scores nothing and drops out of the totals.'},
+};
+
+const getVerdicts = () => readLS(LS.verdicts, {})[wsKey()] || {};
+function setVerdict(assetId, finding, verdict) {
+  const all = readLS(LS.verdicts, {});
+  const ws = all[wsKey()] || (all[wsKey()] = {});
+  if (verdict) ws[`${assetId}|${finding}`] = verdict;
+  else delete ws[`${assetId}|${finding}`];
+  writeLS(LS.verdicts, all);
+}
+
+/** Observed, inferred, or whatever the user decided. */
+function confidenceOf(o, a) {
+  const v = getVerdicts()[`${a.id}|${o.name}`];
+  if (v) return v;
+  // Only CVEs are inferred; everything else EASM reports it actually saw.
+  return cveId(o.name) ? 'inferred' : 'observed';
+}
+
+/** The component the inference most likely came from, so the claim is checkable. */
+function inferenceBasis(o, a) {
+  const comps = (a.evidence || {}).web_components || [];
+  const words = String(o.name || '').toLowerCase();
+  const hit = comps.find(c => {
+    const base = c.split(/[\s:]/)[0].toLowerCase();
+    return base.length > 3 && words.includes(base);
+  });
+  return hit || comps[0] || '';
+}
+
 function observationRisk(o, a) {
   if (o.remediationState === 'nonApplicable') return 0;
   const cvss = o.cvssScoreV3 || o.cvssScoreV2 || 0;
@@ -600,7 +695,9 @@ function observationRisk(o, a) {
   // theoretical vulnerability where CVSS put it.
   const e = EPSS[cveId(o.name)];
   const exploit = 1 + (e ? e.epss : 0);
-  return (PRIORITY_WEIGHT[o.priority] ?? 0.5) * (1 + cvss / 10) * exploit * assetWeight(a);
+  const conf = CONFIDENCE[confidenceOf(o, a)] || CONFIDENCE.observed;
+  return (PRIORITY_WEIGHT[o.priority] ?? 0.5) * (1 + cvss / 10) * exploit
+         * assetWeight(a) * conf.w;
 }
 // ── Exploitation likelihood (EPSS) ──────────────────────────────────────────
 // CVSS says how bad a vulnerability would be; it says nothing about whether
@@ -914,6 +1011,8 @@ function assetRows(assets, obsByAsset, {mergePages = true} = {}) {
       g.seen.add(key);
       g.observations.push({...o, risk: observationRisk(o, g.asset), owasp: owaspFor(o),
                            kind: (o.types || []).includes('cve') ? 'cve' : 'insight',
+                           confidence: confidenceOf(o, g.asset),
+                           basis: inferenceBasis(o, g.asset),
                            via: a === g.asset ? '' : a.name});
     }
   }
@@ -1620,6 +1719,421 @@ function coverageSvg(rows, hasMde) {
     ${at.blind.length > dotCap ? `<text x="${blind.x + blind.w / 2}" y="${blind.y + blind.h - 14}"
       class="cov-cap" text-anchor="middle">+${at.blind.length - dotCap} more</text>` : ''}
   </svg></div>`;
+}
+
+// ── Change detection ────────────────────────────────────────────────────────
+// Everything else here is a snapshot, and a snapshot only tells you the state.
+// Exposure management runs on the delta: an asset that appeared this week, a port
+// that opened, a finding that is new. That is the event worth acting on, and
+// today it is indistinguishable from the four thousand rows that have been fine
+// for a year.
+//
+// The baseline is explicit rather than "the previous load", because reloading
+// twice in an afternoon would otherwise erase the window you wanted to see. It
+// moves when you say you have reviewed it.
+//
+// Finding names repeat enormously across an estate — the same CVE on two hundred
+// hosts — so they are stored once in a dictionary and referenced by index. A
+// 4,000-asset workspace has to fit in localStorage beside everything else.
+function buildSnapshot(assets, obsByAsset) {
+  const dict = [], index = new Map();
+  const idx = name => {
+    if (!index.has(name)) { index.set(name, dict.length); dict.push(name); }
+    return index.get(name);
+  };
+  const a = {};
+  for (const asset of assets) {
+    const ports = ((asset.evidence || {}).services || [])
+      .filter(x => x.recent !== false).map(x => x.port).sort((x, y) => x - y);
+    const finds = (obsByAsset[asset.id] || [])
+      .filter(o => o.remediationState !== 'nonApplicable').map(o => idx(o.name)).sort((x, y) => x - y);
+    a[asset.id] = [asset.state, ports.join(','), finds];
+  }
+  return {at: new Date().toISOString(), dict, a};
+}
+
+const getBaseline = () => readLS(LS.baseline, {})[wsKey()] || null;
+function saveBaseline(snap) {
+  const all = readLS(LS.baseline, {});
+  all[wsKey()] = snap;
+  // A workspace too large to store must not take the rest of the app down with
+  // it, so the baseline is dropped and the page says the diff is unavailable.
+  try { writeLS(LS.baseline, all); return true; }
+  catch (e) { try { writeLS(LS.baseline, {[wsKey()]: snap}); return true; } catch (e2) { return false; } }
+}
+
+/** What changed between the stored baseline and what is loaded now. */
+function diffSnapshot(base, assets, obsByAsset) {
+  if (!base) return null;
+  const now = buildSnapshot(assets, obsByAsset);
+  const byId = Object.fromEntries(assets.map(x => [x.id, x]));
+  const nameOf = i => base.dict[i];
+  const out = {at: base.at, appeared: [], vanished: [], ports: [], findings: [], states: []};
+
+  for (const [id, cur] of Object.entries(now.a)) {
+    const was = base.a[id];
+    const asset = byId[id];
+    if (!was) { out.appeared.push(asset); continue; }
+    const wasPorts = new Set((was[1] ? was[1].split(',') : []));
+    const newPorts = (cur[1] ? cur[1].split(',') : []).filter(pt => !wasPorts.has(pt));
+    if (newPorts.length) out.ports.push({asset, ports: newPorts.map(Number)});
+    const wasFinds = new Set(was[2].map(nameOf));
+    const newFinds = cur[2].map(i => now.dict[i]).filter(n => !wasFinds.has(n));
+    if (newFinds.length) out.findings.push({asset, names: newFinds});
+    if (was[0] !== cur[0]) out.states.push({asset, from: was[0], to: cur[0]});
+  }
+  for (const id of Object.keys(base.a)) if (!now.a[id]) out.vanished.push(id);
+  return out;
+}
+
+function renderChanges() {
+  if (!DATA) return;
+  const base = getBaseline();
+  $('#chg-note').textContent = base
+    ? `Baseline set ${new Date(base.at).toLocaleString()}`
+    : 'No baseline yet';
+
+  if (!base) {
+    $('#chg-tiles').innerHTML = '';
+    $('#chg-body').innerHTML = `<div class="note">No baseline for this workspace yet, so there is
+      nothing to compare against. One is written the first time a load finishes — reload, and from
+      then on this page shows what appeared, opened or changed since you last marked it reviewed.</div>`;
+    return;
+  }
+
+  const d = diffSnapshot(base, DATA.assets, DATA.obsByAsset);
+  // A new asset is the headline: it is exposure nobody has looked at once.
+  const rank = a => {
+    const ep = entryPoints(a);
+    return entryScore(a, ep);
+  };
+  d.appeared.sort((x, y) => rank(y) - rank(x));
+
+  const total = d.appeared.length + d.ports.length + d.findings.length + d.states.length;
+  $('#chg-tiles').innerHTML = [
+    ['New assets', d.appeared.length, 'not in inventory at the baseline', d.appeared.length ? 'risk' : ''],
+    ['Newly opened ports', d.ports.length, 'assets answering on something new',
+     d.ports.length ? 'risk' : ''],
+    ['New findings', d.findings.length, 'assets carrying something new', ''],
+    ['Gone', d.vanished.length, 'no longer in inventory', ''],
+  ].map(([l, n, sub, cls]) => `<div class="tile ${cls}"><div class="n">${esc(n)}</div>
+      <div class="l">${esc(l)}</div>
+      <div class="l" style="text-transform:none;color:var(--dim)">${esc(sub)}</div></div>`).join('');
+
+  if (!total && !d.vanished.length) {
+    $('#chg-body').innerHTML = `<div class="covhead"><b style="color:var(--green)">Nothing has changed
+      since ${esc(new Date(base.at).toLocaleString())}</b> — no new assets, no newly opened ports, no
+      new findings. That is the answer you want from this page most weeks.</div>`;
+    return;
+  }
+
+  const list = (title, items, render) => items.length ? `
+    <h4>${esc(title)}</h4>
+    <table><tbody>${items.slice(0, 200).map(render).join('')}</tbody></table>
+    ${items.length > 200 ? `<p class="note">…and ${items.length - 200} more.</p>` : ''}` : '';
+
+  $('#chg-body').innerHTML = `
+    <div class="covhead">Compared against the baseline of
+      <b>${esc(new Date(base.at).toLocaleString())}</b>. ${total
+        ? `${total} thing${total === 1 ? '' : 's'} changed.`
+        : ''} Reviewing them and pressing <b>Mark reviewed</b> moves the baseline forward.</div>
+    ${list('New assets', d.appeared, a => {
+      const ep = entryPoints(a);
+      return `<tr>
+        <td><b>${esc(a.name)}</b><div class="evidence">${esc(a.kind)} · ${esc(a.state)}${
+          a.disco_group ? ` · found via ${esc(a.disco_group)}` : ''}</div></td>
+        <td>${ep.edge ? `<span class="badge p-high">${esc(ep.edge.vendor)} appliance</span> ` : ''}${
+          ep.planes.map(pl => `<span class="badge p-high">${esc(pl.ports.map(x => x.name).join(', '))}</span>`).join(' ')}</td>
+        <td class="evidence">${esc(assetIps(a).join(', ') || '')}</td>
+        <td><a href="#" class="chg-jump" data-asset="${esc(a.name)}" style="color:var(--blue)">open</a></td></tr>`;
+    })}
+    ${list('Newly opened ports', d.ports, x => `<tr>
+      <td><b>${esc(x.asset.name)}</b></td>
+      <td>${x.ports.map(pt => {
+        const cls = PORT_CLASS[pt];
+        return `<span class="badge ${cls ? 'p-high' : 'p-none'}"${cls
+          ? ` title="${esc(PLANES[cls[0]].risk)}"` : ''}>${pt}${cls ? ` ${esc(cls[1])}` : ''}</span>`;
+      }).join(' ')}</td>
+      <td><a href="#" class="chg-jump" data-asset="${esc(x.asset.name)}" style="color:var(--blue)">open</a></td></tr>`)}
+    ${list('New findings', d.findings, x => `<tr>
+      <td><b>${esc(x.asset.name)}</b></td>
+      <td>${x.names.slice(0, 6).map(n => `<span class="badge p-none">${findingName(n)}</span>`).join(' ')}${
+        x.names.length > 6 ? ` <span class="evidence">+${x.names.length - 6}</span>` : ''}</td>
+      <td><a href="#" class="chg-jump" data-asset="${esc(x.asset.name)}" style="color:var(--blue)">open</a></td></tr>`)}
+    ${list('State changed', d.states, x => `<tr>
+      <td><b>${esc(x.asset.name)}</b></td>
+      <td><span class="badge p-none">${esc(x.from)}</span> → <span class="badge p-none">${esc(x.to)}</span></td>
+      <td><a href="#" class="chg-jump" data-asset="${esc(x.asset.name)}" style="color:var(--blue)">open</a></td></tr>`)}
+    ${d.vanished.length ? `<h4>Gone from inventory</h4>
+      <p class="note">${d.vanished.length} asset${d.vanished.length === 1 ? '' : 's'} present at the
+      baseline ${d.vanished.length === 1 ? 'is' : 'are'} no longer returned. That can mean it was
+      decommissioned, or that discovery simply stopped reaching it — worth confirming which, because
+      the second one leaves the exposure in place and removes your view of it.</p>` : ''}`;
+
+  $('#chg-body').querySelectorAll('.chg-jump').forEach(el =>
+    el.onclick = ev => {
+      ev.preventDefault();
+      $('#asset-search').value = el.dataset.asset;
+      $('#asset-state').value = 'all';
+      ASSET_FOCUS = '';
+      show('assets');
+    });
+}
+
+// ── Entry points ────────────────────────────────────────────────────────────
+// Vulnerability severity and initial access are different questions, and this
+// tool only answered the first. An internet-facing RDP or an unauthenticated
+// Redis is a more plausible first hop than a CVSS 9.8 on a static marketing
+// site — no exploit required, just a password list or a TCP connection. EASM
+// reports the open ports and this page used to render them as a string.
+//
+// The weights below are about what an attacker gets, not about how hard the
+// service is to attack: a control plane or an open datastore usually hands over
+// everything at once, while a management plane still wants a credential.
+const PLANES = {
+  control:    {w: 10, label: 'Control plane', short: 'control',
+    risk: 'Container and cluster control APIs frequently answer without authentication at all. ' +
+          'Reaching one is not a foothold, it is the whole estate behind it.',
+    fix: 'These should never face the internet. Put the AKS API server behind authorised IP ranges ' +
+         'or make the cluster private; Docker, etcd and kubelet should not be reachable at all.'},
+  data:       {w: 9, label: 'Data store', short: 'database',
+    risk: 'Databases exposed to the internet are routinely found with no authentication, default ' +
+          'credentials, or a version with a pre-auth flaw. Redis, MongoDB and Elasticsearch are ' +
+          'swept continuously and are the classic source of a silent bulk data theft.',
+    fix: 'Take it off the public internet: a Private Endpoint, a firewall rule allowing only known ' +
+         'sources, and public network access disabled on the resource.'},
+  management: {w: 8, label: 'Remote management', short: 'management',
+    risk: 'This is the surface password spraying and credential stuffing exist for, and it is how a ' +
+          'large share of ransomware starts. Exposure alone is the finding — no vulnerability is ' +
+          'needed for a valid password to work.',
+    fix: 'Reach these through Azure Bastion or a VPN rather than from the internet, deny the port ' +
+         'from Internet in the NSG, and use just-in-time access where a jump box is unavoidable.'},
+  transfer:   {w: 7, label: 'File transfer / shares',
+    risk: 'File services expose data directly, often allow anonymous access, and managed file ' +
+          'transfer appliances have been the entry point for several mass-exploitation campaigns.',
+    fix: 'Never expose SMB or NFS to the internet. For external file exchange use SFTP on Storage ' +
+         'with a Private Endpoint, or a managed service kept patched aggressively.'},
+  directory:  {w: 6, label: 'Directory / authentication',
+    risk: 'Directory protocols on the internet leak account and group structure, and give an ' +
+          'attacker somewhere to test credentials that is often less monitored than a login page.',
+    fix: 'LDAP and Kerberos should never be internet-facing. Federate through Entra ID and remove ' +
+         'the direct exposure.'},
+  mail:       {w: 4, label: 'Mail service',
+    risk: 'Mail protocols accept credentials, and legacy endpoints frequently bypass modern ' +
+          'authentication and therefore multi-factor authentication as well.',
+    fix: 'Disable legacy authentication, require modern auth, and confirm the endpoint needs to be ' +
+         'public at all.'},
+};
+
+const PORT_CLASS = {
+  // remote management
+  22: ['management', 'SSH'], 23: ['management', 'Telnet'], 3389: ['management', 'RDP'],
+  5985: ['management', 'WinRM'], 5986: ['management', 'WinRM/TLS'],
+  5900: ['management', 'VNC'], 5901: ['management', 'VNC'], 512: ['management', 'rexec'],
+  513: ['management', 'rlogin'], 514: ['management', 'rsh'], 3283: ['management', 'ARD'],
+  // data stores
+  1433: ['data', 'MSSQL'], 1521: ['data', 'Oracle'], 3306: ['data', 'MySQL'],
+  5432: ['data', 'PostgreSQL'], 27017: ['data', 'MongoDB'], 27018: ['data', 'MongoDB'],
+  6379: ['data', 'Redis'], 9200: ['data', 'Elasticsearch'], 9300: ['data', 'Elasticsearch'],
+  5984: ['data', 'CouchDB'], 11211: ['data', 'Memcached'], 9042: ['data', 'Cassandra'],
+  8123: ['data', 'ClickHouse'], 5433: ['data', 'PostgreSQL'], 1830: ['data', 'Oracle'],
+  // control planes
+  6443: ['control', 'Kubernetes API'], 2375: ['control', 'Docker (plaintext)'],
+  2376: ['control', 'Docker'], 10250: ['control', 'kubelet'], 2379: ['control', 'etcd'],
+  8500: ['control', 'Consul'], 4243: ['control', 'Docker'], 9090: ['control', 'Prometheus'],
+  // file transfer and shares
+  21: ['transfer', 'FTP'], 69: ['transfer', 'TFTP'], 139: ['transfer', 'NetBIOS'],
+  445: ['transfer', 'SMB'], 873: ['transfer', 'rsync'], 2049: ['transfer', 'NFS'],
+  // directory
+  389: ['directory', 'LDAP'], 636: ['directory', 'LDAPS'], 88: ['directory', 'Kerberos'],
+  3268: ['directory', 'Global Catalog'], 3269: ['directory', 'Global Catalog'],
+  // mail
+  110: ['mail', 'POP3'], 143: ['mail', 'IMAP'], 587: ['mail', 'SMTP submission'],
+  993: ['mail', 'IMAPS'], 995: ['mail', 'POP3S'],
+};
+
+// The appliances that sit at the edge by design. When a bug lands in one of
+// these it is mass-scanned within days, so knowing you run one is worth more
+// than any single CVE currently attached to it.
+const EDGE_DEVICES = [
+  [/fortinet|fortigate|forti(os|web|mail)/i, 'Fortinet', 'VPN / firewall'],
+  [/ivanti|pulse ?secure|connect ?secure|neurons/i, 'Ivanti', 'VPN gateway'],
+  [/citrix|netscaler/i, 'Citrix', 'Gateway / ADC'],
+  [/palo ?alto|globalprotect|pan-?os/i, 'Palo Alto', 'VPN / firewall'],
+  [/sonicwall/i, 'SonicWall', 'VPN / firewall'],
+  [/\bsophos\b/i, 'Sophos', 'Firewall'],
+  [/check ?point/i, 'Check Point', 'VPN / firewall'],
+  [/watchguard/i, 'WatchGuard', 'Firewall'],
+  [/barracuda/i, 'Barracuda', 'Appliance'],
+  [/big-?ip|\bf5\b/i, 'F5 BIG-IP', 'ADC / access'],
+  [/cisco (asa|anyconnect|ise)/i, 'Cisco', 'VPN / access'],
+  [/zyxel|draytek|mikrotik/i, 'SOHO router', 'Edge device'],
+  [/moveit|goanywhere|crushftp|cleo (harmony|vltrader)|serv-?u/i, 'Managed file transfer', 'MFT'],
+  [/exchange server|outlook web|\bowa\b/i, 'Exchange', 'Mail / OWA'],
+  [/vmware (horizon|vcenter)|esxi/i, 'VMware', 'Virtualisation'],
+  [/rdweb|remote desktop (gateway|web)/i, 'RD Gateway', 'Remote access'],
+  [/openvpn|wireguard/i, 'VPN server', 'Remote access'],
+  [/papercut|solarwinds|manageengine|jetbrains teamcity/i, 'Management software', 'Admin'],
+];
+
+// Names that advertise an authentication portal. Not a vulnerability — a target:
+// this is what a password spray points at, and it is worth knowing you have one.
+const AUTH_NAME = /^(vpn|remote|access|portal|sso|adfs|sts|login|signin|auth|citrix|rdweb|rdp|owa|webmail|mail|extranet|gateway|gw)\b|[-.](vpn|sso|adfs|portal|login|owa|rdweb)[-.]/i;
+
+/** What an attacker could aim at on this asset. */
+function entryPoints(asset) {
+  const e = asset.evidence || {};
+  const seen = new Map();
+  for (const svc of e.services || []) {
+    if (svc.recent === false) continue;             // historical, not open now
+    const hit = PORT_CLASS[Number(svc.port)];
+    if (!hit) continue;
+    const [plane, name] = hit;
+    if (!seen.has(plane)) seen.set(plane, []);
+    seen.get(plane).push({port: Number(svc.port), name});
+  }
+  const planes = [...seen.entries()]
+    .map(([plane, ports]) => ({plane, ports}))
+    .sort((a, b) => PLANES[b.plane].w - PLANES[a.plane].w);
+
+  const haystack = [...(e.web_components || []), e.cert_subject || '', asset.name || ''].join(' ');
+  const edgeHit = EDGE_DEVICES.find(([re]) => re.test(haystack));
+  const edge = edgeHit ? {vendor: edgeHit[1], role: edgeHit[2]} : null;
+  const authPortal = AUTH_NAME.test(asset.name || '') && (e.services || [])
+    .some(x => [80, 443, 8443, 4443].includes(Number(x.port)));
+
+  return {planes, edge, authPortal};
+}
+
+/** How attractive this asset is as a first hop.
+ *
+ *  Deliberately not the CVE risk score. The strongest plane counts in full and
+ *  each additional one adds a quarter — a box offering RDP and MSSQL is worse
+ *  than one offering RDP, but not twice as bad, and the count of open ports is
+ *  not the point. An edge appliance is weighted up because that class is
+ *  mass-exploited on disclosure, and an authentication portal because it is
+ *  where credential attacks are aimed.
+ */
+function entryScore(asset, ep) {
+  if (!ep.planes.length && !ep.edge && !ep.authPortal) return 0;
+  const weights = ep.planes.map(p => PLANES[p.plane].w).sort((a, b) => b - a);
+  let base = weights.length ? weights[0] + weights.slice(1).reduce((s, w) => s + w * 0.25, 0) : 0;
+  if (ep.edge) base = Math.max(base, 6) * 1.6;
+  if (ep.authPortal) base = Math.max(base, 3) * 1.3;
+  return base * assetWeight(asset);
+}
+
+function renderEntry() {
+  if (!DATA) return;
+  const state = $('#entry-state').value;
+  const q = $('#entry-search').value.trim().toLowerCase();
+  const planeWanted = $('#entry-plane').value;
+
+  const rows = assetRows(DATA.assets, DATA.obsByAsset, {mergePages: true})
+    .filter(r => !excludedBy(r.asset) && matchesState(r.asset.state, state))
+    .map(r => { const ep = entryPoints(r.asset); return {r, ep, score: entryScore(r.asset, ep)}; })
+    .filter(x => x.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  const count = plane => rows.filter(x => x.ep.planes.some(p => p.plane === plane)).length;
+  const sel = $('#entry-plane'), keepPlane = sel.value;
+  sel.innerHTML = '<option value="">every entry point</option>' +
+    Object.entries(PLANES).filter(([k]) => count(k))
+      .map(([k, v]) => `<option value="${k}">${esc(v.label.toLowerCase())} (${count(k)})</option>`).join('') +
+    (rows.filter(x => x.ep.edge).length ? `<option value="__edge">edge appliances (${rows.filter(x => x.ep.edge).length})</option>` : '') +
+    (rows.filter(x => x.ep.authPortal).length ? `<option value="__auth">login portals (${rows.filter(x => x.ep.authPortal).length})</option>` : '');
+  sel.value = [...sel.options].some(o => o.value === keepPlane) ? keepPlane : '';
+
+  const shown = rows.filter(x => {
+    if (planeWanted === '__edge' && !x.ep.edge) return false;
+    if (planeWanted === '__auth' && !x.ep.authPortal) return false;
+    if (planeWanted && !planeWanted.startsWith('__')
+        && !x.ep.planes.some(p => p.plane === planeWanted)) return false;
+    if (q && !x.r.asset.name.toLowerCase().includes(q)
+          && !assetIps(x.r.asset).some(ip => ip.includes(q))
+          && !x.ep.planes.some(p => p.ports.some(s => String(s.port) === q || s.name.toLowerCase().includes(q)))
+          && !(x.ep.edge && x.ep.edge.vendor.toLowerCase().includes(q))) return false;
+    return true;
+  });
+
+  $('#entry-tiles').innerHTML = [
+    ['Exposed entry points', rows.length, 'assets reachable on a first-hop service', rows.length ? 'risk' : ''],
+    ['Management planes', count('management'), 'RDP, SSH, WinRM, VNC', count('management') ? 'risk' : ''],
+    ['Data stores', count('data') + count('control'), 'databases and control APIs',
+     count('data') + count('control') ? 'risk' : ''],
+    ['Edge appliances', rows.filter(x => x.ep.edge).length, 'the mass-exploited class', ''],
+  ].map(([l, n, sub, cls]) => `<div class="tile ${cls}"><div class="n">${esc(n)}</div>
+      <div class="l">${esc(l)}</div>
+      <div class="l" style="text-transform:none;color:var(--dim)">${esc(sub)}</div></div>`).join('');
+
+  $('#entry-note').textContent = `${shown.length} shown of ${rows.length}`;
+
+  if (!shown.length) {
+    $('#entry-list').innerHTML = `<div class="note">${rows.length
+      ? 'Nothing matches those filters.'
+      : `No asset in this selection exposes a management plane, a data store, a control API or a
+         known edge appliance. That is the good answer — it means the obvious first hops are not
+         open. It says nothing about application-level flaws, which the Findings view covers.`}</div>`;
+    return;
+  }
+
+  $('#entry-list').innerHTML = shown.slice(0, 300).map(x => {
+    const {r, ep} = x;
+    const a = r.asset;
+    const worstPlane = ep.planes[0];
+    return `
+    <div class="card" data-asset="${esc(a.id)}">
+      <div class="card-head">
+        <span class="rank">${esc(riskBand(x.score * 3))}</span>
+        ${ep.edge ? `<span class="badge p-high" title="${esc(ep.edge.vendor)} — ${esc(ep.edge.role)}. Edge appliances are scanned within days of a disclosure.">${esc(ep.edge.vendor)}</span>` : ''}
+        ${ep.planes.map(p => `<span class="badge ${p.plane === 'mail' ? 'p-medium' : 'p-high'}"
+           title="${esc(PLANES[p.plane].risk)}">${esc(p.ports.map(s => s.name).join(', '))}</span>`).join('')}
+        ${ep.authPortal ? '<span class="badge p-medium" title="A named login portal — where password spraying is aimed.">login portal</span>' : ''}
+        <span class="aname">${esc(a.name)}</span>
+        <span class="spacer"></span>
+        <span class="badge p-none">${esc(a.state)}</span>
+        ${r.risk > 0 ? `<span class="badge p-none" title="CVE-based risk from the Assets view">${r.risk.toFixed(0)} CVE risk</span>` : ''}
+        <span class="riskn"><b>${x.score.toFixed(0)}</b><span>exposure</span></span>
+      </div>
+      <div class="detail">
+        <p class="note" style="margin:0 0 10px">
+          ${ep.edge ? `<b>${esc(ep.edge.vendor)} ${esc(ep.edge.role.toLowerCase())}.</b> Appliances of this
+             kind are internet-facing by design and are swept en masse within days of any disclosure,
+             so the patch window is short and the consequence of missing it is direct network access.
+             Track this vendor's advisories specifically rather than waiting for it to appear as a CVE
+             on a scan. ` : ''}
+          ${ep.authPortal ? `The name says this is a login portal, which makes it a password-spray
+             target: confirm multi-factor authentication is enforced with no legacy-auth bypass, and
+             that lockout and sign-in monitoring cover it. ` : ''}
+          ${!ep.planes.length && !ep.edge ? 'No exposed service plane — listed for the portal alone. ' : ''}</p>
+        ${ep.planes.map(p => `
+          <h4>${esc(PLANES[p.plane].label)} — ${esc(p.ports.map(s => `${s.name} :${s.port}`).join(', '))}</h4>
+          <p class="note" style="margin:0 0 6px">${esc(PLANES[p.plane].risk)}</p>
+          <p class="note" style="margin:0 0 10px"><b>Fix:</b> ${esc(PLANES[p.plane].fix)}</p>`).join('')}
+        <table><thead><tr><th>Address</th><th>All open ports</th><th>Technology</th></tr></thead><tbody>
+          <tr><td style="font-family:ui-monospace,monospace">${esc(assetIps(a).join(', ') || '—')}</td>
+            <td>${esc(((a.evidence || {}).services || []).map(v => v.port).join(', ') || '—')}</td>
+            <td class="evidence">${esc(((a.evidence || {}).web_components || []).join(', ') || '—')}</td></tr>
+        </tbody></table>
+        <p class="note" style="margin:10px 0 0">Exposure is scored on what reaching the service would
+          give an attacker, not on any CVE — an open management plane needs only a working password
+          and an open data store often needs nothing at all.
+          <a href="#" class="entry-jump" data-asset="${esc(a.name)}" style="color:var(--blue)">Open this
+          asset in Assets</a> for its findings.</p>
+      </div>
+    </div>`;
+  }).join('');
+
+  $('#entry-list').querySelectorAll('.card-head').forEach(h =>
+    h.onclick = () => h.parentElement.classList.toggle('open'));
+  $('#entry-list').querySelectorAll('.entry-jump').forEach(el =>
+    el.onclick = ev => {
+      ev.preventDefault(); ev.stopPropagation();
+      $('#asset-search').value = el.dataset.asset;
+      $('#asset-state').value = 'all';
+      ASSET_FOCUS = '';
+      show('assets');
+    });
 }
 
 // ── Findings: the asset view turned inside out ──────────────────────────────
@@ -2919,6 +3433,21 @@ function renderAssets() {
         >weak attribution</span>` : '',
       isSupplyChain(a) ? `<span class="badge sc-tag help" title="${esc(supplyChainTitle(a))}"
         >supply chain risk</span>` : '',
+      (() => {
+        // The first-hop surface belongs on the asset row as well: somebody
+        // reading the risk ranking should see that this box answers on RDP.
+        const ep = entryPoints(a);
+        if (!ep.planes.length && !ep.edge) return '';
+        const worst = ep.planes[0];
+        const names = worst ? worst.ports.map(s => s.name) : [];
+        const label = ep.edge
+          ? `${ep.edge.vendor} appliance`
+          : `${names.slice(0, 2).join(', ')}${names.length > 2 ? ` +${names.length - 2}` : ''} exposed`;
+        const why = ep.edge
+          ? `${ep.edge.vendor} ${ep.edge.role.toLowerCase()} — an edge appliance, scanned within days of any disclosure.`
+          : PLANES[worst.plane].risk;
+        return `<span class="badge p-high help" title="${esc(why)}">${esc(label)}</span>`;
+      })(),
       svc.warning ? `<span class="badge p-medium help" title="${esc(svc.warning)}">web only</span>` : '',
       stored.causes || stored.assess ? `<span class="badge ai-tag" title="${esc(`Reviewed by AI ${new Date((stored.causes || stored.assess).at).toLocaleString()}`)}">AI</span>` : '',
     ].join('');
@@ -3028,11 +3557,20 @@ function renderAssets() {
           `<span class="badge p-none" style="margin-right:4px">${esc(o)}</span>`).join('')}</p>` : ''}
         ${r.observations.length ? Object.entries(byTheme).map(([theme, list]) => `
           <h4>${esc(theme)}</h4>
-          <table><thead><tr><th>Finding</th><th>Type</th><th>Priority</th><th>CVSS</th><th>Exploit</th><th>Risk</th></tr></thead>
+          <table><thead><tr><th>Finding</th><th>Type</th><th>Confidence</th><th>Priority</th><th>CVSS</th><th>Exploit</th><th>Risk</th></tr></thead>
           <tbody>${list.map(o => `<tr>
             <td><span class="help" title="${esc(findingHelp(o.name))}">${findingName(o.name)}</span>${
               urlPath(o.via) ? `<div class="evidence">on ${esc(urlPath(o.via))}</div>` : ''}</td>
             <td><span class="badge k-${esc(o.kind)}">${esc(o.kind)}</span></td>
+            <td><span class="badge conf-${esc(o.confidence)} help"
+              title="${esc(CONFIDENCE[o.confidence].why)}${o.confidence === 'inferred' && o.basis
+                ? ` Detected here as ${o.basis}.` : ''}">${esc(CONFIDENCE[o.confidence].label)}</span>
+              <div class="verdicts"><a href="#" class="vd" data-asset="${esc(a.id)}"
+                data-find="${esc(o.name)}" data-v="verified">confirm</a> ·
+                <a href="#" class="vd" data-asset="${esc(a.id)}" data-find="${esc(o.name)}"
+                data-v="refuted">rule out</a>${getVerdicts()[`${a.id}|${o.name}`]
+                ? ` · <a href="#" class="vd" data-asset="${esc(a.id)}" data-find="${esc(o.name)}"
+                    data-v="">reset</a>` : ''}</div></td>
             <td><span class="badge p-${esc(o.priority)}">${esc(o.priority)}</span></td>
             <td>${o.cvssScoreV3 || o.cvssScoreV2 || '—'}</td>
             <td>${epssCell(o.name)}</td>
@@ -3072,6 +3610,12 @@ function renderAssets() {
     b.onclick = ev => adviseAsset(ev.target, rows.find(r => r.asset.id === b.dataset.asset)));
   $('#asset-list').querySelectorAll('.ai-causes').forEach(b =>
     b.onclick = ev => clusterAsset(ev.target, rows.find(r => r.asset.id === b.dataset.asset)));
+  $('#asset-list').querySelectorAll('.vd').forEach(el =>
+    el.onclick = ev => {
+      ev.preventDefault(); ev.stopPropagation();
+      setVerdict(el.dataset.asset, el.dataset.find, el.dataset.v);
+      rerenderKeepingOpen();
+    });
   $('#asset-list').querySelectorAll('.shodan-btn').forEach(b =>
     b.onclick = () => verifyWithShodan(b, rows.find(r => r.asset.id === b.dataset.asset)));
   $('#asset-list').querySelectorAll('.own-btn').forEach(b =>
@@ -3228,8 +3772,8 @@ async function adviseAsset(button, row) {
 }
 
 // ── wiring ──────────────────────────────────────────────────────────────────
-const VIEWS = {assets: renderAssets, findings: renderFindings, coverage: renderCoverage,
-               cost: renderCost};
+const VIEWS = {assets: renderAssets, entry: renderEntry, findings: renderFindings,
+               changes: renderChanges, coverage: renderCoverage, cost: renderCost};
 let current = 'assets';
 function show(v) {
   current = v;
@@ -3271,6 +3815,9 @@ async function loadCurrent() {
     });
     show(current);                     // paint before enrichment
     if (await loadEpss(DATA.obsByAsset, progress)) show(current);   // re-rank with EPSS
+    // Seed a baseline the first time, and only on a complete load — half an
+    // inventory recorded as the baseline would report the missing half as new.
+    if (!DATA.interrupted && !getBaseline()) saveBaseline(buildSnapshot(DATA.assets, DATA.obsByAsset));
     progress('');
   } catch (e) {
     progress('');
@@ -3406,6 +3953,18 @@ $('#cost-load').onclick = async () => {
   b.disabled = false; b.textContent = 'Read Azure costs';
   renderCost();
 };
+$('#chg-ack').onclick = () => {
+  if (!DATA) return;
+  const ok = saveBaseline(buildSnapshot(DATA.assets, DATA.obsByAsset));
+  $('#chg-note').textContent = ok ? 'Baseline moved to now'
+    : 'Could not store the baseline — this workspace is too large for browser storage.';
+  renderChanges();
+};
+['#entry-search', '#entry-plane', '#entry-state'].forEach(sel => {
+  const el = $(sel);
+  el.oninput = renderEntry;
+  el.onchange = renderEntry;
+});
 ['#find-search', '#find-kind', '#find-state'].forEach(sel => {
   const el = $(sel);
   el.oninput = renderFindings;
