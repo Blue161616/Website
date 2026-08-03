@@ -108,8 +108,11 @@
   .fixlist li{margin-bottom:6px} .fixlist b{color:var(--text)}
   .evidence{color:var(--muted);font-size:11px}
   code{background:var(--bg);padding:1px 5px;border-radius:3px;color:var(--blue);font-size:11px}
-  td a{color:var(--blue);text-decoration:none}
-  td a:hover{text-decoration:underline}
+  /* findingName() returns a link, and it lands in a card head as well as a cell —
+     unstyled there it fell back to the browser's dark blue, unreadable on this
+     background and purple once visited. */
+  td a,.aname a{color:var(--blue);text-decoration:none}
+  td a:hover,.aname a:hover{text-decoration:underline}
   .toolbar{display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap}
   #gate{position:fixed;inset:0;z-index:999;background:#0d1117;display:flex;flex-direction:column;
         align-items:center;justify-content:center;gap:18px;text-align:center;padding:24px}
@@ -393,7 +396,7 @@
   <button data-view="assets" class="on">Assets</button>
   <button data-view="findings" >Findings</button>
   <button data-view="coverage">Coverage Gap</button>
-  <button data-view="cost">Cost</button>
+  <button data-view="cost">Cost Indicator</button>
 </nav>
 
 <main style="display:none">
@@ -491,6 +494,12 @@
     <div class="tiles" id="cost-tiles"></div>
     <div class="settings">
       <button class="primary" id="cost-load">Read Azure costs</button>
+      <label for="cost-rate">Rate / asset / day</label>
+      <input id="cost-rate" style="width:110px" inputmode="decimal" autocomplete="off" spellcheck="false"/>
+      <select id="cost-per">
+        <option value="month">show per month</option>
+        <option value="day">show per day</option>
+      </select>
       <span class="note" id="cost-note" style="margin:0"></span>
     </div>
     <div id="cost-body"></div>
@@ -558,7 +567,7 @@ const OBS_CONCURRENCY = 8;   // parallel observation POSTs; the API is per-asset
 const LS = {cfg: 'b16_easm_cfg', ai: 'b16_easm_ai', coverage: 'b16_easm_coverage',
             airesults: 'b16_easm_ai_results', shodan: 'b16_easm_shodan',
             ownership: 'b16_easm_ownership', excluded: 'b16_easm_excluded',
-            costs: 'b16_easm_costs'};
+            costs: 'b16_easm_costs', costrate: 'b16_easm_costrate'};
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c =>
@@ -1746,6 +1755,18 @@ function renderFindings() {
 const COST_API = '2023-03-01';
 const getCosts = () => readLS(LS.costs, {});
 
+// Microsoft's published list price for Defender EASM Standard: one asset, one day.
+// https://azure.microsoft.com/pricing/details/defender-external-attack-surface-management/
+// It is a starting point, not a fact about any given tenant — EA, CSP and MCA
+// agreements all discount, and the meter is billed in the tenant's own currency.
+// So it is used only when nothing better is available, is always labelled as list
+// price, and is overridable.
+const LIST_RATE = 0.011, LIST_CURRENCY = 'USD';
+const getRateOverride = () => {
+  const v = parseFloat(readLS(LS.costrate, ''));
+  return Number.isFinite(v) && v > 0 ? v : null;
+};
+
 async function loadCosts() {
   const subs = [...new Set(WORKSPACES.map(w => w.subscription_id))];
   const out = {};
@@ -1781,6 +1802,9 @@ const monthDaysElapsed = () => new Date().getDate();
 
 function renderCost() {
   const store = getCosts();
+  const rateBox = $('#cost-rate');
+  if (document.activeElement !== rateBox) rateBox.value = readLS(LS.costrate, '');
+  rateBox.placeholder = String(LIST_RATE);
   const costs = store.byWorkspace || {};
   const elapsed = monthDaysElapsed();
 
@@ -1797,71 +1821,94 @@ function renderCost() {
     return {w, t, c, assets, billedDays, rate};
   });
 
-  // One demonstrated rate is enough to price every workspace that has not started
-  // paying yet — same product, same tenant, usually the same agreement.
+  // Which rate to price with, best evidence first. A rate you measured beats one
+  // you were quoted, and one you typed beats both — you know your agreement.
   const known = rows.filter(r => r.rate).sort((a, b) => b.billedDays - a.billedDays);
-  const refRate = known.length ? known[0].rate : null;
-  const currency = (known[0] && known[0].c.currency) || (Object.values(costs)[0] || {}).currency || '';
+  const override = getRateOverride();
+  const measured = known.length ? known[0].rate : null;
+  const refRate = override || measured || LIST_RATE;
+  const source = override ? 'yours' : measured ? 'measured' : 'list';
+  const currency = override ? ((known[0] && known[0].c.currency) || '')
+                 : measured ? (known[0].c.currency || '') : LIST_CURRENCY;
   const money = n => `${n.toFixed(2)}${currency ? ' ' + currency : ''}`;
   // A per-asset-per-day rate is a fraction of a cent; two decimals would round it
   // to 0.01 and hide the number every projection on this page is built from.
   const rateMoney = n => `${n.toFixed(4)}${currency ? ' ' + currency : ''}`;
 
-  const project = r => (r.assets && (r.rate || refRate)) ? (r.rate || refRate) * r.assets * 30 : null;
+  const per = $('#cost-per').value;                 // 'month' or 'day'
+  const mult = per === 'day' ? 1 : 30;
+  const perLabel = per === 'day' ? 'day' : 'month';
+  const spend = r => (r.assets != null ? (r.rate || refRate) * r.assets * mult : null);
+
   const mtd = rows.reduce((s, r) => s + (r.c ? r.c.cost : 0), 0);
-  const nextMonth = rows.reduce((s, r) => s + (project(r) || 0), 0);
+  const total = rows.reduce((s, r) => s + (spend(r) || 0), 0);
   const inTrial = rows.filter(r => r.t && r.t.free);
-  const trialValue = inTrial.reduce((s, r) => s + (project(r) || 0), 0);
+  const trialValue = inTrial.reduce((s, r) => s + (spend(r) || 0), 0);
+  const assetTotal = rows.reduce((s, r) => s + (r.assets || 0), 0);
 
   $('#cost-tiles').innerHTML = [
+    ['Assets metered', assetTotal.toLocaleString(), `across ${rows.length} workspaces`, ''],
+    [`Indicated / ${perLabel}`, total ? money(total) : '—', `at ${rateMoney(refRate)} per asset per day`, ''],
     ['Month to date', Object.keys(costs).length ? money(mtd) : '—', 'actual, from Cost Management', ''],
-    ['Projected / month', nextMonth ? money(nextMonth) : '—', 'every workspace, at the measured rate', ''],
-    ['Still free', inTrial.length, `of ${rows.length} workspaces`, ''],
-    ['Starts costing', trialValue ? money(trialValue) : '—', 'per month when those trials end',
+    ['Starts costing', trialValue ? money(trialValue) : '—',
+     `per ${perLabel} when the ${inTrial.length} free trial${inTrial.length === 1 ? '' : 's'} end`,
      trialValue ? 'risk' : ''],
   ].map(([l, n, sub, cls]) => `<div class="tile ${cls}"><div class="n">${esc(n)}</div>
       <div class="l">${esc(l)}</div>
       <div class="l" style="text-transform:none;color:var(--dim)">${esc(sub)}</div></div>`).join('');
 
   $('#cost-note').textContent = store.at
-    ? `Costs read ${new Date(store.at).toLocaleString()}` : 'Costs not read yet';
+    ? `Costs read ${new Date(store.at).toLocaleString()}` : 'Actuals not read yet';
 
   const soonest = inTrial.slice().sort((a, b) => a.t.left - b.t.left)[0];
+  const rateLine = {
+    yours: `Using <b>${rateMoney(refRate)}</b> per asset per day, the rate you entered. Everything
+      below is priced at it.`,
+    measured: `Using <b>${rateMoney(refRate)}</b> per asset per day, <b>measured</b> from
+      ${esc((known[0] || {}).w ? known[0].w.name : '')} — ${money((known[0] || {}).c ? known[0].c.cost : 0)}
+      over ${(known[0] || {}).billedDays} billed day${(known[0] || {}).billedDays === 1 ? '' : 's'} across
+      ${((known[0] || {}).assets || 0).toLocaleString()} assets. A rate you are actually paying beats a
+      quoted one, so it is preferred over the list price.`,
+    list: `Using Microsoft's <b>list price</b> of ${rateMoney(LIST_RATE)} per asset per day
+      (Defender EASM Standard, metered per asset). Nothing here has been billed yet, so there is no
+      measured rate to prefer. EA, CSP and MCA agreements discount this and the meter bills in your
+      own currency — type your rate above to price it properly, or read the actuals once a trial ends.`,
+  }[source];
+
   $('#cost-body').innerHTML = `
-    ${refRate ? `<div class="covhead">Measured rate: <b>${rateMoney(refRate)}</b> per asset per day,
-      derived from ${esc(known[0].w.name)} — ${money(known[0].c.cost)} over ${known[0].billedDays}
-      billed day${known[0].billedDays === 1 ? '' : 's'} across ${known[0].assets.toLocaleString()} assets.
-      Everything projected below uses it.</div>`
-      : `<div class="covhead">No workspace has been billed yet, so there is no measured rate and
-      nothing can be projected. Read Azure costs once a trial has ended — no price is assumed here,
-      because rates differ by region, currency and agreement.</div>`}
+    <div class="covhead">${rateLine}</div>
     ${soonest ? `<p class="note" style="margin:0 0 10px"><b>${esc(soonest.w.name)}</b> leaves its free
-      period first, in ${soonest.t.left} day${soonest.t.left === 1 ? '' : 's'}${project(soonest)
-        ? `, at roughly ${money(project(soonest))} per month` : ''}.</p>` : ''}
-    <table><thead><tr><th>Workspace</th><th>Age</th><th>Assets</th><th>Month to date</th>
-      <th>Rate / asset / day</th><th>Projected / month</th></tr></thead><tbody>
+      period first, in ${soonest.t.left} day${soonest.t.left === 1 ? '' : 's'}${spend(soonest)
+        ? `, at roughly ${money(spend(soonest))} per ${perLabel}` : ''}.</p>` : ''}
+    <table><thead><tr><th>Workspace</th><th>Age</th><th>Assets</th>
+      <th>Indicated / ${esc(perLabel)}</th><th>Rate / asset / day</th>
+      <th>Month to date</th></tr></thead><tbody>
     ${rows.map(r => {
-      const p = project(r);
+      const p = spend(r);
+      const free = r.t && r.t.free;
       return `<tr>
         <td><b>${esc(r.w.name || r.w.key)}</b><div class="evidence">${esc(r.w.location || '')}</div></td>
-        <td>${r.t ? (r.t.free
+        <td>${r.t ? (free
               ? `<span style="color:var(--green)">${r.t.left} free days left</span>`
               : `<span class="warn">day ${r.t.days} — billing</span>`) : '<span class="evidence">—</span>'}</td>
         <td>${r.assets != null ? r.assets.toLocaleString()
              : '<span class="evidence">not counted</span>'}</td>
-        <td>${r.c ? money(r.c.cost) : '<span class="evidence">—</span>'}</td>
-        <td>${r.rate ? rateMoney(r.rate) : (refRate && r.assets
-             ? `<span class="evidence">${rateMoney(refRate)} assumed</span>` : '<span class="evidence">—</span>')}</td>
-        <td>${p ? `<b>${money(p)}</b>` : '<span class="evidence">—</span>'}</td></tr>`;
+        <td>${p != null ? `<b${free ? ' class="evidence" style="font-weight:600"' : ''}>${money(p)}</b>${
+              free ? '<div class="evidence">once the trial ends</div>' : ''}`
+             : '<span class="evidence">—</span>'}</td>
+        <td>${r.rate ? rateMoney(r.rate)
+             : `<span class="evidence">${rateMoney(refRate)} ${source === 'list' ? 'list' : 'assumed'}</span>`}</td>
+        <td>${r.c ? money(r.c.cost) : '<span class="evidence">—</span>'}</td></tr>`;
     }).join('')}
     </tbody></table>
     ${(store.errors || []).length ? `<p class="note warn" style="margin:10px 0 0">
       Cost Management refused ${store.errors.length} subscription${store.errors.length === 1 ? '' : 's'} —
       reading costs needs Cost Management Reader or Billing Reader, which is a separate grant from the
       one that reads EASM. ${esc(store.errors.join(' · '))}</p>` : ''}
-    <p class="note" style="margin:10px 0 0">Month-to-date figures are Azure's own actuals.
-      Projections are those actuals divided by assets and billed days, multiplied back
-      up — arithmetic on measured numbers, not a price list.</p>`;
+    <p class="note" style="margin:10px 0 0"><b>Indicated</b> figures are asset count × rate, and a
+      month is taken as 30 days. <b>Month to date</b> is Azure's own actual and the only measured
+      number on this page. An indication is not an invoice: EASM meters the assets it holds, so a
+      discovery run that adds assets moves the bill.</p>`;
 }
 
 function renderCoverage() {
@@ -3347,6 +3394,11 @@ $('#cov-azure').onclick = async (ev) => {
   finally { ev.target.disabled = false; ev.target.textContent = 'Reload Azure public IPs'; }
 };
 $('#cov-filter').onchange = renderCoverage;
+$('#cost-per').onchange = renderCost;
+$('#cost-rate').oninput = () => {
+  writeLS(LS.costrate, $('#cost-rate').value.trim().replace(',', '.'));
+  renderCost();
+};
 $('#cost-load').onclick = async () => {
   const b = $('#cost-load');
   b.disabled = true; b.textContent = 'Reading…';
