@@ -102,6 +102,7 @@
   .warn{color:var(--gold)} .err{color:var(--red)} .ok{color:var(--green)}
   .alert.amber{background:rgba(210,153,34,.07);border-color:rgba(210,153,34,.45)}
   .az-tag{background:rgba(88,166,255,.14);color:var(--blue)}
+  .sc-tag{background:rgba(188,140,255,.16);color:var(--purple)}
   button .az-tag{margin-right:2px}
   .fixlist{margin:8px 0 0;padding-left:18px;font-size:12px;color:var(--muted);line-height:1.55}
   .fixlist li{margin-bottom:6px} .fixlist b{color:var(--text)}
@@ -387,6 +388,7 @@
   <!-- Asset-first: EASM's inventory is assets, and triage starts from "what is
        this host and how bad is it", not from a CVE looking for victims. -->
   <section id="view-assets" class="view on">
+    <div id="load-warnings"></div>
     <div id="excluded-bar"></div>
     <div id="dangling-alert"></div>
     <div class="tiles" id="asset-tiles"></div>
@@ -870,17 +872,36 @@ function clearInteractionLock() {
   }
 }
 
-async function token(scopes) {
+/** Raised when a token can only be obtained by showing the user something.
+ *  Distinguished from a failure because the load can be resumed from a click. */
+class InteractionRequired extends Error {}
+
+// One in-flight acquisition per scope set. Eight workers reaching token expiry
+// within the same second used to fire eight renewals; and when the silent path
+// fails — third-party-cookie policy blocks MSAL's hidden iframe on most browsers
+// now — that became eight popup attempts from a timer the browser does not treat
+// as a user gesture. Blocked popups plus MSAL's own interaction lock is a
+// permanent stall with nothing on screen to explain it.
+const tokenWait = new Map();
+
+async function token(scopes, {interactive = true} = {}) {
   if (!msalApp || !account) throw new Error('not signed in');
-  try {
-    return (await msalApp.acquireTokenSilent({scopes, account})).accessToken;
-  } catch (e) {
-    // Silent renewal fails when the refresh token has aged out or the hidden
-    // iframe is blocked by third-party-cookie policy. A popup recovers without
-    // losing in-page state, which a redirect would.
-    clearInteractionLock();
-    return (await msalApp.acquireTokenPopup({scopes, account})).accessToken;
-  }
+  const key = scopes.join(' ');
+  if (tokenWait.has(key)) return tokenWait.get(key);
+  const p = (async () => {
+    try {
+      return (await msalApp.acquireTokenSilent({scopes, account})).accessToken;
+    } catch (e) {
+      // A popup is only honest when a click is driving it. Anywhere else, say so
+      // and let the caller decide — a background loop should stop and offer to
+      // resume, not open a window nobody asked for and wait forever.
+      if (!interactive) throw new InteractionRequired('Sign-in needs renewing');
+      clearInteractionLock();
+      return (await msalApp.acquireTokenPopup({scopes, account})).accessToken;
+    }
+  })();
+  tokenWait.set(key, p);
+  try { return await p; } finally { tokenWait.delete(key); }
 }
 
 async function signIn() {
@@ -1037,19 +1058,50 @@ async function discoverWorkspaces() {
   }
   return out;
 }
-async function easm(w, path, {method = 'GET', params = {}, body = null} = {}) {
-  const t = await token(EASM_SCOPES);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const REQ_TIMEOUT_MS = 30000;
+const MAX_RETRIES = 3;
+// Full jitter, so several thousand requests backing off together do not all
+// return at the same instant and throttle each other again.
+const backoff = attempt => Math.round(Math.random() * Math.min(8000, 500 * 2 ** attempt));
+
+/** One EASM request, with a deadline.
+ *
+ *  A fetch with no timeout is a worker that never comes back. Eight of those and
+ *  the load stops dead at whatever number it had reached, spinner still turning,
+ *  because nothing in the loop can distinguish slow from never. Throttling and
+ *  transient 5xx are retried with backoff and Retry-After; everything else is
+ *  reported to the caller.
+ */
+async function easm(w, path, {method = 'GET', params = {}, body = null, interactive = true} = {}) {
   const u = new URL(wsBase(w) + path);
   u.searchParams.set('api-version', EASM_API);
   Object.entries(params).forEach(([k, v]) => u.searchParams.set(k, v));
-  const opts = {method, headers: {Authorization: 'Bearer ' + t}};
-  if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
-  const r = await fetch(u, opts);
-  if (!r.ok) {
+  for (let attempt = 0; ; attempt++) {
+    const t = await token(EASM_SCOPES, {interactive});
+    const ctl = new AbortController();
+    const opts = {method, signal: ctl.signal, headers: {Authorization: 'Bearer ' + t}};
+    if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+    const timer = setTimeout(() => ctl.abort(), REQ_TIMEOUT_MS);
+    let r;
+    try {
+      r = await fetch(u, opts);
+    } catch (e) {
+      if (attempt < MAX_RETRIES) { await sleep(backoff(attempt)); continue; }
+      throw new Error(ctl.signal.aborted
+        ? `EASM timeout after ${REQ_TIMEOUT_MS / 1000}s and ${MAX_RETRIES} retries`
+        : `EASM network error: ${e.message}`);
+    } finally { clearTimeout(timer); }
+    if (r.ok) return r.json();
+    // 429 carries Retry-After often enough to be worth honouring exactly.
+    if ((r.status === 429 || r.status >= 500) && attempt < MAX_RETRIES) {
+      const ra = Number(r.headers.get('retry-after'));
+      await sleep(Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 30000) : backoff(attempt));
+      continue;
+    }
     const code = r.headers.get('x-ms-error-code') || '';
     throw new Error(`EASM ${r.status} ${code}: ${(await r.text()).slice(0, 240)}`);
   }
-  return r.json();
 }
 
 function normalizeAsset(raw) {
@@ -1111,6 +1163,20 @@ function normalizeAsset(raw) {
   };
 }
 
+/** base64url of a string's UTF-8 bytes.
+ *
+ *  The observations endpoint takes the asset id in the path, base64url encoded.
+ *  btoa() only accepts Latin1, so any asset EASM records under an
+ *  internationalised name — an IDN kept in Unicode rather than punycode, a
+ *  Cyrillic or Greek host — made it throw outright. Encoding the UTF-8 bytes
+ *  first is both correct and what the API expects.
+ */
+function b64urlUtf8(s) {
+  let bin = '';
+  for (const b of new TextEncoder().encode(s)) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
 async function loadWorkspace(w, onProgress) {
   const assets = [];
   let mark = '*';
@@ -1130,23 +1196,39 @@ async function loadWorkspace(w, onProgress) {
   const ranked = [...assets].sort((a, b) =>
     (a.state === 'confirmed' ? 0 : 1) - (b.state === 'confirmed' ? 0 : 1));
   const obsByAsset = {};
-  let next = 0, done = 0;
+  const failed = [];
+  let next = 0, done = 0, interrupted = null;
+  const started = Date.now();
   const workers = Array.from({length: OBS_CONCURRENCY}, async () => {
     for (;;) {
+      if (interrupted) return;             // sign-in expired: drain, do not stall
       const asset = ranked[next++];
       if (!asset) return;
-      const encoded = btoa(asset.id).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      // Nothing in here may throw. One asset's problem used to reject the whole
+      // Promise.all, which discarded an inventory that had already cost minutes
+      // to read — an internationalised name at position 1760 of 4236 emptied the
+      // entire board.
       try {
-        const res = await easm(w, `/assets/${encoded}:getObservations`,
-                               {method: 'POST', params: {maxpagesize: 100}});
+        const res = await easm(w, `/assets/${b64urlUtf8(asset.id)}:getObservations`,
+                               {method: 'POST', params: {maxpagesize: 100}, interactive: false});
         obsByAsset[asset.id] = res.value || [];
-      } catch (e) { obsByAsset[asset.id] = []; }
-      if (++done % 5 === 0 || done === ranked.length)
-        onProgress(`Analysing observations — ${done} of ${ranked.length} assets`, done, ranked.length);
+      } catch (e) {
+        obsByAsset[asset.id] = [];
+        if (e instanceof InteractionRequired) { interrupted = e; return; }
+        failed.push({name: asset.name, why: e.message || String(e)});
+      }
+      // Rate is reported because it is the difference between "slow" and
+      // "stopped", and a bare counter cannot tell you which one you are watching.
+      if (++done % 5 === 0 || done === ranked.length) {
+        const rate = done / Math.max(1, (Date.now() - started) / 1000);
+        onProgress(`Analysing observations — ${done} of ${ranked.length} assets` +
+                   ` · ${rate.toFixed(1)}/s`, done, ranked.length);
+      }
     }
   });
   await Promise.all(workers);
-  return {assets, obsByAsset, loadedAt: new Date().toISOString()};
+  return {assets, obsByAsset, failed, interrupted: !!interrupted,
+          pending: interrupted ? ranked.length - done : 0, loadedAt: new Date().toISOString()};
 }
 
 // ── AI layer ────────────────────────────────────────────────────────────────
@@ -1628,6 +1710,9 @@ function convergenceSvg(entries, ips, self) {
 const CLOUD_ASN = /(microsoft|azure|amazon|aws\b|google|digitalocean|hetzner|ovh|8075|8068|16509|15169|14061)/i;
 const SAAS_TARGET = /(outlook\.com|office\.com|office365\.com|microsoftonline\.com|msappproxy\.net|azurewebsites\.net|azurestaticapps\.net|azurefd\.net|azureedge\.net|trafficmanager\.net|sharepoint\.com|lync\.com|teams\.microsoft\.com|azure-api\.net|msecnd\.net|\.windows\.net|cloudapp\.azure\.com|akadns\.net|akamaiedge\.net)/i;
 const SAAS_NAME = /^(autodiscover|enterpriseregistration|enterpriseenrollment|lyncdiscover|sip|msoid|webmail|owa|mail|clientconfig|selector\d*\._domainkey)\./i;
+// The kinds that are a DNS record and can therefore be left pointing somewhere.
+// A page is a URL on a host, so the host is where the finding belongs.
+const DNS_KINDS = ['host', 'domain'];
 
 // Pointing at a Microsoft address you do not own is normal across most of a
 // tenant: autodiscover, enterpriseregistration, sip and lyncdiscover are meant to
@@ -1641,6 +1726,12 @@ const SAAS_NAME = /^(autodiscover|enterpriseregistration|enterpriseenrollment|ly
 function danglingWarning(asset) {
   const cov = getCoverage();
   if (!cov.azure.length) return '';                  // no baseline loaded yet
+  // Dangling is a property of the *record*, not of the address. An ipAddress
+  // asset has no record pointing anywhere — there is nothing to repoint and
+  // nobody inherits a name by claiming it, so the whole remediation is
+  // meaningless there. If one of your names points at it, that name is the
+  // finding and carries this warning itself.
+  if (!DNS_KINDS.includes(asset.kind) || ipish(asset.name)) return '';
   const e = asset.evidence || {};
   const asn = e.asn || '';
   if (!CLOUD_ASN.test(asn)) return '';
@@ -2021,6 +2112,46 @@ function provenanceBlock(asset) {
     </div></div>`;
 }
 
+// ── Somebody else's asset, still your risk ──────────────────────────────────
+// An associated asset is infrastructure your estate depends on but does not run:
+// the identity provider your users sign in to, the payment form your checkout
+// posts to, the CDN your pages load script from. Its CVE count is the wrong
+// number to look at — you cannot patch any of it, which is why these sit outside
+// the default view.
+//
+// But "cannot patch" is not "no risk". It is a different risk, and usually the
+// larger one: a compromise there reaches your users and your data without ever
+// touching a host you own, and it arrives already trusted. That is the supply
+// chain, and naming it is the point — otherwise these rows read as noise and get
+// filtered away rather than governed.
+const SUPPLY_CHAIN_STATES = ['associatedPartner', 'associatedThirdparty'];
+const isSupplyChain = asset => SUPPLY_CHAIN_STATES.includes(asset.state);
+
+const supplyChainTitle = asset =>
+  `${asset.name} is ${asset.state === 'associatedPartner' ? "a partner's" : "a third party's"} ` +
+  `infrastructure that your estate depends on. You cannot patch it, so the findings here are not ` +
+  `your remediation queue — they are evidence about a supplier you already trust. The exposure is ` +
+  `whatever that trust is allowed to reach.`;
+
+function supplyChainBlock(asset, row) {
+  if (!isSupplyChain(asset)) return '';
+  const findings = row.observations.length;
+  return `<div class="alert amber" style="margin:0 0 10px">
+    <div class="alert-h"><span class="badge sc-tag">Supply chain risk</span>
+      <b>Not yours to patch — yours to govern</b></div>
+    <p class="note" style="margin:6px 0 0">${esc(supplyChainTitle(asset))}
+      ${findings ? `The ${findings} finding${findings === 1 ? '' : 's'} below say something about how
+        this supplier runs its estate, which is worth carrying into a vendor review even though none
+        of them is yours to fix.` : ''}</p>
+    <p class="note" style="margin:6px 0 0">What is actually actionable here is the blast radius, not
+      the patch level: what this dependency is permitted to do (federation and SSO trust, OAuth
+      grants and delegated permissions, API keys), what it can reach (network paths, allowlists),
+      what data crosses to it, and what it injects into pages your users load — a CDN or tag manager
+      compromise is script execution in your origin, which Subresource Integrity and a content
+      security policy bound and patching never will.</p>
+  </div>`;
+}
+
 // Hiding is local to this browser: the app is read-only against EASM, so it
 // cannot set an asset to dismissed. Saying so matters — otherwise a hidden asset
 // looks handled to the person who hid it and stays live for everyone else.
@@ -2058,6 +2189,32 @@ function excludedBy(asset) {
 
 function renderAssets() {
   $('#cov-kql').textContent = MDE_KQL;
+  // An asset whose observations could not be read is stored with an empty set,
+  // which is indistinguishable from an asset with nothing wrong with it. Say so,
+  // or a partial load reads as a clean bill of health.
+  const failed = (DATA && DATA.failed) || [];
+  const stopped = DATA && DATA.interrupted;
+  $('#load-warnings').innerHTML = stopped ? `<div class="alert amber" style="margin:0 0 10px">
+    <div class="alert-h"><span class="badge p-medium">Stopped early</span>
+      <b>Sign-in expired part-way through, with ${DATA.pending} assets left to read</b></div>
+    <p class="note" style="margin:6px 0 0">Renewing it needs a click — a browser will not open a
+      sign-in window for a background loop, and waiting on one silently is how a load appears to
+      hang. Everything already read is on this page and is accurate; the assets not reached show no
+      findings.</p>
+    <div class="toolbar" style="margin:8px 0 0"><button id="resume-load">Sign in again and finish
+      loading</button></div></div>`
+  : failed.length ? `<div class="alert amber" style="margin:0 0 10px">
+    <div class="alert-h"><span class="badge p-medium">Incomplete</span>
+      <b>${failed.length} asset${failed.length === 1 ? '' : 's'} could not be read</b></div>
+    <p class="note" style="margin:6px 0 0">Their findings are missing, so they score zero risk here
+      and may look clean when they are not. Everything else on this page is complete.</p>
+    <details class="listbox"><summary>Which ones</summary>
+      <table><thead><tr><th>Asset</th><th>Reason</th></tr></thead><tbody>
+        ${failed.slice(0, 50).map(f => `<tr><td>${esc(f.name)}</td>
+          <td class="evidence">${esc(f.why)}</td></tr>`).join('')}
+      </tbody></table>
+      ${failed.length > 50 ? `<p class="note" style="margin:6px 0 0">…and ${failed.length - 50} more.</p>` : ''}
+    </details></div>` : '';
   const aiOn = aiEnabled();
   const aiResults = getAiResults();
   const mdeCount = getCoverage().mde.length;
@@ -2079,6 +2236,9 @@ function renderAssets() {
     Hidden in this browser only; the app never writes to EASM. To retire them properly, set the
     assets to <b>dismissed</b> in the EASM portal — that also stops discovery walking through them
     again.</div>` : '';
+  const resume = $('#resume-load');
+  // A real click, which is the whole point — this is the gesture MSAL needs.
+  if (resume) resume.onclick = () => loadCurrent();
   $('#excluded-bar').querySelectorAll('.unexcl').forEach(a =>
     a.onclick = ev => { ev.preventDefault(); restoreExcl(a.dataset.kind, a.dataset.key); renderAssets(); });
 
@@ -2228,6 +2388,8 @@ function renderAssets() {
         name match on ${esc((weakProvenance(a) || {}).value)}, which pulled in the unrelated domain
         ${esc((weakProvenance(a) || {}).reached)}. Confirm it is yours before acting on the findings."
         >weak attribution</span>` : '',
+      isSupplyChain(a) ? `<span class="badge sc-tag help" title="${esc(supplyChainTitle(a))}"
+        >supply chain risk</span>` : '',
       svc.warning ? `<span class="badge p-medium help" title="${esc(svc.warning)}">web only</span>` : '',
       stored.causes || stored.assess ? `<span class="badge ai-tag" title="${esc(`Reviewed by AI ${new Date((stored.causes || stored.assess).at).toLocaleString()}`)}">AI</span>` : '',
     ].join('');
@@ -2331,6 +2493,7 @@ function renderAssets() {
           <div class="own-out">${ownershipNote(assetIps(a))}</div>
         </div>` : `<div class="own-out">${ownershipNote(assetIps(a))}</div>`}
         ${provenanceBlock(a)}
+        ${supplyChainBlock(a, r)}
         ${svc.warning ? `<p class="note warn" style="margin:0 0 10px">⚠ ${esc(svc.warning)}</p>` : ''}
         ${r.owasp.length ? `<h4>Weakness themes</h4><p>${r.owasp.map(o =>
           `<span class="badge p-none" style="margin-right:4px">${esc(o)}</span>`).join('')}</p>` : ''}
