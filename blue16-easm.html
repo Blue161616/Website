@@ -596,6 +596,20 @@
         <option value="confirmed">on confirmed assets</option>
         <option value="all">on every asset</option>
       </select>
+      <select id="find-focus">
+        <option value="">everything</option>
+        <option value="exploited">being exploited</option>
+        <option value="cvss9">CVSS 9 and above</option>
+        <option value="spread">on more than one asset</option>
+        <option value="observed">observed, not inferred</option>
+      </select>
+      <label for="find-sort">Rank by</label>
+      <select id="find-sort">
+        <option value="risk">carried risk</option>
+        <option value="cvss">CVE severity</option>
+        <option value="epss">exploitation likelihood</option>
+        <option value="assets">assets affected</option>
+      </select>
       <span class="note" id="find-note" style="margin:0"></span>
     </div>
     <div id="find-list"></div>
@@ -795,7 +809,7 @@ async function loadEpss(obsByAsset, onProgress) {
   for (let i = 0; i < ids.length && i < EPSS_BATCH * EPSS_MAX_BATCHES; i += EPSS_BATCH) {
     const batch = ids.slice(i, i + EPSS_BATCH);
     try {
-      const r = await fetch(`https://api.first.org/data/v1/epss?cve=${batch.join(',')}`);
+      const r = await fetchWithTimeout(`https://api.first.org/data/v1/epss?cve=${batch.join(',')}`);
       if (!r.ok) break;
       for (const row of ((await r.json()).data || [])) {
         EPSS[String(row.cve).toUpperCase()] = {epss: parseFloat(row.epss) || 0,
@@ -1363,6 +1377,21 @@ const trialLong = w => {
 };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/** fetch with a deadline.
+ *
+ *  A hung request is not an error, so a try/catch around it catches nothing and
+ *  "this is optional, never block" becomes "this blocks forever". EPSS sat between
+ *  the two observation batches and froze the whole load at exactly the count where
+ *  the first batch ended — the progress bar still moving in the user's mind and
+ *  not on screen.
+ */
+async function fetchWithTimeout(url, ms = 12000, opts = {}) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try { return await fetch(url, {...opts, signal: ctl.signal}); }
+  finally { clearTimeout(timer); }
+}
 const REQ_TIMEOUT_MS = 30000;
 const MAX_RETRIES = 3;
 // Full jitter, so several thousand requests backing off together do not all
@@ -2057,7 +2086,8 @@ function renderOverview() {
   const rows = assetRows(DATA.assets, DATA.obsByAsset, {mergePages: true})
     .filter(r => !excludedBy(r.asset) && matchesState(r.asset.state, 'yours'));
 
-  const takeover = rows.filter(r => danglingWarning(r.asset));
+  // The same call the Assets banner makes, so the two pages cannot disagree.
+  const takeover = danglingRecords('yours').map(a => ({asset: a}));
   const eps = rows.map(r => ({r, ep: entryPoints(r.asset)}));
   const planeHits = pl => eps.filter(x => x.ep.planes.some(q => q.plane === pl));
   const stores = eps.filter(x => x.ep.planes.some(q => q.plane === 'data' || q.plane === 'control'));
@@ -2117,7 +2147,7 @@ function renderOverview() {
     // Distinct assets, not categories: one box can be an edge appliance with an
     // exposed management plane, and counting it twice would inflate the headline
     // a CISO reads first.
-    shortlist: new Set([...takeover.map(r => r.asset.id),
+    shortlist: new Set([...takeover.map(x => x.asset.id),
                         ...[...stores, ...edge, ...mgmt].map(x => x.r.asset.id)]).size,
   });
 
@@ -2648,7 +2678,7 @@ function findingRows(assetRowsIn) {
       // Worst priority wins: the same finding can be scored differently per asset.
       if (PRIORITY_ORDER.indexOf(o.priority) < PRIORITY_ORDER.indexOf(f.priority)) f.priority = o.priority;
       f.risk += o.risk;
-      f.on.push({row: r, risk: o.risk, via: o.via});
+      f.on.push({row: r, risk: o.risk, via: o.via, confidence: o.confidence});
     }
   }
   const out = [...by.values()];
@@ -2661,38 +2691,101 @@ function renderFindings() {
   if (!DATA) return;
   const state = $('#find-state').value;
   const onlyCve = $('#find-kind').value === 'cve';
+  const focus = $('#find-focus').value;
+  const sortBy = $('#find-sort').value;
   const q = $('#find-search').value.trim().toLowerCase();
 
   const all = assetRows(DATA.assets, DATA.obsByAsset, {mergePages: true})
     .filter(r => !excludedBy(r.asset) && matchesState(r.asset.state, state));
   const findings = findingRows(all);
   const scoped = findings.filter(f => !onlyCve || f.cve);
-  const shown = scoped.filter(f => !q || f.name.toLowerCase().includes(q)
-                                        || f.on.some(o => o.row.asset.name.toLowerCase().includes(q)));
+
+  // Carried risk answers "what does this cost us across the estate", which is the
+  // right default and the wrong only option: it ranks a 9.8 sitting on one host
+  // below a 6.1 sitting on nine. Severity and exploitation likelihood ask
+  // different questions, and the point of this page is that they disagree.
+  const epssOf = f => (EPSS[f.cve] || {}).epss || 0;
+  const RANK = {
+    risk:   (a, b) => b.risk - a.risk,
+    cvss:   (a, b) => (b.cvss - a.cvss) || (b.risk - a.risk),
+    epss:   (a, b) => (epssOf(b) - epssOf(a)) || (b.cvss - a.cvss) || (b.risk - a.risk),
+    assets: (a, b) => (b.on.length - a.on.length) || (b.risk - a.risk),
+  };
+  const matchesFocus = f => {
+    if (focus === 'exploited') { const e = EPSS[f.cve]; return !!e && e.percentile >= 0.9; }
+    if (focus === 'cvss9') return f.cvss >= 9;
+    if (focus === 'spread') return f.on.length > 1;
+    // What EASM tested rather than deduced from a version string — under the
+    // confidence weighting, the findings that survive an argument.
+    if (focus === 'observed')
+      return f.on.some(o => o.confidence === 'observed' || o.confidence === 'verified');
+    return true;
+  };
+  const shown = scoped.filter(matchesFocus)
+    .filter(f => !q || f.name.toLowerCase().includes(q)
+                    || f.on.some(o => o.row.asset.name.toLowerCase().includes(q)))
+    .sort(RANK[sortBy] || RANK.risk);
 
   const exploited = scoped.filter(f => { const e = EPSS[f.cve]; return e && e.percentile >= 0.9; });
   const assetsHit = new Set(scoped.flatMap(f => f.on.map(o => o.row.asset.id)));
-  const worst = scoped[0];
+  // The list is no longer sorted by risk by default, so the worst is found
+  // rather than read off the front.
+  const worst = scoped.reduce((m, f) => (!m || f.risk > m.risk) ? f : m, null);
+  const cvss9 = scoped.filter(f => f.cvss >= 9).length;
   $('#find-tiles').innerHTML = [
-    [onlyCve ? 'CVEs' : 'Findings', scoped.length, 'distinct across the estate', ''],
-    ['Assets affected', assetsHit.size, 'carry at least one', ''],
-    ['Being exploited', exploited.length, 'EPSS 90th percentile or above', exploited.length ? 'risk' : ''],
+    [onlyCve ? 'CVEs' : 'Findings', scoped.length, 'distinct across the estate', '',
+     '', 'risk', scoped.length],
+    ['At CVSS 9 or above', cvss9, 'severity before spread', cvss9 ? 'risk' : '',
+     'cvss9', 'cvss', cvss9],
+    ['Being exploited', exploited.length, 'EPSS 90th percentile or above',
+     exploited.length ? 'risk' : '', 'exploited', 'epss', exploited.length],
     // findingName returns a link, which has no place inside a tile subtitle.
     ['Top carried risk', worst ? worst.risk.toFixed(0) : '—',
      worst ? `${worst.name} on ${worst.on.length} asset${worst.on.length === 1 ? '' : 's'}`
-           : 'nothing scored', worst ? 'risk' : ''],
-  ].map(([l, n, sub, cls]) => `<div class="tile ${cls}"><div class="n">${esc(n)}</div>
+           : 'nothing scored', worst ? 'risk' : '', '', 'risk', worst ? 1 : 0],
+  ].map(([l, n, sub, cls, wantFocus, wantSort, live]) => {
+    const on = wantFocus === focus && wantSort === sortBy;
+    return `<div class="tile ${cls} ${live ? 'clickable' : ''} ${live && on ? 'on' : ''}"
+      ${live ? `data-focus="${esc(wantFocus)}" data-sort="${esc(wantSort)}"` : ''}
+      title="${live ? 'Rank and filter the list this way'
+                    : 'Nothing in the current selection matches this'}"><div class="n">${esc(n)}</div>
       <div class="l">${esc(l)}</div>
-      <div class="l" style="text-transform:none;color:var(--dim)">${esc(sub)}</div></div>`).join('');
+      <div class="l" style="text-transform:none;color:var(--dim)">${esc(sub)}</div></div>`;
+  }).join('');
 
-  $('#find-note').textContent = `${shown.length} shown of ${scoped.length}`;
+  $('#find-tiles').querySelectorAll('.tile.clickable').forEach(t => {
+    t.onclick = () => {
+      // Clicking the active tile returns to the default ranking, so a filter is
+      // never somewhere you get stuck.
+      const same = t.dataset.focus === focus && t.dataset.sort === sortBy;
+      $('#find-focus').value = same ? '' : t.dataset.focus;
+      $('#find-sort').value = same ? 'risk' : t.dataset.sort;
+      renderFindings();
+    };
+  });
+
+  // "CVEs only" is a default, not the nature of the page — and the half it hides
+  // is the half EASM actually tested rather than inferred from a version string.
+  // Saying how much is behind the toggle is the difference between a filter and a
+  // page that looks CVE-shaped because nobody found the dropdown.
+  const otherKind = findings.length - scoped.length;
+  $('#find-note').innerHTML = `${shown.length} shown of ${scoped.length}` +
+    (onlyCve && otherKind ? ` · <a href="#" id="find-showall" style="color:var(--blue)">${otherKind}
+      non-CVE finding${otherKind === 1 ? '' : 's'}</a> hidden` : '');
+  const showAllKinds = $('#find-showall');
+  if (showAllKinds) showAllKinds.onclick = ev => {
+    ev.preventDefault(); $('#find-kind').value = 'all'; renderFindings();
+  };
 
   if (!shown.length) {
-    $('#find-list').innerHTML = `<div class="note">${q
-      ? `Nothing matching <b>${esc(q)}</b>${onlyCve ? ' among CVEs' : ''} on assets that are
-         <b>${esc(state)}</b>. If you are checking a CVE in the news, that is the answer you wanted:
-         this estate does not have it here.`
-      : 'No findings on the selected assets.'}</div>`;
+    const why = [q ? `matching <b>${esc(q)}</b>` : '', onlyCve ? 'among CVEs' : '',
+      focus ? `<b>${esc($('#find-focus').selectedOptions[0].textContent)}</b>` : '',
+      `on assets that are <b>${esc(state)}</b>`].filter(Boolean).join(' · ');
+    $('#find-list').innerHTML = `<div class="note">Nothing ${why}.
+      ${q ? ' If you are checking a CVE in the news, that is the answer you wanted: this estate does not have it here.' : ''}
+      ${focus ? ` <a href="#" id="find-clear-focus" style="color:var(--blue)">Clear the filter.</a>` : ''}</div>`;
+    const cf = $('#find-clear-focus');
+    if (cf) cf.onclick = ev => { ev.preventDefault(); $('#find-focus').value = ''; renderFindings(); };
     return;
   }
 
@@ -3255,6 +3348,19 @@ const DNS_KINDS = ['host', 'domain'];
 // The risk needs a *dedicated* address that was allocated to you and released.
 // So: exactly one address, on a cloud ASN, absent from your subscriptions, and
 // not a published service endpoint by name or by CNAME target.
+/** Every DNS record at risk, in a given state scope.
+ *
+ *  Counted over assets rather than over rows, because rows are grouped by machine
+ *  and a takeover is a property of the record. Two names on one address are two
+ *  records anyone can claim, and collapsing them to one row made the Assets banner
+ *  report seven where the Overview reported eight — the same estate, two units.
+ */
+function danglingRecords(stateFilter) {
+  if (!DATA) return [];
+  return DATA.assets.filter(a => matchesState(a.state, stateFilter)
+                              && !excludedBy(a) && danglingWarning(a));
+}
+
 function danglingWarning(asset) {
   const cov = getCoverage();
   if (!cov.azure.length) return '';                  // no baseline loaded yet
@@ -3312,7 +3418,7 @@ async function shodanLookup(ips) {
     const hit = cache[ip];
     if (hit && Date.now() - hit.at < SHODAN_TTL) { out.push(hit.data); continue; }
     try {
-      const r = await fetch(`https://internetdb.shodan.io/${encodeURIComponent(ip)}`);
+      const r = await fetchWithTimeout(`https://internetdb.shodan.io/${encodeURIComponent(ip)}`);
       if (r.status === 404) { const empty = {ip, notFound: true}; saveShodan(ip, empty); out.push(empty); continue; }
       if (!r.ok) throw new Error(`Shodan ${r.status}`);
       const data = await r.json();
@@ -3796,7 +3902,7 @@ function renderAssets() {
 
   const stateRows = rows.filter(r => matchesState(r.asset.state, sel.value));
   const cvssCount = stateRows.filter(r => r.worstCvss >= 9).length;
-  const dangling = stateRows.filter(r => danglingWarning(r.asset));
+  const dangling = danglingRecords(sel.value).map(a => ({asset: a}));
   const withFindings = stateRows.filter(r => r.risk > 0);
   const critical = stateRows.filter(r => riskBand(r.risk) === 'critical').length;
   const worstCvss = stateRows.reduce((m, r) => Math.max(m, r.worstCvss), 0);
@@ -4301,12 +4407,15 @@ async function loadCurrent() {
     // suppressing a takeover warning — the exact failure the check exists to
     // catch. Each load starts from nothing and re-asks on demand.
     writeLS(LS.ownership, {});
-    DATA = await loadWorkspace(WS, progress, async partial => {
-      // The assets in the default view are ready: paint, score them properly,
-      // and let the rest arrive underneath.
+    DATA = await loadWorkspace(WS, progress, partial => {
+      // The assets in the default view are ready: paint, and let the rest arrive
+      // underneath. Scoring is deliberately not awaited — the background batch
+      // has no reason to wait on a third-party API, and awaiting it here is what
+      // let one slow response stall the entire load. No progress callback either,
+      // so the two do not fight over the same line.
       DATA = partial;
       show(current);
-      if (await loadEpss(DATA.obsByAsset, progress)) show(current);
+      loadEpss(DATA.obsByAsset).then(ok => { if (ok) show(current); }).catch(() => {});
     });
     show(current);                     // paint before enrichment
     if (await loadEpss(DATA.obsByAsset, progress)) show(current);   // re-rank with EPSS
@@ -4317,7 +4426,10 @@ async function loadCurrent() {
   } catch (e) {
     progress('');
     show(current);
-    $('#asset-list').innerHTML = `<div class="note err">${esc(e.message)}</div>`;
+    const msg = `<div class="note err">Loading this workspace failed: ${esc(e.message)}</div>`;
+    // Wherever the reader happens to be standing.
+    ['#asset-list', '#ov-head', '#entry-list', '#find-list', '#chg-body', '#coverage']
+      .forEach(sel => { const el = $(sel); if (el) el.innerHTML = msg; });
   } finally { $('#reload').disabled = false; }
 }
 
@@ -4460,7 +4572,7 @@ $('#chg-ack').onclick = () => {
   el.oninput = renderEntry;
   el.onchange = renderEntry;
 });
-['#find-search', '#find-kind', '#find-state'].forEach(sel => {
+['#find-search', '#find-kind', '#find-state', '#find-focus', '#find-sort'].forEach(sel => {
   const el = $(sel);
   el.oninput = renderFindings;
   el.onchange = renderFindings;
