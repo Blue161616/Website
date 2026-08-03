@@ -75,6 +75,7 @@
   .k-insight{background:rgba(139,148,158,.16);color:var(--muted)}
   .src-azure{background:rgba(0,120,212,.15);color:#4fb3ff}
   .src-defender{background:rgba(88,166,255,.14);color:var(--blue)}
+  .src-easm{background:rgba(63,185,80,.16);color:var(--green)}
   .badge .ico{width:11px;height:11px;vertical-align:-1px;margin-right:4px}
   .v-approve{background:rgba(63,185,80,.16);color:var(--green)}
   .v-dismiss{background:rgba(248,81,73,.16);color:var(--red)}
@@ -104,6 +105,8 @@
   .alert.amber{background:rgba(210,153,34,.07);border-color:rgba(210,153,34,.45)}
   .az-tag{background:rgba(88,166,255,.14);color:var(--blue)}
   .sc-tag{background:rgba(188,140,255,.16);color:var(--purple)}
+  .fx-you{background:rgba(88,166,255,.14);color:var(--blue);margin-left:6px}
+  .fx-ms{background:rgba(139,148,158,.16);color:var(--dim);margin-left:6px}
   .conf-observed{background:rgba(63,185,80,.14);color:var(--green)}
   .conf-verified{background:rgba(63,185,80,.2);color:var(--green)}
   .conf-inferred{background:rgba(139,148,158,.16);color:var(--muted)}
@@ -257,6 +260,8 @@
   .ovsince b{color:var(--text);font-size:15px}
   .ov-up{color:var(--red)} .ov-down{color:var(--green)} .ov-flat{color:var(--dim)}
   .covmap{display:block;margin:0 auto}
+  .cov-pick{cursor:pointer}
+  .cov-pick:hover .cov-lens,rect.cov-pick:hover{stroke-width:2}
   .entryhero{display:block;margin:2px 0 12px}
   .eh-cap{font-size:11px;fill:var(--dim)}
   .eh-src rect{fill:rgba(248,81,73,.08);stroke:var(--red);stroke-width:1.2}
@@ -626,6 +631,8 @@
         <option value="cvss9">CVSS 9 and above</option>
         <option value="spread">on more than one asset</option>
         <option value="observed">observed, not inferred</option>
+        <option value="mine">mine to fix</option>
+        <option value="platform">Microsoft's to fix</option>
       </select>
       <label for="find-sort">Rank by</label>
       <select id="find-sort">
@@ -756,6 +763,56 @@ function assetWeight(a) {
 // credibility the first time an escalation turns out to be a ghost. A finding the
 // scanner *tested* — an expired certificate, a directory listing, an accepted TLS
 // version — is a different kind of claim from one it inferred.
+// ── Who has to fix it ───────────────────────────────────────────────────────
+// "Is this worth scanning" is the wrong question about managed hosting; "can I
+// act on the answer" is the right one. On an App Service the runtime is
+// Microsoft's and a CVE in it is theirs — but the minimum TLS version, the
+// HTTPS-only redirect, the public SCM endpoint and everything the application
+// serves are settings on your resource and your code.
+//
+// So the split is not IaaS versus PaaS. It is per finding, and on PaaS most
+// findings are still yours.
+const FIX_OWNER = {
+  application: {w: 1, label: 'your app', cls: 'fx-you',
+    why: 'Served by your application — your code or content, wherever it is hosted.'},
+  configuration: {w: 1, label: 'your config', cls: 'fx-you',
+    why: 'A setting you control: TLS version, redirects, access restrictions, headers, ' +
+         'certificates, or on a VM the patch level.'},
+  platform: {w: 0.2, label: "Microsoft's", cls: 'fx-ms',
+    why: 'The managed runtime underneath a PaaS service. You cannot patch it — Microsoft does. ' +
+         'It is scored at a fifth here because it is exposure you inherit rather than exposure ' +
+         'you caused, and the only levers you have are escalating or moving off the service.'},
+};
+
+// Findings the application serves, true on any hosting model.
+const FIX_APP = /directory (listing|index)|debug mode|stack trace|exposed (file|backup|config|\.git|\.env)|default page|deprecated tech|jquery|bootstrap|angular|cross[- ]site|injection|traversal/i;
+// Settings on the resource — yours on PaaS and IaaS alike.
+const FIX_CONFIG = /tls 1\.[01]|ssl ?[23]|weak cipher|rc4|3des|hsts|strict-transport|expired|self-?signed|certificate|security header|x-frame|content-security|cors|clickjack|version disclos|banner|scm\.|kudu|management endpoint/i;
+// Managed runtimes: a CVE in one of these is the provider's to patch.
+const PAAS_HOST = /(azurewebsites\.net|azure-api\.net|azurestaticapps\.net|azurefd\.net|azureedge\.net|azurecontainerapps\.io|trafficmanager\.net)/i;
+const PAAS_TECH = /app service|api management|azure functions|static web app|container apps/i;
+
+/** paas | iaas | unknown — from the CNAME, the detected stack, or what the
+ *  ownership check said was carrying the address. */
+function hostingModel(asset) {
+  const e = asset.evidence || {};
+  if ((e.cnames || []).some(c => PAAS_HOST.test(c))) return 'paas';
+  if (PAAS_TECH.test((e.web_components || []).join(' '))) return 'paas';
+  const own = assetIps(asset).map(ip => (getOwnership()[ip] || {}).owner).find(Boolean);
+  if (own && /API Management|App Service/i.test(own.carrier || '')) return 'paas';
+  if (own && /Public IP/i.test(own.carrier || '')) return 'iaas';
+  return 'unknown';
+}
+
+/** Who fixes this finding on this asset. */
+function fixOwner(o, asset) {
+  if (FIX_APP.test(o.name)) return 'application';
+  if (FIX_CONFIG.test(o.name)) return 'configuration';
+  // A CVE is the runtime's on managed hosting and yours on a machine you patch.
+  if (cveId(o.name)) return hostingModel(asset) === 'paas' ? 'platform' : 'configuration';
+  return 'configuration';
+}
+
 const CONFIDENCE = {
   observed: {w: 1, label: 'observed', why:
     'The scanner tested this condition directly rather than deducing it from a version number.'},
@@ -804,9 +861,11 @@ function observationRisk(o, a) {
   const e = EPSS[cveId(o.name)];
   const exploit = 1 + (e ? e.epss : 0);
   const conf = CONFIDENCE[confidenceOf(o, a)] || CONFIDENCE.observed;
-  // An asset that may not be yours should not outrank one that certainly is.
+  // An asset that may not be yours should not outrank one that certainly is, and
+  // a finding you cannot act on should not outrank one you can.
+  const fix = FIX_OWNER[fixOwner(o, a)] || FIX_OWNER.configuration;
   return (PRIORITY_WEIGHT[o.priority] ?? 0.5) * (1 + cvss / 10) * exploit
-         * assetWeight(a) * conf.w * attributionWeight(a);
+         * assetWeight(a) * conf.w * attributionWeight(a) * fix.w;
 }
 // ── Exploitation likelihood (EPSS) ──────────────────────────────────────────
 // CVSS says how bad a vulnerability would be; it says nothing about whether
@@ -1121,6 +1180,7 @@ function assetRows(assets, obsByAsset, {mergePages = true} = {}) {
       g.observations.push({...o, risk: observationRisk(o, g.asset), owasp: owaspFor(o),
                            kind: (o.types || []).includes('cve') ? 'cve' : 'insight',
                            confidence: confidenceOf(o, g.asset),
+                           fix: fixOwner(o, g.asset),
                            basis: inferenceBasis(o, g.asset),
                            via: a === g.asset ? '' : a.name});
     }
@@ -1898,15 +1958,19 @@ function coverageSvg(rows, hasMde) {
     <text x="10" y="18" class="cov-l">${rows.length} public address${rows.length === 1 ? '' : 'es'} you own</text>
     <rect class="cov-frame" x="6" y="30" width="708" height="222" rx="10"/>
 
-    ${lens(L.x, L.r, 'is-easm', at.easm.length + at.both.length, 'EASM sees', 'from outside')}
+    <g class="cov-pick" data-filter="matched" role="button" tabindex="0"
+       aria-label="Show the addresses EASM sees">
+      ${lens(L.x, L.r, 'is-easm', at.easm.length + at.both.length, 'EASM sees', 'from outside')}
+    </g>
     ${hasMde ? lens(R.x, R.r, 'is-mde', at.mde.length + at.both.length, 'Defender sees', 'from inside') : ''}
     ${hasMde && at.both.length ? `<text x="${(L.x + R.x) / 2}" y="${cy + 74}" class="cov-cap"
       text-anchor="middle">${at.both.length} seen by both</text>` : ''}
     ${hasMde ? '' : `<text x="${L.x}" y="${cy + 118}" class="cov-cap" text-anchor="middle">
       Defender devices not imported — the inside view is missing</text>`}
 
-    <rect class="cov-blind ${clear ? 'is-clear' : ''}" x="${blind.x}" y="${blind.y}"
-          width="${blind.w}" height="${blind.h}" rx="10"/>
+    <rect class="cov-blind ${clear ? 'is-clear' : ''} cov-pick" data-filter="missing"
+          role="button" tabindex="0" aria-label="Show the addresses nothing is watching"
+          x="${blind.x}" y="${blind.y}" width="${blind.w}" height="${blind.h}" rx="10"/>
     <text x="${blind.x + blind.w / 2}" y="${blind.y + 34}" class="cov-n ${clear ? '' : 'is-blind'}"
           text-anchor="middle">${at.blind.length}</text>
     <text x="${blind.x + blind.w / 2}" y="${blind.y + 52}" class="cov-l" text-anchor="middle">
@@ -3000,7 +3064,7 @@ function findingRows(assetRowsIn) {
       // Worst priority wins: the same finding can be scored differently per asset.
       if (PRIORITY_ORDER.indexOf(o.priority) < PRIORITY_ORDER.indexOf(f.priority)) f.priority = o.priority;
       f.risk += o.risk;
-      f.on.push({row: r, risk: o.risk, via: o.via, confidence: o.confidence});
+      f.on.push({row: r, risk: o.risk, via: o.via, confidence: o.confidence, fix: o.fix});
     }
   }
   const out = [...by.values()];
@@ -3041,6 +3105,8 @@ function renderFindings() {
     // confidence weighting, the findings that survive an argument.
     if (focus === 'observed')
       return f.on.some(o => o.confidence === 'observed' || o.confidence === 'verified');
+    if (focus === 'mine') return f.on.some(o => o.fix !== 'platform');
+    if (focus === 'platform') return f.on.every(o => o.fix === 'platform');
     return true;
   };
   const shown = scoped.filter(matchesFocus)
@@ -3401,11 +3467,21 @@ function renderCoverage() {
       <td><span class="badge ${r.missing ? 'p-high' : 'v-approve'}">${r.missing ? 'missing' : 'matched'}</span></td>
       <td style="font-family:monospace;color:${r.missing ? 'var(--red)' : 'var(--muted)'}">${esc(r.ip)}</td>
       <td>${r.sources.map(src => `<span class="badge ${src === 'Azure' ? 'src-azure' : 'src-defender'}"
-        style="margin-right:4px">${src === 'Azure' ? AZURE_ICON : DEFENDER_ICON}${esc(src)}</span>`).join('')}</td>
+        style="margin-right:4px">${src === 'Azure' ? AZURE_ICON : DEFENDER_ICON}${esc(src)}</span>`).join('')}${
+        !r.missing ? `<span class="badge src-easm" style="margin-right:4px"
+          title="In ${esc(WS ? (WS.name || WS.key) : 'this workspace')} inventory — EASM sees this from outside">${EASM_SRC_ICON}EASM</span>` : ''}</td>
       <td>${esc(displayNames(r.names) || '—')}</td>
       <td class="evidence">${esc([...new Set(r.where)].join('  |  ') || '—')}</td></tr>`).join('')}
     </tbody></table>`
     : `<div class="note">No ${esc(mode)} entries.</div>`);
+
+  // Attached after the markup exists. Clicking a number in the diagram filters the
+  // table to it, so "the diagram says 4 and the table shows 3" stops being a puzzle.
+  $('#coverage').querySelectorAll('.cov-pick').forEach(el => {
+    const go = () => { $('#cov-filter').value = el.dataset.filter; renderCoverage(); };
+    el.onclick = go;
+    el.onkeydown = ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); go(); } };
+  });
 }
 
 /** Azure public IPs are cheap to fetch next to the EASM walk, so load them with
@@ -3444,6 +3520,13 @@ const DEFENDER_ICON = `<svg class="ico" viewBox="0 0 20 20" aria-hidden="true">
   <path fill="#1a7fd4" d="M2.8 10H10v9.4C6.4 17.8 3.6 14.6 2.8 10z"/>
   <path fill="#0d5fa8" d="M10 10h7.2c-.8 4.6-3.6 7.8-7.2 9.4z"/>
 </svg>`;
+
+const EASM_SRC_ICON = `<svg class="ico" viewBox="0 0 24 24" aria-hidden="true">
+  <path d="M12 2.2 3.8 5.3V11c0 5.2 3.5 8.9 8.2 10.5C16.7 19.9 20.2 16.2 20.2 11V5.3Z" fill="currentColor" opacity=".35"/>
+  <path d="M9.4 9.1 12 14.1M14.6 9.1 12 14.1" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+  <g fill="currentColor"><rect x="7.9" y="7.6" width="3" height="3" rx=".8"/>
+  <rect x="13.1" y="7.6" width="3" height="3" rx=".8"/>
+  <rect x="10.5" y="12.6" width="3" height="3" rx=".8"/></g></svg>`;
 
 const AZURE_ICON = `<svg class="ico" viewBox="0 0 20 20" aria-hidden="true">
   <path fill="#0f6cbd" d="M7.6 2.2h4.2L7.3 15.4c-.1.3-.4.5-.7.5H2.9c-.4 0-.7-.4-.6-.8L6.9 2.7c.1-.3.4-.5.7-.5z"/>
@@ -4593,7 +4676,9 @@ establishes nothing — scored at a quarter weight.' : ' Scored at half weight u
           <h4>${esc(theme)}</h4>
           <table><thead><tr><th>Finding</th><th>Type</th><th>Confidence</th><th>Priority</th><th>CVSS</th><th>Exploit</th><th>Risk</th></tr></thead>
           <tbody>${list.map(o => `<tr>
-            <td><span class="help" title="${esc(findingHelp(o.name))}">${findingName(o.name)}</span>${
+            <td><span class="help" title="${esc(findingHelp(o.name))}">${findingName(o.name)}</span>
+              <span class="badge ${esc(FIX_OWNER[o.fix].cls)} help"
+                title="${esc(FIX_OWNER[o.fix].why)}">${esc(FIX_OWNER[o.fix].label)}</span>${
               urlPath(o.via) ? `<div class="evidence">on ${esc(urlPath(o.via))}</div>` : ''}</td>
             <td><span class="badge k-${esc(o.kind)}">${esc(o.kind)}</span></td>
             <td><span class="badge conf-${esc(o.confidence)} help"
