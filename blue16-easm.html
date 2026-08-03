@@ -99,7 +99,12 @@
   .cells{display:flex;flex-wrap:wrap;gap:3px}
   .cell{width:16px;height:16px;border-radius:3px;background:var(--bg3)}
   .note{font-size:11px;color:var(--dim);margin:10px 0}
-  .warn{color:var(--gold)} .err{color:var(--red)}
+  .warn{color:var(--gold)} .err{color:var(--red)} .ok{color:var(--green)}
+  .alert.amber{background:rgba(210,153,34,.07);border-color:rgba(210,153,34,.45)}
+  .az-tag{background:rgba(88,166,255,.14);color:var(--blue)}
+  button .az-tag{margin-right:2px}
+  .fixlist{margin:8px 0 0;padding-left:18px;font-size:12px;color:var(--muted);line-height:1.55}
+  .fixlist li{margin-bottom:6px} .fixlist b{color:var(--text)}
   .evidence{color:var(--muted);font-size:11px}
   code{background:var(--bg);padding:1px 5px;border-radius:3px;color:var(--blue);font-size:11px}
   td a{color:var(--blue);text-decoration:none}
@@ -382,6 +387,7 @@
   <!-- Asset-first: EASM's inventory is assets, and triage starts from "what is
        this host and how bad is it", not from a CVE looking for victims. -->
   <section id="view-assets" class="view on">
+    <div id="excluded-bar"></div>
     <div id="dangling-alert"></div>
     <div class="tiles" id="asset-tiles"></div>
     <div class="settings">
@@ -481,7 +487,8 @@ const PAGE_SIZE = 100;
 const MAX_PAGES = 80;
 const OBS_CONCURRENCY = 8;   // parallel observation POSTs; the API is per-asset
 const LS = {cfg: 'b16_easm_cfg', ai: 'b16_easm_ai', coverage: 'b16_easm_coverage',
-            airesults: 'b16_easm_ai_results', shodan: 'b16_easm_shodan'};
+            airesults: 'b16_easm_ai_results', shodan: 'b16_easm_shodan',
+            ownership: 'b16_easm_ownership', excluded: 'b16_easm_excluded'};
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c =>
@@ -910,6 +917,106 @@ async function armGet(url, params) {
   if (!r.ok) throw new Error(`ARM ${r.status}: ${(await r.text()).slice(0, 200)}`);
   return r.json();
 }
+async function armPost(url, params, body) {
+  const t = await token([ARM_SCOPE]);
+  const u = new URL(url);
+  Object.entries(params || {}).forEach(([k, v]) => u.searchParams.set(k, v));
+  const r = await fetch(u, {method: 'POST', body: JSON.stringify(body),
+    headers: {Authorization: 'Bearer ' + t, 'Content-Type': 'application/json'}});
+  if (!r.ok) throw new Error(`ARM ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  return r.json();
+}
+
+// ── Who actually holds this address? ────────────────────────────────────────
+// "Not in your subscriptions" is only as good as the subscriptions this account
+// can read, and loadAzurePublicIps() skips any where the Network reader role is
+// missing — so an address in a subscription you have no role on looks exactly
+// like an address nobody owns. That is the whole difference between a real
+// takeover risk and an API Management instance in a colleague's subscription.
+//
+// Resource Graph answers it properly: one query across every subscription at
+// once, reporting *which* resource holds the address rather than only whether
+// one does. It also reaches addresses that are not standalone publicIPAddresses
+// objects — API Management publishes its gateway IPs on the service itself, and
+// App Service on the site, which is why four api.* names looked dangling.
+const RG_API = '2024-04-01';
+const OWNERSHIP_QUERY = `Resources
+| where type =~ 'microsoft.network/publicipaddresses'
+| project ip = tostring(properties.ipAddress), res = name, rg = resourceGroup, sub = subscriptionId, carrier = 'Public IP'
+| union (Resources
+    | where type =~ 'microsoft.apimanagement/service'
+    | mv-expand pip = properties.publicIPAddresses
+    | project ip = tostring(pip), res = name, rg = resourceGroup, sub = subscriptionId, carrier = 'API Management')
+| union (Resources
+    | where type =~ 'microsoft.web/sites'
+    | project ip = tostring(properties.inboundIpAddress), res = name, rg = resourceGroup, sub = subscriptionId, carrier = 'App Service')
+| where isnotempty(ip)`;
+
+const getOwnership = () => readLS(LS.ownership, {});
+
+/** Ask Resource Graph who holds these addresses, and remember the answer.
+ *
+ *  A negative is recorded as carefully as a positive, together with how many
+ *  subscriptions were searched — "not found" only ever means "not in these".
+ */
+async function verifyOwnership(ips) {
+  const clean = [...new Set(ips.filter(ip => /^[0-9a-f.:]+$/i.test(ip)))];
+  const subs = ((await armGet(`${ARM}/subscriptions`, {'api-version': SUBS_API})).value || [])
+    .filter(x => x.state === 'Enabled');
+  if (!clean.length || !subs.length) return {searched: subs.length, held: 0};
+  const names = Object.fromEntries(subs.map(x => [x.subscriptionId, x.displayName || x.subscriptionId]));
+  const res = await armPost(`${ARM}/providers/Microsoft.ResourceGraph/resources`, {'api-version': RG_API},
+    {subscriptions: subs.map(x => x.subscriptionId),
+     query: OWNERSHIP_QUERY + `\n| where ip in~ (${clean.map(ip => `'${ip}'`).join(',')})`});
+  const found = {};
+  for (const row of res.data || [])
+    found[row.ip] = {res: row.res, rg: row.rg, carrier: row.carrier, sub: names[row.sub] || row.sub};
+  const all = getOwnership();
+  const at = new Date().toISOString();
+  for (const ip of clean) all[ip] = {at, searched: subs.length, owner: found[ip] || null};
+  writeLS(LS.ownership, all);
+  return {searched: subs.length, held: Object.keys(found).length, checked: clean.length};
+}
+
+/** What the last check said about these addresses, drawn as a verdict. */
+function ownershipNote(ips) {
+  const own = getOwnership();
+  const known = ips.map(ip => [ip, own[ip]]).filter(([, r]) => r);
+  if (!known.length) return '';
+  return known.map(([ip, r]) => r.owner
+    ? `<p class="note ok" style="margin:0 0 4px">✓ <b>${esc(ip)}</b> is held by
+       <b>${esc(r.owner.res)}</b> (${esc(r.owner.carrier)}) in subscription
+       <b>${esc(r.owner.sub)}</b>, resource group ${esc(r.owner.rg)} — this address is yours, so the
+       record is not dangling.</p>`
+    : `<p class="note err" style="margin:0 0 4px">✗ No resource in the ${r.searched}
+       subscription${r.searched === 1 ? '' : 's'} this account can read holds <b>${esc(ip)}</b>.
+       If it is not in another tenant, the address is gone and the record should be removed.</p>`
+  ).join('');
+}
+
+async function runOwnership(button, ips) {
+  button.disabled = true;
+  const lbl = button.querySelector('.lbl'), was = lbl.textContent;
+  lbl.textContent = 'Querying Azure…';
+  try {
+    const r = await verifyOwnership(ips);
+    rerenderKeepingOpen();
+  } catch (e) {
+    const out = button.closest('.detail, .alert').querySelector('.own-out');
+    if (out) out.innerHTML = `<p class="note err" style="margin:4px 0 0">${esc(e.message)}</p>`;
+  } finally { button.disabled = false; lbl.textContent = was; }
+}
+
+/** Re-render without collapsing whatever the user had open. */
+function rerenderKeepingOpen() {
+  const open = [...$('#asset-list').querySelectorAll('.card.open')].map(c => c.dataset.asset);
+  renderAssets();
+  for (const id of open) {
+    const c = $('#asset-list').querySelector(`.card[data-asset="${CSS.escape(id)}"]`);
+    if (c) c.classList.add('open');
+  }
+}
+
 async function discoverWorkspaces() {
   const subs = (await armGet(`${ARM}/subscriptions`, {'api-version': SUBS_API})).value || [];
   const out = [];
@@ -1544,6 +1651,10 @@ function danglingWarning(asset) {
   if (ips.length !== 1) return '';                   // one dedicated address only
   const mine = new Set(cov.azure.map(x => x.ip));
   if (mine.has(ips[0])) return '';
+  // A Resource Graph check beats the coverage snapshot: it saw every subscription
+  // at once, including ones with no Network reader role.
+  const own = getOwnership()[ips[0]];
+  if (own && own.owner) return '';
   return `This name points at ${ips[0]} — a ${esc(asn.split(' ').slice(1).join(' ') || 'cloud')} ` +
          `address that is not among the public IPs of any subscription this account can read, and ` +
          `not a published service endpoint. Cloud addresses are reassigned once a resource is ` +
@@ -1777,6 +1888,31 @@ function takeoverSvg(asset, ips) {
   </svg></div>`;
 }
 
+/** What to do about it, stated once and reused. Ordered, because the first step
+ *  is the one people skip: most of these are not dangling at all. */
+const TAKEOVER_REMEDIATION = `
+  <ol class="fixlist">
+    <li><b>Confirm ownership before touching DNS.</b> This comparison uses the subscriptions
+      <i>this account</i> can read, so an address in a subscription you have no role on looks
+      identical to one nobody owns. <b>Verify ownership in Azure</b> runs a Resource Graph query
+      across every subscription at once and names the resource holding each address — including
+      API Management and App Service, whose addresses are not standalone Public IP resources.</li>
+    <li><b>If a resource still holds it, nothing is wrong.</b> Grant this account Reader on that
+      subscription so the address stops being reported, and move on.</li>
+    <li><b>If nothing holds it, delete or repoint the record.</b> That is the entire fix, and the
+      only one — a released cloud address cannot be reclaimed.</li>
+    <li><b>If someone is already answering there</b> — the diagram names them once Shodan has been
+      checked — treat it as an incident rather than a cleanup. Search certificate transparency for
+      certificates on that name you did not request, and check whether any application trusts it as
+      an OAuth redirect URI, a CORS origin, or a cookie domain.</li>
+  </ol>
+  <p class="note" style="margin:8px 0 0"><b>To stop it recurring:</b> point records at the resource
+    rather than at the address. An <b>Azure DNS alias record</b> targets the resource object and
+    empties itself when the resource is deleted; a CNAME to the service FQDN plus the
+    <code>asuid</code> TXT verification record stops another tenant binding your name to their
+    resource. And in deprovisioning, remove the DNS record <i>before</i> deleting the resource —
+    most takeovers are just that order reversed.</p>`;
+
 /** The consequences, stated once and reused. */
 const TAKEOVER_CONSEQUENCES = `Whoever holds the address can serve content as this name, pass
   HTTP-01 domain validation to obtain a genuine certificate for it, and receive anything sent there —
@@ -1840,6 +1976,86 @@ function ipAssociationBlock(asset) {
         : ''}</p>`;
 }
 
+// ── Is it yours at all? ─────────────────────────────────────────────────────
+// EASM expands an inventory by pivoting on attributes, and the weakest pivot it
+// offers is the WHOIS registrant name. That field is free text: unrelated
+// companies share a word, registrars fill it inconsistently, and privacy proxies
+// blank it entirely. So "WhoisName:Rubicon" reaches every domain whose registrant
+// happens to contain Rubicon — and everything discovered beyond that point
+// inherits the mistake, which is how an unrelated site's 88 CVEs end up at the
+// top of your risk list.
+//
+// A chain is only called weak when the attribute pivot leads to a *different*
+// registrable domain than the one it started from. Pivoting within your own
+// domain family is exactly what the feature is for.
+const ATTR_PIVOT = /^(whois|registrant|org)[a-z]*\s*[:=]/i;
+const ipish = t => !t || /^[0-9.]+$/.test(t) || t.includes(':');
+const regDomain = t => ipish(t) ? '' : registrable(t);
+
+function weakProvenance(asset) {
+  const trail = asset.audit_trail || [];
+  const i = trail.findIndex(t => ATTR_PIVOT.test(t.name || ''));
+  if (i < 0) return null;
+  const from = [...new Set(trail.slice(0, i).map(t => regDomain(t.name)).filter(Boolean))];
+  const reached = trail.slice(i + 1).map(t => regDomain(t.name)).find(Boolean)
+                  || regDomain(asset.name);
+  if (!reached || !from.length || from.includes(reached)) return null;
+  const pivot = trail[i].name;
+  return {pivot, value: pivot.split(/[:=]/).slice(1).join(':').trim() || pivot, reached, from};
+}
+
+function provenanceBlock(asset) {
+  const w = weakProvenance(asset);
+  if (!w) return '';
+  return `<div class="alert amber" style="margin:0 0 10px">
+    <div class="alert-h"><span class="badge p-medium">Weak attribution</span>
+      <b>This is in your inventory because a WHOIS registrant name matched</b></div>
+    <p class="note" style="margin:6px 0 0">EASM pivoted on the registrant name
+      <b>${esc(w.value)}</b> and pulled in <b>${esc(w.reached)}</b> — a different registrable domain
+      from ${esc(w.from.join(', '))}. A registrant name is free text, so unrelated organisations
+      routinely share one.${asset.kind === 'ipAddress'
+        ? ` Everything counted on this address is inherited from that single match.` : ''}
+      Confirm you own ${esc(w.reached)} before treating any of this as your exposure.</p>
+    <div class="toolbar" style="margin:8px 0 0">
+      <button class="excl-dom" data-dom="${esc(w.reached)}">Not mine — hide ${esc(w.reached)}</button>
+    </div></div>`;
+}
+
+// Hiding is local to this browser: the app is read-only against EASM, so it
+// cannot set an asset to dismissed. Saying so matters — otherwise a hidden asset
+// looks handled to the person who hid it and stays live for everyone else.
+const getExcl = () => readLS(LS.excluded, {})[wsKey()] || {domains: {}, assets: {}};
+function saveExcl(e) {
+  const all = readLS(LS.excluded, {});
+  all[wsKey()] = e;
+  writeLS(LS.excluded, all);
+}
+function excludeDomain(dom) {
+  const e = getExcl();
+  e.domains[dom] = {at: new Date().toISOString()};
+  saveExcl(e);
+}
+function restoreExcl(kind, key) {
+  const e = getExcl();
+  delete e[kind][key];
+  saveExcl(e);
+}
+
+/** Which exclusion hides this asset, or '' when none does.
+ *
+ *  A domain exclusion also removes whatever was discovered *through* that domain
+ *  — the address behind it carries no risk of its own, only the risk it inherited
+ *  from a match you have just rejected. */
+function excludedBy(asset) {
+  const e = getExcl();
+  if (e.assets[asset.id]) return asset.name;
+  const doms = Object.keys(e.domains);
+  if (!doms.length) return '';
+  const touched = new Set([regDomain(asset.name),
+    ...(asset.audit_trail || []).map(t => regDomain(t.name))].filter(Boolean));
+  return doms.find(d => touched.has(d)) || '';
+}
+
 function renderAssets() {
   $('#cov-kql').textContent = MDE_KQL;
   const aiOn = aiEnabled();
@@ -1848,9 +2064,23 @@ function renderAssets() {
   $('#mde-note').textContent = mdeCount ? `${mdeCount} internet-facing devices imported` : '';
   const mode = $('#asset-merge').value;
   const merge = mode !== 'split';
-  const rows = mode === 'platform'
+  const allRows = mode === 'platform'
     ? groupByMachine(assetRows(DATA.assets, DATA.obsByAsset, {mergePages: true}))
     : assetRows(DATA.assets, DATA.obsByAsset, {mergePages: merge});
+  // Hidden before anything is counted, so a rejected match leaves the KPIs and
+  // the risk total as well as the list.
+  const rows = allRows.filter(r => !excludedBy(r.asset));
+  const excl = getExcl(), hidden = allRows.length - rows.length;
+  $('#excluded-bar').innerHTML = hidden ? `<div class="note" style="margin:0 0 10px">
+    <b>${hidden} asset${hidden === 1 ? '' : 's'} hidden as not yours</b> —
+    ${Object.keys(excl.domains).map(d => `${esc(d)}
+      <a href="#" class="unexcl" data-kind="domains" data-key="${esc(d)}"
+         style="color:var(--blue)">restore</a>`).join(', ')}.
+    Hidden in this browser only; the app never writes to EASM. To retire them properly, set the
+    assets to <b>dismissed</b> in the EASM portal — that also stops discovery walking through them
+    again.</div>` : '';
+  $('#excluded-bar').querySelectorAll('.unexcl').forEach(a =>
+    a.onclick = ev => { ev.preventDefault(); restoreExcl(a.dataset.kind, a.dataset.key); renderAssets(); });
 
   // Risk numbers read red; inventory counts stay neutral, so the eye lands on
   // the thing that needs a decision.
@@ -1861,12 +2091,12 @@ function renderAssets() {
   const yoursCount = rows.filter(r => matchesState(r.asset.state, 'yours')).length;
   const sel = $('#asset-state'), keep = sel.value;
   sel.innerHTML =
-    `<option value="confirmed">confirmed (${stateCounts.confirmed || 0})</option>` +
     `<option value="yours">yours — confirmed + candidates (${yoursCount})</option>` +
+    `<option value="confirmed">confirmed (${stateCounts.confirmed || 0})</option>` +
     `<option value="all">all states (${rows.length})</option>` +
     Object.keys(STATE_INFO).filter(st => st !== 'confirmed' && stateCounts[st])
       .map(st => `<option value="${st}">${st} (${stateCounts[st]})</option>`).join('');
-  sel.value = [...sel.options].some(o => o.value === keep) && keep ? keep : 'confirmed';
+  sel.value = [...sel.options].some(o => o.value === keep) && keep ? keep : 'yours';
 
   $('#state-legend').innerHTML = Object.entries(STATE_INFO)
     .map(([st, desc]) => `<div><span class="badge p-none">${esc(st)}</span> ${esc(desc)}
@@ -1944,11 +2174,19 @@ function renderAssets() {
             <td style="font-family:ui-monospace,monospace;color:var(--red)">${esc(assetIps(r.asset).join(', '))}</td></tr>`).join('')}
         </tbody></table>
       </details>
+      <details class="listbox"><summary>How to fix this</summary>${TAKEOVER_REMEDIATION}</details>
+      <div class="toolbar" style="margin:10px 0 0">
+        <button id="verify-own"><span class="badge az-tag">Azure</span>
+          <span class="lbl">Verify ownership in Azure</span></button>
+      </div>
+      <div class="own-out">${ownershipNote(dangling.flatMap(r => assetIps(r.asset)))}</div>
       <p class="note" style="margin:8px 0 0">
         <a href="#" id="show-dangling" style="color:var(--blue)">Filter the list to ${dangling.length > 1 ? 'them' : 'it'}</a>
         · <a href="https://learn.microsoft.com/en-us/azure/security/fundamentals/subdomain-takeover"
              target="_blank" rel="noopener noreferrer" style="color:var(--blue)">Microsoft's guidance</a></p>
     </div>` : '';
+  const verifyOwn = $('#verify-own');
+  if (verifyOwn) verifyOwn.onclick = () => runOwnership(verifyOwn, dangling.flatMap(r => assetIps(r.asset)));
   const showDangling = $('#show-dangling');
   if (showDangling) showDangling.onclick = ev => { ev.preventDefault(); ASSET_FOCUS = 'dangling'; renderAssets(); };
 
@@ -1986,6 +2224,10 @@ function renderAssets() {
       (r.siblings || []).length ? `<span class="badge p-none help" title="${esc(`${[a.name, ...r.siblings].join(', ')} — ${r.groupedBy === 'ip' ? `one machine on ${(r.sharedIps || []).join(', ')}` : 'identical findings, no IP resolved'}`)}">${r.siblings.length + 1} names</span>` : '',
       (r.relatedNames || []).length ? `<span class="badge k-cve help" title="${esc(`Same ${r.relatedReason === 'environment' ? 'machine' : 'hosted platform'} as ${r.relatedNames.join(', ')} — kept separate ${r.relatedReason === 'environment' ? 'because the environment differs' : 'because a shared platform address does not identify a host'}`)}">related</span>` : '',
       danglingHere ? `<span class="badge p-high help" title="${esc(danglingHere)}">takeover risk</span>` : '',
+      weakProvenance(a) ? `<span class="badge p-medium help" title="Reached through a WHOIS registrant
+        name match on ${esc((weakProvenance(a) || {}).value)}, which pulled in the unrelated domain
+        ${esc((weakProvenance(a) || {}).reached)}. Confirm it is yours before acting on the findings."
+        >weak attribution</span>` : '',
       svc.warning ? `<span class="badge p-medium help" title="${esc(svc.warning)}">web only</span>` : '',
       stored.causes || stored.assess ? `<span class="badge ai-tag" title="${esc(`Reviewed by AI ${new Date((stored.causes || stored.assess).at).toLocaleString()}`)}">AI</span>` : '',
     ].join('');
@@ -2081,7 +2323,14 @@ function renderAssets() {
           <p class="note" style="margin:0">${danglingHere} ${TAKEOVER_CONSEQUENCES}
             <a href="https://learn.microsoft.com/en-us/azure/security/fundamentals/subdomain-takeover"
                target="_blank" rel="noopener noreferrer" style="color:var(--blue)">Microsoft's guidance</a></p>
-        </div>` : ''}
+          <details class="listbox"><summary>How to fix this</summary>${TAKEOVER_REMEDIATION}</details>
+          <div class="toolbar" style="margin:10px 0 0">
+            <button class="own-btn" data-asset="${esc(a.id)}"><span class="badge az-tag">Azure</span>
+              <span class="lbl">Verify ownership in Azure</span></button>
+          </div>
+          <div class="own-out">${ownershipNote(assetIps(a))}</div>
+        </div>` : `<div class="own-out">${ownershipNote(assetIps(a))}</div>`}
+        ${provenanceBlock(a)}
         ${svc.warning ? `<p class="note warn" style="margin:0 0 10px">⚠ ${esc(svc.warning)}</p>` : ''}
         ${r.owasp.length ? `<h4>Weakness themes</h4><p>${r.owasp.map(o =>
           `<span class="badge p-none" style="margin-right:4px">${esc(o)}</span>`).join('')}</p>` : ''}
@@ -2133,6 +2382,10 @@ function renderAssets() {
     b.onclick = ev => clusterAsset(ev.target, rows.find(r => r.asset.id === b.dataset.asset)));
   $('#asset-list').querySelectorAll('.shodan-btn').forEach(b =>
     b.onclick = () => verifyWithShodan(b, rows.find(r => r.asset.id === b.dataset.asset)));
+  $('#asset-list').querySelectorAll('.own-btn').forEach(b =>
+    b.onclick = () => runOwnership(b, assetIps((rows.find(r => r.asset.id === b.dataset.asset) || {}).asset || {})));
+  $('#asset-list').querySelectorAll('.excl-dom').forEach(b =>
+    b.onclick = () => { excludeDomain(b.dataset.dom); renderAssets(); });
   // Re-render whatever the model said last time, so reopening a row costs nothing.
   $('#asset-list').querySelectorAll('.card').forEach(card => {
     const prev = aiResults[card.dataset.asset];
