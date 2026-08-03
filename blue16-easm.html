@@ -210,6 +210,20 @@
   .wssize.is-empty{color:var(--dim);font-weight:400;font-style:italic}
   .wstrial{font-size:11px;color:var(--green);margin-top:4px;font-weight:600}
   .wstrial.warn{color:var(--gold)}
+  .ovlist{display:flex;flex-direction:column;gap:8px}
+  .ovrow{display:grid;grid-template-columns:56px 1fr 24px;align-items:center;gap:14px;
+         background:var(--bg2);border:1px solid var(--border);border-left:3px solid var(--red);
+         border-radius:8px;padding:12px 14px;cursor:pointer;transition:border-color .15s}
+  .ovrow:hover{border-color:var(--blue);border-left-color:var(--red)}
+  .ovn{font-size:24px;font-weight:800;color:var(--red);text-align:center;line-height:1}
+  .ovwhat{font-size:13px;font-weight:700;color:var(--text)}
+  .ovwhy{font-size:11.5px;color:var(--muted);margin-top:3px;line-height:1.5}
+  .ovarrow{color:var(--dim);font-size:16px;text-align:center}
+  .ovrow:hover .ovarrow{color:var(--blue)}
+  .ovblind{margin:0;padding-left:18px;font-size:12px;color:var(--muted);line-height:1.8}
+  .ovsince{display:flex;flex-wrap:wrap;gap:10px 22px;font-size:12px;color:var(--muted)}
+  .ovsince b{color:var(--text);font-size:15px}
+  .ov-up{color:var(--red)} .ov-down{color:var(--green)} .ov-flat{color:var(--dim)}
   .covmap{display:block;margin:0 auto}
   .entryhero{display:block;margin:2px 0 12px}
   .eh-cap{font-size:11px;fill:var(--dim)}
@@ -417,11 +431,15 @@
 </header>
 
 <nav style="display:none">
-  <button data-view="assets" class="on">Assets</button>
-  <button data-view="changes">Changes</button>
+  <!-- Ordered as the questions get asked: what have we got, how would somebody
+       get in, what is wrong with it, what are we not seeing, what moved since
+       last time, and what does it cost. -->
+  <button data-view="overview" class="on">Overview</button>
+  <button data-view="assets">Assets</button>
   <button data-view="entry">Entry Points</button>
   <button data-view="findings" >Findings</button>
   <button data-view="coverage">Coverage Gap</button>
+  <button data-view="changes">Changes</button>
   <button data-view="cost">Cost Indicator</button>
 </nav>
 
@@ -502,6 +520,16 @@
       <span class="note" id="chg-note" style="margin:0"></span>
     </div>
     <div id="chg-body"></div>
+  </section>
+
+  <!-- Overview: the only page written for somebody who is not going to open a
+       single asset. Every figure is computed from what the other views already
+       hold and links through to the one it came from — a summary, never a second
+       source of truth, and never a score somebody invented. -->
+  <section id="view-overview" class="view">
+    <div id="ov-head"></div>
+    <div class="tiles" id="ov-tiles"></div>
+    <div id="ov-body"></div>
   </section>
 
   <!-- Entry points: how somebody actually gets in. EASM reports the open ports
@@ -1917,6 +1945,216 @@ function renderChanges() {
     });
 }
 
+// ── Overview ────────────────────────────────────────────────────────────────
+// Every other page is built for whoever does the work: which host, which CVE,
+// which port. The questions a CISO asks are different — are we better than last
+// month, what would actually hurt us, what can we not see, and what does it cost
+// — and none of them were answerable here.
+//
+// Two rules hold this page honest. Nothing is invented: there is no letter grade
+// and no composite score, because a number nobody can derive is a number nobody
+// should act on. And nothing terminates here: every figure links to the view that
+// produced it, so this is a summary rather than a second source of truth.
+
+/** The same measurements taken against the stored baseline, so a trend can be
+ *  stated rather than implied. Only what the snapshot actually holds — asset
+ *  count, ports and finding names — which is why risk is not trended: the
+ *  baseline never stored a score, and reconstructing one would be a guess. */
+function baselineStats(base) {
+  if (!base) return null;
+  let assets = 0, firstHop = 0, findings = 0;
+  for (const rec of Object.values(base.a)) {
+    assets++;
+    const ports = rec[1] ? rec[1].split(',').map(Number) : [];
+    if (ports.some(pt => PORT_CLASS[pt])) firstHop++;
+    findings += rec[2].length;
+  }
+  return {assets, firstHop, findings, at: base.at};
+}
+
+/** Counted the same way on both sides of the comparison, or the trend lies. */
+const firstHopCount = assets => assets.filter(a =>
+  ((a.evidence || {}).services || []).filter(x => x.recent !== false)
+    .some(x => PORT_CLASS[Number(x.port)])).length;
+
+function renderOverview() {
+  if (!DATA) return;
+  const rows = assetRows(DATA.assets, DATA.obsByAsset, {mergePages: true})
+    .filter(r => !excludedBy(r.asset) && matchesState(r.asset.state, 'yours'));
+
+  const takeover = rows.filter(r => danglingWarning(r.asset));
+  const eps = rows.map(r => ({r, ep: entryPoints(r.asset)}));
+  const planeHits = pl => eps.filter(x => x.ep.planes.some(q => q.plane === pl));
+  const stores = eps.filter(x => x.ep.planes.some(q => q.plane === 'data' || q.plane === 'control'));
+  const mgmt = planeHits('management');
+  const edge = eps.filter(x => x.ep.edge);
+  const exploited = [];
+  for (const r of rows) for (const o of r.observations) {
+    const e = EPSS[cveId(o.name)];
+    if (e && e.percentile >= 0.9) exploited.push({r, o});
+  }
+  const exploitedCves = new Set(exploited.map(x => cveId(x.o.name)));
+
+  const cov = getCoverage();
+  const known = easmIpSet();
+  const missing = cov.azure.filter(x => !known.has(x.ip));
+  const noEdr = cov.mde.length
+    ? rows.filter(r => assetIps(r.asset).length &&
+        !assetIps(r.asset).some(ip => cov.mde.some(m => m.ip === ip))).length : null;
+
+  const base = getBaseline();
+  const was = baselineStats(base);
+  const diff = base ? diffSnapshot(base, DATA.assets, DATA.obsByAsset) : null;
+  const totalRisk = rows.reduce((sum, r) => sum + r.risk, 0);
+  const nowFirstHop = firstHopCount(DATA.assets);
+  const nowFindings = rows.reduce((sum, r) => sum + r.observations.length, 0);
+
+  // Direction of travel, shown only where both sides were measured the same way.
+  // `neutral` matters: an estate growing is not good news and not bad news, and
+  // colouring it green would say the attack surface expanding is an improvement.
+  const trend = (now, then, mode = 'lower-better') => {
+    if (then == null) return '';
+    const d = now - then;
+    if (!d) return `<span class="ov-flat">unchanged</span>`;
+    const cls = mode === 'neutral' ? 'ov-flat' : (d > 0 ? 'ov-up' : 'ov-down');
+    return `<span class="${cls}">${d > 0 ? '▲' : '▼'} ${Math.abs(d)} since baseline</span>`;
+  };
+
+  $('#ov-head').innerHTML = `<div class="covhead">
+    <b>${esc(WS ? (WS.name || WS.key) : 'This workspace')}</b> — ${rows.length.toLocaleString()}
+    assets in scope (confirmed and candidates), read
+    ${DATA.loadedAt ? esc(new Date(DATA.loadedAt).toLocaleString()) : 'just now'}.
+    ${was ? `Compared against the review baseline of ${esc(new Date(was.at).toLocaleString())}.`
+          : 'No review baseline yet, so no trend is shown — one is set on the first complete load.'}
+    ${DATA.failed && DATA.failed.length ? `<span class="warn"> ${DATA.failed.length} asset${
+      DATA.failed.length === 1 ? '' : 's'} could not be read, so the figures below are that much short.</span>` : ''}
+  </div>`;
+
+  $('#ov-tiles').innerHTML = [
+    ['Assets in scope', rows.length.toLocaleString(),
+     trend(rows.length, was && was.assets, 'neutral'), '', 'assets'],
+    ['Reachable services', nowFirstHop, trend(nowFirstHop, was && was.firstHop),
+     nowFirstHop ? 'risk' : '', 'entry'],
+    ['Open findings', nowFindings.toLocaleString(), trend(nowFindings, was && was.findings), '', 'findings'],
+    ['Carried risk', totalRisk.toFixed(0), '<span class="ov-flat">no baseline score</span>',
+     totalRisk ? 'risk' : '', 'assets'],
+  ].map(([l, n, sub, cls, view]) => `<div class="tile ${cls} clickable" data-go="${view}">
+      <div class="n">${esc(n)}</div><div class="l">${esc(l)}</div>
+      <div class="l" style="text-transform:none;color:var(--dim)">${sub}</div></div>`).join('');
+
+  // Ranked by what it would take an attacker to use it, hardest requirement last.
+  const actions = [
+    takeover.length && {n: takeover.length, go: 'entry-takeover',
+      what: `subdomain takeover risk${takeover.length === 1 ? '' : 's'}`,
+      why: 'A name pointing at a cloud address you no longer hold. Anyone who allocates that ' +
+           'address answers for the name and can obtain a certificate for it — no access to ' +
+           'anything of yours required.'},
+    stores.length && {n: stores.length, go: 'entry:__stores',
+      what: `database${stores.length === 1 ? '' : 's'} or control API${stores.length === 1 ? '' : 's'} on the internet`,
+      why: 'Frequently reachable with no authentication at all. Nothing needs to be exploited.'},
+    edge.length && {n: edge.length, go: 'entry:__edge',
+      what: `edge appliance${edge.length === 1 ? '' : 's'}`,
+      why: 'VPNs, gateways and file-transfer appliances are mass-scanned within days of any ' +
+           'disclosure. The patch window is short and the consequence is direct network access.'},
+    mgmt.length && {n: mgmt.length, go: 'entry:management',
+      what: `exposed management plane${mgmt.length === 1 ? '' : 's'}`,
+      why: 'RDP, SSH and WinRM reachable from anywhere. One working password is the whole ' +
+           'attack — this is how a large share of ransomware begins.'},
+    exploitedCves.size && {n: exploitedCves.size, go: 'findings',
+      what: `CVE${exploitedCves.size === 1 ? '' : 's'} being exploited in the wild`,
+      why: `In the top 10% by EPSS across ${new Set(exploited.map(x => x.r.asset.id)).size} ` +
+           'of your assets. Exploitation is happening now, not theoretical.'},
+    missing.length && {n: missing.length, go: 'coverage',
+      what: `owned address${missing.length === 1 ? '' : 'es'} EASM never found`,
+      why: 'Public IPs in your subscriptions that discovery has not reached, so nothing is ' +
+           'watching them and none of the figures above include them.'},
+  ].filter(Boolean);
+
+  const blind = [
+    missing.length && `${missing.length} owned public IP${missing.length === 1 ? '' : 's'} absent from
+      EASM inventory`,
+    noEdr ? `${noEdr} asset${noEdr === 1 ? '' : 's'} with no Defender sensor behind the address` : '',
+    !cov.mde.length && 'Defender devices have not been imported, so the inside view is missing entirely',
+    !cov.azure.length && 'Azure public IPs have not loaded, so ownership cannot be checked at all',
+    DATA.failed && DATA.failed.length && `${DATA.failed.length} asset${DATA.failed.length === 1 ? '' : 's'}
+      whose findings could not be read`,
+  ].filter(Boolean);
+
+  const inTrial = WORKSPACES.filter(w => { const i = trialInfo(w.created); return i && i.free; });
+
+  $('#ov-body').innerHTML = `
+    <h3 style="margin:18px 0 8px">Do these first</h3>
+    ${actions.length ? `<div class="ovlist">${actions.map((a, i) => `
+      <div class="ovrow" data-go="${esc(a.go)}">
+        <div class="ovn">${a.n}</div>
+        <div><div class="ovwhat">${esc(a.what)}</div>
+          <div class="ovwhy">${esc(a.why)}</div></div>
+        <div class="ovarrow">→</div>
+      </div>`).join('')}</div>
+      <p class="note" style="margin:8px 0 0">Ordered by what an attacker needs to use it — the top of
+        this list requires nothing of yours at all, the bottom requires a working exploit.</p>`
+      : `<div class="covhead"><b style="color:var(--green)">Nothing on the shortlist.</b> No takeover
+         risk, no exposed database or management plane, no edge appliance and no CVE under active
+         exploitation on the assets in scope.</div>`}
+
+    <h3 style="margin:22px 0 8px">What we cannot see</h3>
+    ${blind.length ? `<ul class="ovblind">${blind.map(b => `<li>${b}</li>`).join('')}</ul>
+      <p class="note" style="margin:6px 0 0">Every figure on this page describes the assets EASM
+        found. These are the ones it did not, which is the part no dashboard can score.</p>`
+      : `<p class="note">Azure and Defender both loaded, every owned address is in EASM inventory, and
+         every asset was read. Nothing known to be missing.</p>`}
+
+    <h3 style="margin:22px 0 8px">Since the last review</h3>
+    ${diff ? `<div class="ovsince">
+        <div><b>${diff.appeared.length}</b> new asset${diff.appeared.length === 1 ? '' : 's'}</div>
+        <div><b>${diff.ports.length}</b> newly opened port${diff.ports.length === 1 ? '' : 's'}</div>
+        <div><b>${diff.findings.length}</b> asset${diff.findings.length === 1 ? '' : 's'} with new findings</div>
+        <div><b>${diff.vanished.length}</b> gone from inventory</div>
+      </div>
+      <p class="note" style="margin:6px 0 0">${diff.appeared.length || diff.ports.length
+        ? `New exposure is the number that says whether the process is working —
+           <a href="#" class="ov-go" data-go="changes" style="color:var(--blue)">review it</a> and move
+           the baseline.`
+        : 'Nothing has appeared since the baseline was set.'}</p>`
+      : `<p class="note">No baseline yet. One is written on the first complete load, and from then on
+         this reports what appeared since you last marked the estate reviewed.</p>`}
+
+    <h3 style="margin:22px 0 8px">Estate and cost</h3>
+    <div class="ovsince">
+      <div><b>${WORKSPACES.length}</b> workspace${WORKSPACES.length === 1 ? '' : 's'} readable</div>
+      <div><b>${inTrial.length}</b> still inside the free 30 days</div>
+      <div><b>${DATA.assets.length.toLocaleString()}</b> assets metered here</div>
+    </div>
+    <p class="note" style="margin:6px 0 0">EASM meters per asset per day, so discovery that adds
+      assets moves the bill —
+      <a href="#" class="ov-go" data-go="cost" style="color:var(--blue)">see the indication</a>.</p>`;
+
+  // Nothing on this page is a destination: every figure goes to its own view.
+  const goTo = spec => {
+    const [view, arg] = String(spec).split(':');
+    if (view === 'entry-takeover') {                 // takeover lives on Assets
+      $('#asset-state').value = 'all'; ASSET_FOCUS = 'dangling';
+      $('#asset-search').value = ''; show('assets'); return;
+    }
+    if (view === 'findings') { $('#find-search').value = ''; $('#find-kind').value = 'cve'; }
+    // The view has to render before its filter can be set: a select only accepts
+    // a value that is already one of its options, and Entry Points builds its
+    // options from the estate each time. Setting it first fails silently.
+    show(view);
+    if (view === 'entry') {
+      // Always set it, including to nothing: arriving from the plain tile means
+      // "all of them", and inheriting the last filter would answer a question
+      // nobody asked.
+      $('#entry-search').value = '';
+      $('#entry-plane').value = arg || '';
+      renderEntry();
+    }
+  };
+  $('#ov-tiles').querySelectorAll('[data-go]').forEach(el => el.onclick = () => goTo(el.dataset.go));
+  $('#ov-body').querySelectorAll('[data-go]').forEach(el =>
+    el.onclick = ev => { ev.preventDefault(); goTo(el.dataset.go); });
+}
+
 // ── Entry points ────────────────────────────────────────────────────────────
 // Vulnerability severity and initial access are different questions, and this
 // tool only answered the first. An internet-facing RDP or an unauthenticated
@@ -2147,12 +2385,19 @@ function renderEntry() {
     Object.entries(PLANES).filter(([k]) => count(k))
       .map(([k, v]) => `<option value="${k}">${esc(v.label.toLowerCase())} (${count(k)})</option>`).join('') +
     (rows.filter(x => x.ep.edge).length ? `<option value="__edge">edge appliances (${rows.filter(x => x.ep.edge).length})</option>` : '') +
-    (rows.filter(x => x.ep.authPortal).length ? `<option value="__auth">login portals (${rows.filter(x => x.ep.authPortal).length})</option>` : '');
+    (rows.filter(x => x.ep.authPortal).length ? `<option value="__auth">login portals (${rows.filter(x => x.ep.authPortal).length})</option>` : '') +
+    // The Data stores tile spans two planes, so the select needs the same union
+    // or a tile click would leave the dropdown showing something else.
+    (rows.filter(x => x.ep.planes.some(p => p.plane === 'data' || p.plane === 'control')).length
+      ? `<option value="__stores">databases and control APIs (${rows.filter(x =>
+          x.ep.planes.some(p => p.plane === 'data' || p.plane === 'control')).length})</option>` : '');
   sel.value = [...sel.options].some(o => o.value === keepPlane) ? keepPlane : '';
 
+  const isStore = x => x.ep.planes.some(p => p.plane === 'data' || p.plane === 'control');
   const shown = rows.filter(x => {
     if (planeWanted === '__edge' && !x.ep.edge) return false;
     if (planeWanted === '__auth' && !x.ep.authPortal) return false;
+    if (planeWanted === '__stores' && !isStore(x)) return false;
     if (planeWanted && !planeWanted.startsWith('__')
         && !x.ep.planes.some(p => p.plane === planeWanted)) return false;
     if (q && !x.r.asset.name.toLowerCase().includes(q)
@@ -2162,15 +2407,36 @@ function renderEntry() {
     return true;
   });
 
+  const stores = rows.filter(isStore).length;
+  const edges = rows.filter(x => x.ep.edge).length;
   $('#entry-tiles').innerHTML = [
-    ['Exposed entry points', rows.length, 'assets reachable on a first-hop service', rows.length ? 'risk' : ''],
-    ['Management planes', count('management'), 'RDP, SSH, WinRM, VNC', count('management') ? 'risk' : ''],
-    ['Data stores', count('data') + count('control'), 'databases and control APIs',
-     count('data') + count('control') ? 'risk' : ''],
-    ['Edge appliances', rows.filter(x => x.ep.edge).length, 'the mass-exploited class', ''],
-  ].map(([l, n, sub, cls]) => `<div class="tile ${cls}"><div class="n">${esc(n)}</div>
+    ['Exposed entry points', rows.length, 'assets reachable on a first-hop service',
+     rows.length ? 'risk' : '', '', rows.length],
+    ['Management planes', count('management'), 'RDP, SSH, WinRM, VNC',
+     count('management') ? 'risk' : '', 'management', count('management')],
+    ['Data stores', stores, 'databases and control APIs', stores ? 'risk' : '', '__stores', stores],
+    ['Edge appliances', edges, 'the mass-exploited class', '', '__edge', edges],
+  ].map(([l, n, sub, cls, focus, live]) => {
+    // Same rule as the Assets tiles: a tile that matches nothing is not offered,
+    // because clicking it lands on an empty list that reads as broken.
+    const on = focus === planeWanted && (focus || planeWanted === '');
+    return `<div class="tile ${cls} ${live ? 'clickable' : ''} ${live && on ? 'on' : ''}"
+      ${live ? `data-plane="${esc(focus)}"` : ''}
+      title="${live ? (focus ? 'Filter the list to these' : 'Show every entry point')
+                    : 'Nothing in the current selection matches this'}"><div class="n">${esc(n)}</div>
       <div class="l">${esc(l)}</div>
-      <div class="l" style="text-transform:none;color:var(--dim)">${esc(sub)}</div></div>`).join('');
+      <div class="l" style="text-transform:none;color:var(--dim)">${esc(sub)}</div></div>`;
+  }).join('');
+
+  // Rebuilt every render, so the handlers go back on every time.
+  $('#entry-tiles').querySelectorAll('.tile.clickable').forEach(t => {
+    t.onclick = () => {
+      const want = t.dataset.plane;
+      // Clicking the active tile again clears it, so a tile is a toggle.
+      sel.value = (want && want === sel.value) ? '' : want;
+      renderEntry();
+    };
+  });
 
   $('#entry-note').textContent = `${shown.length} shown of ${rows.length}`;
   $('#entry-hero').innerHTML = entryHeroSvg(rows);
@@ -3879,9 +4145,10 @@ async function adviseAsset(button, row) {
 }
 
 // ── wiring ──────────────────────────────────────────────────────────────────
-const VIEWS = {assets: renderAssets, entry: renderEntry, findings: renderFindings,
-               changes: renderChanges, coverage: renderCoverage, cost: renderCost};
-let current = 'assets';
+const VIEWS = {overview: renderOverview, assets: renderAssets, entry: renderEntry,
+               findings: renderFindings, changes: renderChanges, coverage: renderCoverage,
+               cost: renderCost};
+let current = 'overview';
 function show(v) {
   current = v;
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.view === v));
