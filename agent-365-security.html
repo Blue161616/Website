@@ -818,6 +818,29 @@ async function graphGetAll(url, tk){
   }
   return out;
 }
+// ── Classic agents ──────────────────────────────────────────────────────────
+// Entra's "Agent identities in your tenant" counts BOTH modern agentIdentity
+// objects and CLASSIC agents — ordinary service principals marked with an agentic
+// tag. This page only read the modern half, so its identity total was short by
+// however many classic agents exist, with no sign that anything was missing.
+//
+// Tag list and query shape lifted from classic-to-modern-agent-migrator.html, which
+// already does this discovery. One query per tag because Graph cannot OR across
+// tags/any() cleanly; results are de-duplicated by service-principal id since an
+// agent can carry more than one tag.
+const AGENTIC_TAGS=['AIAgentBuilder','AgentCreatedBy:CopilotStudio','AgenticApp','AgenticInstance'];
+async function readClassicAgents(tk){
+  const fields='id,displayName,appId,tags,createdDateTime,accountEnabled,servicePrincipalType';
+  const res=await Promise.all(AGENTIC_TAGS.map(tag=>
+    graphGetAll(`${graphBase()}/servicePrincipals?$filter=tags/any(t: t eq '${encodeURIComponent(tag)}')&$top=999&$select=${fields}`, tk)
+      .catch(()=>null)));
+  // A tag whose query failed returns null, not []. If EVERY tag failed we cannot
+  // tell "no classic agents" from "could not look", so the count stays unknown.
+  if(res.every(r=>r===null)) return {ok:false, count:0, items:[]};
+  const map=new Map();
+  res.filter(Boolean).flat().forEach(sp=>{ if(sp&&sp.id) map.set(sp.id, sp); });
+  return {ok:true, count:map.size, items:[...map.values()], partial:res.some(r=>r===null)};
+}
 async function graphGetOne(url, tk){
   const resp=await fetch(url,{headers:{Authorization:"Bearer "+tk, ConsistencyLevel:"eventual"}});
   if(!resp.ok){ const e=new Error("HTTP "+resp.status); e.status=resp.status; throw e; }
@@ -1313,6 +1336,14 @@ async function analyze(){
     }
     if(!auditGranted) notices.push('<div class="notice">Agent <b>sign-in dormancy</b> not evaluated (needs <code>AuditLog.Read.All</code> and may require Entra ID P1/P2). Dormant flag shown as n/a.</div>');
 
+    // 7b) classic agents — agentic service principals. Same directory token as the
+    // modern read, so no extra consent; failure is non-fatal and leaves the count
+    // unknown rather than zero.
+    try{ MODEL.classic = await readClassicAgents(tk); }
+    catch(e){ MODEL.classic = {ok:false, count:0, items:[]}; }
+    if(MODEL.classic && !MODEL.classic.ok)
+      notices.push('<div class="notice">Classic (service-principal) agents could not be enumerated, so the tenant agent-identity total shows the <b>modern</b> count only. Entra’s own "Agent identities in your tenant" counts both.</div>');
+
     // 8) optional: Defender AgentsInfo advanced hunting (KQL). If the table returns rows, the Agent 365 data
     // source + Microsoft 365 connector are enabled and collecting — a live proof the requirements are met.
     let huntState={granted:false};
@@ -1604,7 +1635,7 @@ async function analyze(){
     };
     renderNotices(notices, capped, agents.length);
     const invTotal = (huntState && huntState.ok) ? huntState.total : 0;
-    renderDashboard(overall, domains, MODEL.meta, avail, invTotal);
+    renderDashboard(overall, domains, MODEL.meta, avail, invTotal, MODEL.classic);
     renderCoverage(n, invTotal);
     renderKpis(enriched, bpIds.length, idpState);
     renderEngineSections(enriched, bpMap, caState, domains, idpState);
@@ -1641,7 +1672,7 @@ function statusPill(st){
   if(st==="warn") return '<span class="statuspill warn">● Verify in portal</span>';
   return '<span class="statuspill">● n/a</span>';
 }
-function renderDashboard(overall, domains, meta, avail, invTotal){
+function renderDashboard(overall, domains, meta, avail, invTotal, classic){
   avail=avail||{};
   // Two counts, two nodes. The registry number is the full inventory; the Entra
   // number is the subset holding an Agent ID. The beam between them carries the
@@ -1694,11 +1725,19 @@ function renderDashboard(overall, domains, meta, avail, invTotal){
   // so the split is shown with the classic side marked unread rather than folded
   // into the total — a number that is 82 of an unknown 100 must not render as 100.
   $("coreScore").textContent=entraN; $("coreScore").style.color="var(--entra)";
+  // modern + classic = what Entra calls "Agent identities in your tenant".
+  const cOk = !!(classic && classic.ok);
+  const cN  = cOk ? classic.count : null;
+  const idTotal = cOk ? entraN + cN : null;
+  $("coreScore").textContent = idTotal === null ? entraN : idTotal;
   const sp=$("idSplit");
   if(sp) sp.innerHTML = '<span class="idpart"><b>'+entraN+'</b> modern <span class="idq">agentIdentity</span></span>'
     + '<span class="idsep">+</span>'
-    + '<span class="idpart unread"><b>?</b> classic <span class="idq">service principal</span></span>'
-    + '<span class="idnote">classic agents are not read here — compare with <b>Agent identities in your tenant</b> in Entra</span>';
+    + (cOk
+        ? '<span class="idpart"><b>'+cN+'</b> classic <span class="idq">service principal</span></span>'
+          + (classic.partial ? '<span class="idnote">one or more tag queries failed — the classic count may be low</span>' : '')
+        : '<span class="idpart unread"><b>?</b> classic <span class="idq">service principal</span></span>'
+          + '<span class="idnote">classic agents could not be read — needs Application.Read.All on service principals</span>');
   const cg=$("coreGrade"); if(cg) cg.textContent="";
   $("coreMeta").textContent=meta.blueprints+" blueprint"+(meta.blueprints===1?"":"s")+" (security boundaries) · the only agents Entra can govern";
   // engines → availability (configured?) instead of a numeric score
