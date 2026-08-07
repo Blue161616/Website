@@ -106,6 +106,29 @@
   .notice .nhead { display: flex; align-items: center; flex-wrap: wrap; gap: 2px;
     font-size: 15.5px; font-weight: 700; line-height: 1.35; margin-bottom: 5px; }
   .notice .nhead b { font-weight: 700; }
+  /* ── Detail sections ────────────────────────────────────────────────────
+     The detail panel was four headed lists sharing one background, so the eye had
+     to use the headings alone to find a boundary. Each is a bordered block with a
+     header bar now, and a block can hold two columns — the same treatment the app
+     registration view uses, for the same reason: several distinct answers on one
+     screen, each needing its own edge. */
+  .dblock { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 12px; overflow: hidden; background: var(--card); }
+  .dblock > .dbh { padding: 7px 12px; font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .6px; color: var(--accent); border-bottom: 1px solid var(--border); background: var(--hover); }
+  .dblock > .dbb { padding: 11px 13px; }
+  .dcols { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
+  .dcols > div { padding: 11px 13px; }
+  .dcols > div + div { border-left: 1px solid var(--border); }
+  .dcolh { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px;
+    color: var(--muted); margin-bottom: 6px; }
+  @media (max-width: 780px) { .dcols { grid-template-columns: 1fr; } .dcols > div + div { border-left: 0; border-top: 1px solid var(--border); } }
+  /* Included / excluded rows inside the guardrail block. */
+  .grow { display: flex; align-items: baseline; gap: 7px; padding: 3px 0; font-size: 12.5px; line-height: 1.5; }
+  .grow .gmark { flex: 0 0 auto; font-weight: 700; }
+  .gon  .gmark { color: var(--green); }
+  .goff .gmark { color: var(--red); }
+  .goff { color: var(--text); }
+  .gmeta { color: var(--muted); font-size: 11.5px; }
   /* Tenant panel */
   .thead { display: flex; gap: 26px; align-items: center; flex-wrap: wrap; }
   .tgradewrap { display: flex; align-items: center; gap: 12px; }
@@ -429,7 +452,17 @@ async function readRaiPolicies(accountId, at) {
       if (f.severityThreshold) cur.severity = f.severityThreshold;
       if (f.source && !cur.sources.includes(f.source)) cur.sources.push(f.source);
     });
-    out[p.name] = { name: p.name, mode: props.mode || null, type: props.type || null, filters };
+    // The portal's guardrail list has a Type column — Agent or Model — and they are
+    // different kinds, not just different assignment targets. A Model guardrail is
+    // reachable from the deployments that name it; an Agent one is attached to an
+    // agent and is invisible from the deployment side, which is exactly the gap
+    // that made agent coverage look unreadable. Several property names are tried
+    // because this is preview; `scope` stays null when none matches, and null is
+    // reported as unknown rather than assumed to be Model.
+    const scopeRaw = props.guardrailType || props.policyType || props.scope || props.appliesTo || null;
+    const scope = scopeRaw ? (/agent/i.test(scopeRaw) ? 'Agent' : /model|deployment/i.test(scopeRaw) ? 'Model' : String(scopeRaw)) : null;
+    out[p.name] = { name: p.name, mode: props.mode || null, type: props.type || null,
+                    scope, appliedTo: props.appliedTo || props.assignments || null, filters };
   });
   return out;
 }
@@ -732,9 +765,11 @@ function scoreResource(r) {
     Object.keys(gaps).forEach(label => {
       const who = gaps[label];
       s += 8;
-      reasons.push({ sev: "medium", t: 'Guardrail leaves <b>' + label + '</b> uncovered on ' + who.length +
+      // Plain text, no markup: reason strings are escaped on render (and reused in
+      // the CSV and JSON exports), so a <b> here shows up as literal angle brackets.
+      reasons.push({ sev: "medium", t: 'Guardrail leaves ' + label + ' uncovered on ' + who.length +
         ' deployment(s): ' + who.slice(0, 4).join(', ') + (who.length > 4 ? ', …' : '') +
-        ' — this is one of the agentic risks the guardrail is there to catch, and it is off' });
+        ' — one of the agentic risks the guardrail exists to catch, and it is off' });
     });
     // Say when the guardrail could not be read at all, so an unassessed estate is
     // not scored as a clean one.
@@ -792,11 +827,22 @@ function defenderIcon(size) {
 function renderAgentGuardrailNotice() {
   const L = MODEL.agentLayer;
   if (!L) return "";
-  if (L.state !== "ok")
+  if (L.state !== "ok") {
+    // An Agent-scoped guardrail visible in the policy list proves the agent layer
+    // is in use even when the agent list itself could not be read — which is a
+    // materially different message from "we saw nothing".
+    const agentScoped = [];
+    (MODEL.resources || []).forEach(r => Object.values(r.raiPolicies || {})
+      .forEach(p => { if (p.scope === 'Agent') agentScoped.push(p.name); }));
     return '<div class="notice notice-info">' + defenderIcon() +
       '<b>Agent-level guardrails not read.</b> ' + escHtml(L.note || "") +
+      (agentScoped.length
+        ? ' The policy list does show <b>' + agentScoped.length + '</b> agent-scoped guardrail(s) — ' +
+          escHtml(agentScoped.slice(0, 5).join(', ')) + ' — so agents here do carry their own; which agent has which is what could not be resolved.'
+        : '') +
       ' Guardrail coverage below is the <b>model deployment\'s</b> — which is what an agent inherits when it has ' +
       'none of its own, but an agent that <i>does</i> have its own is not described by it.</div>';
+  }
   if (!L.agents.length)
     return '<div class="notice notice-info">' + defenderIcon() +
       '<b>No Foundry agents found</b> on the accounts read, so guardrail coverage below applies to model deployments only.</div>';
@@ -984,12 +1030,89 @@ function detailHtml(r) {
     ? (r.deployments.length ? '<ul class="dlist">' + r.deployments.map((d) => "<li>" + escHtml(d.name) + " — <b>" + escHtml(d.model) + "</b> · content filter: " + (d.rai ? escHtml(d.rai) : '<span style="color:var(--red)">none set</span>') + "</li>").join("") + "</ul>" : '<p class="dmuted">No model deployments.</p>')
     : '<p class="dmuted">n/a</p>';
   const portal = "https://portal.azure.com/#@/resource" + r.id + "/overview";
-  return '<div class="dpanel">'
-    + '<div class="dsec-wide"><div class="dhead">Posture score ' + r.score + ' (' + r.tier.toUpperCase() + ') — why</div><ul class="dlist">' + why + '</ul></div>'
-    + '<div><div class="dhead">Configuration</div><div class="kv">' + facts.map((f) => "<div>" + f + "</div>").join("") + '</div><div style="margin-top:8px"><a href="' + escHtml(portal) + '" target="_blank" rel="noopener">Open in Azure portal ↗</a></div></div>'
-    + '<div><div class="dhead">Model deployments</div>' + deps + '</div>'
-    + '<div class="dsec-wide"><div class="dhead">Remediation</div><ul class="dlist">' + rem.map((x) => "<li>" + escHtml(x) + "</li>").join("") + '</ul></div>'
+  const block = (title, body) => '<div class="dblock"><div class="dbh">' + title + '</div><div class="dbb">' + body + '</div></div>';
+  return '<div>'
+    + block('Posture score ' + r.score + ' (' + r.tier.toUpperCase() + ') — why', '<ul class="dlist">' + why + '</ul>')
+    + guardrailBlock(r)
+    + '<div class="dblock"><div class="dcols">'
+    +   '<div><div class="dcolh">Configuration</div><div class="kv">' + facts.map((f) => "<div>" + f + "</div>").join("")
+    +     '</div><div style="margin-top:8px"><a href="' + escHtml(portal) + '" target="_blank" rel="noopener">Open in Azure portal ↗</a></div></div>'
+    +   '<div><div class="dcolh">Model deployments</div>' + deps + '</div>'
+    + '</div></div>'
+    + block('Remediation', '<ul class="dlist">' + rem.map((x) => "<li>" + escHtml(x) + "</li>").join("") + '</ul>')
     + '</div>';
+}
+
+// ── Guardrail block · what it covers and what it leaves open ────────────────
+// The portal states this as three lines — a name, risks WITH controls, risks
+// WITHOUT — and that is the shape worth keeping, because the second list is the
+// finding. Reported per deployment, since two deployments on one account can carry
+// different policies.
+//
+// An account whose policies could not be read says so instead of showing an empty
+// "excluded" list, which would read as full coverage.
+function guardrailBlock(r) {
+  if (r.family !== "cognitive") return "";
+  if (r.raiPolicies === null)
+    return '<div class="dblock"><div class="dbh">Guardrail</div><div class="dbb"><p class="dmuted">' +
+      'Guardrail / RAI policy definitions could not be read for this account, so risk coverage is unassessed — ' +
+      'not confirmed absent.</p></div></div>';
+  const deployments = Array.isArray(r.deployments) ? r.deployments : [];
+  if (!deployments.length) return "";
+  const rows = deployments.map(d => {
+    const head = '<div style="font-weight:700;font-size:12.5px;margin-bottom:3px">' + escHtml(d.name) +
+      ' <span class="gmeta">· ' + (d.rai ? escHtml(d.rai) : 'no policy set') + '</span></div>';
+    if (!d.rai)
+      return '<div style="margin-bottom:10px">' + head +
+        '<div class="grow goff"><span class="gmark">✕</span><span>No content-filter policy is attached, so nothing here is covered by an explicit guardrail.</span></div></div>';
+    const cov = d.coverage;
+    if (!cov || cov.empty)
+      return '<div style="margin-bottom:10px">' + head +
+        '<div class="grow"><span class="gmeta">Policy named but its controls could not be read.</span></div></div>';
+    const on  = cov.on.map(c => '<div class="grow gon"><span class="gmark">✓</span><span>' + escHtml(c.label) +
+      (c.severity ? ' <span class="gmeta">· ' + escHtml(c.severity) + ' threshold</span>' : '') +
+      (c.blocking ? ' <span class="gmeta">· blocking</span>' : ' <span class="gmeta">· annotate only</span>') + '</span></div>').join("");
+    const off = cov.off.map(c => '<div class="grow goff"><span class="gmark">✕</span><span>' + escHtml(c.label) +
+      ' <span class="gmeta">· ' + escHtml(c.reason) + '</span></span></div>').join("");
+    return '<div style="margin-bottom:12px">' + head + '<div class="dcols" style="border:1px solid var(--border);border-radius:6px">' +
+      '<div><div class="dcolh" style="color:var(--green)">Included — risks with controls</div>' +
+        (on || '<span class="gmeta">None.</span>') + '</div>' +
+      '<div><div class="dcolh" style="color:var(--red)">Excluded — risks without controls</div>' +
+        (off || '<span class="gmeta">None — every category is covered.</span>') + '</div></div></div>';
+  }).join("");
+  return '<div class="dblock"><div class="dbh">Guardrail — risk coverage per deployment</div><div class="dbb">'
+    + guardrailInventory(r) + rows + '</div></div>';
+}
+
+// The account's guardrails as the portal lists them: name, type, what each is
+// applied to. Worth showing in full because the deployment view above can only see
+// Model-scoped ones — an Agent-scoped guardrail is attached to an agent and never
+// appears against a deployment, so without this it would look like it did not
+// exist. A policy applied to nothing is listed too: harmless, but it is the
+// difference between "configured and unused" and "not configured".
+function guardrailInventory(r) {
+  const pols = r.raiPolicies;
+  if (!pols || !Object.keys(pols).length) return "";
+  const usedBy = {};
+  (r.deployments || []).forEach(d => { if (d.rai) (usedBy[d.rai] = usedBy[d.rai] || []).push(d.name); });
+  const rows = Object.values(pols).map(p => {
+    const deps = usedBy[p.name] || [];
+    // Scope is inferred from the deployments when the API did not state it: a
+    // policy no deployment names, on an account that has deployments, is either
+    // agent-scoped or unused — and those two are not the same thing.
+    const scope = p.scope || (deps.length ? 'Model' : null);
+    const applied = deps.length ? escHtml(deps.join(', '))
+      : scope === 'Agent' ? '<span class="gmeta">agent-scoped — assignment not visible from ARM</span>'
+      : '<span class="gmeta">not applied to any deployment</span>';
+    const scopeTag = scope
+      ? '<span class="badge b-type" style="font-size:9.5px">' + escHtml(scope) + '</span>'
+      : '<span class="gmeta">type unknown</span>';
+    return '<tr><td style="padding:3px 10px 3px 0;font-weight:600">' + escHtml(p.name) + '</td>'
+      + '<td style="padding:3px 10px 3px 0">' + scopeTag + '</td>'
+      + '<td style="padding:3px 0;color:var(--muted)">' + applied + '</td></tr>';
+  }).join("");
+  return '<div class="dcolh">Guardrails on this account</div>'
+    + '<table style="border-collapse:collapse;width:100%;font-size:12px;margin-bottom:12px">' + rows + '</table>';
 }
 
 // ---- Export ----
