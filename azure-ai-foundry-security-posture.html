@@ -234,9 +234,14 @@
             <p><i>APIs my organization uses</i> → <b>Delegated</b>, no admin consent needed</p>
             <table class="perm">
               <tr><td class="api">Azure Service Management</td><td><code>user_impersonation</code></td>
-                  <td class="why">read ARM via Resource Graph</td></tr>
+                  <td class="why">resources, deployments, guardrail policies, Defender plans — <b>required</b></td></tr>
+              <tr><td class="api">Azure AI Foundry<div class="gid">https://ai.azure.com</div></td><td><code>user_impersonation</code></td>
+                  <td class="why">agent-level guardrail assignments <span class="opt">optional</span></td></tr>
             </table>
-            <p class="fine">That is the whole list. The page only ever reads — it queries Azure Resource Graph and writes nothing back.</p>
+            <p class="fine">The first covers everything on the management plane, including which risk categories each
+              guardrail switches on. The second is only for reading <b>Foundry agents</b>, so the page can tell an agent
+              with its own guardrail from one inheriting its model's. Without it the page still reports guardrail coverage
+              per model deployment and says the agent layer was not read. The page only ever reads.</p>
           </div>
         </div>
 
@@ -384,6 +389,113 @@ async function mapPool(items, size, fn) {
 
 const RG_QUERY = "resources | where type in~ ('microsoft.cognitiveservices/accounts','microsoft.machinelearningservices/workspaces') | project id, name, type, kind, location, resourceGroup, subscriptionId, identity, sku, tags, properties";
 
+// ── Guardrails · the risk categories a deployment actually covers ───────────
+// The Foundry portal shows a guardrail per agent with two lists — risks WITH
+// controls and risks WITHOUT. The name it shows (Microsoft.DefaultV2) is an RAI
+// policy name, and RAI policies are an ARM resource on the Cognitive Services
+// account, so the same answer is readable here with the token this page already
+// holds. No new permission: Reader covers it.
+//
+// A deployment's raiPolicyName is already collected; this resolves it to what the
+// policy switches on. "Has a guardrail" was never the useful question — every
+// deployment has one by default. Which risks it leaves uncovered is.
+const RAI_CATEGORIES = [
+  { key: 'jailbreak',      label: 'Jailbreak',                 filters: ['jailbreak'] },
+  { key: 'indirect',       label: 'Indirect prompt injection', filters: ['indirect_attack','indirectattack','prompt_shield_indirect'] },
+  { key: 'contentharms',   label: 'Content harms',             filters: ['hate','sexual','selfharm','self_harm','violence'] },
+  { key: 'protected',      label: 'Protected material',        filters: ['protected_material_text','protected_material_code','protectedmaterial'] },
+  { key: 'pii',            label: 'Sensitive data (PII)',      filters: ['pii','personal_information'] },
+  { key: 'taskadherence',  label: 'Task drift',                filters: ['task_adherence','taskadherence'] }
+];
+// Categories whose absence is a finding rather than a note. Content harms are
+// filtered by default almost everywhere; these three are the agentic risks the
+// portal itself lists as uncovered, and they are the ones that matter once an
+// agent has tools and web grounding.
+const RAI_CRITICAL = ['indirect', 'pii', 'taskadherence'];
+
+async function readRaiPolicies(accountId, at) {
+  const r = await armGet(ARM + accountId + "/raiPolicies?api-version=2024-10-01", at);
+  const out = {};
+  (r.value || []).forEach(p => {
+    const props = p.properties || {};
+    const filters = {};
+    (props.contentFilters || []).forEach(f => {
+      const n = String(f.name || '').toLowerCase();
+      // One filter name appears twice, once per source (Prompt / Completion), so
+      // the states are merged: enabled anywhere counts as enabled.
+      const cur = filters[n] || (filters[n] = { enabled: false, blocking: false, severity: null, sources: [] });
+      if (f.enabled) cur.enabled = true;
+      if (f.blocking) cur.blocking = true;
+      if (f.severityThreshold) cur.severity = f.severityThreshold;
+      if (f.source && !cur.sources.includes(f.source)) cur.sources.push(f.source);
+    });
+    out[p.name] = { name: p.name, mode: props.mode || null, type: props.type || null, filters };
+  });
+  return out;
+}
+
+// ── Agent-level guardrails · the inheritance chain ──────────────────────────
+// A guardrail attaches to agents AND to model deployments, which is why the portal
+// tells an agent with none that it is "inheriting its model's guardrail". So the
+// effective guardrail for an agent is: its own assignment, else the one on the
+// model deployment it runs, else nothing.
+//
+// Agents live on the Foundry DATA plane, not ARM — a different host and a
+// different token audience from everything else this page reads. That token is
+// requested silently and separately: if it is not consented, or the host refuses
+// the browser, the page still reports model-deployment coverage and says plainly
+// that the agent layer was not read. It never silently presents a model's
+// guardrail as though it were the agent's.
+const FOUNDRY_DP_SCOPES = ["https://ai.azure.com/.default"];
+async function foundryDataPlaneToken() {
+  try { return (await msalApp.acquireTokenSilent({ scopes: FOUNDRY_DP_SCOPES, account })).accessToken; }
+  catch { return null; }
+}
+/** Agents in one Foundry project, with whatever guardrail each names. */
+async function readFoundryAgents(endpoint, dpTok) {
+  const r = await fetch(endpoint.replace(/\/$/, "") + "/assistants?api-version=2025-05-01", {
+    headers: { Authorization: "Bearer " + dpTok }
+  });
+  if (!r.ok) throw new Error("data plane " + r.status);
+  const j = await r.json();
+  return (j.data || j.value || []).map(a => ({
+    id: a.id, name: a.name || a.id, model: a.model || null,
+    // Same defensive read as everywhere else: several plausible shapes, and null
+    // when none match rather than a guess.
+    guardrail: (a.guardrail && (a.guardrail.name || a.guardrail.id)) || a.guardrailName || a.guardrail_id || null
+  }));
+}
+/**
+ * Effective guardrail for an agent.
+ * `source` is the honest part: 'agent' when the agent names its own, 'model' when
+ * it inherits, 'none' when neither has one, 'unknown' when the agent layer could
+ * not be read at all.
+ */
+function effectiveGuardrail(agent, deploymentsByModel) {
+  if (!agent) return { source: 'unknown', name: null, coverage: null };
+  if (agent.guardrail) return { source: 'agent', name: agent.guardrail, coverage: null };
+  const dep = agent.model ? deploymentsByModel[agent.model] : null;
+  if (dep && dep.rai) return { source: 'model', name: dep.rai, coverage: dep.coverage || null };
+  return { source: 'none', name: null, coverage: null };
+}
+
+/** Which categories this policy covers, and which it leaves open. */
+function raiCoverage(policy) {
+  if (!policy) return null;
+  const on = [], off = [];
+  RAI_CATEGORIES.forEach(cat => {
+    const hits = cat.filters.map(f => policy.filters[f]).filter(Boolean);
+    // A category the policy never mentions is reported as uncovered only when the
+    // policy listed SOME filters — an empty policy means we read nothing useful.
+    if (!hits.length) { off.push({ ...cat, reason: 'not present in policy' }); return; }
+    const enabled = hits.filter(h => h.enabled);
+    if (enabled.length) on.push({ ...cat, blocking: enabled.some(h => h.blocking),
+                                  severity: (enabled.find(h => h.severity) || {}).severity || null });
+    else off.push({ ...cat, reason: 'present but disabled' });
+  });
+  return { on, off, empty: !Object.keys(policy.filters).length };
+}
+
 // ── Defender for Cloud · AI Services plan ───────────────────────────────────
 // This page assesses how the AI resources are configured. Whether anything is
 // WATCHING them at runtime is a different question, answered per subscription by
@@ -466,8 +578,43 @@ async function scan() {
           const dep = await armGet(ARM + r.id + "/deployments?api-version=2023-05-01", at);
           r.deployments = (dep.value || []).map((d) => ({ name: d.name, model: (d.properties && d.properties.model && d.properties.model.name) || "?", rai: (d.properties && d.properties.raiPolicyName) || null }));
         } catch (e) { r.deployments = null; }
+        // Resolve each deployment's guardrail to the risks it covers. Kept separate
+        // from the deployments read so one failing does not blank the other.
+        try {
+          r.raiPolicies = await readRaiPolicies(r.id, at);
+          (r.deployments || []).forEach(d => {
+            d.coverage = d.rai ? raiCoverage(r.raiPolicies[d.rai]) : null;
+          });
+        } catch (e) { r.raiPolicies = null; }
       }
     });
+
+    // Agent-level guardrails, best effort. A separate token audience and a preview
+    // data-plane API, so every way this can fail is recorded as "not read" rather
+    // than allowed to look like "no agents" or "no guardrail".
+    setStatus("Reading Foundry agents (guardrail assignments)…", false, true);
+    MODEL.agentLayer = { state: "skipped", agents: [], note: null };
+    try {
+      const dpTok = await foundryDataPlaneToken();
+      if (!dpTok) {
+        MODEL.agentLayer = { state: "no-token", agents: [],
+          note: "The Foundry data-plane scope is not consented for this app registration, so agent-level guardrail assignments were not read." };
+      } else {
+        const hosts = resources.filter(x => x.family === "cognitive" && x.endpoint);
+        const all = [];
+        let failed = 0;
+        await mapPool(hosts, 4, async (h) => {
+          try { (await readFoundryAgents(h.endpoint, dpTok)).forEach(a => all.push({ ...a, host: h.name })); }
+          catch (e) { failed++; }
+        });
+        MODEL.agentLayer = failed && !all.length
+          ? { state: "blocked", agents: [],
+              note: "The Foundry data plane refused or blocked the browser on " + failed + " account(s), so agent-level guardrail assignments were not read." }
+          : { state: "ok", agents: all, note: null };
+      }
+    } catch (e) {
+      MODEL.agentLayer = { state: "error", agents: [], note: "Agent read failed: " + ((e && e.message) || e) };
+    }
 
     setStatus("Checking Defender for Cloud AI Services plan…", false, true);
     MODEL.aiPlans = await readDefenderAiPlans(subs, at);
@@ -518,6 +665,9 @@ function parseResource(r, subName) {
     out.privateEndpoints = (p.privateEndpointConnections || []).length;
     out.customSubdomain = p.customSubDomainName || null;
     out.restrictOutbound = p.restrictOutboundNetworkAccess === true;
+    // Where Foundry agents live, if this account hosts any. ARM gives the host;
+    // the agents themselves are only readable on the data plane behind it.
+    out.endpoint = p.endpoint || (p.endpoints && (p.endpoints["AI Foundry API"] || p.endpoints["Azure AI Model Inference API"])) || null;
   } else {
     out.family = "mlworkspace";
     out.typeLabel = kind === "hub" ? "Foundry hub" : kind === "project" ? "Foundry project" : kind ? ("ML: " + r.kind) : "ML workspace";
@@ -569,6 +719,27 @@ function scoreResource(r) {
   if (r.family === "cognitive" && Array.isArray(r.deployments) && r.deployments.length) {
     const unfiltered = r.deployments.filter((d) => !d.rai);
     if (unfiltered.length) { s += 10; reasons.push({ sev: "high", t: unfiltered.length + " of " + r.deployments.length + " model deployment(s) have no explicit content-filter / responsible-AI policy — verify default filtering is active" }); }
+
+    // Guardrail coverage. Every deployment has a policy; what varies is what it
+    // switches on. Reported per uncovered category rather than per deployment, so
+    // "indirect prompt injection is off everywhere" reads as one problem.
+    const gaps = {};
+    r.deployments.forEach(d => {
+      if (!d.coverage || d.coverage.empty) return;
+      d.coverage.off.filter(c => RAI_CRITICAL.includes(c.key))
+        .forEach(c => { (gaps[c.label] = gaps[c.label] || []).push(d.name + (d.rai ? ' (' + d.rai + ')' : '')); });
+    });
+    Object.keys(gaps).forEach(label => {
+      const who = gaps[label];
+      s += 8;
+      reasons.push({ sev: "medium", t: 'Guardrail leaves <b>' + label + '</b> uncovered on ' + who.length +
+        ' deployment(s): ' + who.slice(0, 4).join(', ') + (who.length > 4 ? ', …' : '') +
+        ' — this is one of the agentic risks the guardrail is there to catch, and it is off' });
+    });
+    // Say when the guardrail could not be read at all, so an unassessed estate is
+    // not scored as a clean one.
+    if (r.raiPolicies === null)
+      reasons.push({ sev: "info", t: "Guardrail / RAI policy definitions could not be read for this account — risk coverage is unassessed here, not confirmed absent" });
   }
   // ML legacy mode
   if (r.family === "mlworkspace" && r.v1Legacy) { s += 6; reasons.push({ sev: "medium", t: "v1LegacyMode enabled — legacy access model without the newer RBAC data actions" }); }
@@ -611,6 +782,40 @@ function defenderIcon(size) {
     '<path d="M16 2v28c7-1.2 12-7 12-14.4V6.4Z" fill="#0f6cbd"/>' +
     '<path d="M4 16h12v14c-7-1.2-12-7-12-14Z" fill="#1f8fd4"/>' +
     '<path d="M16 16h12c0 7.4-5 13.2-12 14.4Z" fill="#0a4f9c"/></svg>';
+}
+
+// Agent-level guardrails: what was resolved, and — when the agent layer could not
+// be read — a plain statement that the coverage shown below is the MODEL's. That
+// distinction is the whole point of the inheritance chain: an agent with its own
+// guardrail is not described by its model's, and presenting one as the other would
+// be the most confident kind of wrong.
+function renderAgentGuardrailNotice() {
+  const L = MODEL.agentLayer;
+  if (!L) return "";
+  if (L.state !== "ok")
+    return '<div class="notice notice-info">' + defenderIcon() +
+      '<b>Agent-level guardrails not read.</b> ' + escHtml(L.note || "") +
+      ' Guardrail coverage below is the <b>model deployment\'s</b> — which is what an agent inherits when it has ' +
+      'none of its own, but an agent that <i>does</i> have its own is not described by it.</div>';
+  if (!L.agents.length)
+    return '<div class="notice notice-info">' + defenderIcon() +
+      '<b>No Foundry agents found</b> on the accounts read, so guardrail coverage below applies to model deployments only.</div>';
+  // Build the deployment lookup once, then resolve each agent through the chain.
+  const byModel = {};
+  (MODEL.resources || []).forEach(r => (r.deployments || []).forEach(d => { if (d.model) byModel[d.model] = d; }));
+  const own = [], inherited = [], none = [];
+  L.agents.forEach(a => {
+    const eff = effectiveGuardrail(a, byModel);
+    (eff.source === 'agent' ? own : eff.source === 'model' ? inherited : none).push(a.name + (eff.name ? ' → ' + eff.name : ''));
+  });
+  const bits = [];
+  if (own.length)       bits.push('<b>' + own.length + '</b> with their own guardrail');
+  if (inherited.length) bits.push('<b>' + inherited.length + '</b> inheriting their model\'s');
+  if (none.length)      bits.push('<b style="color:var(--red)">' + none.length + '</b> with none at either level');
+  return '<div class="notice ' + (none.length ? 'notice-warn' : 'notice-ok') + '">' + defenderIcon() +
+    '<b>' + L.agents.length + ' Foundry agent(s)</b> — ' + bits.join(', ') + '. ' +
+    (none.length ? 'An agent with no guardrail on itself and none on the model it runs has no controls at all: '
+                 + escHtml(none.slice(0, 6).join(', ')) + (none.length > 6 ? ' …' : '') : '') + '</div>';
 }
 
 // Only the subscriptions that actually hold AI resources are reported. The plan
@@ -661,6 +866,7 @@ function renderNotices() {
   const n = [];
   if (MODEL.enrichBlocked) n.push('<div class="notice notice-info">Some diagnostic-setting reads were blocked (needs Reader on those resources / Microsoft.Insights) — logging shown as “unknown” where unavailable.</div>');
   if (!MODEL.resources.length) n.push('<div class="notice notice-ok">No Azure OpenAI / AI Services accounts or AI Foundry workspaces found in the subscriptions you can read.</div>');
+  n.push(renderAgentGuardrailNotice());
   n.push(renderAiPlanNotice());
   $("notices").innerHTML = n.filter(Boolean).join("");
 }
