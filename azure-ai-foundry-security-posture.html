@@ -358,6 +358,48 @@ async function mapPool(items, size, fn) {
 
 const RG_QUERY = "resources | where type in~ ('microsoft.cognitiveservices/accounts','microsoft.machinelearningservices/workspaces') | project id, name, type, kind, location, resourceGroup, subscriptionId, identity, sku, tags, properties";
 
+// ── Defender for Cloud · AI Services plan ───────────────────────────────────
+// This page assesses how the AI resources are configured. Whether anything is
+// WATCHING them at runtime is a different question, answered per subscription by
+// Defender for Cloud's AI Services plan — the one that produces prompt-injection
+// and data-exfiltration alerts for Azure OpenAI. A hardened account in a
+// subscription with the plan off is still unmonitored.
+//
+// Read from the Security resource provider, not Resource Graph. Reader on the
+// subscription covers it (*/read), so it needs no permission beyond the one the
+// page already asks for.
+const AI_PLAN_NAMES = ["ai", "aiservices"];   // matched case-insensitively, exact
+async function readDefenderAiPlans(subs, at) {
+  const out = {};
+  await mapPool(subs, 6, async (s) => {
+    const id = s.subscriptionId;
+    try {
+      const r = await armGet(ARM + "/subscriptions/" + id + "/providers/Microsoft.Security/pricings?api-version=2024-01-01", at);
+      const plan = (r.value || []).find(p => AI_PLAN_NAMES.includes(String(p.name || "").toLowerCase()));
+      if (!plan){
+        // The plan is absent from the response rather than reported off. Saying
+        // "off" here would be inventing a reading the API never gave us.
+        out[id] = { state: "absent" };
+        return;
+      }
+      const p = plan.properties || {};
+      const exts = Array.isArray(p.extensions) ? p.extensions : [];
+      const offExts = exts.filter(x => x && x.isEnabled === false).map(x => x.name);
+      out[id] = {
+        state: /^standard$/i.test(p.pricingTier || "") ? "on" : "off",
+        tier: p.pricingTier || "?",
+        extensionsOff: offExts,
+        extensionsTotal: exts.length
+      };
+    } catch (e) {
+      // 403 on the Security RP is a different fact from the plan being off, and
+      // the difference decides whether anyone needs to go turn something on.
+      out[id] = { state: "unreadable", error: String((e && e.message) || e) };
+    }
+  });
+  return out;
+}
+
 // ---- Scan ----
 async function scan() {
   try {
@@ -400,6 +442,10 @@ async function scan() {
         } catch (e) { r.deployments = null; }
       }
     });
+
+    setStatus("Checking Defender for Cloud AI Services plan…", false, true);
+    MODEL.aiPlans = await readDefenderAiPlans(subs, at);
+    MODEL.subNames = subNames;
 
     resources.forEach((r) => { scoreResource(r); });
     MODEL.resources = resources;
@@ -528,11 +574,52 @@ function computeStats() {
 const POSTURE_CLS = { critical: "b-crit", high: "b-high", medium: "b-med", low: "b-low" };
 function render() { renderTenant(); renderNotices(); renderSummary(); renderTable(); }
 
+// Only the subscriptions that actually hold AI resources are reported. The plan
+// being off where there is nothing to protect is not a finding, and listing those
+// would bury the ones that are.
+function renderAiPlanNotice() {
+  const plans = MODEL.aiPlans;
+  if (!plans) return "";
+  // parseResource stores the subscription as `subId`, not `subscriptionId`.
+  const withAi = [...new Set((MODEL.resources || []).map(r => r.subId).filter(Boolean))];
+  if (!withAi.length) return "";
+  const name = id => (MODEL.subNames && MODEL.subNames[id]) || id;
+  const grp = { on: [], partial: [], off: [], unreadable: [], absent: [] };
+  withAi.forEach(id => {
+    const p = plans[id];
+    if (!p) { grp.absent.push(id); return; }
+    if (p.state === "on") (p.extensionsOff && p.extensionsOff.length ? grp.partial : grp.on).push(id);
+    else grp[p.state] ? grp[p.state].push(id) : grp.absent.push(id);
+  });
+  const list = ids => ids.map(i => "<b>" + escHtml(name(i)) + "</b>").join(", ");
+  const out = [];
+  if (grp.off.length)
+    out.push('<div class="notice notice-warn"><b>Defender for Cloud · AI Services is Off</b> on ' + list(grp.off) +
+      ' — these subscriptions hold AI resources that nothing is watching at runtime. The plan is what raises prompt-injection ' +
+      'and data-exfiltration alerts for Azure OpenAI; everything this page scores is configuration, which is a different question. ' +
+      'Turn it on under <i>Defender for Cloud → Environment settings → Defender plans</i>.</div>');
+  if (grp.partial.length){
+    const ex = grp.partial.map(i => escHtml(name(i)) + " (" + (plans[i].extensionsOff || []).map(escHtml).join(", ") + " off)").join("; ");
+    out.push('<div class="notice notice-info"><b>Defender for Cloud · AI Services is On but partial</b> — ' + ex +
+      '. The plan is enabled and some of its extensions are not, which is what the portal shows as <i>Partial</i> monitoring coverage.</div>');
+  }
+  if (grp.on.length)
+    out.push('<div class="notice notice-ok"><b>Defender for Cloud · AI Services is On</b> for ' + list(grp.on) + ', with every extension enabled.</div>');
+  if (grp.unreadable.length)
+    out.push('<div class="notice notice-info">Could not read the Defender plan for ' + list(grp.unreadable) +
+      ' — the account needs read access to <code>Microsoft.Security/pricings</code> there. Reported as unknown, not as off.</div>');
+  if (grp.absent.length)
+    out.push('<div class="notice notice-info">Defender for Cloud returned no AI Services plan for ' + list(grp.absent) +
+      ' — it may not be offered in that subscription\'s cloud or region yet. Reported as unknown, not as off.</div>');
+  return out.join("");
+}
+
 function renderNotices() {
   const n = [];
   if (MODEL.enrichBlocked) n.push('<div class="notice notice-info">Some diagnostic-setting reads were blocked (needs Reader on those resources / Microsoft.Insights) — logging shown as “unknown” where unavailable.</div>');
   if (!MODEL.resources.length) n.push('<div class="notice notice-ok">No Azure OpenAI / AI Services accounts or AI Foundry workspaces found in the subscriptions you can read.</div>');
-  $("notices").innerHTML = n.join("");
+  n.push(renderAiPlanNotice());
+  $("notices").innerHTML = n.filter(Boolean).join("");
 }
 function renderTenant() {
   const s = MODEL.stats;
@@ -542,7 +629,7 @@ function renderTenant() {
   const segs = bands.filter((b) => b[1] > 0).map((b) => '<div class="bandseg" style="width:' + (100 * b[1] / s.total) + '%;background:' + b[2] + '" title="' + b[1] + ' ' + b[0] + '"></div>').join("");
   const leg = bands.map((b) => '<span class="blg"><i style="background:' + b[2] + '"></i>' + b[1] + ' ' + b[0] + '</span>').join("");
   $("tenantPanel").innerHTML =
-    '<div class="thead"><div class="tgradewrap"><div class="tgrade ' + gcls + '" title="Posture score ' + s.tenantScore + ' of 100 (higher is better) — grade ' + s.tenantGrade + '. A ≥85 · B ≥70 · C ≥55 · D ≥40 · F &lt;40">' + s.tenantScore + '<span class="tgrade-max">/100</span></div><div class="tgsub">AI estate posture<br><b>Grade ' + s.tenantGrade + '</b> · A ≥85 · B ≥70 · C ≥55<br><span style="opacity:.8">' + s.total + ' resources · ' + MODEL.subCount + ' subs</span></div></div>'
+    '<div class="thead"><div class="tgradewrap"><div class="tgrade ' + gcls + '" title="Posture score ' + s.tenantScore + ' of 100 (higher is better) — grade ' + s.tenantGrade + '. A ≥85 · B ≥70 · C ≥55 · D ≥40 · F &lt;40">' + s.tenantScore + '<span class="tgrade-max">/100</span></div><div class="tgsub">AI estate posture<br><span style="opacity:.8">' + s.total + ' resources · ' + MODEL.subCount + ' subs</span></div></div>'
     + '<div class="tbandwrap"><div class="tbandlbl">Resource risk distribution</div><div class="bandbar">' + (segs || '<div class="bandseg" style="width:100%;background:var(--green)"></div>') + '</div><div class="blegend">' + leg + '</div></div></div>';
   $("tenantPanel").style.display = "";
 }
