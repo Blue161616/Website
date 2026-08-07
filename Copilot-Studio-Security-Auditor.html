@@ -323,6 +323,73 @@ const URL_RX   = /url["'\s]*[:=]["'\s]*(https?:\/\/[^\s"'\\}]+)/ig;
 // (same field your KQL extracts from RawAgentInfo).
 const MODEL_RX = /modelNameHint["':\s=]+([A-Za-z0-9_.\-]+)/i;
 function extractModel(s){ const m=MODEL_RX.exec(s||''); return m?m[1]:null; }
+
+// ── Guardrail (Preview) ─────────────────────────────────────────────────────
+// Copilot Studio shows a per-agent Guardrail with a name (e.g. Microsoft.DefaultV2)
+// and two lists: risks it has controls for, and risks it does not. An agent with
+// none inherits its model's default, which the portal states outright.
+//
+// The field name is not documented and the feature is in preview, so several
+// spellings are tried rather than one guessed. What matters more than the guessing
+// is the fallback: a regex that matches nothing means "we could not read it", NOT
+// "the agent has no guardrail", and those must not produce the same finding. The
+// caller decides which it was by looking at whether ANY agent in the environment
+// parsed — see the guardrail block in scanEnvironment.
+const GUARDRAIL_RX = [
+  /"guardrail(?:Name|Id)?"\s*:\s*"([^"]{2,120})"/i,
+  /"guardrail"\s*:\s*\{[^}]*?"(?:name|id|displayName)"\s*:\s*"([^"]{2,120})"/i,
+  /guardrail(?:Name|Id)["':\s=]+([A-Za-z0-9_.\-]{2,120})/i
+];
+function extractGuardrail(s){
+  if (!s) return null;
+  for (const rx of GUARDRAIL_RX){ const m = rx.exec(s); if (m && m[1]) return m[1]; }
+  return null;
+}
+/** True when the blob mentions guardrails at all — tells "absent" from "unparsed". */
+function mentionsGuardrail(s){ return !!s && /guardrail/i.test(s); }
+
+// ── Agent capabilities: Tools · Knowledge · Memory · Guardrail ──────────────
+// The four blocks the Copilot Studio agent page shows. All are read out of the
+// same JSON the model and orchestration flags come from, and all carry the same
+// caveat: two of them are Preview and none of the field names are documented.
+//
+// So every one is tri-state, never boolean. `true` and `false` are claims about
+// the agent; `null` means the scan could not tell, which is a claim about the
+// scan. Collapsing null into false would turn "we did not recognise the schema"
+// into "this agent has no guardrail" — a clean bill of health nobody earned.
+const TOOL_PATTERNS = [
+  [/grounding\s*with\s*bing|bingcustomsearch|"bing(search|grounding)"|searchandsummarizecontent/i, 'Web search (Grounding with Bing)'],
+  [/"?connectorid"?\s*[:=]\s*"[^"]*sharepointonline/i, 'SharePoint'],
+  [/"?connectorid"?\s*[:=]\s*"[^"]*office365/i, 'Office 365 / Outlook'],
+  [/"?connectorid"?\s*[:=]\s*"[^"]*dataverse|commondataservice/i, 'Dataverse'],
+  [/invokeexternalagenttaskaction|"mcp"|modelcontextprotocol/i, 'MCP tool'],
+  [/httprequestaction/i, 'HTTP request'],
+  [/codeinterpreter|"pythontool"/i, 'Code interpreter'],
+  [/imagegenerat/i, 'Image generation']
+];
+const KNOWLEDGE_PATTERNS = [
+  [/"knowledgesources?"\s*:/i, 'knowledge source(s) configured'],
+  [/"?searchproviderType"?\s*[:=]/i, 'search provider configured'],
+  [/publicwebsite|"websearchenabled"\s*:\s*true/i, 'public website / web knowledge'],
+  [/"?filesearch"?|uploadedfiles?"\s*:/i, 'uploaded files']
+];
+function agentCapabilities(blobs){
+  const s = (blobs || []).filter(Boolean).join('\n');
+  const tools = [], knowledge = [];
+  TOOL_PATTERNS.forEach(([rx, label]) => { if (rx.test(s)) tools.push(label); });
+  KNOWLEDGE_PATTERNS.forEach(([rx, label]) => { if (rx.test(s)) knowledge.push(label); });
+  // Memory (Preview): only asserted when the key is actually present. A blob that
+  // never mentions memory leaves this null rather than "off".
+  let memory = null;
+  const mm = /"(?:memory|memoryEnabled|longTermMemory|conversationMemory)"\s*:\s*(true|false|\{)/i.exec(s);
+  if (mm) memory = mm[1] === 'false' ? false : true;
+  const guardrail = extractGuardrail(s);
+  return {
+    tools, knowledge, memory, guardrail,
+    guardrailSeen: mentionsGuardrail(s),   // schema recognised even if the name was not
+    sawAny: !!s
+  };
+}
 function modelVendor(m){ const s=(m||'').toLowerCase();
   if(/^(claude|sonnet|haiku|opus)/.test(s)) return {vendor:'Anthropic Claude', eu:false};
   if(/^(gpt|o[1-9])/.test(s))               return {vendor:'OpenAI (Microsoft-hosted)', eu:true};
@@ -340,6 +407,7 @@ async function scanEnvironment(orgUrl, opts){
   const envName = org.replace(/^https?:\/\//,'').split('.')[0];
   const add = (Severity,Finding,Agent,Detail,extra)=>findings.push(Object.assign({Severity,Finding,Environment:envName,Agent,Detail},extra||{}));
   const models = {};   // botid -> {name, model}
+  const capBlobs = {}; // botid -> [configuration, ...component data] for the capability read
 
   // 1) Agents (bot table) — No Auth, Authentication, Orphaned
   const bots = await dvGetAll(api + "/bots?$select=name,botid,authenticationmode,authenticationtrigger,authorizedsecuritygroupids,statecode,configuration,_ownerid_value,_createdby_value", H);
@@ -356,6 +424,7 @@ async function scanEnvironment(orgUrl, opts){
       if (/"isMultiTenant"\s*:\s*true|any \(multitenant\)/i.test(cfg)) add('High','Multi-tenant Shared',b.name,'configuration indicates multi-tenant / org-wide access (heuristic)');
     }
     const mh = extractModel(cfg); if (mh) models[b.botid] = {name:b.name, model:mh};
+    capBlobs[b.botid] = [cfg];
   }
   // Orphaned: owner disabled in Dataverse (batched)
   const owners = [...new Set(bots.map(b=>b._ownerid_value).filter(Boolean))];
@@ -384,6 +453,7 @@ async function scanEnvironment(orgUrl, opts){
       if (HTTP_RX.test(d)){ f.http = true; let m; const rx=new RegExp(URL_RX); while((m=rx.exec(d))) f.urls.add(m[1]); }
       if (MAIL_RX.test(d)){ f.mail = true; let i=d.search(/sendemail/i); if(i>=0){ const w=d.slice(i,i+800); const m=/to["'\s\/]*[:=]["'\s]*([^\n,}{\]]+)/i.exec(w); if(m) f.mailTo.push(m[1].trim().replace(/["']/g,'')); } }
       if (!models[bid]){ const mh=extractModel(d); if(mh) models[bid]={name:f.name, model:mh}; }
+      (capBlobs[bid] = capBlobs[bid] || []).push(d);
     }
     Object.values(flags).forEach(f=>{
       if (f.maker) add('High','Maker Credentials',f.name,'connector runs in maker auth context (connectionProperties.mode=maker)');
@@ -414,6 +484,86 @@ async function scanEnvironment(orgUrl, opts){
     if (mi.eu===false) add('Low','AI Model',x.name, x.model+' · '+mi.vendor+' — processes OUTSIDE the EU Data Boundary', ex);
     else               add('Info','AI Model',x.name, x.model+' · '+mi.vendor, ex);
   });
+
+  // 3a) Agent capabilities — Tools · Knowledge · Memory · Guardrail
+  //
+  // One inventory line per agent so the four blocks on the agent page are visible
+  // without opening each agent, plus findings for the two that carry risk on their
+  // own: web-search grounding sends data outside the Azure compliance boundary
+  // (the portal says so in its own banner), and an unassigned guardrail means the
+  // agent runs on whatever its model happens to default to.
+  const caps = {};
+  bots.forEach(b => { caps[b.botid] = agentCapabilities(capBlobs[b.botid]); });
+  let guardrailParsed = 0, guardrailSeen = 0;
+  bots.forEach(b => { const c = caps[b.botid]; if (c.guardrail) guardrailParsed++; if (c.guardrailSeen) guardrailSeen++; });
+
+  bots.forEach(b => {
+    const c = caps[b.botid], parts = [];
+    parts.push('Tools: '     + (c.tools.length     ? c.tools.join(', ')     : 'none detected'));
+    parts.push('Knowledge: ' + (c.knowledge.length ? c.knowledge.join(', ') : 'none detected'));
+    parts.push('Memory: '    + (c.memory === null ? 'not stated' : c.memory ? 'on' : 'off'));
+    parts.push('Guardrail: ' + (c.guardrail || (c.guardrailSeen ? 'present, name unread' : 'not stated')));
+    add('Info','Agent Capabilities', b.name, parts.join(' · '),
+      { Tools: c.tools.join('; '), Knowledge: c.knowledge.join('; '),
+        Memory: c.memory === null ? '' : String(c.memory), Guardrail: c.guardrail || '' });
+
+    if (c.tools.some(t => /Grounding with Bing/.test(t)))
+      add('Medium','Web Search Grounding', b.name,
+        'This agent grounds answers with Bing web search. Copilot Studio states that customer data flows ' +
+        'OUTSIDE the Azure compliance boundary for this tool — the prompt, and whatever it carries, leaves ' +
+        'with the query. Scope it to curated internal knowledge unless public grounding is genuinely required.',
+        { OutsideComplianceBoundary: true });
+
+    // Only claimable once at least one agent parsed — otherwise every agent would
+    // be reported as unguarded on the strength of a regex that never matched.
+    if (guardrailParsed && !c.guardrail)
+      add('Low','Guardrail Not Assigned', b.name,
+        'No guardrail is assigned to this agent, so it inherits its model\'s default. Guardrails are what ' +
+        'carry the controls for jailbreak, indirect prompt injection, sensitive-data leakage and task drift; ' +
+        'inheriting means those are whatever the model ships with rather than what you chose.');
+  });
+
+  // The honest fallback. If nothing parsed anywhere, that is a statement about this
+  // scanner and not about the tenant, and it is reported once rather than as a
+  // finding against every agent.
+  if (bots.length && !guardrailParsed)
+    add('Info','Guardrail Not Readable','(environment)',
+      guardrailSeen
+        ? 'Agent JSON mentions guardrails but none matched a known field shape, so no guardrail name could be read. This is a gap in this scanner, not a finding about the agents.'
+        : 'No guardrail data was found in the agent JSON. Guardrail is in preview and its field name is undocumented — treat guardrail coverage as unassessed here, not as absent.');
+
+  // 3b) Compliance · EU Data Boundary
+  //
+  // The line above is inventory: it records which model an agent runs on. This is
+  // the consequence, and it is a different question with a different owner — the
+  // model choice is a maker's decision, the transfer basis is the DPO's.
+  //
+  // Deliberately not called a violation. Microsoft's EU Data Boundary commitment
+  // does not cover a model hosted outside it, so prompts and any data the agent
+  // grounds them in leave the boundary — but whether that is lawful depends on the
+  // data and on the transfer mechanism in place, which this page cannot see.
+  // Stating "non-compliant" would be a legal conclusion drawn from a model name.
+  // What it can state is that the commitment no longer covers these agents, and
+  // that somebody has to have decided that was acceptable.
+  const outside = Object.values(models).filter(x=>modelVendor(x.model).eu===false);
+  if (outside.length){
+    const byVendor = {};
+    outside.forEach(x=>{ const v=modelVendor(x.model).vendor; (byVendor[v]=byVendor[v]||[]).push(x); });
+    Object.keys(byVendor).forEach(vendor=>{
+      const agents = byVendor[vendor];
+      const names  = agents.map(a=>a.name);
+      const modelsUsed = [...new Set(agents.map(a=>a.model))];
+      add('Medium','Compliance · EU Data Boundary', names.length===1 ? names[0] : names.length+' agents',
+        names.length+' agent'+(names.length===1?'':'s')+' invoke '+vendor+' ('+modelsUsed.join(', ')+
+        '), which is hosted outside the EU Data Boundary. Prompts — and whatever the agent grounds them in, ' +
+        'including Dataverse rows, SharePoint content and uploaded files — are processed outside it, so ' +
+        "Microsoft's EU Data Boundary commitment does not cover these agents. This needs a documented transfer " +
+        'basis and a record-of-processing entry, or a switch to a Microsoft-hosted model. Agents: ' +
+        names.slice(0,12).join(', ') + (names.length>12 ? ' +' + (names.length-12) + ' more' : ''),
+        { ModelVendor: vendor, ModelEu: false, AgentCount: names.length,
+          Models: modelsUsed.join(', '), Agents: names.join('; ') });
+    });
+  }
 
   // 3) Sharing — RetrieveSharedPrincipalsAndAccess per agent
   if (opts.sharing){
