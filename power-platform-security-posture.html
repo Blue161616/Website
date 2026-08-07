@@ -210,10 +210,21 @@
 <body>
 <header>
   <h1>
-    <svg class="applogo" viewBox="0 0 32 32" role="img" aria-label="Power Platform Security Posture logo">
-      <path class="sh" d="M16 2 28 6v9c0 7.5-5.2 13.3-12 15C9.2 28.3 4 22.5 4 15V6z" />
-      <path class="gr" d="M16 8l6 3.4v6.8L16 21.6l-6-3.4v-6.8z" />
-      <circle class="nd" cx="16" cy="14.8" r="1.9" />
+    <svg class="applogo" viewBox="0 0 32 32" role="img" aria-label="Microsoft Power Platform">
+      <defs>
+        <linearGradient id="ppTop" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#1f9ea8"/><stop offset="1" stop-color="#0b6ea8"/>
+        </linearGradient>
+        <linearGradient id="ppMid" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#3fbf7f"/><stop offset="1" stop-color="#118f8f"/>
+        </linearGradient>
+        <linearGradient id="ppTail" x1="0" y1="0" x2="0.4" y2="1">
+          <stop offset="0" stop-color="#37bd6e"/><stop offset="1" stop-color="#0f9b7d"/>
+        </linearGradient>
+      </defs>
+      <path fill="url(#ppTop)"  d="M13.2 3H22a4.3 4.3 0 0 1 0 8.6H8.9Z"/>
+      <path fill="url(#ppMid)"  d="M8.9 11.6h8.8a4.3 4.3 0 0 1 0 8.6H4.6Z"/>
+      <path fill="url(#ppTail)" d="M4.6 20.2h7.9L6.9 29Z"/>
     </svg>
     <span>Power Platform Security Posture</span>
     <span class="pv">Preview</span>
@@ -246,6 +257,15 @@
           <label for="envs">Environment URLs — one per line (or use “Discover”)</label>
           <textarea id="envs" rows="3" placeholder="https://org.crm.dynamics.com&#10;https://org2.crm4.dynamics.com"></textarea>
           <div class="hint">Coverage is limited to environments where your account has a Dataverse security role.</div>
+          <label for="dlp-file" style="margin-top:12px">Tenant DLP policies — import (optional)</label>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input type="file" id="dlp-file" accept=".json,application/json">
+            <button id="btn-dlp-clear" class="secondary" type="button" style="padding:5px 11px">Clear</button>
+            <span id="dlp-state" class="hint"></span>
+          </div>
+          <div class="hint">The browser cannot read tenant DLP (see left). Export it once and drop the file here —
+            it stays in this browser and turns the DLP finding from a guess into a per-environment answer:<br>
+            <code>Get-DlpPolicy | ConvertTo-Json -Depth 10 | Set-Content dlp.json</code></div>
         </div>
       </div>
       <div class="hint" style="margin-top:12px">Read-only. Runs entirely in your browser against the Dataverse Web API and
@@ -447,7 +467,7 @@ async function discover(){
     await ensureSignedIn();
     setStatus("Discovering environments…", false, true);
     const token = await getToken(GDS);
-    const r = await fetch(GDS + "/api/discovery/v2.0/Instances?$select=ApiUrl,FriendlyName,Region", { headers:{ Authorization:"Bearer "+token, Accept:"application/json" } });
+    const r = await fetch(GDS + "/api/discovery/v2.0/Instances?$select=ApiUrl,FriendlyName,Region,EnvironmentId", { headers:{ Authorization:"Bearer "+token, Accept:"application/json" } });
     if(!r.ok) throw new Error(r.status+" "+(await r.text()).slice(0,160));
     const inst = (await r.json()).value || [];
     const urls = inst.map(i=>(i.ApiUrl||"").replace(/\/$/,"")).filter(Boolean);
@@ -474,7 +494,7 @@ async function scan(){
     if (!window._gds || !Object.keys(window._gds).length){
       try {
         const gtok = await getToken(GDS);
-        const gr = await fetch(GDS + "/api/discovery/v2.0/Instances?$select=ApiUrl,FriendlyName,Region", { headers:{ Authorization:"Bearer "+gtok, Accept:"application/json" } });
+        const gr = await fetch(GDS + "/api/discovery/v2.0/Instances?$select=ApiUrl,FriendlyName,Region,EnvironmentId", { headers:{ Authorization:"Bearer "+gtok, Accept:"application/json" } });
         if (gr.ok){ window._gds = {}; ((await gr.json()).value || []).forEach(i=>{ window._gds[(i.ApiUrl||"").replace(/\/$/,"").toLowerCase()] = i; }); }
       } catch(e){ /* region stays unknown — not fatal */ }
     }
@@ -500,11 +520,107 @@ async function scan(){
   } catch(e){ setStatus(""); showAuthError(e); }
 }
 
+// ── Tenant DLP, imported ────────────────────────────────────────────────────
+// The tenant DLP read is blocked from a browser twice over: api.bap.microsoft.com
+// is not a resource a custom app registration can be granted delegated access to,
+// and the browser blocks the response via CORS regardless. Neither is a role
+// problem, so no amount of Global Admin fixes it.
+//
+// What an admin CAN do is export the policies and drop them here:
+//   Get-DlpPolicy | ConvertTo-Json -Depth 10 | Set-Content dlp.json
+//
+// Both shapes are accepted — the PowerShell object and the raw v2 API body — so a
+// file saved either way works, and so does a paste of a single policy.
+const _DLP_KEY = "ppsp_dlp_import_v1";
+function _asArray(raw){
+  if(Array.isArray(raw)) return raw;
+  if(raw && Array.isArray(raw.value)) return raw.value;      // raw API body
+  if(raw && typeof raw === "object") return [raw];           // ConvertTo-Json of one policy
+  return [];
+}
+function _envGuid(x){
+  if(!x) return null;
+  if(typeof x === "string") return (x.split("/").pop() || x).trim() || null;
+  return _envGuid(x.name || x.id || null);
+}
+/** One shape out of either input, or throw with a reason a human can act on. */
+function normalizeDlpPolicies(raw){
+  const out = _asArray(raw).map(p=>{
+    const q = p.properties || p;                                     // API nests, PowerShell does not
+    const envs = (q.environments || p.Environments || [])
+      .map(_envGuid).filter(Boolean);
+    // A policy that names environments but no type is treated as covering ONLY
+    // those. Assuming the opposite would invent coverage that was never granted.
+    const type = q.environmentType || p.EnvironmentType
+              || (envs.length ? "OnlyEnvironments" : "AllEnvironments");
+    const groups = (q.connectorGroups || p.ConnectorGroups || [])
+      .map(g=>({ classification: g.classification || g.Classification || "?",
+                 count: ((g.connectors || g.Connectors || []).length) }));
+    return {
+      id: p.name || p.PolicyName || q.name || "",
+      display: q.displayName || p.DisplayName || p.name || "(unnamed policy)",
+      environmentType: type,
+      environments: envs,
+      defaultGroup: q.defaultConnectorsClassification || p.DefaultConnectorsClassification || null,
+      groups
+    };
+  }).filter(p=>p.id || p.display);
+  if(!out.length) throw new Error("No policies found in that file. Expected the output of Get-DlpPolicy, or the body of the v2 policies API.");
+  return out;
+}
+/** The policies whose scope includes this environment — or null if undecidable. */
+function dlpPoliciesFor(envId, policies){
+  if(!envId) return null;                       // no GUID to match on: do not guess
+  const id = String(envId).toLowerCase();
+  return (policies||[]).filter(p=>{
+    const listed = p.environments.some(g=>String(g).toLowerCase() === id);
+    if(p.environmentType === "OnlyEnvironments")   return listed;
+    if(p.environmentType === "ExceptEnvironments") return !listed;
+    return true;                                                     // AllEnvironments
+  });
+}
+function loadDlpImport(){
+  try {
+    const raw = localStorage.getItem(_DLP_KEY);
+    if(!raw) return null;
+    const o = JSON.parse(raw);
+    return (o && Array.isArray(o.policies) && o.policies.length) ? o : null;
+  } catch(e){ return null; }
+}
+function saveDlpImport(policies){
+  const o = { at: new Date().toISOString().slice(0,10), policies };
+  try { localStorage.setItem(_DLP_KEY, JSON.stringify(o)); } catch(e){}
+  return o;
+}
+function dlpImportState(){
+  const el = document.getElementById("dlp-state");
+  if(!el) return;
+  const o = loadDlpImport();
+  el.innerHTML = o
+    ? '<b style="color:var(--green)">'+o.policies.length+' policy(ies)</b> imported '+escHtml(o.at)
+    : 'none imported — DLP coverage will read as unknown';
+}
+
+function applyDlpCoverage(env, tenant){
+  if(!tenant.dlpAvailable){ env.dlpCovered = null; env.dlpPolicyNames = []; return; }
+  const hit = dlpPoliciesFor(env.envId, tenant.dlpPolicies);
+  env.dlpCovered = hit === null ? null : hit.length > 0;   // null = we could not tell
+  env.dlpPolicyNames = hit ? hit.map(p=>p.display) : [];
+}
+
+// The Default environment is the one that matters most and was never being tagged:
+// this only read `isDefault`, a flag the Power Platform API does not return. What it
+// returns is environmentSku = "Default" — the SKU IS the marker. The name suffix is
+// a last resort for a list that carries neither, and it is only a convention, so a
+// match on it alone is reported as inferred rather than stated as fact.
+const _defaultFlag = p => !!p.isDefault || /^default$/i.test(p.environmentSku || p.environmentType || "");
+const _defaultName = p => /\(default\)\s*$/i.test(p.displayName || p.name || "");
 const mapEnv = e => { const p = e.properties || e; return {
   id: e.name || e.id,
   display: p.displayName || p.name,
   type: (p.environmentSku || p.environmentType || "?"),
-  isDefault: !!p.isDefault,
+  isDefault: _defaultFlag(p) || _defaultName(p),
+  defaultInferred: !_defaultFlag(p) && _defaultName(p),
   dataverseUrl: ((p.linkedEnvironmentMetadata && p.linkedEnvironmentMetadata.instanceApiUrl) || "").replace(/\/$/,"") || null,
   region: p.azureRegion || p.geographicalRegion }; };
 
@@ -535,10 +651,26 @@ async function scanTenant(){
     try {
       const r = await fetch(BAP + "/providers/PowerPlatform.Governance/v2/policies?$expand=policyDefinition&api-version=2019-01-01", { headers:{ Authorization:"Bearer "+bapTok, Accept:"application/json" } });
       if(r.ok){ const j = await r.json(); t.dlpAvailable = true;
-        t.dlpPolicies = (j.value||[]).map(p=>({ id:p.name, display:(p.properties&&p.properties.displayName)||p.name, defaultGroup:(p.properties&&p.properties.defaultConnectorsClassification), scope:(p.properties&&p.properties.environments) })); }
+        t.dlpPolicies = normalizeDlpPolicies(j); t.dlpSource = "api"; }
     } catch(e){ notes.push("Tenant DLP read (BAP) blocked by the browser (CORS)."); }
   } else {
     notes.push("Tenant DLP not read — the baseline below therefore excludes DLP gaps and may read better than reality. This is a platform limitation, not a role issue: DLP lives only on the legacy admin API (api.bap.microsoft.com), which custom app registrations can't be granted delegated access to, and which browsers block via CORS. Being Global Admin does not change it. Review DLP in the Power Platform admin center, or with Get-DlpPolicy (Microsoft.PowerApps.Administration.PowerShell).");
+  }
+
+  // 3) The import wins where the API could not answer. It is the same data read by
+  //    an admin who could reach the endpoint, so it is not a lesser source — but it
+  //    is a point-in-time copy, which the notice says so nobody reads a stale file
+  //    as live truth.
+  if (!t.dlpAvailable){
+    const imported = loadDlpImport();
+    if (imported && imported.policies.length){
+      t.dlpAvailable = true;
+      t.dlpPolicies  = imported.policies;
+      t.dlpSource    = "import";
+      t.dlpImportedAt = imported.at;
+      notes.length = 0;                       // the CORS explanation no longer applies
+      notes.push("Tenant DLP came from an imported Get-DlpPolicy export taken " + imported.at + ", not from a live read. Re-export after any policy change.");
+    }
   }
 
   if (!ppTok && !bapTok) notes.unshift("No tenant admin API consented — per-environment Dataverse analysis only.");
@@ -555,8 +687,14 @@ async function scanEnv(url, tenant){
   const gds = (window._gds && window._gds[url.toLowerCase()]) || {};
   const bapEnv = tenant.environments ? tenant.environments.find(e=>(e.dataverseUrl||"").toLowerCase()===url.toLowerCase()) : null;
 
-  const env = { url, name:(gds.FriendlyName || (bapEnv&&bapEnv.display) || short), region:(gds.Region||(bapEnv&&bapEnv.region)||"?"),
-    type:(bapEnv&&bapEnv.type)||"?", isDefault:!!(bapEnv&&bapEnv.isDefault),
+  // The environment GUID is the only key a DLP policy expresses its scope in.
+  // Global Discovery carries it and answers from the browser, so it is the reliable
+  // source; the BAP list is a fallback for when discovery was skipped.
+  const env = { url, envId:(gds.EnvironmentId || (bapEnv&&bapEnv.id) || null),
+    name:(gds.FriendlyName || (bapEnv&&bapEnv.display) || short), region:(gds.Region||(bapEnv&&bapEnv.region)||"?"),
+    type:(bapEnv&&bapEnv.type)||"?",
+    isDefault:!!(bapEnv&&bapEnv.isDefault) || /\(default\)\s*$/i.test(gds.FriendlyName||""),
+    defaultInferred:!!(bapEnv ? bapEnv.defaultInferred : /\(default\)\s*$/i.test(gds.FriendlyName||"")),
     agents:[], connectors:[], flows:{count:0,http:0}, appUsers:[], admins:[], solutions:{managed:0,unmanaged:0}, auditEnabled:null, dlpCovered:null, findings:[], score:null };
 
   // Organization settings (audit)
@@ -602,9 +740,14 @@ async function scanEnv(url, tenant){
   const sols = await dvTry(api + "/solutions?$select=uniquename,ismanaged,isvisible&$filter=" + enc("isvisible eq true"), H);
   sols.forEach(s=>{ if(s.ismanaged) env.solutions.managed++; else env.solutions.unmanaged++; });
 
-  // DLP coverage (only if DLP data available). Per-policy scope parsing is unreliable from this API
-  // shape, so v1 treats "at least one tenant DLP policy exists" as coverage; refine when scope is exposed.
-  if(tenant.dlpAvailable) env.dlpCovered = tenant.dlpPolicies.length > 0;
+  // DLP coverage, evaluated per environment against each policy's own scope.
+  //
+  // This used to be `dlpPolicies.length > 0` — one tenant policy existing marked
+  // EVERY environment covered, so "no DLP policy covers this environment" could
+  // only fire in a tenant with zero policies. The common real case, policies that
+  // exist but do not scope this environment, reported as covered. That is the case
+  // worth catching, so the finding was silent exactly when it mattered.
+  applyDlpCoverage(env, tenant);
 
   env.findings = buildFindings(env, tenant);
   return env;
@@ -636,7 +779,14 @@ function buildFindings(env, tenant){
   if(env.appUsers.length) add(1,"privileged",env.appUsers.length+" application user(s) with Dataverse access", "Service principals with a Dataverse security role can read/write env data non-interactively.", "Inventory these and confirm each is least-privilege and owned.");
 
   if(tenant.dlpAvailable){
-    if(!env.dlpCovered) add(env.isDefault?4:3,"dlp","No DLP policy covers this environment"+(env.isDefault?" (Default environment)":""), env.isDefault?"The <b>Default</b> environment ships with no DLP and every user can create resources in it — a prime shadow-IT / exfiltration surface.":"No tenant DLP policy applies here, so any connector (including HTTP and social) can be combined freely.", "Create or extend a DLP policy to cover this environment; for the Default environment, restrict maker access and apply a strict policy.");
+    if(env.dlpCovered === null){
+      // Policies are loaded, but this environment has no GUID to match them
+      // against — that is a different statement from "nothing covers it", and
+      // reporting it as a gap would be inventing a finding.
+      add(1,"dlp","DLP scope not evaluated for this environment", "Tenant DLP policies are loaded, but this environment's id could not be resolved, so no policy scope could be matched to it. Run <b>Discover my environments</b> so Global Discovery supplies the environment id.", "Re-run discovery, or confirm coverage for this environment in the Power Platform admin center.");
+    } else if(!env.dlpCovered){
+      add(env.isDefault?4:3,"dlp","No DLP policy covers this environment"+(env.isDefault?" (Default environment)":""), env.isDefault?"The <b>Default</b> environment ships with no DLP and every user can create resources in it — a prime shadow-IT / exfiltration surface. No imported policy scopes to it.":"No tenant DLP policy scopes to this environment, so any connector (including HTTP and social) can be combined freely here.", "Create or extend a DLP policy to cover this environment; for the Default environment, restrict maker access and apply a strict policy.");
+    }
   } else {
     add(1,"dlp","DLP coverage not verified", "Tenant DLP policies weren't readable from the browser, so DLP coverage for this environment couldn't be confirmed.", "Verify in the Power Platform admin center that a DLP policy covers this environment.");
   }
@@ -670,7 +820,17 @@ function render(){ renderNotices(); renderBaseline(); renderSummary(); renderExp
 function renderNotices(){
   const n=[]; const t=MODEL.tenant||{};
   if(t.note) n.push('<div class="notice notice-info">'+escHtml(t.note)+'</div>');
-  if(t.dlpAvailable) n.push('<div class="notice notice-ok">Tenant DLP read: <b>'+t.dlpPolicies.length+'</b> policy(ies) found via the Power Platform admin API.</div>');
+  // Say where the policies came from. A live read and a file an admin exported
+  // last month justify different amounts of trust in the coverage verdict below.
+  if(t.dlpAvailable){
+    const scoped = t.dlpPolicies.filter(p=>p.environmentType !== "AllEnvironments").length;
+    n.push('<div class="notice notice-ok">Tenant DLP: <b>'+t.dlpPolicies.length+'</b> policy(ies) '
+      + (t.dlpSource === "import"
+          ? 'imported from a <b>Get-DlpPolicy</b> export taken '+escHtml(t.dlpImportedAt||"—")
+          : 'read live from the Power Platform admin API')
+      + (scoped ? ' · '+scoped+' scoped to specific environments' : ' · all tenant-wide')
+      + '. Coverage below is evaluated per environment against each policy\'s own scope.</div>');
+  }
   n.push('<div class="notice notice-info">Read-only posture scan. Baseline = 100 minus weighted findings, averaged across scanned environments. Click a tile, a bar, or a row to investigate.</div>');
   $("notices").innerHTML = n.join("");
 }
@@ -752,7 +912,16 @@ function renderTable(){
   rows.sort((a,b)=>{ let av=a[k], bv=b[k]; if(k==="name"){ av=(av||"").toLowerCase(); bv=(bv||"").toLowerCase(); return av<bv?-d:av>bv?d:0; } av=av==null?999:av; bv=bv==null?999:bv; return (av-bv)*d; });
   $("rows").innerHTML = rows.map(e=>{
     const sc=e.score, scls = sc==null?"b-mut":sc>=80?"risk-1":sc>=55?"risk-2":"risk-3";
-    const typeBadge = e.isDefault?'<span class="badge b-default" title="Default environment — open to all users">Default</span>':'<span class="badge b-type">'+escHtml(e.type)+'</span>';
+    // The Default tag rides next to the NAME as well as in the Type column. It is
+    // the single most load-bearing fact about an environment — every user can
+    // create in it and it ships with no DLP — and the Type column is the first
+    // thing to fall off a narrow screen.
+    const defTitle = e.defaultInferred
+      ? "Looks like the Default environment (its name ends in “(default)”) — inferred from the name, not confirmed by the admin API."
+      : "Default environment — every user can create resources here, and it ships with no DLP.";
+    const defTag = e.isDefault
+      ? ' <span class="badge b-default" title="'+escHtml(defTitle)+'">Default'+(e.defaultInferred?'?':'')+'</span>' : '';
+    const typeBadge = e.isDefault?'<span class="badge b-default" title="'+escHtml(defTitle)+'">Default'+(e.defaultInferred?'?':'')+'</span>':'<span class="badge b-type">'+escHtml(e.type)+'</span>';
     const noAuthN=e.agents.filter(a=>a.active&&a.noAuth).length;
     const agentCell = e.agents.length + (noAuthN?' <span class="badge b-red" title="no-auth agents">'+noAuthN+' no-auth</span>':'');
     const riskyN=e.connectors.filter(c=>c.risky).length;
@@ -762,7 +931,7 @@ function renderTable(){
     return '<tr class="main" data-row="'+escHtml(e.url)+'" tabindex="0">'
       + '<td class="chev">▸</td>'
       + '<td><span class="badge '+scls+'">'+(sc==null?"—":sc)+'</span></td>'
-      + '<td><div class="name">'+escHtml(e.name)+'</div><div class="sub">'+escHtml(e.region)+' · '+escHtml(e.url.replace(/^https?:\/\//,""))+'</div>'+(e.error?'<div class="sub" style="color:var(--red)">scan error: '+escHtml(e.error)+'</div>':'')+'</td>'
+      + '<td><div class="name">'+escHtml(e.name)+defTag+'</div><div class="sub">'+escHtml(e.region)+' · '+escHtml(e.url.replace(/^https?:\/\//,""))+'</div>'+(e.error?'<div class="sub" style="color:var(--red)">scan error: '+escHtml(e.error)+'</div>':'')+'</td>'
       + '<td>'+typeBadge+'</td>'
       + '<td style="text-align:center">'+agentCell+'</td>'
       + '<td style="text-align:center">'+connCell+'</td>'
@@ -898,6 +1067,46 @@ function showAuthError(e){
 }
 
 // ---- wire up ----
+// Importing after a scan re-grades in place rather than demanding a re-scan: the
+// environment data is already here, only the DLP question was unanswered.
+function _reapplyDlp(){
+  if(!MODEL || !MODEL.envs || !MODEL.envs.length) return false;
+  const imported = loadDlpImport();
+  MODEL.tenant = MODEL.tenant || {};
+  if(imported && imported.policies.length){
+    MODEL.tenant.dlpAvailable = true;
+    MODEL.tenant.dlpPolicies  = imported.policies;
+    MODEL.tenant.dlpSource    = "import";
+  } else if(MODEL.tenant.dlpSource === "import"){
+    MODEL.tenant.dlpAvailable = false;
+    MODEL.tenant.dlpPolicies  = [];
+    MODEL.tenant.dlpSource    = null;
+  }
+  MODEL.envs.forEach(e=>{ applyDlpCoverage(e, MODEL.tenant); e.findings = buildFindings(e, MODEL.tenant); });
+  computeScores();
+  render();
+  return true;
+}
+$("dlp-file").addEventListener("change", async ev=>{
+  const file = ev.target.files && ev.target.files[0];
+  if(!file) return;
+  try {
+    const policies = normalizeDlpPolicies(JSON.parse(await file.text()));
+    saveDlpImport(policies);
+    dlpImportState();
+    const scoped = policies.filter(p=>p.environmentType !== "AllEnvironments").length;
+    setStatus("Imported "+policies.length+" DLP policy(ies)"+(scoped?" ("+scoped+" scoped to specific environments)":"")+(_reapplyDlp()?" — environments re-graded.":". Scan to apply."));
+  } catch(e){
+    setStatus("Could not read that file: "+((e&&e.message)||e), true);
+  } finally { ev.target.value = ""; }
+});
+$("btn-dlp-clear").addEventListener("click", ()=>{
+  try { localStorage.removeItem(_DLP_KEY); } catch(e){}
+  dlpImportState();
+  setStatus(_reapplyDlp() ? "DLP import cleared — environments re-graded without it." : "DLP import cleared.");
+});
+dlpImportState();
+
 $("btn-discover").addEventListener("click", discover);
 $("btn-scan").addEventListener("click", scan);
 $("btn-rescan").addEventListener("click", scan);
