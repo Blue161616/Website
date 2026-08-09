@@ -1044,9 +1044,9 @@ AgentsInfo
 | where LifecycleStatus != "Deleted"
 | extend ToolsStr = tostring(DeclaredTools), TriggersStr = tostring(Triggers), McpStr = tostring(McpServers), SkillsStr = tostring(Skills), CapsStr = tostring(Capabilities), RawStr = tostring(RawAgentInfo)
 | where ToolsStr matches regex suspicious_patterns or TriggersStr matches regex suspicious_patterns or McpStr matches regex suspicious_patterns or SkillsStr matches regex suspicious_patterns or CapsStr matches regex suspicious_patterns or RawStr matches regex suspicious_patterns or Instructions matches regex suspicious_patterns
-| summarize Count = dcount(AgentId), Ids = make_set(AgentId, 100000)`},
+| summarize Ids = make_set(AgentId, 100000) | extend Count = array_length(Ids)`},
   {short:"MCP configured", name:"Agents with an MCP tool / server configured", kql:
-`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where array_length(McpServers) > 0 | summarize Count = dcount(AgentId), Ids = make_set(AgentId, 100000)`},
+`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where array_length(McpServers) > 0 | summarize Ids = make_set(AgentId, 100000) | extend Count = array_length(Ids)`},
   {short:"Missing tools", name:"Tools configured but not mentioned in instructions", kql:
 `let LatestAgents = materialize (AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted");
 let AgentToolNames = LatestAgents | where array_length(DeclaredTools) > 0 | mv-expand Tool = DeclaredTools | extend ToolName = tostring(Tool.name) | where isnotempty(ToolName) | summarize ToolNames = make_set(ToolName) by AgentId;
@@ -1055,9 +1055,9 @@ LatestAgents
 | join kind=inner AgentToolNames on AgentId
 | mv-apply ToolName = ToolNames to typeof(string) on (where Instructions !has ToolName | summarize MissingTools = make_list(ToolName))
 | where array_length(MissingTools) > 0
-| summarize Count = dcount(AgentId), Ids = make_set(AgentId, 100000)`},
+| summarize Ids = make_set(AgentId, 100000) | extend Count = array_length(Ids)`},
   {short:"Org-wide shared", name:"Organization-wide shared agents (SharedWith = *)", kql:
-`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where array_length(SharedWith) > 0 | mv-expand Shared = SharedWith to typeof(string) | where tostring(Shared) == "*" | summarize Count = dcount(AgentId), Ids = make_set(AgentId, 100000)`},
+`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where array_length(SharedWith) > 0 | mv-expand Shared = SharedWith to typeof(string) | where tostring(Shared) == "*" | summarize Ids = make_set(AgentId, 100000) | extend Count = array_length(Ids)`},
   {short:"Orphaned owners", name:"Orphaned agents — all owners disabled / removed", kql:
 `let EnabledAccountIds = materialize (IdentityInfo | where IsAccountEnabled == 1 | distinct AccountObjectId = tostring(AccountObjectId));
 AgentsInfo
@@ -1070,9 +1070,9 @@ AgentsInfo
 | summarize OwnerIds = make_set(OwnerId) by AgentId
 | mv-apply OwnerId = OwnerIds to typeof(string) on (where OwnerId !in (EnabledAccountIds) | summarize DisabledOrMissingOwners = make_list(OwnerId))
 | where array_length(DisabledOrMissingOwners) == array_length(OwnerIds)
-| summarize Count = dcount(AgentId), Ids = make_set(AgentId, 100000)`},
+| summarize Ids = make_set(AgentId, 100000) | extend Count = array_length(Ids)`},
   {short:"No instructions", name:"Published agents without instructions", kql:
-`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where PublishedStatus == "Published" | where isempty(Instructions) or Instructions == "N/A" | summarize Count = dcount(AgentId), Ids = make_set(AgentId, 100000)`}
+`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted" | where PublishedStatus == "Published" | where isempty(Instructions) or Instructions == "N/A" | summarize Ids = make_set(AgentId, 100000) | extend Count = array_length(Ids)`}
 ];
 // Extract display names from an AgentsInfo dynamic tool column. Elements may be objects, plain strings, or
 // (as with DeclaredTools) JSON STRINGS — each tool serialized — so parse those and pull the name.
@@ -1444,10 +1444,26 @@ async function analyze(){
     const huntTk=await optionalToken(OPT_HUNT);
     if(huntTk){
       try{
-        const base=await runHunting("AgentsInfo | summarize Agents=dcount(AgentId)", huntTk);
-        const brow=base.results&&base.results[0];
-        const total=brow?(brow.Agents!=null?brow.Agents:Object.values(brow)[0]):0;
-        huntState={granted:true, ok:true, total:Number(total)||0};
+        // The headline inventory count. Two things this must NOT do, both of which it used to:
+        //  · dcount() is HyperLogLog — approximate. At a few hundred agents there is nothing to
+        //    approximate, and the estimate read high against an exact `distinct AgentId | count`.
+        //  · counting every AgentId the table has ever held counts DELETED agents, which the
+        //    admin-centre total does not, and which every hunting tile below already excludes.
+        // So: collapse to the latest row per agent (the same LATEST base the tiles use), count
+        // exactly, and split live from deleted so the beam and the coverage bar are measured
+        // against agents that still exist.
+        let seen=0, live=0;
+        try{
+          const b=await runHunting('AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | summarize Seen=count(), Live=countif(LifecycleStatus != "Deleted")', huntTk);
+          const r=(b.results&&b.results[0])||{};
+          seen=Number(r.Seen)||0; live=Number(r.Live)||0;
+        }catch(e){
+          // No LifecycleStatus column in this tenant's table — fall back to an exact distinct count.
+          const b=await runHunting("AgentsInfo | summarize by AgentId | count", huntTk);
+          const r=(b.results&&b.results[0])||{};
+          seen=live=Number(r.Count!=null?r.Count:Object.values(r)[0])||0;
+        }
+        huntState={granted:true, ok:true, total:live, seen, deleted:Math.max(0, seen-live)};
         // run Microsoft's prebuilt "AI Agents" hunting queries → a count each.
         // SEQUENTIALLY — the advanced-hunting API throttles concurrent queries (parallel = all fail).
         const qres=[];
@@ -1519,7 +1535,7 @@ async function analyze(){
           }
           // tool authentication types (unauthenticated tools = a real risk) — tostring is safe if the column exists
           if(colSet.has("ToolsAuthenticationType")){
-            try{ const r=await runHunting(`${LATEST} | summarize Agents=dcount(AgentId) by Auth=tostring(ToolsAuthenticationType) | order by Agents desc`, huntTk);
+            try{ const r=await runHunting(`${LATEST} | summarize Agents=count() by Auth=tostring(ToolsAuthenticationType) | order by Agents desc`, huntTk);
               tools.auth=(r.results||[]).map(x=>({auth:(x.Auth||"").trim()||"(none/blank)", agents:Number(x.Agents)||0})); }catch{}
           }
           huntState.tools=tools;
@@ -1527,7 +1543,7 @@ async function analyze(){
           if(colSet.has("Model")){
             try{
               setStatus("Reading AI models from AgentsInfo…");
-              const r=await runHunting(`${LATEST} | where isnotempty(Model) | summarize Agents=dcount(AgentId) by Model | order by Agents desc | take 100`, huntTk);
+              const r=await runHunting(`${LATEST} | where isnotempty(Model) | summarize Agents=count() by Model | order by Agents desc | take 100`, huntTk);
               huntState.models={ok:true, items:(r.results||[]).map(x=>({model:x.Model, agents:Number(x.Agents)||0}))};
             }catch(e){ huntState.models={ok:false, error:(e&&e.message)||"error"}; }
           } else { huntState.models={ok:false, error:"no Model column in AgentsInfo"}; }
@@ -1729,7 +1745,7 @@ async function analyze(){
     };
     renderNotices(notices, capped, agents.length);
     const invTotal = (huntState && huntState.ok) ? huntState.total : 0;
-    renderDashboard(overall, domains, MODEL.meta, avail, invTotal, MODEL.classic);
+    renderDashboard(overall, domains, MODEL.meta, avail, invTotal, MODEL.classic, huntState);
     renderCoverage(n, invTotal);
     renderKpis(enriched, bpIds.length, idpState);
     renderEngineSections(enriched, bpMap, caState, domains, idpState);
@@ -1766,7 +1782,7 @@ function statusPill(st){
   if(st==="warn") return '<span class="statuspill warn">● Verify in portal</span>';
   return '<span class="statuspill">● n/a</span>';
 }
-function renderDashboard(overall, domains, meta, avail, invTotal, classic){
+function renderDashboard(overall, domains, meta, avail, invTotal, classic, hunt){
   avail=avail||{};
   // Two counts, two nodes. The registry number is the full inventory; the Entra
   // number is the subset holding an Agent ID. The beam between them carries the
@@ -1779,6 +1795,14 @@ function renderDashboard(overall, domains, meta, avail, invTotal, classic){
     regEl.style.color = "var(--blue-bright)";
     const rm=$("regMeta");
     if(rm && !known) rm.textContent = "grant ThreatHunting.Read.All to count the full inventory";
+    // Say which agents this counts. "Agents seen" over a hunting table is ambiguous — the table
+    // keeps deleted agents, so the honest headline is the live ones, with the retired tail named
+    // rather than folded in.
+    const del = hunt && hunt.ok ? (hunt.deleted||0) : 0;
+    if(rm && known)
+      rm.innerHTML = "agents still live in the Defender inventory — an exact count of the latest record per agent"
+        + (del ? (", with <b>" + del + "</b> deleted agent" + (del===1?"":"s") + " still held in the table and left out") : "")
+        + ". The <b>Agent 365 registry</b> reports its own total in the admin centre and the two rarely match exactly — different collectors, different scopes.";
     const gap = known ? Math.max(0, invTotal - entraN) : null;
     const gl=$("gapLbl");
     if(gl){
@@ -1799,7 +1823,7 @@ function renderDashboard(overall, domains, meta, avail, invTotal, classic){
         : gap === 0
           ? "Every agent Defender can see holds an Entra Agent ID."
           : ["WHY THE DIFFERENCE", "",
-             invTotal + " = every agent Defender sees in the AgentsInfo hunting table.",
+             invTotal + " = every live agent in the Defender AgentsInfo hunting table.",
              entraN + " = agents holding a first-class directory identity (Graph agentIdentity).", "",
              "An Entra Agent ID is only issued to modern agent identities — in practice, agents built in "
              + "Copilot Studio and Foundry that register as a directory principal. The other " + gap
@@ -2331,7 +2355,7 @@ function renderHunt(hunt){
   if(!hunt.ok){
     el.innerHTML=head+'<div class="engine-clean" style="border-left-color:var(--crit);background:#f871711a"><b>AgentsInfo not available</b> ('+escapeHtml(hunt.error||"error")+'). The Agent 365 Defender data source / Microsoft 365 connector may not be enabled — no agent telemetry is being collected.</div></div>'; return;
   }
-  let html=head+'<div class="engine-clean" style="border-left-color:var(--green);background:#34d3990f;margin-bottom:14px"><b>Agent data collection is active.</b> <code>AgentsInfo</code> is reachable'+(hunt.total?(' ('+hunt.total+' agents)'):'')+' — so the Agent 365 data source and Microsoft 365 connector are enabled and feeding Defender.</div>';
+  let html=head+'<div class="engine-clean" style="border-left-color:var(--green);background:#34d3990f;margin-bottom:14px"><b>Agent data collection is active.</b> <code>AgentsInfo</code> is reachable'+(hunt.total?(' ('+hunt.total+' live agents'+(hunt.deleted?', '+hunt.deleted+' deleted':'')+')'):'')+' — so the Agent 365 data source and Microsoft 365 connector are enabled and feeding Defender.</div>';
   if(hunt.queries && hunt.queries.length){
     html+='<div class="hint" style="margin:0 0 8px">Microsoft\'s official <b>AI Agents</b> hunting queries (Azure-Sentinel) — number of agents matching each (0 = clean). <span style="color:var(--dim)">Click a highlighted tile to filter the Agents view to the matching Entra agents (tiles whose agents are all local/store/classic — no Entra Agent ID — aren\'t clickable).</span></div>';
     html+='<div class="kpis" style="grid-template-columns:repeat('+hunt.queries.length+',minmax(0,1fr))">';
