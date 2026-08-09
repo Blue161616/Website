@@ -335,6 +335,8 @@
   .kpi.hq-tile{cursor:pointer; transition:.15s}
   .kpi.hq-tile:hover{border-color:var(--defender); box-shadow:0 6px 18px -10px var(--defender); transform:translateY(-2px)}
   .kpi.hq-tile.sel{border-color:var(--defender); background:#5b8def14; box-shadow:0 6px 18px -10px var(--defender)}
+  .invsub-link{cursor:pointer; border-bottom:1px dashed var(--dim)}
+  .invsub-link:hover{color:var(--defender); border-bottom-color:var(--defender)}
   .hfchip{cursor:pointer; font-family:'Consolas',monospace; font-size:11px; color:var(--defender); border:1px solid #5b8def66; background:#5b8def14; padding:5px 11px; border-radius:7px; white-space:nowrap}
   .hfchip b{color:var(--crit); margin-left:4px}
   .detail{background:#0b111c; font-size:12px}
@@ -600,6 +602,8 @@
       <button type="button" class="navitem" data-view="defender"><svg width="18" height="18" aria-hidden="true"><use href="#ic-defender"/></svg>Microsoft Defender</button>
       <button type="button" class="navitem" data-view="purview"><svg width="18" height="18" aria-hidden="true"><use href="#ic-purview"/></svg>Microsoft Purview</button>
       <button type="button" class="navitem" data-view="inventory"><span class="ni-ic">▤</span>Inventory</button>
+      <button type="button" class="navitem sub" data-view="inventory" data-invf="local"><span class="ni-ic">▪</span>Local agents</button>
+      <button type="button" class="navitem sub" data-view="inventory" data-invf="cloud"><span class="ni-ic">☁</span>Cloud agents</button>
       <button type="button" class="navitem" data-view="agents"><span class="ni-ic">▦</span>Agents</button>
       <button type="button" class="navitem sub" data-view="models"><span class="ni-ic">◇</span>Models</button>
       <button type="button" class="navitem sub" data-view="tools"><span class="ni-ic">⛓</span>Tools &amp; MCP</button>
@@ -1162,9 +1166,14 @@ let HUNT_FILTER=null; // {short, ids:Set(EntraAgentId lc), count} — set by cli
 let FINDING_FILTER=null; // {ids:Set(agent id), title} — set by clicking a finding card
 let SPONSORS_READABLE=true; // false if the beta agentIdentity/sponsors relationship is blocked (no directory role)
 let CURRENT_VIEW="overview";
-function showView(v){
+function showView(v, opts){
+  opts=opts||{};
   CURRENT_VIEW=v;
-  document.querySelectorAll('#sidenav .navitem[data-view]').forEach(b=>b.classList.toggle('active', b.dataset.view===v));
+  // Several nav items can share a view (Inventory + its Local / Cloud sub-items). When a click told us
+  // WHICH one, mark that one; otherwise fall back to the parent item — the one with no filter of its own.
+  document.querySelectorAll('#sidenav .navitem[data-view]').forEach(b=>b.classList.toggle('active',
+    opts.btn ? b===opts.btn : (b.dataset.view===v && b.dataset.invf==null)));
+  if(v==='inventory' && opts.invf!=null) setInventoryFilter(opts.invf);
   document.querySelectorAll('.content > [data-view]').forEach(el=>{ el.style.display = (el.dataset.view===v)? '' : 'none'; });
   // Leaflet lays out at 0px while its card is hidden — recompute size AND re-fit the bounds once it's shown,
   // otherwise the map stays centred/zoomed on the wrong region it computed while hidden.
@@ -2444,6 +2453,26 @@ function buildInventory(rows){
           named: items.filter(i=>i.name!=="(unnamed)").length,
           byVendor, byDevice};
 }
+// One filter key drives the tiles, the dropdown and the two nav sub-items, so they can never disagree.
+// "cloud" is every agent that is NOT local — the split the sub-menu asks for — and the two identity keys
+// answer the question the Entra tile poses rather than making you re-derive it from the category.
+const INV_FILTERS={
+  "":          {label:"All agents",              match:()=>true},
+  local:       {label:"Local (on endpoints)",    match:i=>i.cat==="local"},
+  cloud:       {label:"Cloud agents",            match:i=>i.cat!=="local"},
+  tenant:      {label:"Built in your tenant",    match:i=>i.cat==="tenant"},
+  catalogue:   {label:"Store & publisher",       match:i=>i.cat==="catalogue"},
+  entra:       {label:"Holds an Entra Agent ID", match:i=>!!i.entraId},
+  noentra:     {label:"No Entra Agent ID",       match:i=>!i.entraId}
+};
+// A filter can be requested (menu click, tile click) before the inventory has ever been rendered — park it.
+let INV_PENDING=null;
+function setInventoryFilter(key){
+  key=key||"";
+  const sel=document.getElementById("invCat");
+  if(!sel){ INV_PENDING=key; return; }
+  sel.value=key; sel.dispatchEvent(new Event("change"));
+}
 function renderInventory(hunt){
   const el=$("invPanel"); if(!el) return;
   const inv=hunt&&hunt.inventory;
@@ -2451,12 +2480,16 @@ function renderInventory(hunt){
   if(!inv||!inv.ok){ el.innerHTML='<div class="engine-clean" style="border-left-color:var(--crit);background:#f871711a"><b>Inventory could not be read</b> ('+escapeHtml((inv&&inv.error)||"error")+').</div>'; return; }
   const n=inv.items.length;
   // Tiles first: the split IS the answer to "why don't these numbers match".
+  // Every tile is a filter. A number you cannot click is a number you have to take on trust.
+  const tile=(key,label,val,col,sub)=>'<div class="kpi hq-tile" data-invf="'+key+'" role="button" tabindex="0" title="Show only: '+escapeHtml(INV_FILTERS[key].label)+'">'
+    +'<div class="k">'+escapeHtml(label)+'</div><div class="v"'+(col?' style="color:'+col+'"':'')+'>'+val+'</div>'
+    +'<div class="ksub" style="color:var(--dim)">'+sub+'</div></div>';
   let html='<div class="kpis k5" style="margin-top:0">'
-    +'<div class="kpi"><div class="k">Agents discovered</div><div class="v">'+n+'</div><div class="ksub" style="color:var(--dim)">live in AgentsInfo</div></div>'
-    +INV_CATS.map(c=>'<div class="kpi"><div class="k">'+escapeHtml(c.label)+'</div><div class="v" style="color:'+c.col+'">'+(inv.counts[c.key]||0)+'</div>'
-      +'<div class="ksub" style="color:var(--dim)">'+Math.round((inv.counts[c.key]||0)/Math.max(1,n)*100)+'% of inventory</div></div>').join("")
-    +'<div class="kpi"><div class="k">Hold an Entra Agent ID</div><div class="v" style="color:'+(inv.withEntra?'var(--entra)':'var(--crit)')+'">'+inv.withEntra+'</div>'
-      +'<div class="ksub" style="color:var(--dim)">'+(n-inv.withEntra)+' cannot be governed by Entra</div></div>'
+    +tile("","Agents discovered",n,"","live in AgentsInfo")
+    +INV_CATS.map(c=>tile(c.key,c.label,(inv.counts[c.key]||0),c.col,
+        Math.round((inv.counts[c.key]||0)/Math.max(1,n)*100)+'% of inventory')).join("")
+    +tile("entra","Hold an Entra Agent ID",inv.withEntra,(inv.withEntra?'var(--entra)':'var(--crit)'),
+        '<span class="invsub-link" data-invf="noentra" role="button" tabindex="0">'+(n-inv.withEntra)+' cannot be governed by Entra</span>')
     +'</div>';
 
   // Local agents — the population neither the admin centre nor Entra can see at all.
@@ -2484,13 +2517,21 @@ function renderInventory(hunt){
 
   // Everything Defender sees, by name. Client-side filter — the whole inventory is already in memory.
   html+='<div class="toolbar" style="margin-top:20px"><input id="invSearch" placeholder="Filter by name, platform, vendor, device…" autocomplete="off" />'
-    +'<select id="invCat"><option value="">All categories</option>'+INV_CATS.map(c=>'<option value="'+c.key+'">'+escapeHtml(c.label)+'</option>').join("")+'</select>'
+    +'<select id="invCat">'
+      +'<option value="">All agents</option>'
+      +'<optgroup label="Where it runs"><option value="local">Local (on endpoints)</option><option value="cloud">Cloud agents (everything else)</option></optgroup>'
+      +'<optgroup label="Category">'+INV_CATS.filter(c=>c.key!=="local").map(c=>'<option value="'+c.key+'">'+escapeHtml(c.label)+'</option>').join("")+'</optgroup>'
+      +'<optgroup label="Identity"><option value="entra">Holds an Entra Agent ID</option><option value="noentra">No Entra Agent ID</option></optgroup>'
+    +'</select>'
     +'<span class="count" id="invCount"></span></div>'
     +'<div style="overflow-x:auto"><table id="invTable"><thead><tr><th>Agent</th><th>Category</th><th>Platform</th><th>Status</th><th>Entra Agent ID</th><th>Where it runs</th></tr></thead><tbody></tbody></table></div>';
   el.innerHTML=html;
   const draw=()=>{
-    const q=($("invSearch").value||"").toLowerCase().trim(), cat=$("invCat").value;
-    const rows=inv.items.filter(i=>(!cat||i.cat===cat) && (!q ||
+    const q=($("invSearch").value||"").toLowerCase().trim(), key=$("invCat").value;
+    const f=(INV_FILTERS[key]||INV_FILTERS[""]).match;
+    // The tiles ARE the filter state — keep the highlight on whichever one is live.
+    el.querySelectorAll('.kpi[data-invf]').forEach(t=>t.classList.toggle('sel', t.dataset.invf===key));
+    const rows=inv.items.filter(i=>f(i) && (!q ||
       (i.name+" "+i.platform+" "+(i.local?i.local.vendor+" "+i.local.device+" "+i.local.process:"")).toLowerCase().includes(q)));
     const catOf=k=>INV_CATS.find(c=>c.key===k)||{label:k,col:"var(--dim)"};
     $("invTable").querySelector("tbody").innerHTML = rows.length ? rows.map(i=>{
@@ -2504,7 +2545,24 @@ function renderInventory(hunt){
     }).join("") : '<tr><td colspan="6" style="color:var(--dim)">No agents match.</td></tr>';
     $("invCount").textContent=rows.length+" of "+inv.items.length;
   };
-  $("invSearch").addEventListener("input",draw); $("invCat").addEventListener("change",draw); draw();
+  $("invSearch").addEventListener("input",draw); $("invCat").addEventListener("change",draw);
+  // Tiles (and the "cannot be governed" sub-line inside the Entra tile) drive the same dropdown.
+  // Clicking the live tile a second time clears the filter — otherwise the only way back to "all"
+  // is the dropdown, which is not where the eye is.
+  const apply=(k,e)=>{ if(e){ e.stopPropagation(); } const sel=$("invCat");
+    sel.value = (sel.value===k && k!=="") ? "" : k; draw();
+    const tb=$("invTable"); if(tb) tb.scrollIntoView({behavior:"smooth", block:"nearest"}); };
+  el.querySelectorAll('.kpi[data-invf]').forEach(t=>{
+    t.addEventListener("click",()=>apply(t.dataset.invf));
+    t.addEventListener("keydown",ev=>{ if(ev.key==="Enter"||ev.key===" "){ ev.preventDefault(); apply(t.dataset.invf); } });
+  });
+  el.querySelectorAll('.invsub-link[data-invf]').forEach(s=>{
+    s.addEventListener("click",ev=>apply(s.dataset.invf,ev));
+    s.addEventListener("keydown",ev=>{ if(ev.key==="Enter"||ev.key===" "){ ev.preventDefault(); apply(s.dataset.invf,ev); } });
+  });
+  // Honour a filter chosen from the menu before this view had ever rendered.
+  if(INV_PENDING!=null){ $("invCat").value=INV_PENDING; INV_PENDING=null; }
+  draw();
 }
 function renderHunt(hunt){
   const el=$("defHunt"); if(!el) return;
@@ -2881,7 +2939,9 @@ $("setupToggle").addEventListener("click",()=>{
 document.querySelectorAll('#sidenav .navitem[data-view]').forEach(b=>b.addEventListener("click",()=>{
   // a direct menu click to Agents clears any drill-down (finding or hunting-query) so the menu shows the full list
   if(b.dataset.view==="agents" && (FINDING_FILTER||HUNT_FILTER)){ FINDING_FILTER=null; HUNT_FILTER=null; if(MODEL) renderTable(MODEL.agents); }
-  showView(b.dataset.view);
+  // The Inventory sub-items are the same view with a filter pre-applied — pass the button so the
+  // active mark lands on the item that was actually clicked, not on every item sharing the view.
+  showView(b.dataset.view, {btn:b, invf:b.dataset.invf!=null?b.dataset.invf:(b.dataset.view==="inventory"?"":null)});
 }));
 $("loadBtn").addEventListener("click",analyze);
 $("exportCsv").addEventListener("click",exportCsv);
