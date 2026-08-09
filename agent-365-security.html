@@ -599,6 +599,7 @@
       <button type="button" class="navitem" data-view="entra"><svg width="18" height="18" aria-hidden="true"><use href="#ic-entra"/></svg>Microsoft Entra</button>
       <button type="button" class="navitem" data-view="defender"><svg width="18" height="18" aria-hidden="true"><use href="#ic-defender"/></svg>Microsoft Defender</button>
       <button type="button" class="navitem" data-view="purview"><svg width="18" height="18" aria-hidden="true"><use href="#ic-purview"/></svg>Microsoft Purview</button>
+      <button type="button" class="navitem" data-view="inventory"><span class="ni-ic">▤</span>Inventory</button>
       <button type="button" class="navitem" data-view="agents"><span class="ni-ic">▦</span>Agents</button>
       <button type="button" class="navitem sub" data-view="models"><span class="ni-ic">◇</span>Models</button>
       <button type="button" class="navitem sub" data-view="tools"><span class="ni-ic">⛓</span>Tools &amp; MCP</button>
@@ -626,12 +627,12 @@
              title above the Entra count said those were the same number, which is
              exactly the confusion this page exists to remove. -->
         <div class="cp-row">
-          <div class="node core click" style="--d:.3s" data-jump="agents" role="button" tabindex="0">
+          <div class="node core click" style="--d:.3s" data-jump="inventory" role="button" tabindex="0">
             <div class="nt">Control plane · your tenant</div>
             <div class="nn">Discovered inventory — Defender <code>AgentsInfo</code></div>
             <div class="core-score"><span class="cs" id="regScore">—</span><span class="cs-max">agents seen</span></div>
             <div class="nd" id="regMeta">every agent Defender sees. The <b>Agent 365 registry</b> reports its own total in the admin centre and the two rarely match exactly — different collectors, different scopes.</div>
-            <span class="jump">view all agents ↓</span>
+            <span class="jump">name every agent ↓</span>
           </div>
         </div>
         <div class="beam gapbeam" id="gapBeam"><span class="lbl" id="gapLbl">issue identity</span><span class="flow"></span><span class="flow d2"></span></div>
@@ -751,6 +752,16 @@
         <a href="https://purview.microsoft.com" target="_blank" rel="noopener">purview.microsoft.com ↗</a>
       </div>
     </div>
+  </div>
+
+  <div class="card" id="inventoryCard" data-view="inventory" style="display:none">
+    <h2 style="margin-bottom:4px">Discovered inventory — every agent Defender can see</h2>
+    <div class="hint" style="margin:0 0 14px">Three systems count agents and none of them agree, because they are counting different things.
+      The <b>Agent 365 admin centre</b> counts <b>catalogue titles</b> — what is listed in your org, so it cannot see an agent installed on a laptop.
+      <b>Entra</b> counts <b>directory principals</b> — only agent kinds that are issued an Agent ID, which is the subset any identity control can reach.
+      Defender's <code>AgentsInfo</code> counts <b>running agents</b>, wherever they run. This view is the third number, broken into the populations that behave differently,
+      because the gaps between them are where governance silently stops.</div>
+    <div id="invPanel"></div>
   </div>
 
   <div class="card" id="agentsCard" data-view="agents" style="display:none">
@@ -1512,6 +1523,34 @@ async function analyze(){
           }
           const tools={schema:cols, present:[]};
           const LATEST=`AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | where LifecycleStatus != "Deleted"`;
+
+          // ── The inventory itself, BY NAME. The hero counts this table, but until now the page could only
+          // identify the few agents carrying an Entra Agent ID — the rest of the inventory was a number with
+          // no rows behind it. AgentsInfo does carry Name and Platform. And for agents installed on an
+          // endpoint it carries a localAgentMetadata blob inside RawAgentInfo: vendor, process, device,
+          // signed-in account. Those agents have no catalogue title, so the Agent 365 admin centre cannot
+          // list them, and no directory principal, so Entra cannot govern them. Defender's endpoint sensor
+          // is the only thing that sees them — which makes naming them here the whole point of the view.
+          // Column names are read from the probed schema rather than guessed: this tenant has Name, not
+          // AgentName/DisplayName, and a guess returns silent blanks instead of an error.
+          try{
+            setStatus("Reading the discovered inventory from AgentsInfo…");
+            const nameCol=[...colSet].find(c=>/^name$/i.test(c));
+            const pick=["AgentId"].concat(
+              ["Platform","PublishedStatus","Availability","InstanceCount","Description"].filter(c=>colSet.has(c)));
+            if(nameCol) pick.push("Name="+nameCol);
+            if(eidCol)  pick.push("EntraAgentID="+eidCol);
+            const hasRaw=colSet.has("RawAgentInfo");
+            const ext=hasRaw ? '| extend __L = todynamic(RawAgentInfo).localAgentMetadata ' : '';
+            const locProj=hasRaw
+              ? ', Vendor=tostring(__L.vendor), Process=tostring(__L.relatedProcess), Device=tostring(__L.deviceName)'
+                +', Account=tostring(__L.accountName), OsPlatform=tostring(__L.osPlatform)'
+                +', AutoApprove=tostring(__L.autoApprove), TrustedProcess=tostring(__L.trustedProcess)'
+              : '';
+            const ir=await runHunting(`${LATEST} ${ext}| project ${pick.join(", ")}${locProj} | take 5000`, huntTk);
+            huntState.inventory=buildInventory(ir.results||[]);
+          }catch(e){ huntState.inventory={ok:false, error:(e&&e.message)||"error"}; }
+
           // array-shaped tool columns → how many agents carry each, and total refs (array_length is safe on dynamic)
           const ARR=["DeclaredTools","McpServers","Connectors","Skills","Capabilities","Plugins"].filter(c=>colSet.has(c));
           tools.present=ARR; tools.details={};
@@ -1752,6 +1791,7 @@ async function analyze(){
     renderRiskCaFlow(idpState, caState);
     renderIDP(idpState, n);
     renderHunt(huntState);
+    renderInventory(huntState);
     renderTools(huntState);
     renderModels(huntState);
     renderDefenderFlow(incidentState);
@@ -1828,8 +1868,15 @@ function renderDashboard(overall, domains, meta, avail, invTotal, classic, hunt)
              "An Entra Agent ID is only issued to modern agent identities — in practice, agents built in "
              + "Copilot Studio and Foundry that register as a directory principal. The other " + gap
              + " are classic Copilot agents, Microsoft-built agents, external-publisher and Teams-store "
-             + "agents, and locally installed ones. They still run, still reach data and still appear in "
-             + "the registry — they simply have no principal for Entra to attach to.", "",
+             + "agents, and locally installed ones. They still run and still reach data — they simply have "
+             + "no principal for Entra to attach to.",
+             // Local agents are the sharpest case and deserve naming: they are missing from the Agent 365
+             // registry as well, so neither the admin centre nor Entra accounts for them at all.
+             (hunt && hunt.inventory && hunt.inventory.ok && hunt.inventory.local.length)
+               ? (hunt.inventory.local.length + " of them are installed on endpoints. Those have no catalogue "
+                  + "title either, so they are missing from the Agent 365 admin centre too — Defender's endpoint "
+                  + "sensor is the only control that sees them. See the Inventory view.")
+               : "", "",
              "So nothing was forgotten: with no identity there is nothing to apply ID Protection, "
              + "Conditional Access for Agents or agent-risk enforcement to. Closing the gap means rebuilding "
              + "those agents on a platform that issues an identity, or governing them through Defender and "
@@ -1888,7 +1935,7 @@ function renderCoverage(entraCount, total){
 }
 // Clickable dashboard nodes → drill into the matching section
 function diagramNav(node){
-  const map={agents:"agents", entra:"entra", defender:"defender", purview:"purview"};
+  const map={inventory:"inventory", agents:"agents", entra:"entra", defender:"defender", purview:"purview"};
   const v=map[node.dataset.jump];
   if(v) showView(v);
 }
@@ -2345,6 +2392,119 @@ function renderPurviewLabels(ls, agents){
   el.innerHTML=head+summary
     +'<div class="hint" style="margin:0 0 4px"><b>Label Taxonomy ('+labels.length+')</b> · highest sensitivity first · <span class="mono" style="color:var(--dim)">'+escapeHtml(ls.src||'graph')+'</span>. The <b class="hot">read-cleartext</b> chips show <b>agents</b> (agent identities) whose data-read permissions let them open content carrying that label.</div>'
     +'<div>'+rows+'</div></div>';
+}
+// ── Discovered inventory ────────────────────────────────────────────────────────────────────
+// Turn the raw AgentsInfo rows into the four populations that actually behave differently, because
+// "345 agents" is only useful once you can say which of them any given control can reach:
+//   local      — installed on an endpoint. No catalogue title, no directory principal. Defender only.
+//   tenant     — built here (Copilot Studio / Foundry / Agent Builder). Usually holds an Entra Agent ID.
+//   catalogue  — store & publisher agents. In the Agent 365 registry, but nothing for Entra to attach to.
+const INV_CATS=[
+  {key:"local",     label:"Local (on endpoints)",  col:"var(--crit)"},
+  {key:"tenant",    label:"Built in your tenant",  col:"var(--entra)"},
+  {key:"catalogue", label:"Store & publisher",     col:"var(--dim)"}
+];
+function buildInventory(rows){
+  const items=(rows||[]).map(r=>{
+    const vendor=String(r.Vendor||"").trim();
+    const platform=String(r.Platform||"").trim();
+    // LocalAgents is the Platform value Defender writes for endpoint-discovered agents; the vendor blob is
+    // the corroborating signal. Either one is enough — a tenant that writes only one of them still sorts right.
+    const isLocal = !!vendor || /^localagents$/i.test(platform);
+    const tenantBuilt = /copilot studio|foundry|agent builder/i.test(platform);
+    return {
+      id:String(r.AgentId||""),
+      name:String(r.Name||"").trim() || "(unnamed)",
+      platform: platform || "(unknown)",
+      published:String(r.PublishedStatus||"").trim(),
+      availability:String(r.Availability||"").trim(),
+      entraId:String(r.EntraAgentID||"").trim().toLowerCase(),
+      instances:(r.InstanceCount!=null && r.InstanceCount!=="") ? Number(r.InstanceCount) : null,
+      cat: isLocal ? "local" : tenantBuilt ? "tenant" : "catalogue",
+      local: isLocal ? {
+        vendor: vendor || "(unknown vendor)",
+        process:String(r.Process||"").trim(),
+        device:String(r.Device||"").trim() || "(unknown device)",
+        account:String(r.Account||"").trim(),
+        os:String(r.OsPlatform||"").trim(),
+        autoApprove:/^true$/i.test(String(r.AutoApprove||"")),
+        trusted:/^true$/i.test(String(r.TrustedProcess||""))
+      } : null
+    };
+  });
+  items.sort((a,b)=>a.name.localeCompare(b.name));
+  const counts={}; INV_CATS.forEach(c=>counts[c.key]=0);
+  items.forEach(i=>{ counts[i.cat]=(counts[i.cat]||0)+1; });
+  const local=items.filter(i=>i.local);
+  const byVendor={}, byDevice={};
+  local.forEach(i=>{ byVendor[i.local.vendor]=(byVendor[i.local.vendor]||0)+1;
+                     (byDevice[i.local.device]=byDevice[i.local.device]||[]).push(i); });
+  return {ok:true, items, counts, local,
+          withEntra: items.filter(i=>i.entraId).length,
+          named: items.filter(i=>i.name!=="(unnamed)").length,
+          byVendor, byDevice};
+}
+function renderInventory(hunt){
+  const el=$("invPanel"); if(!el) return;
+  const inv=hunt&&hunt.inventory;
+  if(!hunt||!hunt.granted){ el.innerHTML='<div class="engine-clean" style="border-left-color:var(--dim);background:var(--panel-2)">Grant <b>ThreatHunting.Read.All</b> and rescan to list the discovered inventory by name.</div>'; return; }
+  if(!inv||!inv.ok){ el.innerHTML='<div class="engine-clean" style="border-left-color:var(--crit);background:#f871711a"><b>Inventory could not be read</b> ('+escapeHtml((inv&&inv.error)||"error")+').</div>'; return; }
+  const n=inv.items.length;
+  // Tiles first: the split IS the answer to "why don't these numbers match".
+  let html='<div class="kpis k5" style="margin-top:0">'
+    +'<div class="kpi"><div class="k">Agents discovered</div><div class="v">'+n+'</div><div class="ksub" style="color:var(--dim)">live in AgentsInfo</div></div>'
+    +INV_CATS.map(c=>'<div class="kpi"><div class="k">'+escapeHtml(c.label)+'</div><div class="v" style="color:'+c.col+'">'+(inv.counts[c.key]||0)+'</div>'
+      +'<div class="ksub" style="color:var(--dim)">'+Math.round((inv.counts[c.key]||0)/Math.max(1,n)*100)+'% of inventory</div></div>').join("")
+    +'<div class="kpi"><div class="k">Hold an Entra Agent ID</div><div class="v" style="color:'+(inv.withEntra?'var(--entra)':'var(--crit)')+'">'+inv.withEntra+'</div>'
+      +'<div class="ksub" style="color:var(--dim)">'+(n-inv.withEntra)+' cannot be governed by Entra</div></div>'
+    +'</div>';
+
+  // Local agents — the population neither the admin centre nor Entra can see at all.
+  if(inv.local.length){
+    const devices=Object.keys(inv.byDevice).sort();
+    const vend=Object.entries(inv.byVendor).sort((a,b)=>b[1]-a[1])
+      .map(([v,c])=>'<span class="hfchip" style="cursor:default">'+escapeHtml(v)+' · '+c+'</span>').join(" ");
+    html+='<div class="engine-clean" style="border-left-color:var(--crit);background:#f871711a;margin-top:16px">'
+      +'<b>'+inv.local.length+' locally installed agent'+(inv.local.length===1?'':'s')+' on '+devices.length+' device'+(devices.length===1?'':'s')+'.</b> '
+      +'These run on an endpoint, not in your tenant. They have no catalogue title, so the <b>Agent 365 admin centre cannot list them</b>, '
+      +'and no directory principal, so <b>Conditional Access, ID Protection and agent-risk enforcement never apply</b>. '
+      +'Defender\'s endpoint sensor is the only control that sees them at all.'
+      +'<div style="margin-top:10px">'+vend+'</div></div>'
+      +'<div style="overflow-x:auto;margin-top:12px"><table><thead><tr><th>Agent</th><th>Vendor</th><th>Process</th><th>Device</th><th>Signed-in account</th><th>OS</th></tr></thead><tbody>'
+      +devices.map(d=>inv.byDevice[d].slice().sort((a,b)=>a.name.localeCompare(b.name)).map(i=>
+          '<tr><td><b>'+escapeHtml(i.name)+'</b></td><td>'+escapeHtml(i.local.vendor)+'</td>'
+          +'<td class="mono" style="color:var(--dim)">'+escapeHtml(i.local.process||"—")+'</td>'
+          +'<td class="mono">'+escapeHtml(i.local.device)+'</td>'
+          +'<td>'+escapeHtml(i.local.account||"—")+'</td>'
+          +'<td style="color:var(--dim)">'+escapeHtml(i.local.os||"—")+'</td></tr>').join("")).join("")
+      +'</tbody></table></div>';
+  } else {
+    html+='<div class="engine-clean" style="border-left-color:var(--green);background:#34d3990f;margin-top:16px">No locally installed agents are recorded on your endpoints.</div>';
+  }
+
+  // Everything Defender sees, by name. Client-side filter — the whole inventory is already in memory.
+  html+='<div class="toolbar" style="margin-top:20px"><input id="invSearch" placeholder="Filter by name, platform, vendor, device…" autocomplete="off" />'
+    +'<select id="invCat"><option value="">All categories</option>'+INV_CATS.map(c=>'<option value="'+c.key+'">'+escapeHtml(c.label)+'</option>').join("")+'</select>'
+    +'<span class="count" id="invCount"></span></div>'
+    +'<div style="overflow-x:auto"><table id="invTable"><thead><tr><th>Agent</th><th>Category</th><th>Platform</th><th>Status</th><th>Entra Agent ID</th><th>Where it runs</th></tr></thead><tbody></tbody></table></div>';
+  el.innerHTML=html;
+  const draw=()=>{
+    const q=($("invSearch").value||"").toLowerCase().trim(), cat=$("invCat").value;
+    const rows=inv.items.filter(i=>(!cat||i.cat===cat) && (!q ||
+      (i.name+" "+i.platform+" "+(i.local?i.local.vendor+" "+i.local.device+" "+i.local.process:"")).toLowerCase().includes(q)));
+    const catOf=k=>INV_CATS.find(c=>c.key===k)||{label:k,col:"var(--dim)"};
+    $("invTable").querySelector("tbody").innerHTML = rows.length ? rows.map(i=>{
+      const c=catOf(i.cat);
+      return '<tr><td><b>'+escapeHtml(i.name)+'</b>'+(i.instances>1?' <span style="color:var(--dim)">×'+i.instances+'</span>':'')+'</td>'
+        +'<td style="color:'+c.col+'">'+escapeHtml(c.label)+'</td>'
+        +'<td style="color:var(--dim)">'+escapeHtml(i.platform)+'</td>'
+        +'<td>'+escapeHtml(i.published||i.availability||"—")+'</td>'
+        +'<td class="mono" style="font-size:11px;color:'+(i.entraId?'var(--entra)':'var(--dim)')+'">'+escapeHtml(i.entraId||"none")+'</td>'
+        +'<td class="mono" style="font-size:11px">'+escapeHtml(i.local?(i.local.device+" · "+i.local.process):"your tenant")+'</td></tr>';
+    }).join("") : '<tr><td colspan="6" style="color:var(--dim)">No agents match.</td></tr>';
+    $("invCount").textContent=rows.length+" of "+inv.items.length;
+  };
+  $("invSearch").addEventListener("input",draw); $("invCat").addEventListener("change",draw); draw();
 }
 function renderHunt(hunt){
   const el=$("defHunt"); if(!el) return;
