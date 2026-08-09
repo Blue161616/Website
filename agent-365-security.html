@@ -1564,7 +1564,7 @@ async function analyze(){
             setStatus("Reading the discovered inventory from AgentsInfo…");
             const nameCol=[...colSet].find(c=>/^name$/i.test(c));
             const pick=["AgentId"].concat(
-              ["Platform","PublishedStatus","Availability","InstanceCount","Description"].filter(c=>colSet.has(c)));
+              ["Platform","PublishedStatus","Availability","InstanceCount","Description","Model"].filter(c=>colSet.has(c)));
             if(nameCol) pick.push("Name="+nameCol);
             if(eidCol)  pick.push("EntraAgentID="+eidCol);
             const hasRaw=colSet.has("RawAgentInfo");
@@ -2449,6 +2449,7 @@ function buildInventory(rows){
       availability:String(r.Availability||"").trim(),
       entraId:String(r.EntraAgentID||"").trim().toLowerCase(),
       instances:(r.InstanceCount!=null && r.InstanceCount!=="") ? Number(r.InstanceCount) : null,
+      model:String(r.Model||"").trim(),
       cat: isLocal ? "local" : tenantBuilt ? "tenant" : "catalogue",
       local: isLocal ? {
         vendor: vendor || "(unknown vendor)",
@@ -2487,6 +2488,17 @@ const INV_FILTERS={
 };
 // A filter can be requested (menu click, tile click) before the inventory has ever been rendered — park it.
 let INV_PENDING=null;
+// "Which agents run Claude?" is a question about the whole inventory, not just the ones holding an identity,
+// so a model click filters the inventory table and shows a clearable chip rather than silently narrowing it.
+let INV_MODEL=null;
+function filterInventoryToModel(m){
+  INV_MODEL=m||null;
+  const sel=document.getElementById("invCat"); if(sel) sel.value="";
+  const s=document.getElementById("invSearch"); if(s) s.value="";
+  showView('agents',{scope:'inventory'});
+  if(window.__invDraw) window.__invDraw();
+  const t=document.getElementById("invTable"); if(t) t.scrollIntoView({behavior:"smooth", block:"nearest"});
+}
 // Agents is one view over two populations that genuinely overlap: the 345 agents Defender sees running, and
 // the agent identities Entra can govern (some of which have no live agent left). They were two menu entries
 // showing the same agents twice. One view, one scope switch — never both tables at once, because stacking
@@ -2508,6 +2520,7 @@ function setAgentScope(s){ AGENT_SCOPE = (s==="identities") ? "identities" : "in
 function setInventoryFilter(key){
   key=key||"";
   setAgentScope("inventory"); // a category filter only means anything against the inventory table
+  INV_MODEL=null;             // a fresh category choice is not "…and still only Claude"
   const sel=document.getElementById("invCat");
   if(!sel){ INV_PENDING=key; return; }
   sel.value=key; sel.dispatchEvent(new Event("change"));
@@ -2592,9 +2605,9 @@ function renderInventory(hunt, identityCount){
       +'<optgroup label="Where it runs"><option value="local">Local (on endpoints)</option><option value="cloud">Cloud agents (everything else)</option></optgroup>'
       +'<optgroup label="Category">'+INV_CATS.filter(c=>c.key!=="local").map(c=>'<option value="'+c.key+'">'+escapeHtml(c.label)+'</option>').join("")+'</optgroup>'
     +'</select>'
-    +'<span class="count" id="invCount"></span></div>'
+    +'<span id="invModelChip"></span><span class="count" id="invCount"></span></div>'
     +localHtml
-    +'<div id="invTableBox" style="overflow-x:auto"><table id="invTable"><thead><tr><th>Agent</th><th>Category</th><th>Platform</th><th>Status</th><th>Where it runs</th></tr></thead><tbody></tbody></table></div>'
+    +'<div id="invTableBox" style="overflow-x:auto"><table id="invTable"><thead><tr><th>Agent</th><th>Category</th><th>Platform</th><th>Model</th><th>Status</th><th>Where it runs</th></tr></thead><tbody></tbody></table></div>'
     +'</div>';
   el.innerHTML=html;
   el.querySelectorAll('.scopesw button[data-scope]').forEach(b=>b.addEventListener("click",()=>setAgentScope(b.dataset.scope)));
@@ -2618,19 +2631,30 @@ function renderInventory(hunt, identityCount){
       $("invCount").textContent = shown+" of "+inv.local.length+" local";
       return;
     }
-    const rows=inv.items.filter(i=>f(i) && (!q ||
-      (i.name+" "+i.platform+" "+(i.local?i.local.vendor+" "+i.local.device+" "+i.local.process:"")).toLowerCase().includes(q)));
+    // A model filter arrives from the Models view; show it as a chip you can clear, never as a silent narrowing.
+    const chip=document.getElementById("invModelChip");
+    if(chip) chip.innerHTML = INV_MODEL
+      ? '<span class="hfchip" id="invModelClear" role="button" tabindex="0" title="Clear the model filter">model · '+escapeHtml(INV_MODEL)+' <b>✕</b></span>'
+      : '';
+    const rows=inv.items.filter(i=>f(i) && (!INV_MODEL || i.model===INV_MODEL) && (!q ||
+      (i.name+" "+i.platform+" "+i.model+" "+(i.local?i.local.vendor+" "+i.local.device+" "+i.local.process:"")).toLowerCase().includes(q)));
     const catOf=k=>INV_CATS.find(c=>c.key===k)||{label:k,col:"var(--dim)"};
     $("invTable").querySelector("tbody").innerHTML = rows.length ? rows.map(i=>{
       const c=catOf(i.cat);
       return '<tr><td><b>'+escapeHtml(i.name)+'</b>'+(i.instances>1?' <span style="color:var(--dim)">×'+i.instances+'</span>':'')+'</td>'
         +'<td style="color:'+c.col+'">'+escapeHtml(c.label)+'</td>'
         +'<td style="color:var(--dim)">'+escapeHtml(i.platform)+'</td>'
+        +'<td'+(i.model?'':' style="color:var(--dim)"')+'>'+escapeHtml(i.model||"—")+'</td>'
         +'<td>'+escapeHtml(i.published||i.availability||"—")+'</td>'
         +'<td class="mono" style="font-size:11px">'+escapeHtml(i.local?(i.local.device+" · "+i.local.process):"your tenant")+'</td></tr>';
-    }).join("") : '<tr><td colspan="5" style="color:var(--dim)">No agents match.</td></tr>';
+    }).join("") : '<tr><td colspan="6" style="color:var(--dim)">No agents match.</td></tr>';
     $("invCount").textContent=rows.length+" of "+inv.items.length;
+    const cl=document.getElementById("invModelClear");
+    if(cl){ const clear=()=>{ INV_MODEL=null; draw(); };
+      cl.addEventListener("click",clear);
+      cl.addEventListener("keydown",ev=>{ if(ev.key==="Enter"||ev.key===" "){ ev.preventDefault(); clear(); } }); }
   };
+  window.__invDraw=draw;   // the Models view drives this table when you click a model row
   $("invSearch").addEventListener("input",draw); $("invCat").addEventListener("change",draw);
   // Tiles (and the "cannot be governed" sub-line inside the Entra tile) drive the same dropdown.
   // Clicking the live tile a second time clears the filter — otherwise the only way back to "all"
@@ -2805,8 +2829,19 @@ function renderModels(hunt){
   if(!hunt || !hunt.granted){ mapEl.innerHTML=clean('var(--dim)','var(--panel-2)','Grant <b>ThreatHunting.Read.All</b> and rescan to read the AI models your agents run on (from the <code>AgentsInfo Model</code> column).'); tblEl.innerHTML=""; return; }
   // Prefer the PER-AGENT model (via the EntraAgentID map) so the counts equal the agents you can click through to
   // — exactly like the Tools view. Fall back to the aggregate dcount-by-Model when no per-agent map is available.
-  let rows=null, clickable=false;
-  if(MODEL && MODEL.agents.some(a=>a.model)){
+  let rows=null, clickable=false, byInventory=false;
+  // Prefer the full inventory: "12 agents run GPT-4.1" should mean 12 of the 345 Defender sees, not 12 of the
+  // subset holding an Entra identity. Counting only identity agents made the model view quietly under-report,
+  // and clicking through landed on a table that could never show the rest.
+  const invItems=(hunt.inventory && hunt.inventory.ok) ? hunt.inventory.items.filter(i=>i.model) : [];
+  if(invItems.length){
+    const byModel={};
+    invItems.forEach(i=>{ (byModel[i.model]=byModel[i.model]||[]).push(i); });
+    rows=Object.keys(byModel).map(raw=>{ const info=detectModel(raw);
+      return Object.assign({raw, agents:byModel[raw].length}, info, {bucket:residencyBucket(info.residency)}); })
+      .sort((a,b)=>b.agents-a.agents);
+    clickable=true; byInventory=true;
+  } else if(MODEL && MODEL.agents.some(a=>a.model)){
     const byModel={};
     MODEL.agents.forEach(a=>{ if(!a.model) return; (byModel[a.model]=byModel[a.model]||[]).push(a.id); });
     rows=Object.keys(byModel).map(raw=>{ const info=detectModel(raw); return Object.assign({raw, agents:byModel[raw].length, ids:byModel[raw]}, info, {bucket:residencyBucket(info.residency)}); }).sort((a,b)=>b.agents-a.agents);
@@ -2833,9 +2868,13 @@ function renderModels(hunt){
     : r.gdprOk?'<span class="flagchip" style="color:var(--green);border-color:#34d39944">GDPR OK</span>'
     : '<span class="flagchip bad">outside EU</span>';
   const trows=rows.map((r,i)=>'<tr'+(clickable?' class="toolrow" data-idx="'+i+'" title="Show the agents using this model"':'')+'><td><b>'+escapeHtml(r.model)+'</b></td><td>'+escapeHtml(r.provider||'—')+'</td><td>'+escapeHtml(r.residency||'—')+'</td><td>'+gcell(r)+'</td><td>'+r.agents+(clickable?' →':'')+'</td></tr>').join("");
-  tblEl.innerHTML='<div class="hint" style="margin:0 0 6px"><b>'+rows.length+' distinct model'+(rows.length===1?'':'s')+'</b> across your agents'+(clickable?' — <b>click a row</b> to filter the Agents view to the agents using that model':'')+'. Rows flagged <b class="hot">outside EU</b> send prompt content out of the EU data boundary — a GDPR consideration for the data those agents touch.</div>'
+  tblEl.innerHTML='<div class="hint" style="margin:0 0 6px"><b>'+rows.length+' distinct model'+(rows.length===1?'':'s')+'</b> across your agents'+(clickable?' — <b>click a row</b> to list the agents running it'+(byInventory?' in the Agents view':' (agents holding an Entra identity)'):'')+'. Rows flagged <b class="hot">outside EU</b> send prompt content out of the EU data boundary — a GDPR consideration for the data those agents touch.</div>'
     +'<div style="overflow-x:auto"><table><thead><tr><th>Model (AgentsInfo)</th><th>Provider</th><th>Data residency</th><th>GDPR</th><th>Agents</th></tr></thead><tbody>'+trows+'</tbody></table></div>';
-  if(clickable){ tblEl.querySelectorAll('.toolrow').forEach(tr=>tr.addEventListener('click',()=>filterAgentsToIds(rows[+tr.dataset.idx].ids, 'model “'+rows[+tr.dataset.idx].raw+'”'))); }
+  if(clickable){ tblEl.querySelectorAll('.toolrow').forEach(tr=>tr.addEventListener('click',()=>{
+    const r=rows[+tr.dataset.idx];
+    if(byInventory) filterInventoryToModel(r.raw);            // every agent running it, identity or not
+    else filterAgentsToIds(r.ids, 'model “'+r.raw+'”');       // identity-only fallback
+  })); }
 }
 function buildResidencyMap(rows){
   const el=document.getElementById('modelsMap'); if(!el) return;
