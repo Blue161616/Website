@@ -441,6 +441,35 @@ async function readTenant(){
     try{
       const pkgs=await graphGetAll("https://graph.microsoft.com/beta/copilot/admin/catalog/packages?$top=100", pTk);
       S.counts.registry=pkgs.length; S.avail.registry="ok"; S.registryRaw=pkgs;
+      // This API is the SUPERSET and the admin-centre tile is narrower — reported by others and confirmed here.
+      // Rather than guess which filter the portal applies, count the two buckets most likely to explain a gap and
+      // show the arithmetic, so anyone comparing the two screens can see where their own difference comes from.
+      const arr=v=>Array.isArray(v)?v:(v==null?[]:[v]);
+      const hostsOf=p=>arr(p.supportedHosts||p.SupportedHosts||p.hosts);
+      const blockedOf=p=>p.isBlocked===true||p.IsBlocked===true||p.blocked===true;
+      const hasBlockedField=pkgs.some(p=>"isBlocked" in p||"IsBlocked" in p||"blocked" in p);
+      const hasHostField=pkgs.some(p=>hostsOf(p).length>0);
+      const hostDist={};
+      pkgs.forEach(p=>hostsOf(p).forEach(h=>{ const k=String(h); hostDist[k]=(hostDist[k]||0)+1; }));
+      // Schema probe. This API's shape is still moving and guessing field names cost us two-thirds of the
+      // classification, so report what the response ACTUALLY contains: every top-level field name, and — only for
+      // fields that look like enumerations — their distinct values. Short values on a low-cardinality field are
+      // things like "ThirdParty" or "Copilot Studio"; long or high-cardinality ones are agent and publisher
+      // names, which are tenant data and are deliberately not shown.
+      const fields={}, vals={};
+      pkgs.forEach(p=>Object.keys(p||{}).forEach(k=>{
+        fields[k]=(fields[k]||0)+1;
+        const v=p[k];
+        if(typeof v==="string" && v.length<=40){ (vals[k]=vals[k]||new Set()).add(v); }
+      }));
+      const enums={};
+      Object.keys(vals).forEach(k=>{ if(vals[k].size<=12) enums[k]=[...vals[k]].sort(); });
+      S.registryStats={
+        total:pkgs.length,
+        blocked:hasBlockedField?pkgs.filter(blockedOf).length:null,
+        copilot:hasHostField?pkgs.filter(p=>hostsOf(p).some(h=>/copilot/i.test(String(h)))).length:null,
+        hosts:hostDist, fields:Object.keys(fields).sort(), enums
+      };
       // Field names on this API are still moving, so classify defensively and say so when we cannot.
       const pick=o=>{
         const s=JSON.stringify(o||{}).toLowerCase();
@@ -471,6 +500,8 @@ function availPill(a){
 // burying it in the explainer — the whole reason these counts get misread is that the missing half is one click away.
 function tileSecond(key){
   if(STATE.avail[key]!=="ok") return "";
+  if(key==="registry")
+    return '<div class="ss" style="color:var(--amber)">API count · your admin centre may show fewer</div>';
   if(key==="defender" && STATE.localCount!=null)
     return '<div class="ss" style="color:var(--crit)">+ '+STATE.localCount+' local · second tab</div>';
   if(key==="agentsinfo" && STATE.deleted!=null)
@@ -519,9 +550,46 @@ function renderScreenExp(){
         +'number. Both are correct; they answer different questions.'
         +(STATE.classicPartial?' <span class="mono" style="color:var(--amber)">One or more tag queries failed, so the classic count may be low.</span>':'')+'</p>';
   }
-  if(s.key==="registry" && a==="ok" && STATE.registryClassified!=null && STATE.registryClassified<STATE.counts.registry)
-    extra='<p class="mono" style="color:var(--amber)">Classified '+STATE.registryClassified+' of '+STATE.counts.registry
-      +' packages by publisher/platform — this API\'s field names are still changing, so the per-row registry split is partial.</p>';
+  if(s.key==="registry" && a==="ok"){
+    const st=STATE.registryStats||{};
+    // The reconciliation. Do not hide the gap and do not pretend to know which filter the portal applies —
+    // show the buckets that could account for it and let the reader do the subtraction against their own tile.
+    let recon='<div class="k" style="margin-top:14px">Why this may not match your admin centre</div>'
+      +'<p>This API is the <b>superset</b>. The <i>Agent registry</i> tile in the Microsoft 365 admin centre counts a '
+      +'narrower set, and the two are known to disagree. Rather than guess which filter the portal applies, here is '
+      +'what your own packages contain — subtract whichever bucket your tenant\'s tile excludes:</p>'
+      +'<dl class="kv"><dt>API returned</dt><dd>'+st.total+' packages</dd>'
+      +'<dt>Blocked</dt><dd>'+(st.blocked==null?'field not present on this response':st.blocked
+          +(st.blocked?' — a tile that hides blocked agents would show '+(st.total-st.blocked):''))+'</dd>'
+      +'<dt>Copilot-hosted</dt><dd>'+(st.copilot==null?'supportedHosts not present on this response':st.copilot
+          +' of '+st.total+(st.copilot<st.total?' — filtering to Copilot hosts would show '+st.copilot:''))+'</dd>';
+    const hk=Object.keys(st.hosts||{});
+    if(hk.length) recon+='<dt>Hosts seen</dt><dd>'+hk.sort().map(h=>escapeHtml(h)+' ('+st.hosts[h]+')').join(' · ')+'</dd>';
+    recon+='</dl>';
+    // The portal's own number cannot be fetched — admin.microsoft.com's tile is served by an internal API on
+    // another origin, with an audience a custom app registration cannot get a token for and no CORS for us.
+    // So take it as input and do the subtraction, which is the part that was going to be done by hand anyway.
+    recon+='<div class="k" style="margin-top:14px">Compare with your portal</div>'
+      +'<p>Type the number on your <i>Agent registry</i> tile and this will tell you which bucket accounts for the difference. '
+      +'This page cannot read that tile itself: it is served by an internal admin-centre API on another origin.</p>'
+      +'<div style="max-width:240px"><label for="portalCount">Admin centre tile shows</label>'
+      +'<input id="portalCount" type="number" min="0" inputmode="numeric" placeholder="e.g. 326" /></div>'
+      +'<div id="portalDiff" class="hint" style="margin-top:10px"></div>';
+    if(STATE.registryClassified!=null && STATE.registryClassified<STATE.counts.registry){
+      recon+='<p class="mono" style="color:var(--amber);margin-top:12px">Classified only '+STATE.registryClassified+' of '
+        +STATE.counts.registry+' packages by publisher/platform — so the third-party and Microsoft first-party rows '
+        +'in the matrix are incomplete. What this response actually contains:</p>';
+      if((st.fields||[]).length)
+        recon+='<dl class="kv"><dt>Fields</dt><dd>'+st.fields.map(escapeHtml).join(' · ')+'</dd></dl>';
+      const ek=Object.keys(st.enums||{});
+      if(ek.length)
+        recon+='<dl class="kv">'+ek.map(k=>'<dt>'+escapeHtml(k)+'</dt><dd>'
+          +st.enums[k].map(escapeHtml).join(' · ')+'</dd>').join("")+'</dl>'
+          +'<p class="hint" style="margin-top:8px">Only low-cardinality short values are listed — those are the '
+          +'enumerations worth classifying on. Agent and publisher names are tenant data and are not shown.</p>';
+    }
+    extra=recon;
+  }
   if(a==="error") extra='<p class="mono" style="color:var(--crit)">'+escapeHtml(STATE.errors[s.key]||"")+'</p>';
   if(a==="noconsent") extra='<p class="mono" style="color:var(--amber)">Not granted. This column needs <b>'+escapeHtml(s.scope)+'</b>'+(s.role!=="—"?' and the '+escapeHtml(s.role)+' role':'')+'.</p>';
   el.innerHTML='<div class="exp"><div class="k">What this number counts</div><h3>'+escapeHtml(s.name)+'</h3>'
@@ -530,6 +598,35 @@ function renderScreenExp(){
     +'<dt>API</dt><dd>'+escapeHtml(s.api)+'</dd>'
     +'<dt>Permission</dt><dd>'+escapeHtml(s.scope)+'</dd>'
     +'<dt>Role</dt><dd>'+escapeHtml(s.role)+'</dd></dl></div>';
+  const pc=document.getElementById("portalCount");
+  if(pc){
+    pc.value=localStorage.getItem("a365v_portal")||"";
+    const upd=()=>{ localStorage.setItem("a365v_portal",pc.value); portalDiff(); };
+    pc.addEventListener("input",upd);
+    portalDiff();
+  }
+}
+// Name the cause when the arithmetic identifies one, and say plainly when it does not. A gap the buckets cannot
+// explain is a finding worth reporting to Microsoft, not something to round away.
+function portalDiff(){
+  const el=document.getElementById("portalDiff"), pc=document.getElementById("portalCount");
+  if(!el||!pc) return;
+  const n=parseInt(pc.value,10), st=STATE.registryStats||{}, api=STATE.counts.registry;
+  if(!Number.isFinite(n)||n<0||api==null){ el.innerHTML=""; return; }
+  const d=api-n;
+  if(d===0){ el.innerHTML='<span class="ok mono">The API and your tile agree at '+api+'.</span>'; return; }
+  const dir=d>0?"more":"fewer", mag=Math.abs(d);
+  let cause="";
+  if(d>0 && st.blocked===d)
+    cause="That is exactly your <b>blocked</b> package count — the tile is hiding blocked agents.";
+  else if(d>0 && st.copilot!=null && (st.total-st.copilot)===d)
+    cause="That is exactly the packages <b>not hosted on Copilot</b> — the tile filters on <code>supportedHosts</code>.";
+  else if(d>0 && st.blocked && st.copilot!=null && (st.blocked+(st.total-st.copilot))===d)
+    cause="That is the blocked packages plus the non-Copilot-hosted ones together.";
+  else
+    cause="None of the buckets above accounts for it. Worth raising: the catalog API and the portal tile are "
+         +"reporting different populations for a reason neither surface explains.";
+  el.innerHTML='<b>The API returns '+mag+' '+dir+' than your tile</b> ('+api+' vs '+n+'). '+cause;
 }
 function markFor(v){
   return v==="y" ? '<span class="mark ok">✓</span>'
