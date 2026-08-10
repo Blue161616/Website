@@ -280,6 +280,11 @@
       <h2>Check it yourself</h2>
       <p class="hint" style="margin:4px 0 12px">Everything above comes from these three calls. Run them directly if you
         want to verify a number rather than take this page's word for it.</p>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 16px">
+        <button type="button" id="copyReportBtn">Copy findings report</button>
+        <span class="hint">Every number and name list on this page, as text you can paste into a support case.</span>
+      </div>
+      <div id="reportOut"></div>
       <div id="calls"></div>
     </div>
   </div>
@@ -757,7 +762,8 @@ function renderScreenExp(){
       // the file never leaves the browser, which matters because it is a full inventory of your agents.
       +'<div style="margin-top:16px"><label for="regCsv">Or diff against your registry export (CSV)</label>'
       +'<input id="regCsv" type="file" accept=".csv,text/csv" style="padding:8px" /></div>'
-      +'<div id="csvDiff" class="hint" style="margin-top:10px"></div>';
+      +'<div id="csvDiff" class="hint" style="margin-top:10px"></div>'
+      + renderApiVsDefender();
     if(STATE.registryClassified!=null && STATE.registryClassified<STATE.counts.registry){
       recon+='<p class="mono" style="color:var(--amber);margin-top:12px">Classified only '+STATE.registryClassified+' of '
         +STATE.counts.registry+' packages by publisher/platform — so the third-party and Microsoft first-party rows '
@@ -783,8 +789,11 @@ function renderScreenExp(){
     +'<dt>Role</dt><dd>'+escapeHtml(s.role)+'</dd></dl></div>';
   const pc=document.getElementById("portalCount");
   if(pc){
-    pc.value=localStorage.getItem("a365v_portal")||"";
-    const upd=()=>{ localStorage.setItem("a365v_portal",pc.value); portalDiff(); };
+    // Key the remembered tile number to the TENANT. Sharing one key across tenants meant signing into a second
+    // tenant inherited the first one's figure and produced a confidently wrong difference — the number is a
+    // property of a tenant, not of this browser.
+    pc.value=localStorage.getItem(portalKey())||"";
+    const upd=()=>{ localStorage.setItem(portalKey(),pc.value); portalDiff(); };
     pc.addEventListener("input",upd);
     portalDiff();
   }
@@ -839,7 +848,7 @@ function csvDiff(file){
       // so find every field where all the extras agree AND the rest of the catalogue mostly does not. Ranked by
       // how rare the shared value is in the remainder — a value the other 325 never have is a strong lead; one
       // they all share too is noise.
-      let common="";
+      let common="", sharpHits=[];
       const extras=onlyApi.map(k=>apiRows.find(p=>norm(p.displayName||p.DisplayName||p.name)===k)).filter(Boolean);
       if(extras.length>1){
         const rest=apiRows.filter(p=>extras.indexOf(p)<0);
@@ -881,7 +890,7 @@ function csvDiff(file){
             pct:100-pct, date:new Date(Math.min(...ex)).toISOString().slice(0,10), alsoRecent:re.length-older});
         });
         hits.sort((a,b)=>a.inRest-b.inRest);
-        const sharp=hits.filter(h=>h.pct<50).slice(0,6);
+        const sharp=hits.filter(h=>h.pct<50).slice(0,6); sharpHits=sharp;
         common='<div class="k" style="margin-top:14px">What the extras have in common</div>'
           +(sharp.length
             ? '<p>Every one of the '+extras.length+' shares these values, and most of the other '+rest.length
@@ -906,12 +915,61 @@ function csvDiff(file){
                         :'<span class="ok">Nothing in your export is missing from the API.</span>')
         +'</div>'+common
         +'<div class="hint" style="margin-top:10px;color:var(--dim)">Matched on name, so an agent renamed between the two reads shows on both sides. The file was parsed in this browser and never uploaded.</div>';
+      // Keep the result so the findings report can quote it without you re-running the diff.
+      STATE.csvDiff={csvRows:csvNames.length, apiRows:apiNames.length,
+        onlyApi:onlyApi.map(pretty), onlyCsv:onlyCsv.slice(), common:sharpHits.slice()};
     }catch(e){ el.innerHTML='<span class="bad">Could not parse that CSV: '+escapeHtml(e.message||String(e))+'</span>'; }
   };
   rd.readAsText(file);
 }
 // Name the cause when the arithmetic identifies one, and say plainly when it does not. A gap the buckets cannot
 // explain is a finding worth reporting to Microsoft, not something to round away.
+// ── Catalogue vs what Defender sees ─────────────────────────────────────────
+// Both sides are APIs this page already calls, so this cross-check needs no export and runs in any tenant.
+// Local agents are excluded from the comparison by definition: they were never published, so they cannot have
+// a catalogue entry, and leaving them in would report every one of them as a false discrepancy.
+function apiVsDefender(){
+  if(!STATE || STATE.avail.registry!=="ok" || STATE.avail.agentsinfo!=="ok") return null;
+  const norm=s=>String(s||"").trim().toLowerCase();
+  const cat=(STATE.registryRaw||[]).map(p=>norm(p.displayName||p.DisplayName||p.name)).filter(Boolean);
+  const run=(STATE.agents||[]).filter(a=>!isLocalAgent(a)).map(a=>norm(agentName(a))).filter(x=>x&&x!=="(unnamed)");
+  if(!cat.length||!run.length) return null;
+  const cnt=a=>{ const m=new Map(); a.forEach(x=>m.set(x,(m.get(x)||0)+1)); return m; };
+  const C=cnt(cat), R=cnt(run), onlyCat=[], onlyRun=[];
+  C.forEach((v,k)=>{ for(let i=0;i<v-(R.get(k)||0);i++) onlyCat.push(k); });
+  R.forEach((v,k)=>{ for(let i=0;i<v-(C.get(k)||0);i++) onlyRun.push(k); });
+  const pretty=(k,src)=>{ const hit=src.find(x=>norm(x)===k); return hit||k; };
+  const catNames=(STATE.registryRaw||[]).map(p=>p.displayName||p.DisplayName||p.name||"");
+  const runNames=(STATE.agents||[]).filter(a=>!isLocalAgent(a)).map(agentName);
+  return {cat:cat.length, run:run.length,
+          onlyCat:onlyCat.map(k=>pretty(k,catNames)).sort(),
+          onlyRun:onlyRun.map(k=>pretty(k,runNames)).sort()};
+}
+function renderApiVsDefender(){
+  const d=apiVsDefender(); if(!d) return "";
+  const list=a=>a.length?('<div class="mono" style="margin-top:7px;color:var(--amber);line-height:1.9">'
+    +a.slice(0,30).map(x=>'<span style="background:#fbbf2412;border-left:2px solid var(--amber);padding:1px 8px;border-radius:0 4px 4px 0">'
+    +escapeHtml(x)+'</span>').join('<br>')
+    +(a.length>30?'<br><span style="color:var(--dim)">… and '+(a.length-30)+' more</span>':'')+'</div>'):'';
+  return '<div class="k" style="margin-top:14px">Catalogue vs what Defender sees</div>'
+    +'<p>Two APIs, no export needed. The catalogue holds <b>'+d.cat+'</b> packages; Defender sees <b>'+d.run
+    +'</b> cloud agents running. Local agents are left out — they were never published, so they can\'t have a catalogue entry.</p>'
+    +(d.onlyCat.length||d.onlyRun.length
+      ? '<div style="margin-top:8px">'
+        +(d.onlyCat.length?'<b class="warn">'+d.onlyCat.length+' in the catalogue that Defender has never seen run</b>'+list(d.onlyCat)
+                          :'<span class="ok">Everything in the catalogue has been seen running.</span>')
+        +'</div><div style="margin-top:10px">'
+        +(d.onlyRun.length?'<b class="warn">'+d.onlyRun.length+' running that have no catalogue entry</b>'+list(d.onlyRun)
+                          :'<span class="ok">Everything Defender sees has a catalogue entry.</span>')
+        +'</div>'
+      : '<p><span class="ok">The two agree exactly.</span></p>');
+}
+// Which tenant's admin-centre tile number we remembered. Falls back to the typed directory value before
+// sign-in completes, so the box still works if someone fills it in early.
+function portalKey(){
+  const t=(account&&account.tenantId) || ((document.getElementById("tenantId")||{}).value) || "default";
+  return "a365v_portal_"+String(t).trim().toLowerCase();
+}
 function portalDiff(){
   const el=document.getElementById("portalDiff"), pc=document.getElementById("portalCount");
   if(!el||!pc) return;
@@ -1076,6 +1134,79 @@ function renderRank(){
       +(r.a?'<div class="hint" style="margin-top:6px;color:var(--text)"><b>Do this:</b> '+r.a+'</div>':'')+'</li>';
   }).join("");
 }
+// ── Findings report ─────────────────────────────────────────────────────────
+// Everything the page established, in one block you can paste into a support case. Tenant is identified by
+// domain rather than GUID, and only agent display names appear — the same names already visible on screen.
+function buildReport(){
+  const S=STATE, L=[], u=x=>x==null?"unknown":x;
+  const n=k=>(S.avail[k]==="ok"&&S.counts[k]!=null)?S.counts[k]:null;
+  L.push("# Agent 365 — agent inventory cross-check");
+  L.push("Tenant: "+((account&&account.username&&account.username.split("@")[1])||"unknown"));
+  L.push("");
+  L.push("## Counts");
+  L.push("- Agent registry (catalog API): "+u(n("registry")));
+  const pv=(document.getElementById("portalCount")||{}).value;
+  if(pv) L.push("- Agent registry (admin centre tile, entered manually): "+pv);
+  L.push("- Defender AI Agents, Agents tab: "+u(n("defender"))+(S.localCount!=null?"  (+"+S.localCount+" on the Local agents tab)":""));
+  L.push("- AgentsInfo live agents: "+u(n("agentsinfo"))+(S.deleted!=null?"  ("+S.deleted+" deleted, excluded; "+u(S.seenTotal)+" agent IDs over 30 days)":""));
+  L.push("- Entra agent identities: "+u(n("entra"))+(S.classic!=null?"  (+"+S.classic+" classic)":""));
+  L.push("");
+  L.push("## Estate by platform");
+  PLATFORMS.forEach(p=>{ const c=rowCount(p.key); if(c!=null) L.push("- "+p.name+": "+c); });
+  const st=S.registryStats;
+  if(st){
+    L.push("");
+    L.push("## Catalogue package properties");
+    L.push("- Packages returned: "+st.total);
+    L.push("- Blocked: "+(st.blocked==null?"field not present":st.blocked));
+    L.push("- Copilot-hosted: "+(st.copilot==null?"field not present":st.copilot+" of "+st.total));
+    const hk=Object.keys(st.hosts||{}); if(hk.length) L.push("- Hosts seen: "+hk.sort().map(h=>h+" ("+st.hosts[h]+")").join(", "));
+  }
+  const d=S.csvDiff;
+  if(d){
+    L.push("");
+    L.push("## Registry export vs catalog API (matched on name)");
+    L.push("Export rows: "+d.csvRows+" | API packages: "+d.apiRows);
+    L.push("");
+    L.push("In the API but NOT in the admin-centre export ("+d.onlyApi.length+"):");
+    d.onlyApi.forEach(x=>L.push("- "+x));
+    L.push("");
+    L.push("In the export but NOT in the API ("+d.onlyCsv.length+"):");
+    d.onlyCsv.forEach(x=>L.push("- "+x));
+    L.push("");
+    L.push("What the extras have in common: "+(d.common.length
+      ? d.common.map(h=>h.k+" = "+h.v).join("; ")
+      : "nothing — every field the API returns (including the array fields supportedHosts and elementTypes, and created/modified dates compared as ranges) looks ordinary."));
+  }
+  const av=apiVsDefender();
+  if(av){
+    L.push("");
+    L.push("## Catalogue vs Defender AgentsInfo (both APIs, no export)");
+    L.push("Catalogue: "+av.cat+" packages | Defender sees running (cloud only): "+av.run);
+    L.push("In the catalogue, never seen running ("+av.onlyCat.length+")"+(av.onlyCat.length?":":""));
+    av.onlyCat.slice(0,50).forEach(x=>L.push("- "+x));
+    L.push("Running with no catalogue entry ("+av.onlyRun.length+")"+(av.onlyRun.length?":":""));
+    av.onlyRun.slice(0,50).forEach(x=>L.push("- "+x));
+  }
+  L.push("");
+  L.push("## How each number was obtained");
+  SCREENS.forEach(s=>L.push("- "+s.name+": "+s.api+"  ["+s.scope+(s.role!=="—"?" · "+s.role:"")+"]"));
+  L.push("");
+  L.push("Generated by the Blue16 Agent 365 visibility page. All reads are read-only.");
+  return L.join("\n");
+}
+function copyReport(){
+  const txt=buildReport(), el=$("reportOut");
+  const done=ok=>{ el.innerHTML='<div class="exp" style="border-left-color:'+(ok?'var(--green)':'var(--amber)')+'">'
+    +'<div class="k">'+(ok?"Copied to your clipboard":"Copy it from here")+'</div>'
+    +'<textarea readonly style="width:100%;height:260px;background:#0a0f18;color:var(--text);border:1px solid var(--border);border-radius:9px;padding:12px;font:12px var(--mono)">'
+    +escapeHtml(txt)+'</textarea></div>'; };
+  // Clipboard access can be refused (permissions, insecure context). Always render the text as well, so the
+  // report is never trapped behind a failed copy.
+  if(navigator.clipboard&&navigator.clipboard.writeText)
+    navigator.clipboard.writeText(txt).then(()=>done(true)).catch(()=>done(false));
+  else done(false);
+}
 function renderCalls(){
   $("calls").innerHTML=SCREENS.filter(s=>s.key!=="defender").map(s=>
     '<div class="exp" style="border-left-color:var(--border);margin-top:10px">'
@@ -1089,6 +1220,7 @@ function renderCalls(){
 $("signInBtn").addEventListener("click",signIn);
 $("signOutBtn").addEventListener("click",signOut);
 $("signOutBtn2").addEventListener("click",signOut);
+$("copyReportBtn").addEventListener("click",copyReport);
 document.querySelectorAll('#nav button[data-view]').forEach(b=>b.addEventListener("click",()=>showView(b.dataset.view)));
 </script>
 </body>
