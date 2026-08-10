@@ -202,7 +202,7 @@ $("ruHere").textContent=redirectUri;
 // Every scope is OPTIONAL and requested separately. A tenant where nobody holds AI Administrator should still
 // get three of the four columns rather than a failed sign-in — so the base request asks for almost nothing.
 const BASE_SCOPES=["User.Read"];
-const SC_ENTRA   =["AgentIdentity.Read.All"];
+const SC_ENTRA   =["AgentIdentity.Read.All","Application.Read.All"]; // Application.Read.All finds the CLASSIC half
 const SC_HUNT    =["ThreatHunting.Read.All"];
 const SC_PKG     =["CopilotPackages.Read.All"];
 
@@ -279,6 +279,7 @@ async function runHunting(kql, tk, _try){
 // ── platform rows ────────────────────────────────────────────────────────────
 // The order is the story: publisher software first, then what your own people built, then what nobody
 // approved. The `col` drives the stripe, which is the only place risk is expressed as colour.
+const AGENTIC_TAGS=['AIAgentBuilder','AgentCreatedBy:CopilotStudio','AgenticApp','AgenticInstance'];
 const PLATFORMS=[
   {key:"thirdparty",  name:"Third-party publishers", sub:"Teams / Copilot store listings",   col:"var(--amber)"},
   {key:"firstparty",  name:"Microsoft first-party",  sub:"Researcher, Analyst, SharePoint…", col:"var(--green)"},
@@ -295,23 +296,23 @@ const SCREENS=[
    scope:"CopilotPackages.Read.All", role:"AI Administrator or Global Administrator",
    counts:"What has been <b>published</b> to your organisation. Every row is a catalogue title, which is why store listings dominate it.",
    blind:"Anything installed on a laptop. A local agent was never published, so it has no title and can never appear here."},
-  {key:"defender",   name:"Defender AI Agents", unit:"monitored agents",
+  {key:"defender",   name:"Defender AI Agents", unit:"cloud agents",
    where:"Defender → AI Agents (preview) → Agents tab",
    api:"derived: live agents in AgentsInfo, minus the local ones",
    scope:"ThreatHunting.Read.All", role:"Security Reader",
    counts:"Cloud-resident agents Defender monitors. This is the <b>Agents</b> tab only.",
    blind:"Local agents — but only from this <i>number</i>. They are on the second tab, with device and process. Both tabs print the same label, <i>Total monitored agents</i>, so a screenshot of either is ambiguous."},
-  {key:"agentsinfo", name:"AgentsInfo",        unit:"agent IDs · 30 days",
+  {key:"agentsinfo", name:"AgentsInfo",        unit:"live agents",
    where:"Defender advanced hunting",
    api:"POST /v1.0/security/runHuntingQuery",
    scope:"ThreatHunting.Read.All", role:"Security Reader",
-   counts:"Every <b>agent ID</b> the telemetry has held in the window — including agents that have since been deleted, because the table keeps writing rows through deletion.",
-   blind:"Nothing, and that is the point: this is the only place your whole estate appears at once. It is also the only count that includes agents that no longer exist."},
-  {key:"entra",      name:"Entra agent identities", unit:"directory principals",
+   counts:"Every agent Defender currently sees running — cloud and endpoint together. <b>Deleted agents are excluded.</b> The table keeps writing rows for an agent through its deletion, so this collapses to the latest snapshot per agent and drops anything marked <code>Deleted</code> before counting.",
+   blind:"Nothing, and that is the point: this is the only place your whole estate appears at once. Be careful how you count it, though — a naive <code>distinct AgentId</code> over the same window silently includes the deleted."},
+  {key:"entra",      name:"Entra agent identities", unit:"modern identities",
    where:"Entra → Agents → Agent identities",
    api:"GET /beta/servicePrincipals/microsoft.graph.agentIdentity",
    scope:"AgentIdentity.Read.All", role:"—",
-   counts:"Agents holding a first-class <b>directory identity</b>. Conditional Access, ID Protection and agent-risk enforcement all bind to a principal, so this is the population your identity controls can actually act on.",
+   counts:"Agents holding a first-class <b>modern</b> directory identity (<code>agentIdentity</code>). Conditional Access, ID Protection and agent-risk enforcement all bind to a principal, so this is the population your identity controls can actually act on. Entra's own overview tile is <i>larger</i> than this, because it adds <b>classic</b> agent service principals — the same trick as Defender's tile, counting a broader set than the blade you work in.",
    blind:"Everything that is not issued an Agent ID — store agents, Microsoft's own, Agent Builder agents and every local install. Not a registration failure: an Agent ID is only issued to agent kinds that support one."}
 ];
 // Structural visibility. These are properties of how each system is built, not of any one tenant — so they are
@@ -319,21 +320,21 @@ const SCREENS=[
 const VIS={
   thirdparty:{registry:"y", defender:"y", agentsinfo:"y", entra:"n"},
   firstparty:{registry:"y", defender:"y", agentsinfo:"y", entra:"n"},
-  copilot:   {registry:"y", defender:"y", agentsinfo:"y", entra:"y"},
+  copilot:   {registry:"y", defender:"y", agentsinfo:"y", entra:"y", note:{entra:"modern · classic counted apart"}},
   foundry:   {registry:"y", defender:"y", agentsinfo:"y", entra:"y"},
   builder:   {registry:"y", defender:"y", agentsinfo:"y", entra:"n", note:{entra:"no identity issued"}},
   local:     {registry:"n", defender:"p", agentsinfo:"y", entra:"n",
               note:{registry:"no title", defender:"2nd tab · not in the total", agentsinfo:"only here", entra:"no principal"}},
-  deleted:   {registry:"n", defender:"n", agentsinfo:"y", entra:"n", note:{agentsinfo:"inflates the total"}}
+  deleted:   {registry:"n", defender:"n", agentsinfo:"n", entra:"n", note:{agentsinfo:"in the table, excluded here"}}
 };
 const WHY={
   "local|registry":"The registry is a catalogue of published titles. Nobody publishes Claude Desktop to your org — an employee installs it. There is no title, so there is nothing for the registry to list. This is not a collection failure you can fix; it is what a catalogue is.",
   "local|defender":"Defender <b>does</b> see these — on the <b>Local agents</b> tab, with device, process and signed-in account. It is the only console in the stack that can. They are simply not part of the headline number on the Agents tab, and both tabs label their tile <i>Total monitored agents</i>.",
   "local|agentsinfo":"The endpoint sensor reports them, and <code>RawAgentInfo.localAgentMetadata</code> carries the vendor, the process, the device and the signed-in account. This is the only count that contains them.",
   "local|entra":"A locally installed agent has no directory principal, so there is nothing for Conditional Access or ID Protection to bind to. You cannot write an identity policy for something with no identity — this is an endpoint control problem (app control / WDAC, egress monitoring, an allowed-vendor decision).",
-  "deleted|agentsinfo":"<code>AgentsInfo</code> stores snapshots and keeps writing rows for an agent through its deletion, so a naive <code>distinct AgentId</code> counts the dead with the living. Collapse with <code>arg_max</code> and exclude <code>LifecycleStatus == \"Deleted\"</code> before you quote the number.",
+  "deleted|agentsinfo":"Deleted agents <b>are</b> in the table — <code>AgentsInfo</code> stores snapshots and keeps writing rows for an agent through its deletion — but this page excludes them, which is why its number is lower than a naive <code>distinct AgentId</code> over the same window. Collapse with <code>arg_max</code> and drop <code>LifecycleStatus == \"Deleted\"</code> before you quote anything. Note the filter is by <i>absence</i>: the column is only ever written when an agent is deleted.",
+  "copilot|entra":"Copilot Studio agents register as directory principals, which is what makes them governable — and what gives them reach. Behind each one is a <b>blueprint</b> holding client secrets and impersonating every agent under it. Older ones may be <b>classic</b> agents: service principals carrying an agentic tag rather than a modern <code>agentIdentity</code>. They are counted on the tile as the classic half, and they never surface an <code>EntraAgentID</code> in AgentsInfo.",
   "builder|entra":"Agent Builder agents are assembled by end users inside Copilot chat in about a minute. They are not issued an Agent ID, so your identity controls cannot see them — and because creation is ungated, they are the population most likely to grow without anyone noticing. Purview and DLP still apply; Conditional Access does not.",
-  "copilot|entra":"Copilot Studio agents register as directory principals, which is what makes them governable — and what gives them reach. Behind each one is a <b>blueprint</b> holding client secrets and impersonating every agent under it.",
   "foundry|entra":"Foundry agents register as directory principals and are code-first, so their tool and model surface is whatever your developers wired up.",
   "thirdparty|entra":"Store agents run on the publisher's infrastructure and hold no principal in your directory. Your control surface is the consent granted at install, not runtime policy.",
   "firstparty|entra":"Microsoft's own agents run under Microsoft's controls inside the M365 boundary. No Agent ID is issued in your tenant."
@@ -377,13 +378,17 @@ async function readTenant(){
       const r=await runHunting(
         `AgentsInfo | summarize arg_max(Timestamp, *) by AgentId ${ext}| project ${proj}${loc} | take 5000`, hTk);
       const rows=r.results||[];
+      // LifecycleStatus is only ever WRITTEN as "Deleted" — for a live agent it is empty — so live agents are
+      // identified by the absence of a value, not the presence of one.
       const live=rows.filter(x=>String(x.LifecycleStatus||"").toLowerCase()!=="deleted");
-      S.counts.agentsinfo=rows.length;
       S.deleted=rows.length-live.length;
       const isLocal=x=>String(x.Vendor||"").trim()||/^localagents$/i.test(String(x.Platform||"").trim());
       S.local=live.filter(isLocal);
-      S.counts.defender=live.length-S.local.length;
+      S.counts.defender=live.length-S.local.length;   // the Agents tab: cloud only
+      S.localCount=S.local.length;                     // the Local agents tab
       S.liveTotal=live.length;
+      S.counts.agentsinfo=live.length;                 // live only — deleted are reported separately, never folded in
+      S.seenTotal=rows.length;
       // Platform rows, from the system that actually owns each population.
       const p=(k)=>S.platform[k]=(S.platform[k]||0);
       PLATFORMS.forEach(x=>p(x.key));
@@ -409,6 +414,22 @@ async function readTenant(){
       const ids=await graphGetAll("https://graph.microsoft.com/beta/servicePrincipals/microsoft.graph.agentIdentity?$select=id,displayName&$top=999", eTk);
       S.counts.entra=ids.length; S.avail.entra="ok";
     }catch(e){ S.avail.entra="error"; S.errors.entra=e.message||String(e); }
+    // The CLASSIC half. Entra's overview tile counts these too, which is why it reads higher than the blade.
+    // They are ordinary service principals carrying an agentic tag, so they never surface an EntraAgentID in
+    // AgentsInfo — a tag query is the only way to find them.
+    try{
+      const res=await Promise.all(AGENTIC_TAGS.map(tag=>
+        graphGetAll("https://graph.microsoft.com/beta/servicePrincipals?$filter=tags/any(t: t eq '"
+          +encodeURIComponent(tag)+"')&$top=999&$select=id,displayName", eTk).catch(()=>null)));
+      // A tag whose query failed returns null, not [] — if every one failed we cannot tell "none" from
+      // "could not look", so the classic count stays unknown rather than being reported as zero.
+      if(res.every(x=>x===null)) S.classic=null;
+      else{
+        const seen=new Set();
+        res.filter(Boolean).flat().forEach(sp=>{ if(sp&&sp.id) seen.add(sp.id); });
+        S.classic=seen.size; S.classicPartial=res.some(x=>x===null);
+      }
+    }catch{ S.classic=null; }
   }
 
   // 3) Agent 365 registry. Newest of the four APIs and the one most likely to be refused — it wants the
@@ -446,6 +467,20 @@ function availPill(a){
     a==="noconsent" ? '<span class="pill no">not granted</span>' :
     a==="error" ? '<span class="pill bad">error</span>' : '<span class="pill no">—</span>';
 }
+// Three of the four numbers have a second half that the portal tile leaves off. Print it on the tile rather than
+// burying it in the explainer — the whole reason these counts get misread is that the missing half is one click away.
+function tileSecond(key){
+  if(STATE.avail[key]!=="ok") return "";
+  if(key==="defender" && STATE.localCount!=null)
+    return '<div class="ss" style="color:var(--crit)">+ '+STATE.localCount+' local · second tab</div>';
+  if(key==="agentsinfo" && STATE.deleted!=null)
+    return '<div class="ss" style="color:var(--dim)">'+STATE.deleted+' deleted, excluded</div>';
+  if(key==="entra")
+    return STATE.classic==null
+      ? '<div class="ss" style="color:var(--amber)">+ ? classic · could not read</div>'
+      : '<div class="ss" style="color:var(--amber)">+ '+STATE.classic+' classic'+(STATE.classicPartial?' (partial)':'')+'</div>';
+  return "";
+}
 function renderScreens(){
   $("screens").innerHTML=SCREENS.map(s=>{
     const v=STATE.counts[s.key], a=STATE.avail[s.key];
@@ -454,6 +489,7 @@ function renderScreens(){
       +'<div class="sn">'+escapeHtml(s.name)+'</div>'
       +'<div class="sv">'+val+'</div>'
       +'<div class="ss">'+escapeHtml(s.unit)+'</div>'
+      +tileSecond(s.key)
       +(a!=="ok"?'<div class="sx">'+(a==="noconsent"?"permission not granted":"could not be read")+'</div>':'')
       +'</button>';
   }).join("");
@@ -467,11 +503,22 @@ function renderScreenExp(){
   const s=SCREENS.find(x=>x.key===SEL.screen), a=STATE.avail[s.key];
   let extra="";
   if(s.key==="agentsinfo" && STATE.avail.agentsinfo==="ok")
-    extra='<p><b>In your tenant:</b> '+STATE.counts.agentsinfo+' agent IDs = <b>'+STATE.liveTotal
-      +'</b> live + <b>'+STATE.deleted+'</b> deleted. Quote the live number, not this one.</p>';
+    extra='<p><b>In your tenant:</b> <b>'+STATE.counts.agentsinfo+'</b> live agents. The same 30-day window holds '
+      +STATE.seenTotal+' agent IDs in total — the extra <b>'+STATE.deleted+'</b> are deleted agents still being written '
+      +'to telemetry, and are excluded here.</p>';
   if(s.key==="defender" && STATE.avail.defender==="ok")
-    extra='<p><b>In your tenant:</b> '+STATE.liveTotal+' live agents − '+STATE.local.length
-      +' local = <b>'+STATE.counts.defender+'</b> on the Agents tab. The Local agents tab shows the other '+STATE.local.length+'.</p>';
+    extra='<p><b>In your tenant:</b> <b>'+STATE.counts.defender+'</b> cloud agents on the <i>Agents</i> tab and <b>'
+      +STATE.localCount+'</b> on the <i>Local agents</i> tab — '+STATE.liveTotal+' running in total. Both tabs print the '
+      +'same tile label, so quoting one without saying which tab it came from is how the local ones go missing.</p>';
+  if(s.key==="entra" && STATE.avail.entra==="ok"){
+    extra = STATE.classic==null
+      ? '<p class="mono" style="color:var(--amber)">The classic half could not be read — the tag query on /servicePrincipals needs Application.Read.All. Modern identities only are shown.</p>'
+      : '<p><b>In your tenant:</b> <b>'+STATE.counts.entra+'</b> modern <code>agentIdentity</code> objects + <b>'
+        +STATE.classic+'</b> classic agent service principals = <b>'+(STATE.counts.entra+STATE.classic)
+        +'</b>, which is roughly what Entra\'s overview tile reports. The blade you actually work in shows the modern '
+        +'number. Both are correct; they answer different questions.'
+        +(STATE.classicPartial?' <span class="mono" style="color:var(--amber)">One or more tag queries failed, so the classic count may be low.</span>':'')+'</p>';
+  }
   if(s.key==="registry" && a==="ok" && STATE.registryClassified!=null && STATE.registryClassified<STATE.counts.registry)
     extra='<p class="mono" style="color:var(--amber)">Classified '+STATE.registryClassified+' of '+STATE.counts.registry
       +' packages by publisher/platform — this API\'s field names are still changing, so the per-row registry split is partial.</p>';
