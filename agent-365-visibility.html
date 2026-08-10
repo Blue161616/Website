@@ -832,19 +832,39 @@ function csvDiff(file){
       const extras=onlyApi.map(k=>apiRows.find(p=>norm(p.displayName||p.DisplayName||p.name)===k)).filter(Boolean);
       if(extras.length>1){
         const rest=apiRows.filter(p=>extras.indexOf(p)<0);
+        // Arrays and objects get a canonical form so supportedHosts / elementTypes are compared too — an
+        // earlier version only looked at scalars and declared "nothing separates them" without ever having
+        // examined the array fields.
+        const canon=v=>{
+          if(v==null) return "undefined";
+          if(Array.isArray(v)) return JSON.stringify(v.map(x=>typeof x==="object"?JSON.stringify(x):String(x)).sort());
+          if(typeof v==="object") return JSON.stringify(v);
+          return String(v);
+        };
+        const SKIP=/(^|[^a-z])(id|ids)$|name|description|url|version/i;
+        const DATEY=/date|time|created|modified/i;
         const cand=new Set();
-        apiRows.forEach(p=>Object.keys(p||{}).forEach(k=>{
-          const v=p[k];
-          if(typeof v==="boolean" || (typeof v==="string" && v.length<=40 && !/(^|[^a-z])(id|ids)$|name|description|url|version/i.test(k))) cand.add(k);
-        }));
+        apiRows.forEach(p=>Object.keys(p||{}).forEach(k=>{ if(!SKIP.test(k) && canon(p[k]).length<=140) cand.add(k); }));
         const hits=[];
         cand.forEach(k=>{
-          const vals=new Set(extras.map(p=>String(p[k])));
+          if(DATEY.test(k)) return;                       // handled separately — timestamps are never equal
+          const vals=new Set(extras.map(p=>canon(p[k])));
           if(vals.size!==1) return;                       // the extras disagree — not a shared trait
           const v=[...vals][0];
           if(v==="undefined") return;
-          const inRest=rest.filter(p=>String(p[k])===v).length;
+          const inRest=rest.filter(p=>canon(p[k])===v).length;
           hits.push({k,v,inRest,pct:Math.round(inRest/Math.max(1,rest.length)*100)});
+        });
+        // Dates can only be compared as a range: "all six are newer than 97% of the catalogue" is the shape
+        // a sync lag would take, and equality testing would never surface it.
+        [...cand].filter(k=>DATEY.test(k)).forEach(k=>{
+          const val=p=>{ const t=Date.parse(p[k]); return isFinite(t)?t:null; };
+          const ex=extras.map(val).filter(x=>x!=null), re=rest.map(val).filter(x=>x!=null);
+          if(ex.length!==extras.length || re.length<10) return;
+          const older=re.filter(t=>t<Math.min(...ex)).length;
+          const pct=Math.round(older/re.length*100);
+          if(pct>=90) hits.push({k, v:"all newer than "+pct+"% of the catalogue", inRest:re.length-older,
+            pct:100-pct, date:new Date(Math.min(...ex)).toISOString().slice(0,10)});
         });
         hits.sort((a,b)=>a.inRest-b.inRest);
         const sharp=hits.filter(h=>h.pct<50).slice(0,6);
@@ -853,11 +873,14 @@ function csvDiff(file){
             ? '<p>Every one of the '+extras.length+' shares these values, and most of the other '+rest.length
               +' packages do not — the likeliest reason the portal leaves them out:</p><dl class="kv">'
               +sharp.map(h=>'<dt>'+escapeHtml(h.k)+'</dt><dd><b style="color:var(--amber)">'+escapeHtml(h.v)+'</b> — '
-                +(h.inRest===0?'no other package has this':h.inRest+' of the other '+rest.length+' ('+h.pct+'%)')+'</dd>').join("")
+                +(h.date?'earliest is '+escapeHtml(h.date)
+                        :h.inRest===0?'no other package has this':h.inRest+' of the other '+rest.length+' ('+h.pct+'%)')+'</dd>').join("")
               +'</dl>'
-            : '<p>No field separates them from the rest of the catalogue: on every value the API returns, these '
-              +extras.length+' look like ordinary packages. That points at the portal\'s own counting rather than at '
-              +'anything about these agents.</p>');
+            : '<p>No field separates them from the rest of the catalogue — including the array fields '
+              +'(<code>supportedHosts</code>, <code>elementTypes</code>) and the created / modified dates, which were '
+              +'compared as ranges rather than for equality. On every value this API returns, these '+extras.length
+              +' look like ordinary packages. Nothing here explains why the admin centre omits them, which makes it '
+              +'that surface\'s problem rather than a property of these agents.</p>');
       }
       el.innerHTML='<b>Export has '+csvNames.length+' rows; the API returned '+apiNames.length+'.</b>'
         +'<div style="margin-top:8px">'
