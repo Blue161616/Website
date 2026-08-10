@@ -84,6 +84,14 @@
   tr.hot td{background:#f871710a}
 
   /* ── explainer ────────────────────────────────────────────────── */
+  td.rowname{cursor:pointer}
+  tr:hover td.rowname{background:#5b8def0e}
+  .alist{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:2px 18px;max-height:340px;
+    overflow:auto;margin-top:10px;padding-right:4px}
+  .ai{display:flex;justify-content:space-between;gap:10px;padding:4px 0;border-bottom:1px solid #1b263766}
+  .an{font-size:13px;color:var(--text)}
+  .as{font-family:var(--mono);font-size:10.5px;color:var(--dim);text-align:right;flex:none;max-width:52%;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .exp{border:1px solid var(--border);border-left:3px solid var(--blue);border-radius:0 12px 12px 0;
        background:var(--panel-2);padding:18px 20px;margin-top:16px}
   .exp h3{margin:0 0 8px;font-size:16px}
@@ -385,6 +393,19 @@ async function runHunting(kql, tk, _try){
 // The order is the story: publisher software first, then what your own people built, then what nobody
 // approved. The `col` drives the stripe, which is the only place risk is expressed as colour.
 const AGENTIC_TAGS=['AIAgentBuilder','AgentCreatedBy:CopilotStudio','AgenticApp','AgenticInstance'];
+// The registry API's own fields, confirmed against a live response rather than guessed: `type` carries
+// firstParty / thirdParty / lob / shared. Shared by the counting pass and the per-row agent lists, so a row's
+// number and its names can never be built from different rules.
+function regRowOf(o){
+  const t=String((o&&(o.type||o.Type))||"").toLowerCase();
+  if(t==="firstparty") return "firstparty";
+  if(t==="thirdparty") return "thirdparty";
+  if(t==="lob")        return "lob";
+  if(t==="shared")     return "shared";   // built in your tenant; `platform` says with what
+  return null;
+}
+const isLocalAgent=x=>!!String(x.Vendor||"").trim() || /^localagents$/i.test(String(x.Platform||"").trim());
+const agentName=x=>String(x.Name||x.displayName||x.DisplayName||"").trim()||"(unnamed)";
 const PLATFORMS=[
   {key:"thirdparty",  name:"Third-party publishers", sub:"Teams / Copilot store listings",   col:"var(--amber)"},
   {key:"firstparty",  name:"Microsoft first-party",  sub:"Researcher, Analyst, SharePoint…", col:"var(--green)"},
@@ -489,7 +510,9 @@ async function readTenant(){
       // identified by the absence of a value, not the presence of one.
       const live=rows.filter(x=>String(x.LifecycleStatus||"").toLowerCase()!=="deleted");
       S.deleted=rows.length-live.length;
-      const isLocal=x=>String(x.Vendor||"").trim()||/^localagents$/i.test(String(x.Platform||"").trim());
+      const isLocal=isLocalAgent;
+      // Keep the rows, not just the tallies — every count in the matrix should be openable to the agents behind it.
+      S.agents=live; S.deletedAgents=rows.filter(x=>String(x.LifecycleStatus||"").toLowerCase()==="deleted");
       S.local=live.filter(isLocal);
       S.counts.defender=live.length-S.local.length;   // the Agents tab: cloud only
       S.localCount=S.local.length;                     // the Local agents tab
@@ -582,18 +605,7 @@ async function readTenant(){
         hosts:hostDist, fields:Object.keys(fields).sort(), enums
       };
       // Field names on this API are still moving, so classify defensively and say so when we cannot.
-      // The API's own fields, confirmed against a live response rather than guessed: `type` carries
-      // firstParty / thirdParty / lob / shared, and `platform` carries the builder platform. An earlier
-      // version pattern-matched the whole JSON blob and classified under a third of packages.
-      const typeOf=o=>String(o.type||o.Type||"").toLowerCase();
-      const pick=o=>{
-        const t=typeOf(o);
-        if(t==="firstparty") return "firstparty";
-        if(t==="thirdparty") return "thirdparty";
-        if(t==="lob")        return "lob";
-        if(t==="shared")     return "shared";   // built in your tenant; `platform` says with what
-        return null;
-      };
+      const pick=regRowOf;
       let classified=0;
       pkgs.forEach(o=>{ const k=pick(o); if(k){ S.platform["reg_"+k]=(S.platform["reg_"+k]||0)+1; classified++; } });
       S.registryClassified=classified;
@@ -962,9 +974,11 @@ function renderMatrix(){
       +'</span></th>').join("")+'</tr></thead><tbody>';
   PLATFORMS.forEach(p=>{
     const c=rowCount(p.key);
-    h+='<tr'+(p.hot?' class="hot"':'')+'><td><span class="stripe" style="background:'+p.col+'"></span>'
+    h+='<tr'+(p.hot?' class="hot"':'')+'><td class="rowname" data-row="'+p.key+'" title="List the agents in this row">'
+      +'<span class="stripe" style="background:'+p.col+'"></span>'
       +'<span class="pf">'+svgIc(ROWICON[p.key])+escapeHtml(p.name)+'</span><br><span class="pfs" style="margin-left:14px">'+escapeHtml(p.sub)+'</span></td>'
-      +'<td class="pfn" style="color:'+p.col+'">'+(c==null?'<span style="color:var(--dim)">—</span>':c)+'</td>';
+      +'<td class="pfn rowname" data-row="'+p.key+'" style="color:'+p.col+'" title="List the agents in this row">'
+      +(c==null?'<span style="color:var(--dim)">—</span>':c)+'</td>';
     SCREENS.forEach(s=>{
       const v=VIS[p.key][s.key], note=(VIS[p.key].note||{})[s.key];
       h+='<td class="cell" data-p="'+p.key+'" data-s="'+s.key+'">'+markFor(v)
@@ -995,11 +1009,52 @@ function renderMatrix(){
       +'the store &amp; publisher population is unknown rather than zero.</td></tr></tfoot>';
   }
   $("matrix").innerHTML=h+'</tbody>'+foot;
+  $("matrix").querySelectorAll("td.rowname[data-row]").forEach(td=>td.addEventListener("click",()=>{
+    SEL.cell=null; renderRowList(td.dataset.row);
+    const t=$("cellExp"); if(t) t.scrollIntoView({behavior:"smooth", block:"nearest"});
+  }));
   $("matrix").querySelectorAll("td.cell").forEach(td=>td.addEventListener("click",()=>{
     const k=td.dataset.p+"|"+td.dataset.s;
     SEL.cell = SEL.cell===k ? null : k; renderCellExp();
   }));
   renderCellExp();
+}
+// Which agents are behind a row. Sourced from whichever system owns that population, so the names always come
+// from the same place as the number above them.
+function agentsForRow(k){
+  const A=STATE.agents||[], D=STATE.deletedAgents||[], R=STATE.registryRaw||[];
+  const plat=x=>String(x.Platform||"");
+  const fromInv=(f,sub)=>({src:"Defender AgentsInfo", items:A.filter(f).map(x=>({n:agentName(x), s:sub?sub(x):plat(x)}))});
+  if(k==="local")   return fromInv(isLocalAgent, x=>[x.Device,x.Process,x.Account].filter(Boolean).join(" · "));
+  if(k==="deleted") return {src:"Defender AgentsInfo", items:D.map(x=>({n:agentName(x), s:plat(x)||"deleted"}))};
+  if(k==="copilot") return fromInv(x=>!isLocalAgent(x)&&/copilot studio/i.test(plat(x)));
+  if(k==="foundry") return fromInv(x=>!isLocalAgent(x)&&/foundry/i.test(plat(x)));
+  if(k==="builder") return fromInv(x=>!isLocalAgent(x)&&/agent builder/i.test(plat(x)));
+  if(REG_ROWS.indexOf(k)>=0){
+    if(!R.length) return {src:"Agent registry", items:null};   // never read — not "none"
+    return {src:"Agent registry", items:R.filter(p=>regRowOf(p)===k)
+      .map(p=>({n:agentName(p), s:String(p.platform||p.Platform||"")}))};
+  }
+  return {src:"", items:[]};
+}
+function renderRowList(k){
+  const el=$("cellExp"), p=PLATFORMS.find(x=>x.key===k); if(!el||!p) return;
+  const {src,items}=agentsForRow(k);
+  if(items==null){
+    el.innerHTML='<div class="exp" style="border-left-color:'+p.col+'"><div class="k">'+escapeHtml(p.name)+'</div>'
+      +'<p>These come from the <b>Agent registry</b>, which was not read — grant <b>CopilotPackages.Read.All</b> to list them.</p></div>';
+    return;
+  }
+  items.sort((a,b)=>a.n.localeCompare(b.n));
+  const CAP=200, shown=items.slice(0,CAP);
+  el.innerHTML='<div class="exp" style="border-left-color:'+p.col+'">'
+    +'<div class="k">'+escapeHtml(p.name)+' &nbsp;·&nbsp; '+items.length+' agent'+(items.length===1?'':'s')
+    +' &nbsp;·&nbsp; from '+escapeHtml(src)+'</div>'
+    +(items.length?'<div class="alist">'+shown.map(x=>'<div class="ai"><span class="an">'+escapeHtml(x.n)+'</span>'
+        +(x.s?'<span class="as">'+escapeHtml(x.s)+'</span>':'')+'</div>').join("")+'</div>'
+       +(items.length>CAP?'<p class="hint" style="margin-top:8px">Showing the first '+CAP+' of '+items.length+'.</p>':'')
+      :'<p>None in this tenant.</p>')
+    +'</div>';
 }
 function renderCellExp(){
   const el=$("cellExp"); if(!SEL.cell){ el.innerHTML=""; return; }
