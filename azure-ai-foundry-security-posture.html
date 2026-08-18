@@ -1832,8 +1832,19 @@ async function gwReadApis(at) {
     svc.apisWhy = r.ok ? '' : r.why;
     // Which of these point back at a Foundry account, and which are something
     // else somebody published on the same instance.
-    svc.foundryApis = svc.apis.filter(a => FOUNDRY_HOST_RE.test(a.serviceUrl || ''));
-    svc.otherApis = svc.apis.filter(a => !FOUNDRY_HOST_RE.test(a.serviceUrl || ''));
+    const acctNames = (MODEL.resources || []).filter(r => r.family === 'cognitive')
+      .map(r => String(r.customSubdomain || r.name || '').toLowerCase()).filter(Boolean);
+    const namesAnAccount = (a) => {
+      const hay = (String(a.serviceUrl || '') + ' ' + String(a.name || '') + ' ' +
+                   String(a.path || '')).toLowerCase();
+      return acctNames.some(n => n && hay.includes(n));
+    };
+    svc.foundryApis = svc.apis.filter(a => FOUNDRY_HOST_RE.test(a.serviceUrl || '') || namesAnAccount(a));
+    // A backend we cannot read cannot be classified, and an unclassifiable API is
+    // not evidence of an agent.
+    const rest = svc.apis.filter(a => !svc.foundryApis.includes(a));
+    svc.otherApis = rest.filter(a => a.serviceUrl);
+    svc.unknownApis = rest.filter(a => !a.serviceUrl);
   });
 
   // Promote candidate → linked where an API actually names the account. Matching
@@ -1842,8 +1853,9 @@ async function gwReadApis(at) {
   (MODEL.resources || []).filter(r => r.family === 'cognitive').forEach(r => {
     if (!r.gateway) return;
     const sub = String(r.customSubdomain || r.name || '').toLowerCase();
-    const fronting = G.v2.filter(svc => (svc.foundryApis || [])
-      .some(a => String(a.serviceUrl).toLowerCase().includes(sub)));
+    const fronting = G.v2.filter(svc => (svc.foundryApis || []).some(a =>
+      (String(a.serviceUrl || '') + ' ' + String(a.name || '') + ' ' + String(a.path || ''))
+        .toLowerCase().includes(sub)));
     if (fronting.length) {
       r.gateway.state = 'linked';
       r.gateway.proven = true;
@@ -1972,6 +1984,17 @@ function renderGatewayNotice() {
     head = '<b>AI Gateway is attached</b> to ' + linked.length + ' of ' + accts.length + ' account(s).';
     body = 'Callers reach the models through Azure API Management, which can authenticate each one '
          + 'separately, cap its tokens and log the call.';
+    // Two different proofs are possible and they are not equally strong: an API
+    // whose backend is the account is direct evidence; a property on the account
+    // is Microsoft telling us. Name whichever fired.
+    const byApi = linked.filter(r => r.gateway.evidence).length;
+    const byProp = linked.filter(r => !r.gateway.evidence && (r.gatewayHints || []).length);
+    const keys = [...new Set(byProp.flatMap(r => (r.gatewayHints || []).map(h => h.key)))];
+    if (byApi) body += ' Confirmed on ' + byApi + ' by reading the gateway: ' +
+      escHtml(linked.find(r => r.gateway.evidence).gateway.evidence) + '.';
+    if (keys.length) body += ' Confirmed on ' + byProp.length + ' by ' +
+      (keys.length === 1 ? 'a property' : 'properties') + ' on the account itself (' +
+      keys.map(k => '<code>' + escHtml(k) + '</code>').join(', ') + ').';
   } else if (cand.length) {
     const names = G.v2.map(a => '<b>' + escHtml(a.name) + '</b>').join(', ');
     head = '<b>No AI Gateway association is visible from here.</b>';
@@ -2043,6 +2066,8 @@ function renderAgentsView() {
   // straight off ARM. Reporting them together as "agents" would merge a reading
   // with a blank.
   const reg = gwRegisteredAgents();
+  const unknownApis = ((MODEL.gateway && MODEL.gateway.v2) || [])
+    .reduce((n, svc) => n + ((svc.unknownApis || []).length), 0);
   if (!agents.length && reg.agents.length) {
     host.innerHTML = '<div class="card"><h2>Agents</h2>' +
       '<div class="hint" style="margin:-4px 0 10px">Registered on the AI Gateway, read from Azure ' +
@@ -2052,7 +2077,11 @@ function renderAgentsView() {
       '<th>Backend</th></tr></thead><tbody>' +
       reg.agents.map(a => '<tr><td>' + escHtml(a.name) + '</td><td>' + escHtml(a.gateway) + '</td>' +
         '<td class="mono" style="font-size:11px">' + escHtml(a.url || a.path || '—') + '</td></tr>').join('') +
-      '</tbody></table></div></div>';
+      '</tbody></table></div>' +
+      (unknownApis ? '<div class="hint" style="margin-top:10px">' + unknownApis + ' further API' +
+        (unknownApis === 1 ? '' : 's') + ' on the gateway had no readable backend, so ' +
+        (unknownApis === 1 ? 'it is' : 'they are') + ' not classified either way.</div>' : '') +
+      '</div>';
     return;
   }
   if (!agents.length) {
