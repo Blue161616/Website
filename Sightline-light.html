@@ -96,6 +96,14 @@
   .hero{border:1px solid var(--border);border-radius:10px;background:
     radial-gradient(ellipse 70% 120% at 50% 0%,rgba(56,139,253,.08),transparent 70%),var(--bg2);
     padding:12px 16px 13px;margin:12px 0 4px}
+  /* Never draw the diagram bigger than it was designed. width:100% alone let it
+     upscale to whatever the pane was — on a wide screen in the full app that put
+     it at 1700px across and ~490px tall, which dwarfed everything around it. The
+     viewBox is 1120 wide, so that is the cap: it shrinks to fit a narrow pane and
+     stops at 1:1 on a wide one. */
+  .hero svg{max-width:1120px;margin:0 auto}
+  /* Lives with the diagram, not with the light build's page chrome — it labels
+     the diagram, so it has to travel with it. */
   /* Transparent hit rects, so the cursor and the hover wash are what say these
      are live until one is active. */
   .hero .hk{cursor:pointer}
@@ -154,9 +162,12 @@
   .risk-row.xhl-nosensor .rk:not([data-from=nosensor]){opacity:.32}
   .risk-row.xhl-nosensor .rk[data-from=nosensor]{border-color:rgba(248,81,73,.7);
     box-shadow:0 0 0 1px rgba(248,81,73,.35)}
-  .hk.xhl rect{stroke:#f85149!important;stroke-opacity:.9!important}
+  /* Labels the diagram, so it travels with the diagram — it was sitting outside
+     the shared block and did not come across to the full app, which left the
+     caption as unstyled body text under a styled graphic. */
   .hero-hint{font-size:10px;color:var(--dim);text-align:center;letter-spacing:.08em;
     text-transform:uppercase;font-weight:700;margin-top:4px}
+  .hk.xhl rect{stroke:#f85149!important;stroke-opacity:.9!important}
   /* The all-clear, on one line. Same information, none of the vertical cost. */
   .chk-ok1{display:flex;gap:18px;flex-wrap:wrap;align-items:center;font-size:11px;
     color:var(--muted);margin-bottom:7px}
@@ -762,6 +773,24 @@ let _SF = { source: '', type: '', sku: '', os: '', country: '', defender: '', pr
 const _SF_PRESETS = {
   nosensor: { label: 'machines with no active sensor',
               fn: r => r.kind !== 'gateway' && r.mde !== 'onboarded' },
+  // The risk strip's six, as presets rather than a separate table registered by
+  // a side effect at load. One place holds every named predicate, _sfMatch
+  // already knows how to run them, and both builds inherit them by extraction.
+  blindlisten:  { label: 'unwatched and listening',
+                  fn: r => r.kind !== 'gateway' && r.mde !== 'onboarded'
+                        && ((IDB_CACHE[r.ip] || {}).ports || []).length > 0 },
+  blindreached: { label: 'unwatched, Microsoft reached it',
+                  fn: r => r.kind !== 'gateway' && r.mde !== 'onboarded'
+                        && !!r.scanned && !!r.scannedPort },
+  hirisk:       { label: 'a high-risk port exposed',
+                  fn: r => ((IDB_CACHE[r.ip] || {}).ports || [])
+                            .some(p => ['critical', 'high'].includes(_portRisk(p))) },
+  cve:          { label: 'CVEs observed by Shodan',
+                  fn: r => ((IDB_CACHE[r.ip] || {}).vulns || []).length > 0 },
+  mshigh:       { label: 'Defender exposure level High',
+                  fn: r => /^high$/i.test(r.exposureLevel || '') },
+  basic:        { label: 'a Basic SKU address',
+                  fn: r => /^basic$/i.test(r.sku || '') },
 };
 
 // Flat fills, no <defs> and no ids — these render once per row, and duplicated
@@ -871,6 +900,403 @@ function cveExploitAgg(cves) {
     if (d.epss != null && (maxEpss === null || d.epss > maxEpss)) maxEpss = d.epss;
   });
   return { anyKev, maxEpss };
+}
+
+// Which headline the filter currently represents, as one answer instead of the
+// same three-way test spelled out at each call site.
+function _sfKpiActive() {
+  if (_SF.preset) return _SF.preset;
+  if (_SF.defender === 'Onboarded') return 'sensor';
+  return _sfActive() ? '' : 'all';
+}
+
+// When the Shodan pass last finished. Freshness is half the credibility of an
+// exposure view, so the strip prints it rather than only how much of it ran.
+let _shodanAt = null;
+
+// -- Risk, but only what these two files plus Shodan can actually support ----
+//
+// The temptation is a row of generic counts: machines with open ports, criticals,
+// and so on. Most of that would be Shodan restated, and Shodan restated is
+// available from shodan.io without either export. What this tool alone can
+// compute is coverage CROSSED with reachability: not "something is listening" and
+// not "nothing is watching it", but both about the same address. That is the
+// finding, and it is what the first two tiles are.
+//
+// The third and fourth are severity of what is exposed, the fifth is Microsoft's
+// own opinion about the device, the sixth is a configuration fact. Each names its
+// own source, because a Defender rating and a Shodan observation are not the same
+// kind of claim and should not read as one.
+//
+// Every Shodan-derived tile shows a dash until the lookup has actually run.
+// Printing 0 there would be the false-zero this app keeps having to fix: "we did
+// not look" rendered as "we looked and found none".
+const _RISK = [
+  { k: 'blindlisten', rank: 1, from: 'nosensor',
+    lab: 'Unwatched and listening', col: '#f85149', shodan: true,
+    why: 'No Defender sensor, and Shodan has seen at least one port open. Nothing is '
+       + 'watching, and something is answering. This is the pair neither tool tells you '
+       + 'about on its own.', },
+  { k: 'blindreached', rank: 2, from: 'nosensor',
+    lab: 'Unwatched, Microsoft got in', col: '#f85149',
+    why: "No Defender sensor, and Defender's own internet scanner reached the address on a "
+       + 'port. Microsoft proved it was reachable and there is no sensor on it. Comes '
+       + 'entirely from the export — no third party involved.', },
+  { k: 'hirisk', rank: 3, lab: 'High-risk port exposed', col: 'var(--orange)', shodan: true,
+    why: 'Shodan reports a port this tool rates critical or high — remote access, file '
+       + 'sharing or a database. Their observation, from whenever their scanners last '
+       + 'passed, not ours.', },
+  { k: 'cve', rank: 4, lab: 'Known CVEs observed', col: '#f85149', shodan: true,
+    why: 'Shodan matched a CVE against what it saw. A lead worth checking, not a confirmed '
+       + 'finding: it may be stale, or patched, or a false match on a banner.', },
+  { k: 'mshigh', rank: 5, lab: 'Defender rates exposure High', col: 'var(--gold)',
+    why: "Defender's own exposure level for the device, straight out of the export. "
+       + "Microsoft's opinion about the machine, not an observation about the address.", },
+  { k: 'basic', rank: 6, lab: 'Basic SKU address', col: 'var(--gold)',
+    why: 'A Basic public IP. No NSG is applied by default and the SKU is retired, so these '
+       + 'are worth moving whatever else is true about them.', },
+];
+
+function _riskStrip(t) {
+  const rows = t.rows;
+  // Has the Shodan pass run at all? undefined means never asked, so a Shodan tile
+  // has nothing to report rather than nothing to find.
+  const asked = rows.filter(r => IDB_CACHE[r.ip] !== undefined && IDB_CACHE[r.ip] !== null).length;
+  const active = _sfKpiActive();
+
+  // Three states, not two. A tile used to be either "has a number" or ".nil",
+  // which put "we have not looked" and "we looked and it is clean" in the same
+  // grey box — the same conflation this app keeps having to undo elsewhere.
+  //   unknown  the lookup has not run. Dash, dim, inert.
+  //   clear    it ran and found none. Zero with a tick, in green: verified.
+  //   hit      a finding. Severity colour, heavier numeral, clickable.
+  const cards = _RISK.map(x => {
+    const pending = x.shodan && !asked;
+    const n = pending ? null : rows.filter(_SF_PRESETS[x.k].fn).length;
+    return { x, state: pending ? 'unknown' : n ? 'hit' : 'clear', n };
+  });
+  // Findings first, worst first, because this row is the output of the page and
+  // was reading as a footnote. Then what is verified clean, then what is unknown
+  // — unknown last, since it is the only group that is not an answer.
+  const ORD = { hit: 0, clear: 1, unknown: 2 };
+  cards.sort((a, b) => ORD[a.state] - ORD[b.state] || a.x.rank - b.x.rank);
+
+  const tiles = cards.map(({ x, state, n }) => {
+    const on = active === x.k;
+    const clickable = state === 'hit';
+    const tip = x.why + (state === 'unknown'
+        ? ' — the Shodan lookup has not run yet, so this is unknown rather than zero.'
+      : state === 'clear' ? ' — checked, and none in this estate.'
+      : on ? ' Showing only these; click to clear.' : ' Click to show only these.');
+    return `<div class="rk ${state}${on ? ' on' : ''}" data-k="${x.k}"${
+      x.from ? ` data-from="${x.from}"` : ''}
+      ${x.from ? 'onmouseenter="_xhlFromTile(this,1)" onmouseleave="_xhlFromTile(this,0)"' : ''}
+      ${clickable ? `role="button" tabindex="0" onclick="surfaceKpiFilter('${x.k}')"
+        onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();surfaceKpiFilter('${x.k}')}"` : ''}
+      title="${esc(tip)}">
+      <b${state === 'hit' ? ` style="color:${x.col}"` : ''}>${
+        state === 'unknown' ? '—' : state === 'clear' ? '0 <i class="tick">✓</i>' : n}</b>
+      <span>${esc(x.lab)}${on ? ' <i>✕</i>' : ''}</span>
+      <em>${x.shodan ? 'Shodan' : x.k === 'blindreached' ? 'Defender scan' : 'from the export'}</em>
+    </div>`;
+  }).join('');
+
+  const hits = cards.filter(c => c.state === 'hit').length;
+  // Freshness is half the credibility of an exposure view, so the strip says when
+  // the lookup actually ran rather than only how much of it did.
+  const when = _shodanAt
+    ? ` · <span title="${esc('Shodan InternetDB last queried ' + new Date(_shodanAt).toLocaleString())}"
+        >checked ${new Date(_shodanAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>`
+    : '';
+  return `<div class="risk">
+    <div class="risk-hd">Worth acting on
+      <span>${asked ? `${hits ? hits + (hits === 1 ? ' finding' : ' findings') + ' · ' : ''}`
+                      + `Shodan checked ${asked} of ${rows.length}${when}`
+                    : `${_RISK.filter(y => y.shodan).length} of these need the Shodan lookup, `
+                      + 'which runs when the report is built — they read \u201c\u2014\u201d, meaning '
+                      + 'unknown rather than none'}</span>
+    </div>
+    <div class="risk-row" id="risk-row">${tiles}</div>
+  </div>`;
+}
+
+// Cross-highlight. The 12 UNWATCHED on the diagram and the "unwatched and
+// listening" tile below it are the same addresses seen twice, and the viewer had
+// to work that out. Hovering either lights the other, which turns two views into
+// one model without adding a word of explanation.
+function _xhl(k, on) {
+  const row = document.getElementById('risk-row');
+  if (row) row.classList.toggle('xhl-' + k, !!on);
+  document.querySelectorAll('.hk[data-k]').forEach(g => {
+    if (g.getAttribute('data-k') === k) g.classList.toggle('xhl', !!on);
+  });
+}
+
+function _xhlFromTile(el, on) {
+  const k = el.getAttribute('data-from');
+  if (k) _xhl(k, on);
+}
+
+// -- The whole report, as one flow -----------------------------------------
+// Two questions about the same addresses -- where each came from, and what is
+// watching it -- answered together, with the count written on every line so the
+// diagram is read rather than measured.
+//
+// Thin lines rather than fat bands, deliberately: at estate scale a true Sankey
+// puts 30-to-90px ribbons across each other and the overlaps mix into something
+// that reads as a rendering fault. But thin was being read as "width means
+// nothing", and it half did -- width came from three coarse buckets, so 12 and 33
+// could draw identically.
+//
+// Width is now continuous in the count, floored so a leg of 1 still exists:
+// max(1.6, n/total * 15). At 79 addresses that is roughly 8px for 46 and 2px for
+// 12, which is a range you can see without any ribbon growing thick enough to
+// obscure the one it crosses. Magnitude is felt, exactness still comes from the
+// chip, and the bars beside each node keep carrying the share.
+//
+// Each source-to-outcome leg is also a gradient, from the source colour into the
+// status colour. That is what makes a path traceable end to end: "Defender-only
+// addresses that are watched" is one continuous gold-into-green band rather than
+// a green line that appears from nowhere mid-diagram.
+//
+// The wiring is the cross-tab, so the four outcome legs are disjoint and sum to
+// the total by construction. That is also what makes the two-46s question
+// answer itself: WATCHED is reached by two separate lines, 13 and 33, so it is
+// visibly not the same set as the 46-strong Azure source beside it.
+function _valueHero() {
+  const snap = _mapSnap();
+  if (!snap) return '';
+  let t; try { t = _surfaceStats(snap); } catch (e) { return ''; }
+  if (!t.total) return '';
+  const still = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  const GREEN = '#3fb950', RED = '#f85149', STEEL = '#8b949e', AZ = '#3b9bf0',
+        GOLD = '#e3b341', BLUE = '#58a6ff';
+  const isGw = r => r.kind === 'gateway';
+  const isOk = r => !isGw(r) && r.mde === 'onboarded';
+
+  const XG = 84, YG = 150, RG = 46;              // the internet
+  const XS = 432;                                 // source badges
+  const XC = 792, CW = 306, CH = 58;              // outcome cards
+  const HH = 322;
+
+  const OUT = [
+    { k: 'sensor',   y: 58,  lab: 'WATCHED',           sub: 'a sensor is reporting',
+      col: GREEN, rows: t.rows.filter(isOk), ico: 'ok' },
+    { k: 'nosensor', y: 150, lab: 'UNWATCHED',         sub: 'nothing would see an intrusion',
+      col: RED,   rows: t.rows.filter(r => !isGw(r) && r.mde !== 'onboarded'), ico: 'eye' },
+    { k: 'gateway',  y: 242, lab: 'NO AGENT EXPECTED', sub: 'gateway, WAF or bastion',
+      col: STEEL, rows: t.rows.filter(isGw), ico: 'gw' },
+  ].filter(o => o.rows.length);
+  const SRC = [
+    { k: 'azure',  y: 74,  lab: 'AZURE EXPORT',  sub: 'Azure issued the address',
+      col: AZ,   rows: t.rows.filter(r => r.src !== 'onprem'), ico: _ICO_AZ },
+    { k: 'onprem', y: 232, lab: 'DEFENDER ONLY', sub: 'no Azure address',
+      col: GOLD, rows: t.rows.filter(r => r.src === 'onprem'), ico: _ICO_MDE },
+  ].filter(s2 => s2.rows.length);
+
+  const active = _sfKpiActive();
+  const lit = k => !active || active === 'all' || active === k;
+
+  // -- lines ---------------------------------------------------------------
+  // Flat, curve, flat: horizontal control points, which is what gives the
+  // reference its shape and keeps the label legs horizontal where the chip sits.
+  const curve = (x1, y1, x2, y2) => {
+    const c = (x2 - x1) * 0.46;
+    return `M${x1},${y1} C${(x1 + c).toFixed(1)},${y1} ${(x2 - c).toFixed(1)},${y2} ${x2},${y2}`;
+  };
+  const at = (x1, y1, x2, y2, tt) => {           // point on that curve
+    const c = (x2 - x1) * 0.46, u = 1 - tt;
+    const cx1 = x1 + c, cx2 = x2 - c;
+    return [u * u * u * x1 + 3 * u * u * tt * cx1 + 3 * u * tt * tt * cx2 + tt * tt * tt * x2,
+            u * u * u * y1 + 3 * u * u * tt * y1 + 3 * u * tt * tt * y2 + tt * tt * tt * y2];
+  };
+  // Source legs, then one leg per non-empty cell of the cross-tab.
+  const legs = [];
+  SRC.forEach(s2 => legs.push({ x1: XG + RG + 6, y1: YG, x2: XS - 34, y2: s2.y,
+                                n: s2.rows.length, col: s2.col, on: [s2.k], tt: 0.42 }));
+  SRC.forEach(s2 => OUT.forEach(o => {
+    const n = s2.rows.filter(r => o.rows.includes(r)).length;
+    if (n) legs.push({ x1: XS + 34, y1: s2.y, x2: XC - 6, y2: o.y,
+                       n, col: o.col, from: s2.col, grad: `lg${s2.k}${o.k}`,
+                       on: [s2.k, o.k], tt: 0.6 });
+  }));
+  // One gradient per leg. gradientUnits="userSpaceOnUse" with the leg's own end
+  // points, so the ramp follows the path's actual direction instead of being
+  // stretched across an arbitrary bounding box.
+  const legGrads = legs.filter(l => l.grad).map(l =>
+    `<linearGradient id="${l.grad}" gradientUnits="userSpaceOnUse"
+       x1="${l.x1}" y1="${l.y1}" x2="${l.x2}" y2="${l.y2}">
+       <stop offset="0" stop-color="${l.from}"/>
+       <stop offset="1" stop-color="${l.col}"/></linearGradient>`).join('');
+
+  const dimOf = l => (active && active !== 'all' && !l.on.includes(active));
+  const lines = legs.map(l => {
+    const d = curve(l.x1, l.y1, l.x2, l.y2), dim = dimOf(l);
+    const w = Math.max(1.6, l.n / t.total * 15);
+    const paint = l.grad ? `url(#${l.grad})` : l.col;
+    return `<path d="${d}" fill="none" stroke="${paint}" stroke-width="${(w + 4).toFixed(1)}"
+        stroke-opacity="${dim ? 0 : .13}" stroke-linecap="round"/>
+      <path d="${d}" fill="none" stroke="${paint}" stroke-width="${w.toFixed(1)}"
+        stroke-opacity="${dim ? .12 : .92}" stroke-linecap="round"/>`;
+  }).join('');
+  // The count, on the line. This is the whole reason thin lines work.
+  const chips = legs.map(l => {
+    const [cx, cy] = at(l.x1, l.y1, l.x2, l.y2, l.tt), dim = dimOf(l);
+    const w = String(l.n).length * 8 + 13;
+    return `<g opacity="${dim ? .18 : 1}">
+      <rect x="${(cx - w / 2).toFixed(1)}" y="${(cy - 9).toFixed(1)}" width="${w}" height="18"
+        rx="5" fill="#0d1117" stroke="${l.col}" stroke-opacity=".45"/>
+      <text x="${cx.toFixed(1)}" y="${(cy + 4.5).toFixed(1)}" text-anchor="middle" font-size="11.5"
+        font-weight="800" fill="${l.col}">${l.n}</text></g>`;
+  }).join('');
+  // Motes, so the lines read as traffic rather than as plumbing.
+  const DUR = 7;
+  const motes = still ? '' : legs.map(l => {
+    const n = Math.max(1, Math.min(5, Math.round(l.n / t.total * 12)));
+    if (dimOf(l)) return '';
+    return Array.from({ length: n }, (_, i) => `<circle r="2.1" fill="${l.col}" opacity="0">
+      <animateMotion dur="${DUR}s" begin="${(-(i / n) * DUR).toFixed(2)}s" repeatCount="indefinite"
+        path="${curve(l.x1, l.y1, l.x2, l.y2)}"/>
+      <animate attributeName="opacity" dur="${DUR}s" begin="${(-(i / n) * DUR).toFixed(2)}s"
+        repeatCount="indefinite" values="0;1;1;0" keyTimes="0;.12;.86;1"/></circle>`).join('');
+  }).join('');
+
+  // -- nodes ---------------------------------------------------------------
+  const hk = (k, x, y, w, h, inner, tip) => {
+    const on = active === k;
+    return `<g class="hk${on ? ' on' : ''}" data-k="${k}" role="button" tabindex="0"
+      onmouseenter="_xhl('${k}',1)" onmouseleave="_xhl('${k}',0)"
+      onclick="surfaceKpiFilter('${k}')"
+      onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();surfaceKpiFilter('${k}')}">
+      <rect x="${x}" y="${y}" width="${w}" height="${h}" rx="9" fill="transparent"
+        stroke="${on ? BLUE : 'transparent'}" stroke-width="1.3"/>${inner}
+      <title>${esc(tip + (on ? ' — showing only these; click to clear.'
+                             : ' — click to show only these.'))}</title></g>`;
+  };
+  // Source badge: the product mark in a tile, count and label beneath, and a
+  // short bar whose height is the share — the proportion the thin lines gave up.
+  const srcNodes = SRC.map(s2 => {
+    const on = active === s2.k, o = lit(s2.k) ? 1 : .3;
+    const bh = Math.max(6, s2.rows.length / t.total * 92);
+    return hk(s2.k, XS - 62, s2.y - 40, 124, 96, `<g opacity="${o}">
+      <rect x="${XS - 26}" y="${s2.y - 26}" width="52" height="52" rx="12"
+        fill="rgba(56,139,253,.10)" stroke="${s2.col}" stroke-opacity="${on ? .9 : .5}"/>
+      <g transform="translate(${XS - 11},${s2.y - 11}) scale(2)">${s2.ico}</g>
+      <rect x="${XS + 32}" y="${(s2.y - bh / 2).toFixed(1)}" width="5" height="${bh.toFixed(1)}"
+        rx="2.5" fill="${s2.col}" fill-opacity=".55"/>
+      <text x="${XS}" y="${s2.y + 42}" text-anchor="middle" font-size="8.5" font-weight="800"
+        letter-spacing=".07em" fill="${s2.col}">${s2.lab}</text>
+      <text x="${XS}" y="${s2.y + 58}" text-anchor="middle" font-size="17" font-weight="800"
+        fill="${s2.col}">${s2.rows.length}</text>
+      <text x="${XS}" y="${s2.y + 69}" text-anchor="middle" font-size="8.5" fill="var(--muted)"
+        >${on ? 'showing these ✕' : s2.sub}</text></g>`,
+      `${s2.rows.length} of the ${t.total} addresses: ${s2.sub}`);
+  }).join('');
+  const ICO = {
+    ok:  `<circle r="9" fill="none" stroke="${GREEN}" stroke-width="1.5"/>
+          <path d="M-4 0.5 -1 3.5 4.5 -2.5" fill="none" stroke="${GREEN}" stroke-width="1.8"
+            stroke-linecap="round" stroke-linejoin="round"/>`,
+    eye: `<path d="M-9 0C-6-4.5 6-4.5 9 0 6 4.5-6 4.5-9 0Z" fill="none" stroke="${RED}"
+            stroke-width="1.5"/><circle r="2.4" fill="${RED}"/>
+          <path d="M-7-6 7 6" stroke="${RED}" stroke-width="1.5" stroke-linecap="round"/>`,
+    gw:  `<circle r="9" fill="none" stroke="${STEEL}" stroke-width="1.5"/>
+          <path d="M-9 0h18M0-9c2.6 2.7 4 5.7 4 9s-1.4 6.3-4 9c-2.6-2.7-4-5.7-4-9s1.4-6.3 4-9Z"
+            fill="none" stroke="${STEEL}" stroke-width="1.2"/>`,
+  };
+  const outNodes = OUT.map(o => {
+    const on = active === o.k, op = lit(o.k) ? 1 : .32;
+    const bh = Math.max(6, o.rows.length / t.total * 92);
+    return hk(o.k, XC - 4, o.y - CH / 2 - 4, CW + 8, CH + 8, `<g opacity="${op}">
+      <rect x="${XC}" y="${o.y - CH / 2}" width="${CW}" height="${CH}" rx="9"
+        fill="${o.col}" fill-opacity="${on ? .12 : .06}" stroke="${on ? BLUE : o.col}"
+        stroke-opacity="${on ? 1 : .45}" stroke-width="${on ? 1.6 : 1}"/>
+      <g transform="translate(${XC + 34},${o.y})">${ICO[o.ico]}</g>
+      <text x="${XC + 60}" y="${o.y - 8}" font-size="9" font-weight="800" letter-spacing=".07em"
+        fill="${o.col}">${o.lab}</text>
+      <text x="${XC + 60}" y="${o.y + 12}" font-size="19" font-weight="800" fill="${o.col}"
+        >${o.rows.length}</text>
+      <text x="${XC + 62 + String(o.rows.length).length * 12}" y="${o.y + 11}" font-size="9"
+        fill="${on ? BLUE : 'var(--muted)'}">${on ? 'showing these ✕' : o.sub}</text>
+      ${o.k !== 'sensor' ? '' : `<text x="${XC + CW - 22}" y="${o.y + 5}" text-anchor="end"
+        font-size="17" font-weight="800" fill="${t.pct >= 70 ? GREEN
+          : t.pct >= 40 ? GOLD : RED}">${t.pct}%</text>
+      <text x="${XC + CW - 22}" y="${o.y + 16}" text-anchor="end" font-size="7.5"
+        fill="var(--muted)">of ${t.comparable} that could carry one</text>`}
+      <rect x="${XC + CW - 12}" y="${(o.y - bh / 2).toFixed(1)}" width="5" height="${bh.toFixed(1)}"
+        rx="2.5" fill="${o.col}" fill-opacity=".5"/></g>`,
+      `${o.rows.length} addresses: ${o.sub}`);
+  }).join('');
+
+  const globe = `
+    <defs>
+      <clipPath id="hGlobe"><circle cx="${XG}" cy="${YG}" r="${RG}"/></clipPath>
+      <radialGradient id="hWell" cx="50%" cy="38%" r="66%">
+        <stop offset="0%" stop-color="#3a1013"/><stop offset="62%" stop-color="#1a0709"/>
+        <stop offset="100%" stop-color="#0b0305"/></radialGradient>
+      <linearGradient id="hRim" x1="0" y1="0" x2=".75" y2="1">
+        <stop offset="0" stop-color="${RED}" stop-opacity=".85"/>
+        <stop offset=".5" stop-color="${RED}" stop-opacity=".45"/>
+        <stop offset="1" stop-color="${RED}" stop-opacity=".16"/></linearGradient>
+    </defs>
+    <circle cx="${XG}" cy="${YG}" r="${RG}" fill="url(#hWell)"/>
+    <g clip-path="url(#hGlobe)"><g transform="translate(${XG},${YG}) scale(2)">
+      <g>${still ? '' : `<animateTransform attributeName="transform" type="translate"
+        values="0,0;92,0" dur="48s" repeatCount="indefinite"/>`}
+        ${[-43, -135].map(dx => `<path transform="translate(${dx},-23)" fill="${RED}"
+          fill-opacity=".28" d="M14,7 22,5 30,6 31,10 27,13 24,17 21,15 18,12 15,11Z
+             M33,3 38,2 39,6 35,7Z M27,20 32,19 35,22 34,27 31,33 29,37 27,32 26,25Z
+             M43,7 50,6 55,8 54,12 49,13 45,11Z
+             M45,14 54,13 58,16 56,22 53,28 50,32 47,27 45,20Z
+             M55,5 70,4 80,7 83,12 78,16 72,19 66,17 60,13 56,10Z M64,17 68,17 66,22Z
+             M75,27 82,26 84,29 81,32 76,31Z"/>`).join('')}
+      </g></g></g>
+    <circle cx="${XG}" cy="${YG}" r="${RG}" fill="none" stroke="url(#hRim)" stroke-width="1.6"/>
+    ${still ? '' : [0, -1.9, -3.8].map(b2 => `<circle cx="${XG}" cy="${YG}" r="${RG + 1}"
+      fill="none" stroke="${RED}" stroke-width="1.2" opacity="0">
+      <animate attributeName="r" values="${RG + 1};${RG + 22}" dur="5.7s" begin="${b2}s"
+        repeatCount="indefinite"/>
+      <animate attributeName="opacity" values=".42;0" dur="5.7s" begin="${b2}s"
+        repeatCount="indefinite"/></circle>`).join('')}
+    ${Array.from({ length: 20 }, (_, k) => { const ang = k * 18 * Math.PI / 180;
+      const long = k % 5 === 0, r0 = RG + 6, r1 = RG + 6 + (long ? 8 : 4);
+      return `<line x1="${(XG + r0 * Math.cos(ang)).toFixed(1)}" y1="${(YG + r0 * Math.sin(ang)).toFixed(1)}"
+        x2="${(XG + r1 * Math.cos(ang)).toFixed(1)}" y2="${(YG + r1 * Math.sin(ang)).toFixed(1)}"
+        stroke="${RED}" stroke-width="${long ? 1.3 : 1}"
+        stroke-opacity="${long ? '.5' : '.24'}"/>`; }).join('')}`;
+
+  return `<div class="hero">
+    <svg viewBox="0 0 1120 ${HH}" style="width:100%;height:auto;display:block"
+      font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" role="img"
+      aria-label="${t.total} public IPs. From ${SRC.map(x =>
+        `${x.rows.length} ${x.lab}`).join(' and ')}. Outcome: ${OUT.map(x =>
+        `${x.rows.length} ${x.lab}`).join(', ')}.">
+      ${globe}
+      <defs>${legGrads}</defs>
+      ${lines}${motes}${chips}
+      ${hk('all', XG - 56, YG + RG + 12, 112, 54, `
+        <text x="${XG}" y="${YG + RG + 40}" text-anchor="middle" font-size="26" font-weight="800"
+          fill="${BLUE}">${t.total}</text>
+        <text x="${XG}" y="${YG + RG + 52}" text-anchor="middle" font-size="8" font-weight="800"
+          letter-spacing=".09em" fill="${BLUE}">ADDRESSES</text>
+        <text x="${XG}" y="${YG + RG + 63}" text-anchor="middle" font-size="8.5" fill="var(--muted)"
+          >${active === 'all' ? 'showing all' : 'reachable from the internet'}</text>`,
+        `All ${t.total} addresses either export knows about`)}
+      ${lblRow(XG, YG - RG - 12, 'THE INTERNET', RED, 8.5)}
+      ${srcNodes}${outNodes}
+      <text x="${XS}" y="16" text-anchor="middle" font-size="8.5" font-weight="800"
+        letter-spacing=".11em" fill="var(--muted)">WHERE IT CAME FROM</text>
+      <text x="${XC}" y="16" font-size="8.5" font-weight="800"
+        letter-spacing=".11em" fill="var(--muted)">WHAT IS WATCHING IT</text>
+    </svg>
+    <div class="hero-hint">Click any figure to filter the table below</div>
+    ${_riskStrip(t)}
+  </div>`;
+}
+
+function lblRow(x, y, txt, col, sz) {
+  return `<text x="${x}" y="${y}" text-anchor="middle" font-size="${sz || 9}" font-weight="800"
+    letter-spacing=".08em" fill="${col}">${txt}</text>`;
 }
 
 // Deliberately free of PowerShell's backtick line-continuation: a backtick
@@ -1140,19 +1566,6 @@ function buildSurfaceReport(snap) {
   const when = new Date(s.at).toLocaleString();
   const pctCol = t.pct >= 70 ? '#3fb950' : t.pct >= 40 ? 'var(--gold)' : 'var(--red)';
 
-  // kpi: the headline tiles filter the table. The section-1 tiles below stay
-  // plain — they are a breakdown of what the filter bar already offers, and
-  // three ways to set the same filter is worse than one.
-  const stat = (v, l, col, tip, kpi) => { const on = kpi && (kpi === 'all'
-      ? !_sfActive() : kpi === 'sensor' ? _SF.defender === 'Onboarded' : _SF.preset === 'nosensor');
-    return `<div style="flex:1 1 118px;min-width:118px;padding:11px 12px;
-    background:${on ? 'rgba(56,139,253,.12)' : 'var(--bg2)'};border-radius:8px;
-    border:1px solid ${on ? 'var(--blue)' : 'var(--border)'}${kpi ? ';cursor:pointer' : ''}"${
-      kpi ? ` role="button" tabindex="0" onclick="surfaceKpiFilter('${kpi}')"
-        onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();surfaceKpiFilter('${kpi}')}"` : ''}${
-      tip ? ` title="${esc(tip + (kpi ? ' — click to filter the table' : ''))}"` : ''}>
-    <div style="font-size:21px;font-weight:800;line-height:1.1;color:${col || 'var(--text)'}">${v}</div>
-    <div style="font-size:10px;color:${on ? 'var(--text)' : 'var(--muted)'};margin-top:3px">${l}${kpi ? `<span style="opacity:.5"> ${on ? '✕' : '⌄'}</span>` : ''}</div></div>`; };
 
   const hdr = (n, txt, sub) => `<div style="margin:20px 0 8px">
     <div style="font-size:12px;font-weight:700;color:var(--text)">
@@ -1186,6 +1599,9 @@ function buildSurfaceReport(snap) {
         `<button class="btn btn-secondary" style="font-size:10px;padding:4px 10px"
           onclick="closeSurfaceReport()">← Back</button>`}
     </div>
+
+    ${_valueHero()}
+
 
     ${s.looksFiltered ? `<div style="margin-top:12px;padding:9px 12px;border-radius:7px;
       border-left:2px solid var(--gold);background:rgba(227,179,65,.08);font-size:11.5px;line-height:1.7">
@@ -1387,7 +1803,6 @@ const RESULTS = [], TARGETS = [];
 
 let SURFACE_SNAP = null;
 let IDB_CACHE = {};      // ip -> Shodan InternetDB record, null while in flight
-let _shodanAt = null;    // when the last Shodan pass finished, for the freshness line
 
 // ip -> { countryCode, country, city, lat, lon }, persisted.
 //
@@ -1435,6 +1850,10 @@ let _PENDING = null;
 // yet — and _surfaceSnapFrom is pure, so building one early costs nothing and
 // commits to nothing.
 let _PREVIEW_SNAP = null;
+// Overrides scanner.html's, which returns SURFACE_SNAP alone. Here the map sits
+// on the import page and has to draw from a parse that has not been committed
+// yet, so it accepts the preview snapshot as well. The only shared function this
+// build deliberately redefines.
 function _mapSnap() { return SURFACE_SNAP || _PREVIEW_SNAP; }
 
 // -- Does this look like the right export? ----------------------------------
@@ -1639,418 +2058,51 @@ _SF_PRESETS.azure  = { label: 'addresses from the Azure export',
 _SF_PRESETS.onprem = { label: 'addresses only Defender reported',
                        fn: r => r.src === 'onprem' };
 
-// -- Risk, but only what these two files plus Shodan can actually support ----
-//
-// The temptation is a row of generic counts: machines with open ports, criticals,
-// and so on. Most of that would be Shodan restated, and Shodan restated is
-// available from shodan.io without either export. What this tool alone can
-// compute is coverage CROSSED with reachability: not "something is listening" and
-// not "nothing is watching it", but both about the same address. That is the
-// finding, and it is what the first two tiles are.
-//
-// The third and fourth are severity of what is exposed, the fifth is Microsoft's
-// own opinion about the device, the sixth is a configuration fact. Each names its
-// own source, because a Defender rating and a Shodan observation are not the same
-// kind of claim and should not read as one.
-//
-// Every Shodan-derived tile shows a dash until the lookup has actually run.
-// Printing 0 there would be the false-zero this app keeps having to fix: "we did
-// not look" rendered as "we looked and found none".
-const _RISK = [
-  { k: 'blindlisten', rank: 1, from: 'nosensor',
-    lab: 'Unwatched and listening', col: '#f85149', shodan: true,
-    why: 'No Defender sensor, and Shodan has seen at least one port open. Nothing is '
-       + 'watching, and something is answering. This is the pair neither tool tells you '
-       + 'about on its own.',
-    fn: r => r.kind !== 'gateway' && r.mde !== 'onboarded'
-          && ((IDB_CACHE[r.ip] || {}).ports || []).length > 0 },
-  { k: 'blindreached', rank: 2, from: 'nosensor',
-    lab: 'Unwatched, Microsoft got in', col: '#f85149',
-    why: "No Defender sensor, and Defender's own internet scanner reached the address on a "
-       + 'port. Microsoft proved it was reachable and there is no sensor on it. Comes '
-       + 'entirely from the export — no third party involved.',
-    fn: r => r.kind !== 'gateway' && r.mde !== 'onboarded' && !!r.scanned && !!r.scannedPort },
-  { k: 'hirisk', rank: 3, lab: 'High-risk port exposed', col: 'var(--orange)', shodan: true,
-    why: 'Shodan reports a port this tool rates critical or high — remote access, file '
-       + 'sharing or a database. Their observation, from whenever their scanners last '
-       + 'passed, not ours.',
-    fn: r => ((IDB_CACHE[r.ip] || {}).ports || [])
-              .some(p => ['critical', 'high'].includes(_portRisk(p))) },
-  { k: 'cve', rank: 4, lab: 'Known CVEs observed', col: '#f85149', shodan: true,
-    why: 'Shodan matched a CVE against what it saw. A lead worth checking, not a confirmed '
-       + 'finding: it may be stale, or patched, or a false match on a banner.',
-    fn: r => ((IDB_CACHE[r.ip] || {}).vulns || []).length > 0 },
-  { k: 'mshigh', rank: 5, lab: 'Defender rates exposure High', col: 'var(--gold)',
-    why: "Defender's own exposure level for the device, straight out of the export. "
-       + "Microsoft's opinion about the machine, not an observation about the address.",
-    fn: r => /^high$/i.test(r.exposureLevel || '') },
-  { k: 'basic', rank: 6, lab: 'Basic SKU address', col: 'var(--gold)',
-    why: 'A Basic public IP. No NSG is applied by default and the SKU is retired, so these '
-       + 'are worth moving whatever else is true about them.',
-    fn: r => /^basic$/i.test(r.sku || '') },
-];
-_RISK.forEach(x => { _SF_PRESETS[x.k] = { label: x.lab.toLowerCase(), fn: x.fn }; });
+// The six risk predicates used to be registered here, off _RISK's own fn
+// properties. They now live in _SF_PRESETS in scanner.html and arrive by
+// extraction, so this line survived as a loop that overwrote all seven correct
+// presets with { fn: undefined } — and rows.filter(undefined) took the whole
+// report down to a blank pane. Deliberately left as a comment: the lesson is
+// that moving a definition upstream means deleting the downstream copy, not
+// just stopping using it.
 
-function _riskStrip(t) {
-  const rows = t.rows;
-  // Has the Shodan pass run at all? undefined means never asked, so a Shodan tile
-  // has nothing to report rather than nothing to find.
-  const asked = rows.filter(r => IDB_CACHE[r.ip] !== undefined && IDB_CACHE[r.ip] !== null).length;
-  const active = _sfKpiActive();
 
-  // Three states, not two. A tile used to be either "has a number" or ".nil",
-  // which put "we have not looked" and "we looked and it is clean" in the same
-  // grey box — the same conflation this app keeps having to undo elsewhere.
-  //   unknown  the lookup has not run. Dash, dim, inert.
-  //   clear    it ran and found none. Zero with a tick, in green: verified.
-  //   hit      a finding. Severity colour, heavier numeral, clickable.
-  const cards = _RISK.map(x => {
-    const pending = x.shodan && !asked;
-    const n = pending ? null : rows.filter(x.fn).length;
-    return { x, state: pending ? 'unknown' : n ? 'hit' : 'clear', n };
-  });
-  // Findings first, worst first, because this row is the output of the page and
-  // was reading as a footnote. Then what is verified clean, then what is unknown
-  // — unknown last, since it is the only group that is not an answer.
-  const ORD = { hit: 0, clear: 1, unknown: 2 };
-  cards.sort((a, b) => ORD[a.state] - ORD[b.state] || a.x.rank - b.x.rank);
 
-  const tiles = cards.map(({ x, state, n }) => {
-    const on = active === x.k;
-    const clickable = state === 'hit';
-    const tip = x.why + (state === 'unknown'
-        ? ' — the Shodan lookup has not run yet, so this is unknown rather than zero.'
-      : state === 'clear' ? ' — checked, and none in this estate.'
-      : on ? ' Showing only these; click to clear.' : ' Click to show only these.');
-    return `<div class="rk ${state}${on ? ' on' : ''}" data-k="${x.k}"${
-      x.from ? ` data-from="${x.from}"` : ''}
-      ${x.from ? 'onmouseenter="_xhlFromTile(this,1)" onmouseleave="_xhlFromTile(this,0)"' : ''}
-      ${clickable ? `role="button" tabindex="0" onclick="surfaceKpiFilter('${x.k}')"
-        onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();surfaceKpiFilter('${x.k}')}"` : ''}
-      title="${esc(tip)}">
-      <b${state === 'hit' ? ` style="color:${x.col}"` : ''}>${
-        state === 'unknown' ? '—' : state === 'clear' ? '0 <i class="tick">✓</i>' : n}</b>
-      <span>${esc(x.lab)}${on ? ' <i>✕</i>' : ''}</span>
-      <em>${x.shodan ? 'Shodan' : x.k === 'blindreached' ? 'Defender scan' : 'from the export'}</em>
-    </div>`;
-  }).join('');
 
-  const hits = cards.filter(c => c.state === 'hit').length;
-  // Freshness is half the credibility of an exposure view, so the strip says when
-  // the lookup actually ran rather than only how much of it did.
-  const when = _shodanAt
-    ? ` · <span title="${esc('Shodan InternetDB last queried ' + new Date(_shodanAt).toLocaleString())}"
-        >checked ${new Date(_shodanAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>`
-    : '';
-  return `<div class="risk">
-    <div class="risk-hd">Worth acting on
-      <span>${asked ? `${hits ? hits + (hits === 1 ? ' finding' : ' findings') + ' · ' : ''}`
-                      + `Shodan checked ${asked} of ${rows.length}${when}`
-                    : `${_RISK.filter(y => y.shodan).length} of these need the Shodan lookup, `
-                      + 'which runs when the report is built — they read \u201c\u2014\u201d, meaning '
-                      + 'unknown rather than none'}</span>
-    </div>
-    <div class="risk-row" id="risk-row">${tiles}</div>
-  </div>`;
-}
 
-// Cross-highlight. The 12 UNWATCHED on the diagram and the "unwatched and
-// listening" tile below it are the same addresses seen twice, and the viewer had
-// to work that out. Hovering either lights the other, which turns two views into
-// one model without adding a word of explanation.
-function _xhl(k, on) {
-  const row = document.getElementById('risk-row');
-  if (row) row.classList.toggle('xhl-' + k, !!on);
-  document.querySelectorAll('.hk[data-k]').forEach(g => {
-    if (g.getAttribute('data-k') === k) g.classList.toggle('xhl', !!on);
-  });
-}
-function _xhlFromTile(el, on) {
-  const k = el.getAttribute('data-from');
-  if (k) _xhl(k, on);
-}
-
-// -- The whole report, as one flow -----------------------------------------
-// Two questions about the same addresses -- where each came from, and what is
-// watching it -- answered together, with the count written on every line so the
-// diagram is read rather than measured.
-//
-// Thin lines rather than fat bands, deliberately: at estate scale a true Sankey
-// puts 30-to-90px ribbons across each other and the overlaps mix into something
-// that reads as a rendering fault. But thin was being read as "width means
-// nothing", and it half did -- width came from three coarse buckets, so 12 and 33
-// could draw identically.
-//
-// Width is now continuous in the count, floored so a leg of 1 still exists:
-// max(1.6, n/total * 15). At 79 addresses that is roughly 8px for 46 and 2px for
-// 12, which is a range you can see without any ribbon growing thick enough to
-// obscure the one it crosses. Magnitude is felt, exactness still comes from the
-// chip, and the bars beside each node keep carrying the share.
-//
-// Each source-to-outcome leg is also a gradient, from the source colour into the
-// status colour. That is what makes a path traceable end to end: "Defender-only
-// addresses that are watched" is one continuous gold-into-green band rather than
-// a green line that appears from nowhere mid-diagram.
-//
-// The wiring is the cross-tab, so the four outcome legs are disjoint and sum to
-// the total by construction. That is also what makes the two-46s question
-// answer itself: WATCHED is reached by two separate lines, 13 and 33, so it is
-// visibly not the same set as the 46-strong Azure source beside it.
-function _valueHero() {
-  const snap = _mapSnap();
-  if (!snap) return '';
-  let t; try { t = _surfaceStats(snap); } catch (e) { return ''; }
-  if (!t.total) return '';
-  const still = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-
-  const GREEN = '#3fb950', RED = '#f85149', STEEL = '#8b949e', AZ = '#3b9bf0',
-        GOLD = '#e3b341', BLUE = '#58a6ff';
-  const isGw = r => r.kind === 'gateway';
-  const isOk = r => !isGw(r) && r.mde === 'onboarded';
-
-  const XG = 84, YG = 150, RG = 46;              // the internet
-  const XS = 432;                                 // source badges
-  const XC = 792, CW = 306, CH = 58;              // outcome cards
-  const HH = 322;
-
-  const OUT = [
-    { k: 'sensor',   y: 58,  lab: 'WATCHED',           sub: 'a sensor is reporting',
-      col: GREEN, rows: t.rows.filter(isOk), ico: 'ok' },
-    { k: 'nosensor', y: 150, lab: 'UNWATCHED',         sub: 'nothing would see an intrusion',
-      col: RED,   rows: t.rows.filter(r => !isGw(r) && r.mde !== 'onboarded'), ico: 'eye' },
-    { k: 'gateway',  y: 242, lab: 'NO AGENT EXPECTED', sub: 'gateway, WAF or bastion',
-      col: STEEL, rows: t.rows.filter(isGw), ico: 'gw' },
-  ].filter(o => o.rows.length);
-  const SRC = [
-    { k: 'azure',  y: 74,  lab: 'AZURE EXPORT',  sub: 'Azure issued the address',
-      col: AZ,   rows: t.rows.filter(r => r.src !== 'onprem'), ico: _ICO_AZ },
-    { k: 'onprem', y: 232, lab: 'DEFENDER ONLY', sub: 'no Azure address',
-      col: GOLD, rows: t.rows.filter(r => r.src === 'onprem'), ico: _ICO_MDE },
-  ].filter(s2 => s2.rows.length);
-
-  const active = _sfKpiActive();
-  const lit = k => !active || active === 'all' || active === k;
-
-  // -- lines ---------------------------------------------------------------
-  // Flat, curve, flat: horizontal control points, which is what gives the
-  // reference its shape and keeps the label legs horizontal where the chip sits.
-  const curve = (x1, y1, x2, y2) => {
-    const c = (x2 - x1) * 0.46;
-    return `M${x1},${y1} C${(x1 + c).toFixed(1)},${y1} ${(x2 - c).toFixed(1)},${y2} ${x2},${y2}`;
-  };
-  const at = (x1, y1, x2, y2, tt) => {           // point on that curve
-    const c = (x2 - x1) * 0.46, u = 1 - tt;
-    const cx1 = x1 + c, cx2 = x2 - c;
-    return [u * u * u * x1 + 3 * u * u * tt * cx1 + 3 * u * tt * tt * cx2 + tt * tt * tt * x2,
-            u * u * u * y1 + 3 * u * u * tt * y1 + 3 * u * tt * tt * y2 + tt * tt * tt * y2];
-  };
-  // Source legs, then one leg per non-empty cell of the cross-tab.
-  const legs = [];
-  SRC.forEach(s2 => legs.push({ x1: XG + RG + 6, y1: YG, x2: XS - 34, y2: s2.y,
-                                n: s2.rows.length, col: s2.col, on: [s2.k], tt: 0.42 }));
-  SRC.forEach(s2 => OUT.forEach(o => {
-    const n = s2.rows.filter(r => o.rows.includes(r)).length;
-    if (n) legs.push({ x1: XS + 34, y1: s2.y, x2: XC - 6, y2: o.y,
-                       n, col: o.col, from: s2.col, grad: `lg${s2.k}${o.k}`,
-                       on: [s2.k, o.k], tt: 0.6 });
-  }));
-  // One gradient per leg. gradientUnits="userSpaceOnUse" with the leg's own end
-  // points, so the ramp follows the path's actual direction instead of being
-  // stretched across an arbitrary bounding box.
-  const legGrads = legs.filter(l => l.grad).map(l =>
-    `<linearGradient id="${l.grad}" gradientUnits="userSpaceOnUse"
-       x1="${l.x1}" y1="${l.y1}" x2="${l.x2}" y2="${l.y2}">
-       <stop offset="0" stop-color="${l.from}"/>
-       <stop offset="1" stop-color="${l.col}"/></linearGradient>`).join('');
-
-  const dimOf = l => (active && active !== 'all' && !l.on.includes(active));
-  const lines = legs.map(l => {
-    const d = curve(l.x1, l.y1, l.x2, l.y2), dim = dimOf(l);
-    const w = Math.max(1.6, l.n / t.total * 15);
-    const paint = l.grad ? `url(#${l.grad})` : l.col;
-    return `<path d="${d}" fill="none" stroke="${paint}" stroke-width="${(w + 4).toFixed(1)}"
-        stroke-opacity="${dim ? 0 : .13}" stroke-linecap="round"/>
-      <path d="${d}" fill="none" stroke="${paint}" stroke-width="${w.toFixed(1)}"
-        stroke-opacity="${dim ? .12 : .92}" stroke-linecap="round"/>`;
-  }).join('');
-  // The count, on the line. This is the whole reason thin lines work.
-  const chips = legs.map(l => {
-    const [cx, cy] = at(l.x1, l.y1, l.x2, l.y2, l.tt), dim = dimOf(l);
-    const w = String(l.n).length * 8 + 13;
-    return `<g opacity="${dim ? .18 : 1}">
-      <rect x="${(cx - w / 2).toFixed(1)}" y="${(cy - 9).toFixed(1)}" width="${w}" height="18"
-        rx="5" fill="#0d1117" stroke="${l.col}" stroke-opacity=".45"/>
-      <text x="${cx.toFixed(1)}" y="${(cy + 4.5).toFixed(1)}" text-anchor="middle" font-size="11.5"
-        font-weight="800" fill="${l.col}">${l.n}</text></g>`;
-  }).join('');
-  // Motes, so the lines read as traffic rather than as plumbing.
-  const DUR = 7;
-  const motes = still ? '' : legs.map(l => {
-    const n = Math.max(1, Math.min(5, Math.round(l.n / t.total * 12)));
-    if (dimOf(l)) return '';
-    return Array.from({ length: n }, (_, i) => `<circle r="2.1" fill="${l.col}" opacity="0">
-      <animateMotion dur="${DUR}s" begin="${(-(i / n) * DUR).toFixed(2)}s" repeatCount="indefinite"
-        path="${curve(l.x1, l.y1, l.x2, l.y2)}"/>
-      <animate attributeName="opacity" dur="${DUR}s" begin="${(-(i / n) * DUR).toFixed(2)}s"
-        repeatCount="indefinite" values="0;1;1;0" keyTimes="0;.12;.86;1"/></circle>`).join('');
-  }).join('');
-
-  // -- nodes ---------------------------------------------------------------
-  const hk = (k, x, y, w, h, inner, tip) => {
-    const on = active === k;
-    return `<g class="hk${on ? ' on' : ''}" data-k="${k}" role="button" tabindex="0"
-      onmouseenter="_xhl('${k}',1)" onmouseleave="_xhl('${k}',0)"
-      onclick="surfaceKpiFilter('${k}')"
-      onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();surfaceKpiFilter('${k}')}">
-      <rect x="${x}" y="${y}" width="${w}" height="${h}" rx="9" fill="transparent"
-        stroke="${on ? BLUE : 'transparent'}" stroke-width="1.3"/>${inner}
-      <title>${esc(tip + (on ? ' — showing only these; click to clear.'
-                             : ' — click to show only these.'))}</title></g>`;
-  };
-  // Source badge: the product mark in a tile, count and label beneath, and a
-  // short bar whose height is the share — the proportion the thin lines gave up.
-  const srcNodes = SRC.map(s2 => {
-    const on = active === s2.k, o = lit(s2.k) ? 1 : .3;
-    const bh = Math.max(6, s2.rows.length / t.total * 92);
-    return hk(s2.k, XS - 62, s2.y - 40, 124, 96, `<g opacity="${o}">
-      <rect x="${XS - 26}" y="${s2.y - 26}" width="52" height="52" rx="12"
-        fill="rgba(56,139,253,.10)" stroke="${s2.col}" stroke-opacity="${on ? .9 : .5}"/>
-      <g transform="translate(${XS - 11},${s2.y - 11}) scale(2)">${s2.ico}</g>
-      <rect x="${XS + 32}" y="${(s2.y - bh / 2).toFixed(1)}" width="5" height="${bh.toFixed(1)}"
-        rx="2.5" fill="${s2.col}" fill-opacity=".55"/>
-      <text x="${XS}" y="${s2.y + 42}" text-anchor="middle" font-size="8.5" font-weight="800"
-        letter-spacing=".07em" fill="${s2.col}">${s2.lab}</text>
-      <text x="${XS}" y="${s2.y + 58}" text-anchor="middle" font-size="17" font-weight="800"
-        fill="${s2.col}">${s2.rows.length}</text>
-      <text x="${XS}" y="${s2.y + 69}" text-anchor="middle" font-size="8.5" fill="var(--muted)"
-        >${on ? 'showing these ✕' : s2.sub}</text></g>`,
-      `${s2.rows.length} of the ${t.total} addresses: ${s2.sub}`);
-  }).join('');
-  const ICO = {
-    ok:  `<circle r="9" fill="none" stroke="${GREEN}" stroke-width="1.5"/>
-          <path d="M-4 0.5 -1 3.5 4.5 -2.5" fill="none" stroke="${GREEN}" stroke-width="1.8"
-            stroke-linecap="round" stroke-linejoin="round"/>`,
-    eye: `<path d="M-9 0C-6-4.5 6-4.5 9 0 6 4.5-6 4.5-9 0Z" fill="none" stroke="${RED}"
-            stroke-width="1.5"/><circle r="2.4" fill="${RED}"/>
-          <path d="M-7-6 7 6" stroke="${RED}" stroke-width="1.5" stroke-linecap="round"/>`,
-    gw:  `<circle r="9" fill="none" stroke="${STEEL}" stroke-width="1.5"/>
-          <path d="M-9 0h18M0-9c2.6 2.7 4 5.7 4 9s-1.4 6.3-4 9c-2.6-2.7-4-5.7-4-9s1.4-6.3 4-9Z"
-            fill="none" stroke="${STEEL}" stroke-width="1.2"/>`,
-  };
-  const outNodes = OUT.map(o => {
-    const on = active === o.k, op = lit(o.k) ? 1 : .32;
-    const bh = Math.max(6, o.rows.length / t.total * 92);
-    return hk(o.k, XC - 4, o.y - CH / 2 - 4, CW + 8, CH + 8, `<g opacity="${op}">
-      <rect x="${XC}" y="${o.y - CH / 2}" width="${CW}" height="${CH}" rx="9"
-        fill="${o.col}" fill-opacity="${on ? .12 : .06}" stroke="${on ? BLUE : o.col}"
-        stroke-opacity="${on ? 1 : .45}" stroke-width="${on ? 1.6 : 1}"/>
-      <g transform="translate(${XC + 34},${o.y})">${ICO[o.ico]}</g>
-      <text x="${XC + 60}" y="${o.y - 8}" font-size="9" font-weight="800" letter-spacing=".07em"
-        fill="${o.col}">${o.lab}</text>
-      <text x="${XC + 60}" y="${o.y + 12}" font-size="19" font-weight="800" fill="${o.col}"
-        >${o.rows.length}</text>
-      <text x="${XC + 62 + String(o.rows.length).length * 12}" y="${o.y + 11}" font-size="9"
-        fill="${on ? BLUE : 'var(--muted)'}">${on ? 'showing these ✕' : o.sub}</text>
-      <rect x="${XC + CW - 12}" y="${(o.y - bh / 2).toFixed(1)}" width="5" height="${bh.toFixed(1)}"
-        rx="2.5" fill="${o.col}" fill-opacity=".5"/></g>`,
-      `${o.rows.length} addresses: ${o.sub}`);
-  }).join('');
-
-  const globe = `
-    <defs>
-      <clipPath id="hGlobe"><circle cx="${XG}" cy="${YG}" r="${RG}"/></clipPath>
-      <radialGradient id="hWell" cx="50%" cy="38%" r="66%">
-        <stop offset="0%" stop-color="#3a1013"/><stop offset="62%" stop-color="#1a0709"/>
-        <stop offset="100%" stop-color="#0b0305"/></radialGradient>
-      <linearGradient id="hRim" x1="0" y1="0" x2=".75" y2="1">
-        <stop offset="0" stop-color="${RED}" stop-opacity=".85"/>
-        <stop offset=".5" stop-color="${RED}" stop-opacity=".45"/>
-        <stop offset="1" stop-color="${RED}" stop-opacity=".16"/></linearGradient>
-    </defs>
-    <circle cx="${XG}" cy="${YG}" r="${RG}" fill="url(#hWell)"/>
-    <g clip-path="url(#hGlobe)"><g transform="translate(${XG},${YG}) scale(2)">
-      <g>${still ? '' : `<animateTransform attributeName="transform" type="translate"
-        values="0,0;92,0" dur="48s" repeatCount="indefinite"/>`}
-        ${[-43, -135].map(dx => `<path transform="translate(${dx},-23)" fill="${RED}"
-          fill-opacity=".28" d="M14,7 22,5 30,6 31,10 27,13 24,17 21,15 18,12 15,11Z
-             M33,3 38,2 39,6 35,7Z M27,20 32,19 35,22 34,27 31,33 29,37 27,32 26,25Z
-             M43,7 50,6 55,8 54,12 49,13 45,11Z
-             M45,14 54,13 58,16 56,22 53,28 50,32 47,27 45,20Z
-             M55,5 70,4 80,7 83,12 78,16 72,19 66,17 60,13 56,10Z M64,17 68,17 66,22Z
-             M75,27 82,26 84,29 81,32 76,31Z"/>`).join('')}
-      </g></g></g>
-    <circle cx="${XG}" cy="${YG}" r="${RG}" fill="none" stroke="url(#hRim)" stroke-width="1.6"/>
-    ${still ? '' : [0, -1.9, -3.8].map(b2 => `<circle cx="${XG}" cy="${YG}" r="${RG + 1}"
-      fill="none" stroke="${RED}" stroke-width="1.2" opacity="0">
-      <animate attributeName="r" values="${RG + 1};${RG + 22}" dur="5.7s" begin="${b2}s"
-        repeatCount="indefinite"/>
-      <animate attributeName="opacity" values=".42;0" dur="5.7s" begin="${b2}s"
-        repeatCount="indefinite"/></circle>`).join('')}
-    ${Array.from({ length: 20 }, (_, k) => { const ang = k * 18 * Math.PI / 180;
-      const long = k % 5 === 0, r0 = RG + 6, r1 = RG + 6 + (long ? 8 : 4);
-      return `<line x1="${(XG + r0 * Math.cos(ang)).toFixed(1)}" y1="${(YG + r0 * Math.sin(ang)).toFixed(1)}"
-        x2="${(XG + r1 * Math.cos(ang)).toFixed(1)}" y2="${(YG + r1 * Math.sin(ang)).toFixed(1)}"
-        stroke="${RED}" stroke-width="${long ? 1.3 : 1}"
-        stroke-opacity="${long ? '.5' : '.24'}"/>`; }).join('')}`;
-
-  return `<div class="hero">
-    <svg viewBox="0 0 1120 ${HH}" style="width:100%;height:auto;display:block"
-      font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" role="img"
-      aria-label="${t.total} public IPs. From ${SRC.map(x =>
-        `${x.rows.length} ${x.lab}`).join(' and ')}. Outcome: ${OUT.map(x =>
-        `${x.rows.length} ${x.lab}`).join(', ')}.">
-      ${globe}
-      <defs>${legGrads}</defs>
-      ${lines}${motes}${chips}
-      ${hk('all', XG - 56, YG + RG + 12, 112, 54, `
-        <text x="${XG}" y="${YG + RG + 40}" text-anchor="middle" font-size="26" font-weight="800"
-          fill="${BLUE}">${t.total}</text>
-        <text x="${XG}" y="${YG + RG + 52}" text-anchor="middle" font-size="8" font-weight="800"
-          letter-spacing=".09em" fill="${BLUE}">ADDRESSES</text>
-        <text x="${XG}" y="${YG + RG + 63}" text-anchor="middle" font-size="8.5" fill="var(--muted)"
-          >${active === 'all' ? 'showing all' : 'reachable from the internet'}</text>`,
-        `All ${t.total} addresses either export knows about`)}
-      ${lblRow(XG, YG - RG - 12, 'THE INTERNET', RED, 8.5)}
-      ${srcNodes}${outNodes}
-      <text x="${XS}" y="16" text-anchor="middle" font-size="8.5" font-weight="800"
-        letter-spacing=".11em" fill="var(--muted)">WHERE IT CAME FROM</text>
-      <text x="${XC}" y="16" font-size="8.5" font-weight="800"
-        letter-spacing=".11em" fill="var(--muted)">WHAT IS WATCHING IT</text>
-    </svg>
-    <div class="hero-hint">Click any figure to filter the table below</div>
-    ${_riskStrip(t)}
-  </div>`;
-}
-
-function lblRow(x, y, txt, col, sz) {
-  return `<text x="${x}" y="${y}" text-anchor="middle" font-size="${sz || 9}" font-weight="800"
-    letter-spacing=".08em" fill="${col}">${txt}</text>`;
-}
-
+// A throw anywhere in here used to leave the pane empty, which on a dark theme is
+// a black screen — the least informative failure a page can have. The report is
+// one large template literal, so a single bad value takes the whole thing down.
+// Showing the error beats showing nothing: it means a bug report can start with
+// the message rather than with "it went black".
 function _surfaceRedraw() {
   const el = document.getElementById('pane-surface');
   if (!el) return;
+  try { _surfaceRedrawInner(el); }
+  catch (e) {
+    console.error('[report]', e);
+    el.innerHTML = '<div style="padding:22px 18px;max-width:780px">'
+      + '<div style="font-size:12.5px;font-weight:700;color:var(--red);margin-bottom:8px">'
+      + 'The report could not be drawn.</div>'
+      + '<div style="font-size:11.5px;color:var(--muted);line-height:1.7">Both exports were read '
+      + 'and parsed — this is a fault building the page from them, not a problem with your files. '
+      + 'The whole of it is below.</div>'
+      + '<pre style="margin-top:10px;padding:9px 11px;border-radius:6px;background:var(--bg);'
+      + 'border:1px solid var(--border);font-size:10.5px;color:var(--text);white-space:pre-wrap;'
+      + 'overflow-x:auto">' + esc(String((e && e.stack) || e)) + '</pre>'
+      + '<button class="btn btn-secondary" style="margin-top:11px;font-size:11px;padding:5px 12px" '
+      + 'onclick="closeSurfaceReport()">← Back to the imports</button></div>';
+  }
+}
+
+function _surfaceRedrawInner(el) {
   el.innerHTML = buildSurfaceReport();
-  // The hero goes AFTER the report's own title block: that block names the page,
-  // carries the passive pill and holds the Back button, so it has to lead. The
-  // diagram is an explanation of the page, and an explanation before the title
-  // leaves the reader a paragraph of argument before they know what they are
-  // looking at.
-  //
-  // Positioned by DOM node rather than by splicing the report's HTML string.
-  // buildSurfaceReport is lifted verbatim from scanner.html, and string surgery
-  // on its output would break silently the next time its markup moved; walking
-  // two element children either finds them or falls back to prepending.
-  const hero = _valueHero();
-  if (!hero) return;
-  const holder = document.createElement('div');
-  holder.innerHTML = hero;
-  const node = holder.firstElementChild;
-  if (!node) return;
-  const outer = el.firstElementChild;                     // the report's padding wrapper
-  const title = outer && outer.firstElementChild;         // its title row
-  if (title) title.insertAdjacentElement('afterend', node);
-  else el.insertBefore(node, el.firstChild);
+  // The hero used to be spliced in here as a DOM node, because buildSurfaceReport
+  // did not render it. It does now — the diagram was ported into scanner.html so the
+  // full app has it too — and leaving this in drew it twice. Second time in one
+  // sitting that moving a definition upstream left a downstream copy behind, so:
+  // when something moves into scanner.html, the glue's version has to be deleted,
+  // not merely stop being called.
 }
 
 // ── Enrichment, straight from the browser ──────────────────────────────────
@@ -2302,12 +2354,6 @@ function surfaceKpiFilter(kind) {
     else _SF.preset = kind;                 // nosensor | gateway | azure | onprem
   }
   _surfaceRedraw();
-}
-// Which figure is currently driving the table, so the diagram can show it.
-function _sfKpiActive() {
-  if (_SF.preset) return _SF.preset;
-  if (_SF.defender === 'Onboarded') return 'sensor';
-  return _sfActive() ? '' : 'all';
 }
 function surfaceClearFilters() {
   _SF = { source: '', type: '', sku: '', os: '', country: '', defender: '', preset: '' };
