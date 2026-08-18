@@ -556,9 +556,16 @@ async function grantFoundryAccess(btn) {
 }
 /** Agents in one Foundry project, with whatever guardrail each names. */
 async function readFoundryAgents(endpoint, dpTok) {
-  const r = await fetch(endpoint.replace(/\/$/, "") + "/assistants?api-version=2025-05-01", {
-    headers: { Authorization: "Bearer " + dpTok }
-  });
+  let r;
+  try {
+    r = await fetch(endpoint.replace(/\/$/, "") + "/assistants?api-version=2025-05-01", {
+      headers: { Authorization: "Bearer " + dpTok }
+    });
+  } catch (netErr) {
+    // No status on a browser-level block, so it is flagged rather than counted
+    // as a refusal — the two need different advice.
+    const e = new Error("blocked by the browser"); e.cors = true; throw e;
+  }
   if (!r.ok) throw new Error("data plane " + r.status);
   const j = await r.json();
   return (j.data || j.value || []).map(a => ({
@@ -711,10 +718,33 @@ function rtEligibility(agent) {
 // and "we were not allowed to look" are opposite findings and the page must not
 // render them the same way.
 const RT_API = '2025-11-15-preview';
+
+// The evals surface is PROJECT-scoped — /api/projects/{project}/openai/evals —
+// and `endpoint` on a Cognitive Services account is the ACCOUNT host. Hanging
+// /openai/evals straight off it produced a 404 that the notice then explained as
+// "preview API may not be enabled there", which was a guess about a URL this code
+// had built wrong.
+//
+// Returns null when the project segment cannot be determined, so the caller can
+// say that instead of inventing a reason.
+function rtProjectBase(endpoint) {
+  const e = String(endpoint || '').replace(/\/$/, '');
+  if (!e) return null;
+  const m = e.match(/^(https:\/\/[^/]+\/api\/projects\/[^/]+)/i);
+  return m ? m[1] : null;
+}
+
 async function readRedTeams(endpoint, dpTok) {
-  const base = endpoint.replace(/\/$/, '');
+  const base = rtProjectBase(endpoint);
+  if (!base) { const e = new Error('no project path'); e.noProject = true; throw e; }
+  // fetch() rejects with a TypeError and no status when the browser itself blocks
+  // the call — CORS, most often, since these data-plane hosts do not answer a
+  // cross-origin preflight from a page like this one. That is a completely
+  // different finding from an HTTP error and must not be reported as one.
   const get = async (path) => {
-    const r = await fetch(base + path, { headers: { Authorization: 'Bearer ' + dpTok } });
+    let r;
+    try { r = await fetch(base + path, { headers: { Authorization: 'Bearer ' + dpTok } }); }
+    catch (netErr) { const e = new Error('blocked by the browser'); e.cors = true; throw e; }
     if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
     return r.json();
   };
@@ -839,14 +869,19 @@ async function scan() {
       } else {
         const hosts = resources.filter(x => x.family === "cognitive" && x.endpoint);
         const all = [];
-        let failed = 0;
+        let failed = 0, corsA = 0;
         await mapPool(hosts, 4, async (h) => {
           try { (await readFoundryAgents(h.endpoint, dpTok)).forEach(a => all.push({ ...a, host: h.name })); }
-          catch (e) { failed++; }
+          catch (e) { if (e && e.cors) corsA++; else failed++; }
         });
-        MODEL.agentLayer = failed && !all.length
+        MODEL.agentLayer = all.length
+          ? { state: "ok", agents: all, note: null }
+          : corsA
+          ? { state: "cors", agents: [],
+              note: "The browser blocked the call on " + corsA + " account(s) — the Foundry data plane does not answer a cross-origin request from a page like this one, so this cannot be read from the browser however the permissions are set." }
+          : failed
           ? { state: "blocked", agents: [],
-              note: "The Foundry data plane refused or blocked the browser on " + failed + " account(s), so agent-level guardrail assignments were not read." }
+              note: "The Foundry data plane refused the request on " + failed + " account(s), so agent-level guardrail assignments were not read." }
           : { state: "ok", agents: all, note: null };
       }
     } catch (e) {
@@ -865,17 +900,32 @@ async function scan() {
           note: "The Foundry data-plane scope is not consented for this sign-in." };
       } else {
         const hosts2 = resources.filter(x => x.family === "cognitive" && x.endpoint);
-        const found = []; let denied = 0, failed2 = 0;
+        // Four causes, counted apart, because each one has a different answer and
+        // a single "could not be read" sends people to fix the wrong thing.
+        const found = []; let denied = 0, cors = 0, noProject = 0, other = 0, lastMsg = '';
         await mapPool(hosts2, 3, async (h) => {
           try { (await readRedTeams(h.endpoint, dpTok2)).forEach(t => found.push({ ...t, host: h.name })); }
-          catch (e) { if (e && (e.status === 401 || e.status === 403)) denied++; else failed2++; }
+          catch (e) {
+            if (e && e.noProject) noProject++;
+            else if (e && e.cors) cors++;
+            else if (e && (e.status === 401 || e.status === 403)) denied++;
+            else { other++; lastMsg = (e && e.message) || ''; }
+          }
         });
-        MODEL.redTeamRaw = (denied && !found.length)
+        MODEL.redTeamRaw = found.length
+          ? { state: "ok", items: found, note: null }
+          : cors
+          ? { state: "cors", items: [],
+              note: "The browser blocked the call to the Foundry data plane on " + cors + " account(s) — these endpoints do not answer a cross-origin request from a page like this one. This is a limit of reading them from a browser, not a permission or a configuration problem." }
+          : denied
           ? { state: "denied", items: [],
               note: "The evals surface refused this sign-in on " + denied + " account(s) — the Foundry User role on the project is what grants it." }
-          : (failed2 && !found.length)
+          : noProject
+          ? { state: "no-project", items: [],
+              note: "No project endpoint was published for " + noProject + " account(s), and the evals surface is addressed per project (/api/projects/<name>/), so there was no URL to call." }
+          : other
           ? { state: "blocked", items: [],
-              note: "The evals surface could not be read on " + failed2 + " account(s); it is a preview API and may not be enabled there." }
+              note: "The evals surface could not be read on " + other + " account(s)" + (lastMsg ? " (" + lastMsg + ")" : "") + "." }
           : { state: "ok", items: found, note: null };
       }
     } catch (e) {
