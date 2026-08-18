@@ -48,6 +48,37 @@
   header .right { display: flex; align-items: center; gap: 16px; }
   .applogo { width: 28px; height: 28px; flex-shrink: 0; }
 
+  /* ── Left rail ────────────────────────────────────────────────────────
+     Four subjects had accreted onto one scroll. The rail names them and
+     carries the count that decides whether a view is worth opening — the
+     same reasoning as the row tabs, one level up.
+     Collapses above the content on narrow screens rather than becoming a
+     drawer: four items do not earn a hamburger. */
+  .shell { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 18px; align-items: start; }
+  @media (max-width: 860px) { .shell { grid-template-columns: 1fr; } }
+  .rail { position: sticky; top: 14px; display: flex; flex-direction: column; gap: 3px; }
+  @media (max-width: 860px) { .rail { position: static; flex-direction: row; flex-wrap: wrap; } }
+  .rail button { appearance: none; width: 100%; text-align: left; background: none; border: 0;
+                 border-left: 2px solid transparent; border-radius: 0 7px 7px 0; color: var(--muted);
+                 font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
+                 padding: 9px 11px; display: flex; align-items: center; gap: 8px; }
+  @media (max-width: 860px) { .rail button { width: auto; border-left: 0;
+                 border-bottom: 2px solid transparent; border-radius: 7px 7px 0 0; } }
+  .rail button:hover { color: var(--fg); background: var(--hover); }
+  .rail button.on { color: var(--accent); border-left-color: var(--accent);
+                    background: color-mix(in srgb, var(--accent) 9%, transparent); }
+  @media (max-width: 860px) { .rail button.on { border-left-color: transparent;
+                    border-bottom-color: var(--accent); } }
+  .rail .rn { margin-left: auto; font-size: 10px; font-weight: 700; padding: 1px 6px;
+              border-radius: 9px; background: var(--hover); color: var(--muted); }
+  .rail button.on .rn { background: var(--accent); color: #fff; }
+  .rail .rn.crit { background: var(--red); color: #fff; }
+  .rail .rn.ok { background: var(--green); color: #fff; }
+  .rail .rgrp { font-size: 9px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase;
+                color: var(--muted); padding: 14px 11px 5px; }
+  .view { display: none; }
+  .view.on { display: block; }
+
   /* ── AI Red Teaming explainer ──────────────────────────────────────────
      Collapsed by default: it is background, not a finding, and the estate's
      own results belong above it. Open it and it explains what the thing
@@ -405,6 +436,11 @@
       <button id="csvBtn" class="secondary">Export CSV</button>
       <button id="jsonBtn" class="secondary">Export JSON</button>
     </div>
+    <div class="shell">
+      <nav class="rail" id="rail" aria-label="Sections"></nav>
+      <div>
+
+    <div class="view on" id="view-overview">
     <div id="notices"></div>
     <div class="card" id="tenantPanel" style="display:none"></div>
     <div class="summary" id="summary"></div>
@@ -433,6 +469,14 @@
         </table>
       </div>
       <div id="empty" class="dmuted hidden" style="padding:16px">No AI resources matched.</div>
+    </div>
+    </div>
+
+    <div class="view" id="view-gateway"></div>
+    <div class="view" id="view-redteam"></div>
+    <div class="view" id="view-agents"></div>
+
+      </div>
     </div>
   </section>
 </main>
@@ -1418,7 +1462,21 @@ function computeStats() {
 
 // ---- Render ----
 const POSTURE_CLS = { critical: "b-crit", high: "b-high", medium: "b-med", low: "b-low" };
-function render() { renderTenant(); renderNotices(); renderSummary(); renderTable(); }
+function render() {
+  renderTenant(); renderNotices(); renderSummary(); renderTable();
+  // Each subject renders into its own view; the rail counts come from the same
+  // model, so a badge cannot disagree with the page it opens.
+  const gw = document.getElementById('view-gateway');
+  if (gw) gw.innerHTML = renderGatewayNotice() ||
+    '<div class="card"><h2>AI Gateway</h2><p class="dmuted" style="margin:10px 0 0">' +
+    'No Cognitive Services accounts were read, so there is nothing to front with a gateway.</p></div>';
+  const rt = document.getElementById('view-redteam');
+  if (rt) rt.innerHTML = rtBlock() ||
+    '<div class="card"><h2>AI red teaming</h2><p class="dmuted" style="margin:10px 0 0">' +
+    'Nothing to report — no Foundry projects were read.</p></div>';
+  renderAgentsView();
+  renderRail();
+}
 
 // The Defender shield, so a plan notice is identifiable as being about Defender
 // for Cloud rather than about the resources this page scanned itself — they are
@@ -1836,6 +1894,162 @@ function renderGatewayNotice() {
     '</div>';
 }
 
+// ── Agents · what they are, and how exposed each one is ────────────────────
+// An agent inherits almost all of its exposure from the account it runs on: the
+// network path, whether a static key can reach it, whether anything is logged,
+// and which risk categories its model's guardrail actually switches on. Only the
+// last of those is agent-specific, and only when the agent carries a policy of
+// its own.
+//
+// So the score is composed, not invented: the account's own posture, plus what
+// the guardrail leaves uncovered, plus whether anyone has ever attacked it.
+// Every term names its source, because an agent scored 80 for reasons that all
+// belong to its account should say so rather than reading as an agent problem.
+function agentRisk(a, acct, redTeam) {
+  const why = [];
+  let sc = 0;
+  if (acct) {
+    if (acct.publicNetwork) { sc += 24; why.push({ sev: 'critical', t: 'Reachable from the internet — the account it runs on has public network access enabled', src: 'account' }); }
+    if (acct.localAuth)     { sc += 22; why.push({ sev: 'critical', t: 'A static API key can call it — local authentication is enabled on the account', src: 'account' }); }
+    if (acct.diag === false){ sc += 10; why.push({ sev: 'high', t: 'Nothing it does is logged — no diagnostic setting on the account', src: 'account' }); }
+  }
+  const gaps = (a.uncovered || []);
+  if (gaps.length) { sc += Math.min(24, gaps.length * 8);
+    why.push({ sev: 'medium', t: 'Guardrail leaves ' + gaps.join(', ') + ' uncovered', src: 'guardrail' }); }
+  // Never adversarially tested is not the same as tested and clean, and it is
+  // not the same as unknown either. Only the first two are scoreable.
+  if (redTeam === 'never') { sc += 12; why.push({ sev: 'medium', t: 'Never adversarially tested — no red teaming run recorded', src: 'red teaming' }); }
+  else if (redTeam === 'unknown') why.push({ sev: 'info', t: 'Whether it has ever been adversarially tested could not be read', src: 'red teaming' });
+  const score = Math.max(0, Math.min(100, sc));
+  return { score, tier: score >= 70 ? 'critical' : score >= 45 ? 'high' : score >= 20 ? 'medium' : 'low', why };
+}
+
+function renderAgentsView() {
+  const L = MODEL.agentLayer, host = document.getElementById('view-agents');
+  if (!host) return;
+  const agents = (L && Array.isArray(L.agents)) ? L.agents : [];
+  const acctBy = {};
+  (MODEL.resources || []).forEach(r => { acctBy[(r.name || '').toLowerCase()] = r; });
+  const rtState = (MODEL.redTeam && MODEL.redTeam.state === 'ok') ? 'known' : 'unknown';
+
+  // Read failure and empty estate are different answers and must not share a
+  // screen. The first is "we could not look"; the second is "we looked".
+  if (!agents.length) {
+    const blocked = L && L.state && L.state !== 'ok';
+    host.innerHTML = '<div class="card"><h2>Agents</h2>' +
+      (blocked
+        ? '<p class="dmuted" style="margin:10px 0 0">The agent list could not be read. ' +
+          escHtml(L.note || 'The Foundry data plane did not answer.') +
+          (L.state === 'cors'
+            ? ' This is a browser restriction rather than a permission: the call cannot be made from a page ' +
+              'like this one however the roles are set, so the agent inventory and its risk scores are ' +
+              '<b>unknown here</b> rather than empty.'
+            : '') + '</p>'
+        : '<p class="dmuted" style="margin:10px 0 0">No agents were found in the projects this sign-in can read.</p>') +
+      '<div class="hint" style="margin-top:12px">What this view would score, once the list is readable: the ' +
+      'account exposure each agent inherits — internet reachability, static keys, logging — plus the risk ' +
+      'categories its guardrail leaves uncovered, plus whether it has ever been red teamed.</div></div>';
+    return;
+  }
+
+  const rows = agents.map(a => {
+    const acct = acctBy[String(a.account || '').toLowerCase()] || null;
+    const r = agentRisk(a, acct, rtState === 'known' ? (a.everRun ? 'tested' : 'never') : 'unknown');
+    return { a, acct, r };
+  }).sort((x, y) => y.r.score - x.r.score);
+
+  host.innerHTML = '<div class="card"><h2>Agents</h2>' +
+    '<div class="hint" style="margin:-4px 0 10px">One row per agent, scored on what it inherits from its ' +
+    'account plus what its own guardrail leaves open. Click a row for the breakdown.</div>' +
+    '<div style="overflow-x:auto"><table><thead><tr>' +
+      '<th style="width:20px"></th><th>Risk</th><th>Agent</th><th>Account</th><th>Model</th>' +
+      '<th>Uncovered risks</th></tr></thead><tbody>' +
+    rows.map((x, i) =>
+      '<tr class="rowx agrow" data-agent="' + i + '"><td class="chev">▸</td>' +
+      '<td><span class="riskscore ' + POSTURE_CLS[x.r.tier] + '">' + x.r.score + '</span>' +
+        '<div class="risklbl">' + x.r.tier.toUpperCase() + '</div></td>' +
+      '<td>' + escHtml(x.a.name || '(unnamed)') + '</td>' +
+      '<td>' + escHtml(x.a.account || '—') + '</td>' +
+      '<td>' + escHtml(x.a.model || '—') + '</td>' +
+      '<td>' + ((x.a.uncovered || []).length
+        ? '<span class="badge b-med">' + (x.a.uncovered || []).length + '</span> ' +
+          escHtml((x.a.uncovered || []).join(', '))
+        : '<span class="dmuted">none listed</span>') + '</td></tr>' +
+      '<tr class="detail hidden" data-agentdetail="' + i + '"><td colspan="6">' +
+        '<ul class="dlist">' + x.r.why.map(w =>
+          '<li><span class="badge ' + (POSTURE_CLS[w.sev] || 'b-med') + '" style="margin-right:6px">' +
+          w.sev.toUpperCase() + '</span>' + escHtml(w.t) +
+          ' <span class="gmeta">· from the ' + escHtml(w.src) + '</span></li>').join('') +
+        '</ul></td></tr>').join('') +
+    '</tbody></table></div></div>';
+
+  host.querySelectorAll('tr.agrow').forEach(tr => tr.addEventListener('click', () => {
+    const d = host.querySelector('tr[data-agentdetail="' + tr.getAttribute('data-agent') + '"]');
+    const open = !d.classList.contains('hidden');
+    d.classList.toggle('hidden', open);
+    tr.querySelector('.chev').textContent = open ? '▸' : '▾';
+  }));
+}
+
+// ── The rail ───────────────────────────────────────────────────────────────
+// Counts, not decoration: each badge is the number that decides whether the view
+// is worth opening, and a dash where the answer could not be read — never a zero,
+// which would say we looked and found none.
+const VIEWS = ['overview', 'gateway', 'redteam', 'agents'];
+let activeView = 'overview';
+
+function railCounts() {
+  const res = MODEL.resources || [];
+  const crit = res.filter(r => r.tier === 'critical').length;
+  const G = MODEL.gateway, accts = res.filter(r => r.family === 'cognitive');
+  const linked = accts.filter(r => r.gateway && r.gateway.state === 'linked').length;
+  const L = MODEL.agentLayer;
+  const agentsUnknown = !L || (L.state && L.state !== 'ok');
+  const rt = MODEL.redTeam;
+  return {
+    overview: { n: res.length, crit: crit },
+    gateway: linked ? { n: linked, ok: true }
+           : (G && G.v2 && G.v2.length) ? { n: G.v2.length }
+           : { n: accts.length ? 0 : null, crit: !!accts.length },
+    redteam: (!rt || rt.state !== 'ok') ? { n: null }
+           : { n: (rt.everRun || []).length, ok: (rt.everRun || []).length > 0 },
+    agents: agentsUnknown ? { n: null } : { n: (L.agents || []).length },
+  };
+}
+
+function renderRail() {
+  const rail = document.getElementById('rail');
+  if (!rail) return;
+  const c = railCounts();
+  const item = (id, label, badge) => {
+    const b = badge && badge.n != null
+      ? '<span class="rn' + (badge.crit ? ' crit' : badge.ok ? ' ok' : '') + '">' + badge.n + '</span>'
+      : '<span class="rn" title="Could not be read — unknown rather than none">—</span>';
+    return '<button type="button" data-view="' + id + '"' + (activeView === id ? ' class="on"' : '') + '>' +
+      escHtml(label) + b + '</button>';
+  };
+  rail.innerHTML =
+    item('overview', 'Overview', c.overview) +
+    '<div class="rgrp">Controls</div>' +
+    item('gateway', 'AI Gateway', c.gateway) +
+    item('redteam', 'AI Red Teaming', c.redteam) +
+    '<div class="rgrp">Inventory</div>' +
+    item('agents', 'Agents', c.agents);
+  rail.querySelectorAll('button').forEach(b =>
+    b.addEventListener('click', () => showView(b.getAttribute('data-view'))));
+}
+
+function showView(id) {
+  if (!VIEWS.includes(id)) id = 'overview';
+  activeView = id;
+  VIEWS.forEach(v => {
+    const el = document.getElementById('view-' + v);
+    if (el) el.classList.toggle('on', v === id);
+  });
+  renderRail();
+  window.scrollTo(0, 0);
+}
+
 function renderNotices() {
   const n = [];
   if (MODEL.enrichBlocked) n.push('<div class="notice notice-info">Some diagnostic-setting reads were blocked (needs Reader on those resources / Microsoft.Insights) — logging shown as “unknown” where unavailable.</div>');
@@ -1844,13 +2058,12 @@ function renderNotices() {
   // about the estate rather than about what this page could not read, and a
   // plan being on or off outranks a browser limitation.
   n.push(renderAiPlanNotice());
-  n.push(renderGatewayNotice());
   n.push(renderAgentGuardrailNotice());
   // Red teaming was three separate blocks — the read failure, the generated
   // scan, and the explainer — scattered between unrelated notices. One subject,
   // one block, in the order someone meets it: what we know, what to run, what
   // the thing even is.
-  n.push(rtBlock());
+
   $("notices").innerHTML = n.filter(Boolean).join("");
 }
 function renderTenant() {
