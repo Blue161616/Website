@@ -489,10 +489,70 @@ async function readRaiPolicies(accountId, at) {
 // the browser, the page still reports model-deployment coverage and says plainly
 // that the agent layer was not read. It never silently presents a model's
 // guardrail as though it were the agent's.
-const FOUNDRY_DP_SCOPES = ["https://ai.azure.com/.default"];
-async function foundryDataPlaneToken() {
-  try { return (await msalApp.acquireTokenSilent({ scopes: FOUNDRY_DP_SCOPES, account })).accessToken; }
-  catch { return null; }
+// Two scope strings, tried in order, because which one works depends on how the
+// tenant is set up and neither is reliably the right answer.
+//
+// `.default` means "every permission this app registration has configured for
+// that resource", so it can only succeed once somebody has added the Foundry
+// permission to the registration — and it can never be the thing that gets it
+// added. Worse, the Foundry resource is not findable in the portal's permission
+// picker by its identifier URI, which is where most people give up.
+//
+// The explicit scope takes the dynamic-consent path instead and needs nothing
+// pre-registered. It is tried first because it works in the tenant that has
+// configured nothing, and in the tenant that HAS configured the permission the
+// token comes back just the same.
+const FOUNDRY_DP_SCOPES = [
+  ["https://ai.azure.com/user_impersonation"],
+  ["https://ai.azure.com/.default"],
+];
+
+// Silent acquisition cannot consent. On its own it meant a tenant that had never
+// granted this could never grant it THROUGH this page: the call failed quietly,
+// the notice said "not consented", and the only way out was a portal screen that
+// does not surface the resource. So the scan stays silent — no popup fires from
+// inside an async scan, where the browser would likely block it anyway — and
+// consent is offered as a button on the notice, where the click is a real user
+// gesture. `interactive` is what that button passes.
+let _foundryDenied = null;      // remembered failure, so a rescan does not retry pointlessly
+async function foundryDataPlaneToken(interactive) {
+  for (const scopes of FOUNDRY_DP_SCOPES) {
+    try { return (await msalApp.acquireTokenSilent({ scopes, account })).accessToken; }
+    catch (e) {}
+  }
+  if (!interactive) return null;
+  for (const scopes of FOUNDRY_DP_SCOPES) {
+    try { _foundryDenied = null; return (await msalApp.acquireTokenPopup({ scopes })).accessToken; }
+    catch (e) {
+      const m = String((e && (e.errorMessage || e.message)) || '');
+      _foundryDenied = m;
+      // AADSTS500011: the resource principal is not in this tenant at all. The
+      // other scope string will fail identically, so stop rather than throw a
+      // second popup at someone for the same reason.
+      if (/500011/.test(m)) break;
+    }
+  }
+  return null;
+}
+
+// Offered from the two notices that report the data plane as unread. Runs the
+// interactive grant, then repeats the scan so the page fills in rather than
+// asking for another button press.
+async function grantFoundryAccess(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "Waiting for consent…"; }
+  const tok = await foundryDataPlaneToken(true);
+  if (btn) { btn.disabled = false; btn.textContent = "Grant Foundry access"; }
+  if (!tok) {
+    const m = _foundryDenied || "";
+    setStatus(/500011/.test(m)
+      ? "Microsoft Foundry is not registered as a resource in this tenant, so no token can be issued for it. "
+        + "Signing in to the Foundry portal once usually provisions it."
+      : /consent|AADSTS65004|cancel/i.test(m)
+      ? "Consent was not granted, so the agent and red teaming reads stay unavailable."
+      : ("Could not get a Foundry data-plane token" + (m ? ": " + m : ".")), true);
+    return;
+  }
+  scan();
 }
 /** Agents in one Foundry project, with whatever guardrail each names. */
 async function readFoundryAgents(endpoint, dpTok) {
@@ -772,10 +832,10 @@ async function scan() {
     setStatus("Reading Foundry agents (guardrail assignments)…", false, true);
     MODEL.agentLayer = { state: "skipped", agents: [], note: null };
     try {
-      const dpTok = await foundryDataPlaneToken();
+      const dpTok = await foundryDataPlaneToken(false);
       if (!dpTok) {
         MODEL.agentLayer = { state: "no-token", agents: [],
-          note: "The Foundry data-plane scope is not consented for this app registration, so agent-level guardrail assignments were not read." };
+          note: "The Foundry data-plane scope is not consented for this sign-in, so agent-level guardrail assignments were not read." };
       } else {
         const hosts = resources.filter(x => x.family === "cognitive" && x.endpoint);
         const all = [];
@@ -799,10 +859,10 @@ async function scan() {
     setStatus("Reading AI red teaming results…", false, true);
     MODEL.redTeamRaw = { state: "skipped", items: [], note: null };
     try {
-      const dpTok2 = await foundryDataPlaneToken();
+      const dpTok2 = await foundryDataPlaneToken(false);
       if (!dpTok2) {
         MODEL.redTeamRaw = { state: "no-token", items: [],
-          note: "The Foundry data-plane scope is not consented for this app registration." };
+          note: "The Foundry data-plane scope is not consented for this sign-in." };
       } else {
         const hosts2 = resources.filter(x => x.family === "cognitive" && x.endpoint);
         const found = []; let denied = 0, failed2 = 0;
@@ -998,6 +1058,15 @@ function defenderIcon(size) {
 // distinction is the whole point of the inheritance chain: an agent with its own
 // guardrail is not described by its model's, and presenting one as the other would
 // be the most confident kind of wrong.
+// Only offered where consent is the actual blocker. A 403 from the evals surface
+// is an RBAC problem and no amount of consenting fixes it, so the button would be
+// a wrong instruction dressed as a fix.
+function grantBtn(state) {
+  if (state !== "no-token") return "";
+  return ' <button type="button" class="rtcopy" style="margin-left:6px"'
+       + ' onclick="grantFoundryAccess(this)">Grant Foundry access</button>';
+}
+
 function renderAgentGuardrailNotice() {
   const L = MODEL.agentLayer;
   if (!L) return "";
@@ -1009,7 +1078,7 @@ function renderAgentGuardrailNotice() {
     (MODEL.resources || []).forEach(r => Object.values(r.raiPolicies || {})
       .forEach(p => { if (p.scope === 'Agent') agentScoped.push(p.name); }));
     return '<div class="notice notice-info">' + defenderIcon() +
-      '<b>Agent-level guardrails not read.</b> ' + escHtml(L.note || "") +
+      '<b>Agent-level guardrails not read.</b> ' + escHtml(L.note || "") + grantBtn(L.state) +
       (agentScoped.length
         ? ' The policy list does show <b>' + agentScoped.length + '</b> agent-scoped guardrail(s) — ' +
           escHtml(agentScoped.slice(0, 5).join(', ')) + ' — so agents here do carry their own; which agent has which is what could not be resolved.'
@@ -1052,7 +1121,7 @@ function renderRedTeamNotice() {
   // mean the estate is untested, and it must never be drawn as though it were.
   if (M.state !== 'ok') {
     return '<div class="notice notice-info">' + defenderIcon() +
-      '<b>Red teaming results not read.</b> ' + escHtml(M.note || '') +
+      '<b>Red teaming results not read.</b> ' + escHtml(M.note || '') + grantBtn(M.state) +
       ' Whether these models and agents have ever been adversarially tested is <b>unknown here</b>, ' +
       'not answered — reading it needs the <b>Foundry User</b> role on the project.' +
       rtScriptFold(M) + '</div>';
