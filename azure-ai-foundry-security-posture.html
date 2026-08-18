@@ -94,6 +94,9 @@
   .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -2px; margin-right: 6px; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .hidden { display: none; }
+  .rtcopy { font: inherit; font-size: 11px; font-weight: 700; cursor: pointer; padding: 4px 11px;
+    border-radius: 5px; border: 1px solid var(--border); background: var(--card); color: var(--text); }
+  .rtcopy:hover { background: var(--hover); }
   .notice { border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 10px; line-height: 1.5; }
   .notice-warn { background: var(--amber-bg); color: var(--text); border: 1px solid var(--amber); }
   .notice-info { background: var(--code-bg); color: var(--text); border: 1px solid var(--border); }
@@ -500,6 +503,11 @@ async function readFoundryAgents(endpoint, dpTok) {
   const j = await r.json();
   return (j.data || j.value || []).map(a => ({
     id: a.id, name: a.name || a.id, model: a.model || null,
+    // Tool types decide whether the agent can be red teamed at all — the service
+    // supports Azure tool calls and refuses function, connected-agent, browser
+    // and computer-use ones.
+    tools: Array.isArray(a.tools) ? a.tools : [],
+    version: a.version || a.assistant_version || null,
     // Same defensive read as everywhere else: several plausible shapes, and null
     // when none match rather than a guess.
     guardrail: (a.guardrail && (a.guardrail.name || a.guardrail.id)) || a.guardrailName || a.guardrail_id || null
@@ -579,6 +587,135 @@ async function readDefenderAiPlans(subs, at) {
 }
 
 // ---- Scan ----
+// ── AI Red Teaming Agent ────────────────────────────────────────────────────
+// Everything above assesses how the AI estate is CONFIGURED: reachable from the
+// internet, keys on or off, a guardrail present, a category enabled and
+// blocking. None of it says what happens when somebody attacks it. A content
+// filter that is switched on and a content filter that holds are different
+// claims, and only the second one is evidence.
+//
+// The AI Red Teaming Agent is what produces the second one. It probes a model or
+// agent with adversarial prompts, applies PyRIT obfuscation strategies on top,
+// and scores the responses into an Attack Success Rate. This section reads those
+// results where they exist, works out which agents could be tested at all, and
+// writes the command for the ones that have never been.
+//
+// Read-only, deliberately. The scan itself sends adversarial traffic to a live
+// endpoint and Microsoft's own guidance is to run it in a purple environment, so
+// a posture page has no business firing one. It reports and it generates; it does
+// not attack.
+
+// Cloud red teaming runs only in these regions. A project outside them cannot be
+// tested for the agentic categories at all, which is worth knowing before an
+// afternoon is spent on it. Azure location codes, lower-cased.
+const RT_REGIONS = ['eastus2', 'francecentral', 'swedencentral', 'switzerlandwest', 'northcentralus'];
+const RT_REGION_NAMES = 'East US 2, France Central, Sweden Central, Switzerland West, US North Central';
+
+// The supportability matrix, as blockers rather than as an allow-list: Azure tool
+// calls are supported, and these five are not. Matched loosely because the
+// data-plane spells tool types differently across API versions.
+const RT_BLOCKING_TOOLS = [
+  { re: /function/i,            label: 'function tool' },
+  { re: /connected[_-]?agent/i, label: 'connected agent' },
+  { re: /browser/i,             label: 'browser automation' },
+  { re: /computer[_-]?use/i,    label: 'computer use' },
+];
+
+// Which red-teaming risk category answers which guardrail category. The mapping
+// runs one way on purpose: the app already knows which categories a policy leaves
+// uncovered, and those are exactly the ones a scan should be pointed at.
+const RT_BY_RAI = {
+  indirect:      { evaluator: null,                         strategy: 'IndirectJailbreak', label: 'Indirect prompt injection (XPIA)' },
+  pii:           { evaluator: 'builtin.sensitive_data_leakage', strategy: null,            label: 'Sensitive data leakage' },
+  taskadherence: { evaluator: 'builtin.task_adherence',      strategy: null,               label: 'Task adherence' },
+  jailbreak:     { evaluator: null,                         strategy: 'Jailbreak',         label: 'Jailbreak (UPIA)' },
+};
+
+// Can this agent be red teamed today? Foundry hosted prompt and container agents
+// with Azure tool calls can; the five tool types above cannot, and a workflow
+// agent cannot at all. Returns the reason rather than a boolean, because "not
+// eligible" is only useful with the because.
+function rtEligibility(agent) {
+  const tools = (agent.tools || []).map(t => String((t && (t.type || t)) || ''));
+  const blocked = [];
+  RT_BLOCKING_TOOLS.forEach(b => { if (tools.some(t => b.re.test(t))) blocked.push(b.label); });
+  if (blocked.length) return { ok: false, why: 'uses ' + blocked.join(' and ') };
+  return { ok: true, why: null };
+}
+
+// Red teaming results live on the OpenAI-compatible evals surface of the Foundry
+// project, on the same host and the same data-plane token the agent list already
+// uses. A red team is an eval whose data source declares the red_team scenario.
+//
+// Every failure is recorded, never swallowed into an empty list: "never tested"
+// and "we were not allowed to look" are opposite findings and the page must not
+// render them the same way.
+const RT_API = '2025-11-15-preview';
+async function readRedTeams(endpoint, dpTok) {
+  const base = endpoint.replace(/\/$/, '');
+  const get = async (path) => {
+    const r = await fetch(base + path, { headers: { Authorization: 'Bearer ' + dpTok } });
+    if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+    return r.json();
+  };
+  const list = await get('/openai/evals?api-version=' + RT_API);
+  const evals = (list.data || list.value || []).filter(e => {
+    const sc = e && e.data_source_config && (e.data_source_config.scenario || e.data_source_config.type);
+    return /red[_-]?team/i.test(String(sc || '')) || /red[_-]?team/i.test(String((e || {}).name || ''));
+  });
+  // The runs hold the outcome. List where the endpoint offers it, and degrade to
+  // "defined, runs not readable" rather than reporting a red team as untested.
+  const out = [];
+  for (const ev of evals.slice(0, 25)) {
+    let runs = null;
+    try {
+      const rl = await get('/openai/evals/' + encodeURIComponent(ev.id) + '/runs?api-version=' + RT_API);
+      runs = (rl.data || rl.value || []).map(r => ({
+        id: r.id, name: r.name || null, status: r.status || null,
+        created: r.created_at || r.created || null,
+        // The result shape has moved between previews, so read several and keep
+        // null when none match — a made-up ASR is worse than no ASR.
+        asr: (r.result_counts && r.result_counts.attack_success_rate) != null
+               ? r.result_counts.attack_success_rate
+           : (r.results && r.results.attack_success_rate) != null
+               ? r.results.attack_success_rate
+           : (r.metrics && (r.metrics.attack_success_rate ?? r.metrics.asr)) != null
+               ? (r.metrics.attack_success_rate ?? r.metrics.asr) : null,
+      }));
+    } catch (e) { runs = null; }
+    out.push({
+      id: ev.id, name: ev.name || ev.id, created: ev.created_at || ev.created || null,
+      criteria: (ev.testing_criteria || []).map(c => c.evaluator_name || c.name).filter(Boolean),
+      runs,
+    });
+  }
+  return out;
+}
+
+// Ties the three together per project: was it ever tested, can its agents be
+// tested, and is it even in a region where the cloud service runs.
+function rtBuildModel(resources, agentLayer, redTeams) {
+  const hosts = resources.filter(r => r.family === 'cognitive' && r.endpoint);
+  const agents = (agentLayer && agentLayer.state === 'ok') ? (agentLayer.agents || []) : [];
+  const eligible = [], ineligible = [];
+  agents.forEach(a => {
+    const e = rtEligibility(a);
+    (e.ok ? eligible : ineligible).push({ ...a, why: e.why });
+  });
+  const outOfRegion = hosts.filter(h => h.location && !RT_REGIONS.includes(String(h.location).toLowerCase()));
+  // Categories the guardrail analysis found uncovered, deduplicated across the
+  // estate — the scan below is pointed at exactly these.
+  const gaps = new Set();
+  resources.forEach(r => Object.values(r.raiPolicies || {}).forEach(p => {
+    const cov = raiCoverage(p);
+    if (cov) cov.off.forEach(c => { if (RT_BY_RAI[c.key]) gaps.add(c.key); });
+  }));
+  const tested = (redTeams && redTeams.state === 'ok') ? redTeams.items : [];
+  const everRun = tested.filter(t => (t.runs || []).some(r => /complete|succeed/i.test(String(r.status || ''))));
+  return { hosts, agents, eligible, ineligible, outOfRegion, gaps: [...gaps], tested, everRun,
+           state: redTeams ? redTeams.state : 'skipped', note: redTeams ? redTeams.note : null };
+}
+
 async function scan() {
   try {
     $("signInBtn").disabled = true; $("rescanBtn").disabled = true; $("notices").innerHTML = "";
@@ -656,11 +793,41 @@ async function scan() {
       MODEL.agentLayer = { state: "error", agents: [], note: "Agent read failed: " + ((e && e.message) || e) };
     }
 
+    // Red teaming results — same data-plane token and the same hosts as the agent
+    // read above, so this adds a call per account and no new permission. Kept in
+    // its own try so a failure here cannot cost the agent layer.
+    setStatus("Reading AI red teaming results…", false, true);
+    MODEL.redTeamRaw = { state: "skipped", items: [], note: null };
+    try {
+      const dpTok2 = await foundryDataPlaneToken();
+      if (!dpTok2) {
+        MODEL.redTeamRaw = { state: "no-token", items: [],
+          note: "The Foundry data-plane scope is not consented for this app registration." };
+      } else {
+        const hosts2 = resources.filter(x => x.family === "cognitive" && x.endpoint);
+        const found = []; let denied = 0, failed2 = 0;
+        await mapPool(hosts2, 3, async (h) => {
+          try { (await readRedTeams(h.endpoint, dpTok2)).forEach(t => found.push({ ...t, host: h.name })); }
+          catch (e) { if (e && (e.status === 401 || e.status === 403)) denied++; else failed2++; }
+        });
+        MODEL.redTeamRaw = (denied && !found.length)
+          ? { state: "denied", items: [],
+              note: "The evals surface refused this sign-in on " + denied + " account(s) — the Foundry User role on the project is what grants it." }
+          : (failed2 && !found.length)
+          ? { state: "blocked", items: [],
+              note: "The evals surface could not be read on " + failed2 + " account(s); it is a preview API and may not be enabled there." }
+          : { state: "ok", items: found, note: null };
+      }
+    } catch (e) {
+      MODEL.redTeamRaw = { state: "error", items: [], note: "Red teaming read failed: " + ((e && e.message) || e) };
+    }
+
     setStatus("Checking Defender for Cloud AI Services plan…", false, true);
     MODEL.aiPlans = await readDefenderAiPlans(subs, at);
     MODEL.subNames = subNames;
 
     resources.forEach((r) => { scoreResource(r); });
+    MODEL.redTeam = rtBuildModel(resources, MODEL.agentLayer, MODEL.redTeamRaw);
     MODEL.resources = resources;
     MODEL.subCount = subs.length;
     MODEL.generatedAt = new Date();
@@ -874,6 +1041,168 @@ function renderAgentGuardrailNotice() {
 // Only the subscriptions that actually hold AI resources are reported. The plan
 // being off where there is nothing to protect is not a finding, and listing those
 // would bury the ones that are.
+// The notice. Three questions in one block, in the order they actually get
+// asked: has anything ever been tested, can it be, and how would I run it.
+function renderRedTeamNotice() {
+  const M = MODEL.redTeam;
+  if (!M || !M.hosts.length) return "";
+
+  // Not permitted and never tested are opposite findings. A 403 on the evals
+  // surface means the sign-in lacks Foundry User on the project — it does not
+  // mean the estate is untested, and it must never be drawn as though it were.
+  if (M.state !== 'ok') {
+    return '<div class="notice notice-info">' + defenderIcon() +
+      '<b>Red teaming results not read.</b> ' + escHtml(M.note || '') +
+      ' Whether these models and agents have ever been adversarially tested is <b>unknown here</b>, ' +
+      'not answered — reading it needs the <b>Foundry User</b> role on the project.' +
+      rtScriptFold(M) + '</div>';
+  }
+
+  const bits = [];
+  if (M.everRun.length) bits.push('<b>' + M.everRun.length + '</b> with a completed red teaming run');
+  const untested = Math.max(0, M.hosts.length - M.everRun.length);
+  if (untested) bits.push('<b style="color:var(--red)">' + untested + '</b> never tested');
+
+  // ASR where a run reported one. Microsoft's own note is that this is judged by
+  // a generative model and is non-deterministic, so it is shown as the reading it
+  // is rather than as a score the page stands behind.
+  const asrs = [];
+  M.everRun.forEach(t => (t.runs || []).forEach(r => {
+    if (r.asr != null) asrs.push({ n: t.name, asr: r.asr });
+  }));
+
+  const elig = [];
+  if (M.eligible.length)   elig.push('<b>' + M.eligible.length + '</b> can be red teamed today');
+  if (M.ineligible.length) elig.push('<b style="color:var(--amber)">' + M.ineligible.length + '</b> cannot');
+
+  const cls = untested ? 'notice-warn' : (M.everRun.length ? 'notice-ok' : 'notice-info');
+  let h = '<div class="notice ' + cls + '">' + defenderIcon() +
+    '<b>Adversarial testing</b> — ' + (bits.length ? bits.join(', ') : 'no red teaming runs found') + '. ';
+
+  h += 'Everything else on this page is how the estate is <i>configured</i>; this is the only line that ' +
+       'reports what happened when something <i>attacked</i> it. ';
+
+  if (untested && M.gaps.length) {
+    h += 'The guardrail analysis above already found ' +
+         M.gaps.map(k => '<b>' + escHtml((RT_BY_RAI[k] || {}).label || k) + '</b>').join(', ') +
+         ' uncovered somewhere in this estate — those are the categories a scan should be pointed at first. ';
+  }
+
+  if (asrs.length) {
+    h += '<div style="margin-top:6px">Attack Success Rate: ' +
+      asrs.slice(0, 6).map(a => escHtml(a.n) + ' <b>' +
+        (typeof a.asr === 'number' ? (a.asr <= 1 ? Math.round(a.asr * 100) + '%' : a.asr) : escHtml(String(a.asr))) +
+        '</b>').join(' · ') +
+      ' <span style="color:var(--muted)">— scored by a generative model, non-deterministic, and worth ' +
+      'reviewing before acting on.</span></div>';
+  }
+
+  // Eligibility. The supportability matrix is restrictive enough that this is
+  // usually a surprise, and it is answered entirely from the agent list already
+  // read — no extra call.
+  if (M.agents.length) {
+    h += '<div style="margin-top:6px">' + M.agents.length + ' Foundry agent(s) — ' + elig.join(', ') + '.';
+    if (M.ineligible.length) {
+      h += ' Not eligible: ' + M.ineligible.slice(0, 6).map(a =>
+        escHtml(a.name) + ' <span style="color:var(--muted)">(' + escHtml(a.why) + ')</span>').join(', ') +
+        (M.ineligible.length > 6 ? ' …' : '') +
+        ' <span style="color:var(--muted)">— the agent red teaming service supports Azure tool calls only.</span>';
+    }
+    h += '</div>';
+  }
+
+  if (M.outOfRegion.length) {
+    h += '<div style="margin-top:6px"><b>' + M.outOfRegion.length + '</b> account(s) sit outside the regions ' +
+      'where cloud red teaming runs (' + RT_REGION_NAMES + '), so the agentic categories — prohibited actions, ' +
+      'sensitive data leakage, task adherence — cannot be tested there at all: ' +
+      escHtml(M.outOfRegion.slice(0, 5).map(r => r.name + ' (' + r.location + ')').join(', ')) +
+      (M.outOfRegion.length > 5 ? ' …' : '') + '</div>';
+  }
+
+  return h + rtScriptFold(M) + '</div>';
+}
+
+// The command, not the attack. Same principle as the KQL and PowerShell in the
+// coverage tools: the page knows the endpoint, the agent and which categories are
+// uncovered, so it can write the exact scan — and then hand it over, because the
+// scan sends adversarial traffic and belongs in a purple environment, run by
+// someone who chose to run it.
+function rtScriptFold(M) {
+  const host = (M.hosts[0] || {});
+  const ep = host.endpoint ? String(host.endpoint).replace(/\/$/, '') : 'https://<account>.services.ai.azure.com/api/projects/<project>';
+  const agent = (M.eligible[0] || M.agents[0] || {}).name || '<agent-name>';
+  // Point it at what is actually uncovered; fall back to the three agentic
+  // evaluators when the guardrail read found nothing to single out.
+  const picked = M.gaps.map(k => RT_BY_RAI[k]).filter(x => x && x.evaluator);
+  const evaluators = (picked.length ? picked : [RT_BY_RAI.pii, RT_BY_RAI.taskadherence])
+    .map(x => x.evaluator).filter((v, i, a) => a.indexOf(v) === i);
+  const strategies = M.gaps.map(k => (RT_BY_RAI[k] || {}).strategy).filter(Boolean);
+  const strat = (strategies.length ? strategies : ['Jailbreak']).concat(['Flip', 'Base64'])
+    .filter((v, i, a) => a.indexOf(v) === i);
+
+  const py = 'pip install "azure-ai-projects>=2.0.0"\n\n'
+    + '# az login first — keyless via DefaultAzureCredential. Needs Foundry User on the project.\n'
+    + 'import os\n'
+    + 'from azure.identity import DefaultAzureCredential\n'
+    + 'from azure.ai.projects import AIProjectClient\n\n'
+    + 'endpoint = "' + ep + '"\n'
+    + 'agent_name = "' + agent + '"\n\n'
+    + 'with DefaultAzureCredential() as cred:\n'
+    + '    with AIProjectClient(endpoint=endpoint, credential=cred) as project:\n'
+    + '        client = project.get_openai_client()\n'
+    + '        red_team = client.evals.create(\n'
+    + '            name="Posture-driven red team",\n'
+    + '            data_source_config={"type": "azure_ai_source", "scenario": "red_team"},\n'
+    + '            testing_criteria=[\n'
+    + evaluators.map(e =>
+        '                {"type": "azure_ai_evaluator", "name": "' + e.replace('builtin.', '') + '",\n'
+      + '                 "evaluator_name": "' + e + '", "evaluator_version": "1"},').join('\n') + '\n'
+    + '            ],\n'
+    + '        )\n'
+    + '        run = client.evals.runs.create(\n'
+    + '            eval_id=red_team.id,\n'
+    + '            name="Run 1",\n'
+    + '            data_source={\n'
+    + '                "type": "azure_ai_red_team",\n'
+    + '                "item_generation_params": {\n'
+    + '                    "type": "red_team_taxonomy",\n'
+    + '                    "attack_strategies": ' + JSON.stringify(strat) + ',\n'
+    + '                    "num_turns": 5,\n'
+    + '                },\n'
+    + '                "target": {"type": "azure_ai_agent", "name": agent_name, "version": "1"},\n'
+    + '            },\n'
+    + '        )\n'
+    + '        print(run.id, run.status)';
+
+  const id = 'rtpy';
+  return '<details class="setup" style="margin-top:10px">'
+    + '<summary>Generate the scan for this estate</summary>'
+    + '<div class="step"><div class="sb">'
+    + '<p>Written against <b>' + escHtml(host.name || 'this project') + '</b>'
+    + (M.gaps.length ? ' and pointed at the categories the guardrail analysis found uncovered' : '')
+    + '. It is not run from here: the scan sends adversarial prompts to a live endpoint, and Microsoft\'s '
+    + 'guidance is to run it in a <b>purple environment</b> — production-like, not production.</p>'
+    + '<p style="color:var(--muted)">Needs <b>Foundry User</b> on the project, Python 3.9+, and a region '
+    + 'from ' + RT_REGION_NAMES + ' for the agentic categories.</p>'
+    + '<button type="button" class="rtcopy" data-t="' + escHtml(py) + '">Copy scan script</button>'
+    + '<pre class="mono" style="white-space:pre-wrap;font-size:11px;background:var(--code-bg);'
+    + 'border:1px solid var(--border);border-radius:6px;padding:9px 11px;margin:8px 0 0;overflow-x:auto">'
+    + escHtml(py) + '</pre>'
+    + '</div></div></details>';
+}
+
+// Delegated, so it survives the notice block being re-rendered.
+document.addEventListener('click', (e) => {
+  const b = e.target.closest && e.target.closest('.rtcopy');
+  if (!b) return;
+  const t = b.getAttribute('data-t') || '';
+  const done = (ok) => { b.textContent = ok ? 'Copied' : 'Press Ctrl+C';
+                         setTimeout(() => { b.textContent = 'Copy scan script'; }, 1600); };
+  if (navigator.clipboard && navigator.clipboard.writeText)
+    navigator.clipboard.writeText(t).then(() => done(true), () => done(false));
+  else done(false);
+});
+
 function renderAiPlanNotice() {
   const plans = MODEL.aiPlans;
   if (!plans) return "";
@@ -920,6 +1249,7 @@ function renderNotices() {
   if (MODEL.enrichBlocked) n.push('<div class="notice notice-info">Some diagnostic-setting reads were blocked (needs Reader on those resources / Microsoft.Insights) — logging shown as “unknown” where unavailable.</div>');
   if (!MODEL.resources.length) n.push('<div class="notice notice-ok">No Azure OpenAI / AI Services accounts or AI Foundry workspaces found in the subscriptions you can read.</div>');
   n.push(renderAgentGuardrailNotice());
+  n.push(renderRedTeamNotice());
   n.push(renderAiPlanNotice());
   $("notices").innerHTML = n.filter(Boolean).join("");
 }
