@@ -56,6 +56,12 @@
   /* One frame around the subject. The inner notices keep their own borders —
      they are still distinct statements — but the group says they are about the
      same thing, which three loose blocks between unrelated notices did not. */
+  .gwdiag { width: 100%; max-width: 760px; display: block; margin: 12px auto 2px; }
+  @media (prefers-reduced-motion: reduce) { .gwdiag animate, .gwdiag animateMotion { display: none; } }
+  .gwnote { margin-top: 9px; padding-left: 10px; border-left: 2px solid var(--red);
+            font-size: 11.5px; line-height: 1.6; color: var(--muted); }
+  .gwfine { font-size: 10px; color: var(--muted); opacity: .8; line-height: 1.55; margin-top: 4px; }
+
   .rtgroup { border: 1px solid var(--border); border-radius: 12px; padding: 8px 12px 12px;
              margin: 14px 0; background: color-mix(in srgb, var(--fg) 2%, transparent); }
   .rtgroup-h { font-size: 10px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase;
@@ -507,7 +513,67 @@ async function mapPool(items, size, fn) {
   return out;
 }
 
-const RG_QUERY = "resources | where type in~ ('microsoft.cognitiveservices/accounts','microsoft.machinelearningservices/workspaces') | project id, name, type, kind, location, resourceGroup, subscriptionId, identity, sku, tags, properties";
+// APIM rides along in the same Resource Graph sweep. AI Gateway is not its own
+// resource type — it IS an API Management instance — so a separate query would be
+// a second round trip for rows this one already reaches.
+const RG_QUERY = "resources | where type in~ ('microsoft.cognitiveservices/accounts','microsoft.machinelearningservices/workspaces','microsoft.apimanagement/service') | project id, name, type, kind, location, resourceGroup, subscriptionId, identity, sku, tags, properties";
+
+// The v2 tiers are the only ones Foundry will attach. Anything else in the
+// subscription is an ordinary APIM instance and must not be read as a gateway.
+const GW_V2_SKUS = ['basicv2', 'standardv2', 'premiumv2'];
+
+// What can and cannot be proven from ARM at this API version.
+//
+// Learn documents three hard constraints — same subscription, same tenant, a v2
+// tier — and one strong hint: the APIM instance is named after the gateway. It
+// does NOT document a property on either side that records the association, and
+// the management API is still 2026-05-01-preview. So this reports a CANDIDATE and
+// says so, rather than asserting a link it cannot see.
+//
+// The account's own properties are scanned for anything gateway-shaped as well.
+// If Microsoft does surface the association there, it lights up on the first
+// tenant that has one instead of waiting for someone to notice — and it prints
+// the key it found, so the guess can be replaced with the real thing.
+function gwScanAccountProps(props) {
+  const hits = [];
+  const walk = (o, path, depth) => {
+    if (!o || typeof o !== 'object' || depth > 3) return;
+    Object.keys(o).forEach(k => {
+      const p = path ? path + '.' + k : k;
+      if (/gateway|apim|apimanagement/i.test(k)) hits.push({ key: p, value: o[k] });
+      if (o[k] && typeof o[k] === 'object') walk(o[k], p, depth + 1);
+    });
+  };
+  try { walk(props, '', 0); } catch (e) {}
+  return hits;
+}
+
+function gwBuild(rows, resources) {
+  const apim = rows.filter(r => /microsoft\.apimanagement\/service/i.test(r.type || ''))
+    .map(r => ({
+      id: r.id, name: r.name, location: r.location, rg: r.resourceGroup, subId: r.subscriptionId,
+      sku: (r.sku && (r.sku.name || r.sku.tier)) || '',
+      v2: GW_V2_SKUS.includes(String((r.sku && (r.sku.name || r.sku.tier)) || '').toLowerCase()),
+    }));
+  // Same subscription is a documented requirement, so it is the only join that
+  // holds. Region is deliberately NOT matched: the portal shows a gateway region
+  // of its own and Learn never says it has to equal the account's.
+  resources.forEach(r => {
+    if (r.family !== 'cognitive') { r.gateway = null; return; }
+    const inSub = apim.filter(a => a.subId === r.subId);
+    const eligible = inSub.filter(a => a.v2);
+    r.gatewayHints = gwScanAccountProps(r.propsRaw);
+    r.gateway = {
+      candidates: eligible,
+      otherApim: inSub.length - eligible.length,
+      // A property on the account naming the gateway would be proof; a v2 instance
+      // in the same subscription is only opportunity.
+      proven: r.gatewayHints.length > 0,
+      state: r.gatewayHints.length ? 'linked' : eligible.length ? 'candidate' : 'none',
+    };
+  });
+  return { apim, v2: apim.filter(a => a.v2) };
+}
 
 // ── Guardrails · the risk categories a deployment actually covers ───────────
 // The Foundry portal shows a guardrail per agent with two lists — risks WITH
@@ -1064,7 +1130,11 @@ async function scan() {
       if (++page > 40) break;
     } while (skip);
 
-    const resources = rows.map((r) => parseResource(r, subNames[r.subscriptionId] || r.subscriptionId));
+    // APIM rows are infrastructure for the gateway check, not assessable AI
+    // resources — they must not reach the posture table or the score.
+    const aiRows = rows.filter((r) => !/microsoft\.apimanagement\/service/i.test(r.type || ""));
+    const resources = aiRows.map((r) => parseResource(r, subNames[r.subscriptionId] || r.subscriptionId));
+    MODEL.gateway = gwBuild(rows, resources);
 
     // Enrich: diagnostic settings (all) + deployments (cognitive), concurrency-limited.
     MODEL.enrichBlocked = false;
@@ -1215,7 +1285,10 @@ function parseResource(r, subName) {
   const out = {
     id: r.id, name: r.name, rg: r.resourceGroup, subId: r.subscriptionId, sub: subName, location: r.location,
     kindRaw: r.kind || "", tags: r.tags || {}, sku: (r.sku && (r.sku.name || r.sku.tier)) || "",
-    identity: r.identity, deployments: null, diag: null
+    identity: r.identity, deployments: null, diag: null,
+    // Kept only so gwScanAccountProps can look for a gateway association that
+    // Learn does not yet document. Not rendered, not exported.
+    propsRaw: p
   };
   if (typeLc.indexOf("cognitiveservices") >= 0) {
     out.family = "cognitive";
@@ -1634,6 +1707,135 @@ function rtBlock() {
     '<div class="rtgroup-h">AI red teaming</div>' + parts.join('') + '</div>';
 }
 
+// ── AI Gateway · callers, the gateway, and what is behind it ───────────────
+// The diagram earns its place by drawing the DIFFERENCE, not the topology. With
+// no gateway the callers reach the models directly and share one key, and the
+// lines are red and unbroken. With one, every line passes through a single point
+// that authenticates the caller, counts its tokens and logs the call.
+//
+// Which of the two is drawn comes from the scan, so this is a finding rendered as
+// a picture rather than an illustration sitting next to one.
+function gwDiagram(g, deployN, agentN) {
+  const on = g && g.state !== 'none';
+  const C = on ? '#3fb950' : '#e5484d';
+  const callers = [
+    { y: 34,  t: 'Agents',       s: agentN != null ? agentN + ' known' : 'bursty, unpredictable' },
+    { y: 100, t: 'Applications', s: 'one call per action' },
+    { y: 166, t: 'Tools / MCP',  s: 'called on the model’s behalf' },
+  ];
+  // Straight into the models, or bent through the gateway. The bend is the point.
+  const lane = (y) => on
+    ? 'M188 ' + (y + 24) + ' C260 ' + (y + 24) + ' 300 118 372 118'
+    : 'M188 ' + (y + 24) + ' C300 ' + (y + 24) + ' 380 118 556 118';
+  const dot = (y, i) =>
+    '<circle r="3" fill="' + C + '" opacity="0">' +
+      '<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;.05;.15;.85;.95;1" ' +
+        'dur="4s" begin="' + (i * 1.1) + 's" repeatCount="indefinite"/>' +
+      '<animateMotion dur="4s" begin="' + (i * 1.1) + 's" repeatCount="indefinite" ' +
+        'path="' + lane(y) + '"/></circle>';
+  return '' +
+  '<svg class="gwdiag" viewBox="0 0 760 236" role="img" aria-label="' +
+      (on ? 'Callers reach the models through the AI Gateway, which authenticates each caller, applies token limits and logs the request'
+          : 'Callers reach the model deployments directly, sharing one key, with no gateway between them') + '">' +
+    '<defs><linearGradient id="gwBeam" x1="0" x2="1">' +
+      '<stop offset="0" stop-color="' + C + '" stop-opacity=".08"/>' +
+      '<stop offset="1" stop-color="' + C + '" stop-opacity=".45"/></linearGradient></defs>' +
+
+    '<text x="96" y="14" text-anchor="middle" font-size="9" font-weight="700" letter-spacing=".12em" ' +
+      'fill="currentColor" opacity=".45">CALLERS</text>' +
+    callers.map(function (c) {
+      return '<g transform="translate(20,' + c.y + ')">' +
+        '<rect width="168" height="48" rx="8" fill="rgba(88,166,255,.06)" stroke="#58a6ff" ' +
+          'stroke-opacity=".45" stroke-width="1"/>' +
+        '<text x="12" y="20" font-size="11.5" font-weight="700" fill="#58a6ff">' + c.t + '</text>' +
+        '<text x="12" y="35" font-size="9.5" fill="currentColor" opacity=".55">' + c.s + '</text>' +
+        '</g>';
+    }).join('') +
+
+    callers.map(function (c) {
+      return '<path d="' + lane(c.y) + '" fill="none" stroke="url(#gwBeam)" stroke-width="2"' +
+        (on ? '' : ' stroke-dasharray="7 4"') + '/>';
+    }).join('') +
+    callers.map(function (c, i) { return dot(c.y, i); }).join('') +
+
+    (on
+      ? '<g transform="translate(372,64)">' +
+          '<rect width="112" height="108" rx="12" fill="rgba(63,185,80,.09)" stroke="#3fb950" stroke-width="1.4"/>' +
+          '<text x="56" y="24" text-anchor="middle" font-size="10" font-weight="800" ' +
+            'letter-spacing=".07em" fill="#3fb950">AI GATEWAY</text>' +
+          '<text x="56" y="38" text-anchor="middle" font-size="8.5" fill="currentColor" opacity=".5">Azure API Management</text>' +
+          ['identity per caller', 'token limit', 'every call logged'].map(function (l, i) {
+            return '<text x="56" y="' + (58 + i * 15) + '" text-anchor="middle" font-size="9.5" ' +
+              'fill="currentColor" opacity=".75">' + l + '</text>'; }).join('') +
+        '</g>' +
+        '<path d="M484 118 H556" fill="none" stroke="#3fb950" stroke-opacity=".5" stroke-width="2"/>'
+      : '<g transform="translate(372,86)">' +
+          '<rect width="112" height="64" rx="12" fill="none" stroke="#e5484d" stroke-width="1.2" ' +
+            'stroke-dasharray="5 4" opacity=".8"/>' +
+          '<text x="56" y="27" text-anchor="middle" font-size="10" font-weight="800" ' +
+            'letter-spacing=".06em" fill="#e5484d">NO GATEWAY</text>' +
+          '<text x="56" y="44" text-anchor="middle" font-size="9" fill="#e5484d" opacity=".8">one shared key</text>' +
+        '</g>') +
+
+    '<text x="650" y="14" text-anchor="middle" font-size="9" font-weight="700" letter-spacing=".12em" ' +
+      'fill="currentColor" opacity=".45">BEHIND IT</text>' +
+    '<g transform="translate(556,72)">' +
+      '<rect width="188" height="92" rx="10" fill="rgba(88,166,255,.07)" stroke="#58a6ff" stroke-width="1.2"/>' +
+      '<text x="94" y="26" text-anchor="middle" font-size="11.5" font-weight="800" fill="#58a6ff">Model deployments</text>' +
+      '<text x="94" y="47" text-anchor="middle" font-size="17" font-weight="800" fill="currentColor">' +
+        (deployN != null ? deployN : '—') + '</text>' +
+      '<text x="94" y="68" text-anchor="middle" font-size="9.5" fill="currentColor" opacity=".55">' +
+        (on ? 'reachable only through the gateway' : 'reachable by anyone holding the key') + '</text>' +
+      '<text x="94" y="82" text-anchor="middle" font-size="9" fill="currentColor" opacity=".4">and the tools each one can call</text>' +
+    '</g>' +
+  '</svg>';
+}
+
+// One notice per estate, not per account: the gateway is enabled at the Foundry
+// RESOURCE level, so a per-row finding would repeat the same sentence.
+function renderGatewayNotice() {
+  const G = MODEL.gateway;
+  if (!G) return '';
+  const accts = (MODEL.resources || []).filter(r => r.family === 'cognitive');
+  if (!accts.length) return '';
+  const linked = accts.filter(r => r.gateway && r.gateway.state === 'linked');
+  const cand   = accts.filter(r => r.gateway && r.gateway.state === 'candidate');
+  const deployN = accts.reduce((n, r) => n + ((r.deployments || []).length), 0);
+  const keyed = accts.filter(r => r.localAuth).length;
+  const on = linked.length > 0;
+
+  // Named separately from what it means, because a candidate is not a finding.
+  let head, body;
+  if (on) {
+    head = '<b>AI Gateway is attached</b> to ' + linked.length + ' of ' + accts.length + ' account(s).';
+    body = 'Callers reach the models through Azure API Management, which can authenticate each one '
+         + 'separately, cap its tokens and log the call.';
+  } else if (cand.length) {
+    const names = G.v2.map(a => '<b>' + escHtml(a.name) + '</b>').join(', ');
+    head = '<b>No AI Gateway association is visible from here.</b>';
+    body = 'There ' + (G.v2.length === 1 ? 'is a v2-tier API Management instance' :
+             'are ' + G.v2.length + ' v2-tier API Management instances') + ' in the same subscription — ' +
+           names + ' — which is what an AI Gateway is built on. Azure Resource Manager does not expose the '
+         + 'association at this preview API version, so this page cannot tell a gateway from an ordinary '
+         + 'API Management instance. Check <b>Manage &gt; AI Gateway</b> in the Foundry portal.';
+  } else {
+    head = '<b>No AI Gateway.</b>';
+    body = 'No v2-tier API Management instance exists in ' +
+           (accts.length === 1 ? 'this subscription' : 'these subscriptions') + ', and a gateway is one. '
+         + 'Callers reach the model deployments directly.';
+  }
+  const keyNote = (!on && keyed)
+    ? '<div class="gwnote">' + keyed + ' of these account(s) also have <b>local authentication (keys) enabled</b>. '
+      + 'That is the pairing AI Gateway exists to break: one shared key means one compromised caller exposes '
+      + 'every model, and no per-caller record of who called what.</div>'
+    : '';
+  return '<div class="notice ' + (on ? 'notice-ok' : 'notice-info') + '">' + defenderIcon() + head + ' ' + body +
+    keyNote + gwDiagram(on ? { state: 'linked' } : null, deployN, null) +
+    '<div class="gwfine">AI Gateway is an Azure API Management instance in the same subscription and tenant, '
+    + 'on a v2 tier, named after the gateway. Detection here is limited to what ARM exposes.</div>' +
+    '</div>';
+}
+
 function renderNotices() {
   const n = [];
   if (MODEL.enrichBlocked) n.push('<div class="notice notice-info">Some diagnostic-setting reads were blocked (needs Reader on those resources / Microsoft.Insights) — logging shown as “unknown” where unavailable.</div>');
@@ -1642,6 +1844,7 @@ function renderNotices() {
   // about the estate rather than about what this page could not read, and a
   // plan being on or off outranks a browser limitation.
   n.push(renderAiPlanNotice());
+  n.push(renderGatewayNotice());
   n.push(renderAgentGuardrailNotice());
   // Red teaming was three separate blocks — the read failure, the generated
   // scan, and the explainer — scattered between unrelated notices. One subject,
