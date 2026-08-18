@@ -90,6 +90,13 @@
                   border-radius: 8px; background: var(--hover); color: var(--muted); }
   .dtab.on .dcount { background: var(--accent); color: #fff; }
   .dtab .dcount.crit { background: var(--red); color: #fff; }
+  /* The fix, under the finding it closes. Indented and quieter than the finding:
+     the finding is what is true, the fix is what to do about it, and the eye
+     should reach them in that order. */
+  .rfix { margin: 5px 0 2px 2px; padding-left: 9px; border-left: 2px solid var(--accent);
+          font-size: 11.5px; line-height: 1.6; color: var(--muted); }
+  .rfix-k { font-size: 9.5px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase;
+            color: var(--accent); margin-right: 7px; }
   .dpane { display: none; }
   .dpane.on { display: block; }
   .pv { font-size: 10px; font-weight: 700; letter-spacing: .7px; text-transform: uppercase; background: rgba(255,255,255,.2); border: 1px solid rgba(255,255,255,.4); padding: 2px 7px; border-radius: 10px; line-height: 1.4; }
@@ -1219,33 +1226,41 @@ function scoreResource(r) {
   // Exposure / network
   if (r.publicNetwork) {
     if (r.family === "cognitive" && (r.networkDefault === "Allow" || r.networkDefault == null) && r.privateEndpoints === 0) {
-      s += 28; reasons.push({ sev: "critical", t: "Public network access enabled with no IP/VNet restriction (network default Allow) — the endpoint is reachable from the internet" });
+      s += 28; reasons.push({ sev: "critical", k: "net", t: "Public network access enabled with no IP/VNet restriction (network default Allow) — the endpoint is reachable from the internet",
+        fix: "Set public network access to Disabled and use a private endpoint; if public is required, set the network ACL default to Deny and allow only known IP/VNet ranges." });
     } else if (r.family === "mlworkspace" && (r.isolationMode == null || /disabled/i.test(r.isolationMode)) && r.privateEndpoints === 0) {
-      s += 24; reasons.push({ sev: "critical", t: "Public network access enabled and managed network isolation is Disabled — no private isolation" });
+      s += 24; reasons.push({ sev: "critical", k: "net", t: "Public network access enabled and managed network isolation is Disabled — no private isolation",
+        fix: "Enable managed network isolation on the workspace and use a private endpoint for inbound access." });
     } else {
-      s += 12; reasons.push({ sev: "high", t: "Public network access enabled (partially restricted by network ACLs / private endpoints)" });
+      s += 12; reasons.push({ sev: "high", k: "net", t: "Public network access enabled (partially restricted by network ACLs / private endpoints)",
+        fix: "Tighten the remaining public path: set the ACL default to Deny, keep only the IP/VNet ranges you can name, and prefer the private endpoint for all callers." });
     }
   }
   // Authentication
   if (r.localAuth) {
-    s += 26; reasons.push({ sev: "critical", t: "Local authentication (API keys) enabled — static keys grant data-plane access and bypass Entra RBAC, Conditional Access and per-user audit" });
+    s += 26; reasons.push({ sev: "critical", k: "auth", t: "Local authentication (API keys) enabled — static keys grant data-plane access and bypass Entra RBAC, Conditional Access and per-user audit",
+      fix: "Disable local authentication (disableLocalAuth = true) and move callers to Entra ID with least-privilege Azure RBAC, e.g. Cognitive Services OpenAI User. Where several apps share one key, front the account with AI Gateway (Azure API Management) so each caller authenticates as its own managed identity." });
   }
   // Identity
   if (!r.managedIdentity) {
-    s += 8; reasons.push({ sev: "medium", t: "No managed identity assigned — outbound connections likely authenticate with stored keys rather than Entra" });
+    s += 8; reasons.push({ sev: "medium", k: "mi", t: "No managed identity assigned — outbound connections likely authenticate with stored keys rather than Entra",
+      fix: "Assign a managed identity and switch the resource's own connections to identity-based auth instead of stored keys." });
   }
   // Data protection
   if (!r.cmk) {
-    s += 4; reasons.push({ sev: "low", t: "Microsoft-managed encryption (no customer-managed key)" });
+    s += 4; reasons.push({ sev: "low", k: "cmk", t: "Microsoft-managed encryption (no customer-managed key)",
+      fix: "Only if your data classification requires control of the key material: attach a customer-managed key from Key Vault. Microsoft-managed encryption is not a gap on its own." });
   }
   // Governance / logging
   if (r.diag === false) {
-    s += 12; reasons.push({ sev: "high", t: "No diagnostic settings — request and audit logs are not exported to Log Analytics / storage (no monitoring or investigation trail)" });
+    s += 12; reasons.push({ sev: "high", k: "diag", t: "No diagnostic settings — request and audit logs are not exported to Log Analytics / storage (no monitoring or investigation trail)",
+      fix: "Add a diagnostic setting to Log Analytics with the Audit and RequestResponse categories, so there is a trail to investigate with." });
   }
   // Deployments without content filter (cognitive)
   if (r.family === "cognitive" && Array.isArray(r.deployments) && r.deployments.length) {
     const unfiltered = r.deployments.filter((d) => !d.rai);
-    if (unfiltered.length) { s += 10; reasons.push({ sev: "high", t: unfiltered.length + " of " + r.deployments.length + " model deployment(s) have no explicit content-filter / responsible-AI policy — verify default filtering is active" }); }
+    if (unfiltered.length) { s += 10; reasons.push({ sev: "high", k: "rai", t: unfiltered.length + " of " + r.deployments.length + " model deployment(s) have no explicit content-filter / responsible-AI policy — verify default filtering is active",
+      fix: "Attach a content-filter / responsible-AI policy to every model deployment and confirm the thresholds, rather than relying on an unstated default." }); }
 
     // Guardrail coverage. Every deployment has a policy; what varies is what it
     // switches on. Reported per uncovered category rather than per deployment, so
@@ -1261,9 +1276,12 @@ function scoreResource(r) {
       s += 8;
       // Plain text, no markup: reason strings are escaped on render (and reused in
       // the CSV and JSON exports), so a <b> here shows up as literal angle brackets.
-      reasons.push({ sev: "medium", t: 'Guardrail leaves ' + label + ' uncovered on ' + who.length +
+      reasons.push({ sev: "medium", k: 'rai-' + label, t: 'Guardrail leaves ' + label + ' uncovered on ' + who.length +
         ' deployment(s): ' + who.slice(0, 4).join(', ') + (who.length > 4 ? ', …' : '') +
-        ' — one of the agentic risks the guardrail exists to catch, and it is off' });
+        ' — one of the agentic risks the guardrail exists to catch, and it is off',
+        fix: 'Switch ' + label + ' on in the content-filter policy used by ' +
+             (who.length === 1 ? 'that deployment' : 'those ' + who.length + ' deployments') +
+             ', then re-check it is set to block rather than annotate.' });
     });
     // Say when the guardrail could not be read at all, so an unassessed estate is
     // not scored as a clean one.
@@ -1704,14 +1722,21 @@ function renderTable() {
   }
 }
 function detailHtml(r) {
-  const why = r.reasons.map((x) => '<li><span class="badge ' + (POSTURE_CLS[x.sev] || "b-med") + '" style="margin-right:6px">' + x.sev.toUpperCase() + '</span>' + escHtml(x.t) + '</li>').join("");
-  const rem = [];
-  if (r.publicNetwork) rem.push("Set public network access to Disabled and use a private endpoint; if public is required, set network ACL default to Deny and allow only known IP/VNet ranges.");
-  if (r.localAuth) rem.push("Disable local authentication (set disableLocalAuth = true) and use Entra ID (Azure RBAC) for data-plane access — assign least-privilege roles (e.g. Cognitive Services OpenAI User).");
-  if (!r.managedIdentity) rem.push("Assign a managed identity and switch connections to identity-based auth instead of stored keys.");
-  if (r.diag === false) rem.push("Enable diagnostic settings to Log Analytics (Audit, RequestResponse) for monitoring and investigation.");
-  if (r.family === "cognitive" && Array.isArray(r.deployments) && r.deployments.some((d) => !d.rai)) rem.push("Attach a content-filter / responsible-AI policy to every model deployment and confirm the filter thresholds.");
-  if (!r.cmk) rem.push("Consider customer-managed keys (CMK) if your data-classification requires control over encryption keys.");
+  // Each finding carries its own fix underneath. Cross-referencing two tabs by
+  // eye was the complaint, and a fix only means anything beside the thing it
+  // closes — read on its own it is generic advice.
+  const why = r.reasons.map((x) =>
+    '<li><span class="badge ' + (POSTURE_CLS[x.sev] || "b-med") + '" style="margin-right:6px">' +
+      x.sev.toUpperCase() + '</span>' + escHtml(x.t) +
+      (x.fix ? '<div class="rfix"><span class="rfix-k">Fix</span>' + escHtml(x.fix) + '</div>' : '') +
+    '</li>').join("");
+  // Remediation is derived from the findings now, not re-tested from the
+  // resource. Ordered by the severity of what each one closes, so the first
+  // action listed is the one that retires the worst finding.
+  const SEV_RANK = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+  const fixes = r.reasons.filter(x => x.fix).map((x, i) => ({ fix: x.fix, sev: x.sev, i }))
+    .sort((a, b) => (SEV_RANK[a.sev] ?? 9) - (SEV_RANK[b.sev] ?? 9) || a.i - b.i);
+  const rem = fixes.map(f => f.fix);
   if (!rem.length) rem.push("No standout remediation — maintain private, Entra-only, logged configuration.");
   const facts = [];
   facts.push("<b>Type</b> " + escHtml(r.typeLabel) + (r.kindRaw ? " (kind " + escHtml(r.kindRaw) + ")" : ""));
@@ -1746,7 +1771,11 @@ function detailHtml(r) {
     { id: 'why', label: 'Findings', n: r.reasons.length, crit: nCrit,
       body: '<ul class="dlist">' + why + '</ul>' },
     { id: 'fix', label: 'Remediation', n: rem.length,
-      body: '<ul class="dlist">' + rem.map(x => '<li>' + escHtml(x) + '</li>').join('') + '</ul>' },
+      body: '<ul class="dlist">' + (fixes.length
+        ? fixes.map(f => '<li><span class="badge ' + (POSTURE_CLS[f.sev] || 'b-med') +
+            '" style="margin-right:6px">' + f.sev.toUpperCase() + '</span>' + escHtml(f.fix) +
+            '</li>').join('')
+        : rem.map(x => '<li>' + escHtml(x) + '</li>').join('')) + '</ul>' },
     { id: 'cfg', label: 'Configuration',
       body: '<div class="dcols"><div><div class="kv">' + facts.map(f => '<div>' + f + '</div>').join('') +
             '</div><div style="margin-top:8px"><a href="' + escHtml(portal) + '" target="_blank" ' +
@@ -1761,9 +1790,10 @@ function detailHtml(r) {
              .replace(/<\/div><\/div>$/, '') });
 
   const tabs = panes.map((p, i) =>
-    '<button type="button" class="dtab' + (i ? '' : ' on') + '" data-dtab="' + p.id + '">' +
+    '<button type="button" class="dtab' + (i ? '' : ' on') + '" data-dtab="' + p.id + '"' +
+      (p.crit ? ' title="' + p.crit + ' of these ' + p.n + ' are critical"' : '') + '>' +
       escHtml(p.label) +
-      (p.n ? '<span class="dcount' + (p.crit ? ' crit' : '') + '">' + (p.crit || p.n) + '</span>' : '') +
+      (p.n ? '<span class="dcount' + (p.crit ? ' crit' : '') + '">' + p.n + '</span>' : '') +
     '</button>').join('');
   const bodies = panes.map((p, i) =>
     '<div class="dpane' + (i ? '' : ' on') + '" data-dpane="' + p.id + '">' + p.body + '</div>').join('');
