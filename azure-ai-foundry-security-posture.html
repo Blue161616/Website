@@ -91,6 +91,16 @@
   @media (prefers-reduced-motion: reduce) { .gwdiag animate, .gwdiag animateMotion { display: none; } }
   /* The distinction between an account and an agent, stated where it is most
      likely to be got wrong. */
+  /* Two sources, two answers, side by side — a dash where the population could
+     not be read and "none" where it could. The distinction was previously three
+     paragraphs of prose. */
+  .agsrc { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  .agsrc td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top;
+              font-size: 12px; }
+  .agsrc tr:last-child td { border-bottom: 0; }
+  .agsrc td:first-child { width: 260px; }
+  .agsrc td div { font-size: 10px; color: var(--muted); margin-top: 2px; }
+
   .agdiff { margin: 10px 0 0; padding: 10px 12px; border-radius: 8px;
             border-left: 2px solid var(--accent);
             background: color-mix(in srgb, var(--accent) 7%, transparent);
@@ -1191,6 +1201,8 @@ async function scan() {
     const aiRows = rows.filter((r) => !/microsoft\.apimanagement\/service/i.test(r.type || ""));
     const resources = aiRows.map((r) => parseResource(r, subNames[r.subscriptionId] || r.subscriptionId));
     MODEL.gateway = gwBuild(rows, resources);
+    // Best-effort, and never fatal: the posture answer does not depend on it.
+    try { await gwReadApis(at); } catch (e) { console.warn('[gateway apis]', e); }
 
     // Enrich: diagnostic settings (all) + deployments (cognitive), concurrency-limited.
     MODEL.enrichBlocked = false;
@@ -1777,6 +1789,86 @@ function rtBlock() {
     '<div class="rtgroup-h">AI red teaming</div>' + parts.join('') + '</div>';
 }
 
+// ── What is published on the gateway ───────────────────────────────────────
+// An API whose backend is a Foundry endpoint is proof the gateway fronts that
+// account — far better than "a v2 APIM exists in the same subscription", which
+// was all this page could say before.
+//
+// Anything else published there is a candidate registered agent: Foundry
+// registers custom agents as APIs on the gateway, so they appear here without
+// the data plane being involved at all.
+//
+// Best-effort by construction. APIM APIs need a read role on the APIM instance,
+// which a Reader on the subscription has but a Reader on only the AI resources
+// does not. A refusal downgrades to the old heuristic rather than erroring.
+const APIM_API_VERSIONS = ['2024-05-01', '2022-08-01'];
+const FOUNDRY_HOST_RE = /\.(services\.ai\.azure\.com|openai\.azure\.com|cognitiveservices\.azure\.com)/i;
+
+async function readApimApis(svc, at) {
+  for (const v of APIM_API_VERSIONS) {
+    try {
+      const r = await armGet(ARM + svc.id + '/apis?api-version=' + v, at);
+      if (r && Array.isArray(r.value)) return { ok: true, apis: r.value.map(a => ({
+        name: (a.properties && a.properties.displayName) || a.name,
+        path: (a.properties && a.properties.path) || '',
+        serviceUrl: (a.properties && a.properties.serviceUrl) || '',
+        id: a.id,
+      })) };
+    } catch (e) {
+      // 404 on an api-version is a wrong guess; anything else is a real refusal.
+      if (!/\b404\b/.test(String(e && e.message))) return { ok: false, why: String(e && e.message || e) };
+    }
+  }
+  return { ok: false, why: 'no supported API version' };
+}
+
+async function gwReadApis(at) {
+  const G = MODEL.gateway;
+  if (!G || !G.v2 || !G.v2.length) return;
+  await mapPool(G.v2, 4, async (svc) => {
+    const r = await readApimApis(svc, at);
+    svc.apisRead = r.ok;
+    svc.apis = r.ok ? r.apis : [];
+    svc.apisWhy = r.ok ? '' : r.why;
+    // Which of these point back at a Foundry account, and which are something
+    // else somebody published on the same instance.
+    svc.foundryApis = svc.apis.filter(a => FOUNDRY_HOST_RE.test(a.serviceUrl || ''));
+    svc.otherApis = svc.apis.filter(a => !FOUNDRY_HOST_RE.test(a.serviceUrl || ''));
+  });
+
+  // Promote candidate → linked where an API actually names the account. Matching
+  // on the account's own subdomain rather than on the name, because an APIM
+  // instance may front several accounts and only the URL says which.
+  (MODEL.resources || []).filter(r => r.family === 'cognitive').forEach(r => {
+    if (!r.gateway) return;
+    const sub = String(r.customSubdomain || r.name || '').toLowerCase();
+    const fronting = G.v2.filter(svc => (svc.foundryApis || [])
+      .some(a => String(a.serviceUrl).toLowerCase().includes(sub)));
+    if (fronting.length) {
+      r.gateway.state = 'linked';
+      r.gateway.proven = true;
+      r.gateway.via = fronting.map(f => f.name);
+      r.gateway.evidence = 'an API on ' + fronting.map(f => f.name).join(', ') +
+        ' has this account as its backend';
+    }
+  });
+}
+
+// Agents registered through the gateway. Not the whole agent estate — an agent
+// living inside a project and never registered does not appear here — so the
+// view says which population this is rather than implying it is all of them.
+function gwRegisteredAgents() {
+  const G = MODEL.gateway;
+  if (!G || !G.v2) return { readable: false, agents: [], blocked: [] };
+  const read = G.v2.filter(s => s.apisRead);
+  const blocked = G.v2.filter(s => !s.apisRead);
+  const agents = [];
+  read.forEach(svc => (svc.otherApis || []).forEach(a => agents.push({
+    name: a.name, gateway: svc.name, url: a.serviceUrl, path: a.path, source: 'registered',
+  })));
+  return { readable: read.length > 0, agents, blocked, gateways: read.length };
+}
+
 // ── AI Gateway · callers, the gateway, and what is behind it ───────────────
 // The diagram earns its place by drawing the DIFFERENCE, not the topology. With
 // no gateway the callers reach the models directly and share one key, and the
@@ -1946,36 +2038,49 @@ function renderAgentsView() {
 
   // Read failure and empty estate are different answers and must not share a
   // screen. The first is "we could not look"; the second is "we looked".
+  // Two populations, two sources. In-project agents need the data plane and are
+  // CORS-blocked; agents registered through the AI Gateway are APIM APIs and come
+  // straight off ARM. Reporting them together as "agents" would merge a reading
+  // with a blank.
+  const reg = gwRegisteredAgents();
+  if (!agents.length && reg.agents.length) {
+    host.innerHTML = '<div class="card"><h2>Agents</h2>' +
+      '<div class="hint" style="margin:-4px 0 10px">Registered on the AI Gateway, read from Azure ' +
+      'Resource Manager. Agents that live inside a project and were never registered need the Foundry ' +
+      'data plane, which a browser cannot call — those are not listed here.</div>' +
+      '<div style="overflow-x:auto"><table><thead><tr><th>Agent</th><th>Gateway</th>' +
+      '<th>Backend</th></tr></thead><tbody>' +
+      reg.agents.map(a => '<tr><td>' + escHtml(a.name) + '</td><td>' + escHtml(a.gateway) + '</td>' +
+        '<td class="mono" style="font-size:11px">' + escHtml(a.url || a.path || '—') + '</td></tr>').join('') +
+      '</tbody></table></div></div>';
+    return;
+  }
   if (!agents.length) {
     const blocked = L && L.state && L.state !== 'ok';
     const nAcct = (MODEL.resources || []).filter(r => r.family === 'cognitive').length;
     // Named explicitly, because the counts invite exactly the wrong reading: the
     // Overview badge says 3 and this one says nothing, and they are not the same
     // population. An account called "claudeagentresource" is still an account.
-    const distinction = nAcct
-      ? '<div class="agdiff"><b>These are not the ' + nAcct + ' row' + (nAcct === 1 ? '' : 's') +
-        ' on Overview.</b> Those are <b>accounts</b> — the Foundry resource that holds the model ' +
-        'deployments and projects, and what every finding elsewhere in this tool is scored against. ' +
-        'An <b>agent</b> is a workflow that lives inside a project on one of them, calls a model many ' +
-        'times per interaction, and can carry a guardrail of its own. ' + nAcct + ' account' +
-        (nAcct === 1 ? '' : 's') + ' here could host agents; what is missing is the list of agents ' +
-        'inside them.</div>'
-      : '';
-    host.innerHTML = '<div class="card"><h2>Agents</h2>' + distinction +
-      (blocked
-        ? '<p class="dmuted" style="margin:10px 0 0">The agent list itself could not be read. ' +
-          escHtml(L.note || 'The Foundry data plane did not answer.') +
-          (L.state === 'cors'
-            ? ' This is a browser restriction rather than a permission: the call cannot be made from a page ' +
-              'like this one however the roles are set, so the agent inventory and its risk scores are ' +
-              '<b>unknown here</b> rather than empty. Reading it needs a server-side call this page ' +
-              'deliberately does not make.'
-            : '') + '</p>'
-        : '<p class="dmuted" style="margin:10px 0 0">The projects this sign-in can read contain no agents. ' +
-          'That is an answer, not a read failure — the call succeeded and returned nothing.</p>') +
-      '<div class="hint" style="margin-top:12px">What this view scores, once the list is readable: the ' +
-      'account exposure each agent inherits — internet reachability, static keys, logging — plus the risk ' +
-      'categories its guardrail leaves uncovered, plus whether it has ever been red teamed.</div></div>';
+    const blockedGw = reg.blocked.length;
+    host.innerHTML = '<div class="card"><h2>Agents</h2>' +
+      '<table class="agsrc"><tbody>' +
+      '<tr><td><b>Registered on the AI Gateway</b><div>Azure Resource Manager</div></td>' +
+        '<td>' + (reg.readable
+          ? '<span class="dmuted">none</span>'
+          : blockedGw
+            ? '<span class="dmuted">—</span> <span class="gmeta">needs a read role on the API Management instance</span>'
+            : '<span class="dmuted">—</span> <span class="gmeta">no gateway found</span>') + '</td></tr>' +
+      '<tr><td><b>Living inside a project</b><div>Foundry data plane</div></td>' +
+        '<td>' + (blocked
+          ? '<span class="dmuted">—</span> <span class="gmeta">' +
+            (L.state === 'cors' ? 'a browser cannot make this call, whatever the roles say'
+                                : escHtml(L.note || 'not answered')) + '</span>'
+          : '<span class="dmuted">none</span> <span class="gmeta">the call succeeded and returned nothing</span>') +
+        '</td></tr></tbody></table>' +
+      (nAcct ? '<div class="hint" style="margin-top:10px">The ' + nAcct + ' row' +
+        (nAcct === 1 ? '' : 's') + ' on Overview are <b>accounts</b>, not agents — an agent runs ' +
+        'inside a project on one of them.</div>' : '') +
+      '</div>';
     return;
   }
 
