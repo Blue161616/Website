@@ -190,6 +190,14 @@
     <div class="hint">Stored in this browser only. Redirect URI is this page's own URL:
       <code id="redirect-uri"></code></div>
 
+    <label class="fld" for="tenant-id">Directory (tenant) ID
+      <span style="text-transform:none;letter-spacing:0;color:var(--dim)">— only for a single-tenant app</span></label>
+    <input id="tenant-id" type="text" spellcheck="false" autocomplete="off"
+           placeholder="leave blank for a multi-tenant registration" />
+    <div class="hint">Entra refuses the shared <code>/common</code> endpoint for single-tenant
+      registrations created after 2018 and answers <code>AADSTS50194</code>. Fill this in to sign in
+      against your own tenant endpoint instead, or flip the registration to multi-tenant — either works.</div>
+
     <div class="gate-actions">
       <button class="btn btn-primary" id="btn-signin">Sign in with Microsoft</button>
       <button class="btn" id="btn-consent" title="Send an administrator to the tenant-wide consent screen for these permissions">Grant admin consent</button>
@@ -219,12 +227,18 @@
             <tr><td class="api">Microsoft Graph</td><td><code>Policy.Read.All</code></td>
                 <td class="why">the cross-tenant access policy — <b>required</b></td></tr>
             <tr><td class="api">Microsoft Graph</td><td><code>CrossTenantInformation.ReadBasic.All</code></td>
-                <td class="why">resolve partner tenant IDs to names — <b>required</b></td></tr>
+                <td class="why">names partner tenants instead of listing GUIDs <span class="opt">optional</span></td></tr>
             <tr><td class="api">Microsoft Graph</td><td><code>User.Read.All</code></td>
                 <td class="why">correlate guests to partner tenants <span class="opt">optional</span></td></tr>
           </table>
-          <p class="fine">Without the third the report still runs; the guest correlation section reports
-            itself unevaluated rather than showing zero guests.</p>
+          <p class="fine">Only the first is required. Without the second, partners are listed by tenant ID
+            and the report says so — every finding still fires, because the policy is what is being read,
+            not the names. Where a partner has cross-tenant synchronisation configured its display name
+            arrives with that object anyway. Without the third, guest correlation reports itself
+            unevaluated rather than showing zero guests.</p>
+          <p class="fine">In the portal the delegated list sorts <code>CrossTenantInformation</code>
+            directly after <code>Contacts</code>. If it is genuinely absent from your tenant's picker,
+            skip it — nothing here depends on it.</p>
         </div>
       </div>
 
@@ -240,6 +254,24 @@
 
       <div class="step">
         <div class="sn">4</div>
+        <div class="sb">
+          <div class="st">Tenant access — consent alone grants nothing</div>
+          <p>A delegated token acts as the signed-in user, so the account needs a role that may read the
+             policy. Microsoft supports these, and they are not equivalent:</p>
+          <ul>
+            <li><b>Global Reader</b>, <b>Security Reader</b> or <b>Security Administrator</b> — read
+                everything this tool needs.</li>
+            <li><b>Global Secure Access Administrator</b> and <b>Teams Administrator</b> — read partner
+                configuration but <b>not</b> cross-tenant synchronisation. Signed in as one of those, the
+                sync column reports itself unreadable and a finding says so, rather than reporting that
+                no partner can provision users into your directory.</li>
+          </ul>
+          <p class="fine">Global Reader is the least that produces a complete report.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="sn">5</div>
         <div class="sb">
           <div class="st">What this reads, and what it does not</div>
           <p>Only the cross-tenant access policy as Graph returns it: the default configuration, the
@@ -306,6 +338,7 @@ const GRAPH  = 'https://graph.microsoft.com';
 const CORE_SCOPES = [GRAPH + '/Policy.Read.All', GRAPH + '/CrossTenantInformation.ReadBasic.All'];
 const GUEST_SCOPE = [GRAPH + '/User.Read.All'];
 const CID_KEY = 'blue16_xtap_client_id';
+const TID_KEY = 'blue16_xtap_tenant_id';
 const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 // Distinct guest home domains resolved per run. Each is one Graph call, and the
 // cap is stated on screen when it bites rather than silently truncating.
@@ -321,10 +354,16 @@ const plural = (n, s, p) => n === 1 ? s : (p || s + 's');
 
 // ═════════════════════════ Sign-in ═════════════════════════
 $('redirect-uri').textContent = location.href.split('?')[0].split('#')[0];
-try { $('client-id').value = localStorage.getItem(CID_KEY) || ''; } catch (e) {}
+try {
+  $('client-id').value = localStorage.getItem(CID_KEY) || '';
+  $('tenant-id').value = localStorage.getItem(TID_KEY) || '';
+} catch (e) {}
 
 $('client-id').addEventListener('input', () => {
   try { localStorage.setItem(CID_KEY, $('client-id').value.trim()); } catch (e) {}
+});
+$('tenant-id').addEventListener('input', () => {
+  try { localStorage.setItem(TID_KEY, $('tenant-id').value.trim()); } catch (e) {}
 });
 
 function gateError(msg) {
@@ -349,14 +388,18 @@ async function buildMsal() {
     throw new Error('The Microsoft sign-in library did not load. Check the connection or any extension blocking scripts.');
   const cid = clientId();
   if (!GUID_RE.test(cid)) throw new Error('Enter the app registration client ID (a GUID) first.');
-  if (MSAL && MSAL._cid === cid) return MSAL;
+  // A single-tenant registration cannot use the shared endpoint, so the tenant
+  // field switches the authority rather than forcing the registration to change.
+  const tid = ($('tenant-id').value || '').trim();
+  const authority = 'https://login.microsoftonline.com/' + (GUID_RE.test(tid) ? tid : 'common');
+  if (MSAL && MSAL._cid === cid && MSAL._authority === authority) return MSAL;
   const app = new msal.PublicClientApplication({
-    auth: { clientId: cid, authority: 'https://login.microsoftonline.com/common',
+    auth: { clientId: cid, authority: authority,
             redirectUri: location.href.split('?')[0].split('#')[0] },
     cache: { cacheLocation: 'sessionStorage', storeAuthStateInCookie: false },
   });
   if (app.initialize) await app.initialize();
-  MSAL = app; MSAL._cid = cid;
+  MSAL = app; MSAL._cid = cid; MSAL._authority = authority;
   return app;
 }
 
@@ -392,8 +435,12 @@ $('btn-signin').onclick = async () => {
     await run();
   } catch (e) {
     const code = (e && e.errorCode) || '';
+    const msg = (e && e.message) || code || String(e);
     if (!['user_cancelled','access_denied','popup_window_error'].some(c => code.includes(c)))
-      gateError((e && e.message) || code || String(e));
+      gateError(msg.indexOf('AADSTS50194') > -1
+        ? 'This registration is single-tenant, so the shared endpoint is refused. Put your directory '
+          + '(tenant) ID in the field above and sign in again — or set the registration to multi-tenant.'
+        : msg);
   } finally {
     btn.disabled = false; btn.textContent = 'Sign in with Microsoft';
   }
@@ -451,17 +498,27 @@ async function graphAll(path, tok, opts, cap) {
 // Null is not one of those states — it means the partner said nothing and the
 // default applies. Collapsing that into "blocked" is the mistake this surface
 // invites, so it is a first-class state everywhere below.
+// Graph uses named sentinels alongside GUIDs. Office365 is the one that matters:
+// it is the whole Office 365 suite, not "one application", and it is what the
+// standard Teams shared-channel configuration targets.
+const TARGET_NAMES = { AllUsers: 'all users', AllApplications: 'all applications',
+                       Office365: 'the Office 365 suite' };
+function targetLabel(tg) {
+  const names = (tg || []).map(x => TARGET_NAMES[x && x.target] || (x && x.target) || '?');
+  return names.slice(0, 3).join(', ') + (names.length > 3 ? ' +' + (names.length - 3) : '');
+}
 function classifyTargets(t) {
   if (t == null) return { mode: 'inherited', label: 'inherited' };
   const at = String(t.accessType || '').toLowerCase();
   const tg = t.targets || [];
   const all = tg.some(x => x && (x.target === 'AllUsers' || x.target === 'AllApplications'));
+  const what = targetLabel(tg);
   if (at === 'allowed')
-    return all ? { mode: 'allow-all', label: 'all allowed' }
-               : { mode: 'allow-some', label: tg.length + ' allowed', n: tg.length };
+    return all ? { mode: 'allow-all', label: what + ' allowed' }
+               : { mode: 'allow-some', label: what + ' allowed', n: tg.length };
   if (at === 'blocked')
-    return all ? { mode: 'block-all', label: 'all blocked' }
-               : { mode: 'block-some', label: tg.length + ' blocked', n: tg.length };
+    return all ? { mode: 'block-all', label: what + ' blocked' }
+               : { mode: 'block-some', label: what + ' blocked', n: tg.length };
   return { mode: 'unknown', label: 'unrecognised' };
 }
 const permits = mode => mode === 'allow-all' || mode === 'allow-some';
@@ -631,6 +688,20 @@ function buildFindings(ctx) {
     }
   });
 
+  // A role that cannot read synchronisation leaves a hole the table shows and the
+  // findings would otherwise stay silent about. Silence here reads as "nothing
+  // found", which is not what happened.
+  const unreadable = Object.keys(ctx.syncErr || {});
+  if (unreadable.length) {
+    add('medium', 'P9', 'Inbound provisioning could not be read for ' + unreadable.length + ' ' +
+        plural(unreadable.length, 'partner'),
+      'The signed-in account may read partner configuration but not cross-tenant synchronisation. '
+      + 'Whether those partners can provision users into this directory is unknown, not absent — '
+      + 'Global Secure Access Administrator and Teams Administrator both hit this limit.',
+      'Re-run as Global Reader, Security Reader or Security Administrator for a complete answer.',
+      unreadable.map(id => 'partners[' + id + '].identitySynchronization').join('\n'));
+  }
+
   // ── Guest correlation (only when the scope was granted) ─────────────────
   if (ctx.guests && ctx.guests.state === 'ok') {
     const underDefault = ctx.guests.underDefault;
@@ -667,12 +738,27 @@ async function run() {
     const tok = await token(CORE_SCOPES, true);
 
     const def = await graph('/v1.0/policies/crossTenantAccessPolicy/default', tok);
-    const partners = await graphAll('/v1.0/policies/crossTenantAccessPolicy/partners', tok);
 
-    // Cross-tenant sync is a separate object per partner, and 404 is its normal
-    // answer when it was never configured. Anything else is worth surfacing.
+    // The collection supports $expand on the synchronisation policy, so the happy
+    // path is one call rather than one per partner. Fall back to the plain list
+    // if the expanded form is refused.
+    let partners;
+    try {
+      partners = await graphAll(
+        '/v1.0/policies/crossTenantAccessPolicy/partners?$expand=identitySynchronization', tok);
+    } catch (e) {
+      partners = await graphAll('/v1.0/policies/crossTenantAccessPolicy/partners', tok);
+    }
+
+    // Absent from the expand is not the same as absent from the tenant, so every
+    // partner the expand did not answer for is probed directly. 404 there means
+    // never configured; 403 means this account may not look — Global Secure Access
+    // Administrator and Teams Administrator can read partners but not
+    // synchronisation, and reporting their blind spot as "none configured" would
+    // be the exact mistake this tool exists to avoid.
     const sync = {}; const syncErr = {};
     await Promise.all(partners.map(async p => {
+      if (p.identitySynchronization) { sync[p.tenantId] = p.identitySynchronization; return; }
       try {
         sync[p.tenantId] = await graph(
           '/v1.0/policies/crossTenantAccessPolicy/partners/' + encodeURIComponent(p.tenantId) +
@@ -695,6 +781,14 @@ async function run() {
         if (e.status === 403 || e.status === 401) { namesAttempted = false; namesErr = e.message; }
       }
     }));
+
+    // Free fallback for the optional lookup: where synchronisation is configured
+    // it carries the partner's own display name, so some tenants can be named
+    // even when CrossTenantInformation.ReadBasic.All was never granted.
+    Object.keys(sync).forEach(id => {
+      const dn = sync[id] && sync[id].displayName;
+      if (!names[id] && dn) names[id] = { displayName: dn, defaultDomainName: '', fromSync: true };
+    });
 
     const guests = await loadGuests(partners, names, def);
 
@@ -911,10 +1005,10 @@ function render(ctx) {
        plural(ctx.partners.length, 'entry', 'entries') + '</span></div>';
 
   if (!ctx.namesAttempted) {
-    h += '<div class="note note-warn"><b>Tenant names could not be resolved.</b> ' +
-      'The app registration is missing <code>CrossTenantInformation.ReadBasic.All</code>, so partners are ' +
-      'listed by tenant ID only. That is a missing permission, not a missing organisation — the entries below ' +
-      'are real either way.</div>';
+    h += '<div class="note note-info"><b>Partners are listed by tenant ID.</b> ' +
+      'The optional <code>CrossTenantInformation.ReadBasic.All</code> permission was not granted or not ' +
+      'available, so tenant GUIDs were not resolved to organisation names. That is a missing name, not a ' +
+      'missing organisation — every entry below is real and every check below still ran.</div>';
   }
 
   if (!ctx.partners.length) {
@@ -946,6 +1040,10 @@ function render(ctx) {
           '<div class="tid">' + esc(p.tenantId) + '</div>' +
           (p.isServiceProvider ? '<div style="margin-top:4px">' +
             statePill('allow-some', 'service provider', 'Managed-service or delegated-administration relationship') +
+            '</div>' : '') +
+          (p.isInMultiTenantOrganization ? '<div style="margin-top:4px">' +
+            statePill('inherited', 'multi-tenant org',
+              'Member of the same multi-tenant organization, which carries its own trust and sync defaults') +
             '</div>' : '') +
         '</td>' +
         '<td>' + settingRow('Collaboration inbound', p.b2bCollaborationInbound, d.b2bCollaborationInbound) + '</td>' +
