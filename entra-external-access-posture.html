@@ -488,6 +488,12 @@ $('btn-signin').onclick = async () => {
     }
     ACCOUNT = res.account;
     app.setActiveAccount(ACCOUNT);
+    // Fill the field in from the account itself, so the next load already knows
+    // the tenant and a single-tenant registration signs in without being asked.
+    if (ACCOUNT.tenantId && !($('tenant-id').value || '').trim()) {
+      $('tenant-id').value = ACCOUNT.tenantId;
+      try { localStorage.setItem(TID_KEY, ACCOUNT.tenantId); } catch (e) {}
+    }
     $('gate').style.display = 'none';
     $('app').style.display = '';
     $('who-user').textContent = ACCOUNT.username || '';
@@ -513,13 +519,25 @@ $('btn-signout').onclick = async () => {
 };
 $('btn-refresh').onclick = () => run();
 
+// /common is only needed for the first sign-in, when the tenant is unknown.
+// After that the account names its own tenant, and continuing to ask /common is
+// what made a later top-up fail with AADSTS50194 on a single-tenant registration
+// even though sign-in itself had succeeded. Every subsequent call is pinned to
+// the tenant that actually signed in.
+function accountAuthority() {
+  return ACCOUNT && ACCOUNT.tenantId
+    ? 'https://login.microsoftonline.com/' + ACCOUNT.tenantId : undefined;
+}
 async function token(scopes, interactive) {
-  const opts = { scopes, account: ACCOUNT };
-  try { return (await MSAL.acquireTokenSilent(opts)).accessToken; }
-  catch (e) {
+  const authority = accountAuthority();
+  try {
+    return (await MSAL.acquireTokenSilent({ scopes, account: ACCOUNT, authority })).accessToken;
+  } catch (e) {
     if (!interactive) throw e;
     clearInteractionLock();
-    return (await MSAL.acquireTokenPopup({ scopes })).accessToken;
+    // account included so the popup resolves the same identity rather than
+    // starting a fresh account picker against the wrong authority.
+    return (await MSAL.acquireTokenPopup({ scopes, account: ACCOUNT, authority })).accessToken;
   }
 }
 
@@ -1359,7 +1377,12 @@ function viewGuests(ctx) {
       'single-page app signs in as you and can only ever use delegated permissions. ' +
       esc(g.error || '') + '</div>';
   } else if (g.state === 'error') {
-    h += '<div class="note note-warn"><b>Not evaluated.</b> ' + esc(g.error) + '</div>';
+    h += '<div class="note note-warn"><b>Not evaluated.</b> ' +
+      (String(g.error || '').indexOf('AADSTS50194') > -1
+        ? 'The token request went to the shared endpoint against a single-tenant registration. '
+          + 'Sign out and back in — the tenant is remembered from the sign-in now — or put your '
+          + 'directory ID in the field on the sign-in screen.'
+        : esc(g.error)) + '</div>';
   } else if (g.state === 'ok') {
     h += '<div class="grid">' +
       tile(g.total, 'Guest accounts', g.domains + ' distinct home ' + plural(g.domains, 'domain'), 'info') +
