@@ -872,11 +872,25 @@ async function run() {
   }
 }
 
-/** Optional. Never reports zero guests when it could not look. */
-async function loadGuests(partners, names, def) {
+/** Optional. Never reports zero guests when it could not look.
+ *
+ *  The token is asked for silently first, which fails whenever the sign-in
+ *  predates the consent — the cached token simply never carried this scope.
+ *  That is a recoverable state and not the same as the permission being absent,
+ *  so it returns 'not-loaded' and the section offers to top the token up rather
+ *  than declaring a permission missing that the tenant has actually granted. */
+async function loadGuests(partners, names, def, interactive) {
   let tok;
-  try { tok = await token(GUEST_SCOPE, false); }
-  catch (e) { return { state: 'no-scope' }; }
+  try { tok = await token(GUEST_SCOPE, !!interactive); }
+  catch (e) {
+    const code = (e && e.errorCode) || '';
+    if (!interactive) return { state: 'not-loaded' };
+    if (['consent_required', 'access_denied', 'invalid_grant'].some(c => code.indexOf(c) > -1))
+      return { state: 'denied', error: (e && e.message) || code };
+    if (['user_cancelled', 'popup_window_error'].some(c => code.indexOf(c) > -1))
+      return { state: 'not-loaded' };
+    return { state: 'error', error: (e && e.message) || code || String(e) };
+  }
   try {
     const users = await graphAll(
       '/v1.0/users?$filter=' + encodeURIComponent("userType eq 'Guest'") +
@@ -940,6 +954,16 @@ async function loadGuests(partners, names, def) {
 }
 
 // ═════════════════════════ Render ═════════════════════════
+/** Re-run only the guest half, after an interactive consent top-up. */
+async function loadGuestsNow() {
+  if (!LAST) return;
+  const btn = document.getElementById('btn-load-guests');
+  if (btn) { btn.disabled = true; btn.textContent = 'Signing in for guests…'; }
+  LAST.guests = await loadGuests(LAST.partners, LAST.names, LAST.def, true);
+  LAST.findings = buildFindings(LAST);
+  render(LAST);
+}
+
 // ═════════════════════════ Explainers ═════════════════════════
 // One animation per section, drawn from this tenant's own numbers. A picture
 // that says the same thing on every tenant is decoration; these say what YOUR
@@ -1043,9 +1067,11 @@ function animGuests(ctx) {
         '<animateMotion dur="3.2s" repeatCount="indefinite" path="M126 118 H492"/></circle></g>' +
       '<text x="502" y="122" class="xa-lb" text-anchor="end" fill="var(--crit)">nothing recorded</text>' +
     '</svg>';
-  const count = n === null
-    ? 'Guest accounts were not read, so nothing here is counted. '
-    : '<b>' + n + '</b> guest ' + plural(n, 'account') + ' arrived the upper way and can be reviewed. ';
+  const count = n !== null
+    ? '<b>' + n + '</b> guest ' + plural(n, 'account') + ' arrived the upper way and can be reviewed. '
+    : g.state === 'denied'
+      ? 'Guest accounts could not be read, so nothing here is counted. '
+      : 'Guest accounts have not been read yet, so nothing here is counted. ';
   return explainer(
     'Two ways in, and only one leaves a record',
     count + 'B2B collaboration creates a guest object you can review, expire and revoke. ' +
@@ -1320,14 +1346,21 @@ function viewGuests(ctx) {
       '<span class="band-t">Guest correlation</span>' +
       '<span class="band-s">Which partner configuration actually governs the guests you have</span></div>';
 
-  if (g.state === 'no-scope') {
-    h += '<div class="note note-warn"><b>Not evaluated.</b> This section needs delegated ' +
-      '<code>User.Read.All</code>, which this sign-in does not hold. Granting it as an <i>application</i> ' +
-      'permission will not do — a single-page app signs in as you and can only use delegated permissions. ' +
-      'That is different from having no guests: nothing was counted, so nothing is reported.</div>';
+  if (g.state === 'not-loaded') {
+    h += '<div class="note note-info"><b>Not loaded yet.</b> This section reads guest accounts with ' +
+      'delegated <code>User.Read.All</code>, and the current token does not carry that scope — which is ' +
+      'normal when the sign-in happened before the permission was consented. One more sign-in adds it. ' +
+      'Nothing below is a count of zero; nothing has been counted at all.' +
+      '<div style="margin-top:10px"><button class="btn btn-primary" id="btn-load-guests" ' +
+      'style="padding:7px 14px;font-size:12.5px">Load guests</button></div></div>';
+  } else if (g.state === 'denied') {
+    h += '<div class="note note-warn"><b>Refused.</b> Delegated <code>User.Read.All</code> was not granted ' +
+      'to this sign-in. Note that granting it as an <i>application</i> permission will not do — a ' +
+      'single-page app signs in as you and can only ever use delegated permissions. ' +
+      esc(g.error || '') + '</div>';
   } else if (g.state === 'error') {
     h += '<div class="note note-warn"><b>Not evaluated.</b> ' + esc(g.error) + '</div>';
-  } else {
+  } else if (g.state === 'ok') {
     h += '<div class="grid">' +
       tile(g.total, 'Guest accounts', g.domains + ' distinct home ' + plural(g.domains, 'domain'), 'info') +
       tile(g.underDefault, 'Governed by the default', 'home tenant has no partner entry',
@@ -1347,7 +1380,7 @@ function viewGuests(ctx) {
       '<span class="band-t">What these guests cost you</span>' +
       '<span class="band-s">' + own.length + ' ' + plural(own.length, 'finding') + '</span></div>' +
     findingsBlock(own, g.state === 'ok' ? 'Nothing flagged on the guest population.'
-                                        : 'No guest findings, because guests were not read.');
+                                        : 'No guest findings, because guests have not been read.');
   return h;
 }
 
@@ -1359,6 +1392,8 @@ function render(ctx) {
              : VIEW === 'guests'   ? viewGuests(ctx)
              :                       viewOverview(ctx);
   $('content').innerHTML = body;
+  const gb = document.getElementById('btn-load-guests');
+  if (gb) gb.onclick = loadGuestsNow;
   $('foot-when').textContent = 'read ' + ctx.at.toLocaleString();
 }
 
