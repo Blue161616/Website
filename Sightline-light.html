@@ -58,6 +58,13 @@
   .page[hidden]{display:none}
   .step{background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px 16px;
     margin-bottom:12px}
+  /* The two required imports sit side by side because they are one action, not
+     two stages — you export both, then build. The optional pair sits underneath
+     on the same grid so the shape of the page says which is which. */
+  .steps{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}
+  .steps .step{margin-bottom:0}
+  @media (max-width:900px){ .steps{grid-template-columns:1fr} }
+  .opt{font-weight:400;color:var(--dim);font-size:12px}
   .step h2{font-size:12px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:8px}
   .step h2 i{font-style:normal;width:19px;height:19px;border-radius:50%;background:var(--bg4);
     color:var(--muted);font-size:10.5px;display:inline-flex;align-items:center;justify-content:center;
@@ -237,6 +244,7 @@
 
 <main>
   <section class="page" id="page-import">
+    <div class="steps">
     <div class="step" id="step1">
       <h2><i>1</i>Defender device export</h2>
       <p>Defender portal → <b>Hunting</b> → <b>Advanced hunting</b> → paste the query → <b>Run</b> →
@@ -280,7 +288,48 @@
     </div>
 
     <div class="step" id="step3">
-      <h2><i>3</i>Tenant &amp; previous baseline <span style="font-weight:400;color:var(--dim);font-size:12px">— optional</span></h2>
+      <h2><i>3</i>Entra trusted locations <span class="opt">— optional</span></h2>
+      <p>Entra admin centre → <b>Protection</b> → <b>Conditional Access</b> →
+         <b>Named locations</b>, or run the script. A trusted location is your organisation
+         declaring <b>this public range is ours</b> — an ownership claim neither of the files above
+         can make, because one lists devices Defender manages and the other lists addresses Azure
+         issued.</p>
+      <div class="body">
+        <div class="pick">
+          <input type="file" accept=".csv,.json,text/csv,application/json" id="entra-file">
+          <button type="button" class="btn btn-secondary" onclick="_copyScript('entraps',this)">⧉ Copy PowerShell</button>
+          <button type="button" class="btn btn-secondary" data-noun="PowerShell"
+            onclick="_toggleScript('entraps',this)">Show PowerShell</button>
+        </div>
+        <div id="entraps" class="script" style="display:none"># Trusted IP named locations, one row per CIDR.
+Connect-MgGraph -Scopes Policy.Read.All -NoWelcome
+
+$rows = foreach ($loc in (Invoke-MgGraphRequest -Method GET `
+    -Uri 'v1.0/identity/conditionalAccess/namedLocations').value) {
+  if ($loc.'@odata.type' -ne '#microsoft.graph.ipNamedLocation') { continue }
+  if (-not $loc.isTrusted) { continue }
+  foreach ($r in $loc.ipRanges) {
+    [pscustomobject]@{
+      NAME    = $loc.displayName
+      CIDR    = $r.cidrAddress
+      VERSION = $(if ($r.'@odata.type' -match 'iPv6') { 'IPv6' } else { 'IPv4' })
+    }
+  }
+}
+$rows | Export-Csv -NoTypeInformation -Encoding UTF8 .\entra-trusted-locations.csv</div>
+        <div class="note">Needs <code>Install-Module Microsoft.Graph.Authentication</code> — that
+          submodule alone, not the whole SDK. <code>Policy.Read.All</code> is the least-privileged
+          scope and Global Reader or Security Reader already carries it, so no app registration.
+          The raw Graph JSON works here too, if you would rather use Graph Explorer than install
+          anything.</div>
+        <textarea id="entra-input" spellcheck="false"
+          placeholder="…or paste the CSV, or the Graph JSON, here"></textarea>
+        <div class="note" id="entra-state">No ranges loaded.</div>
+      </div>
+    </div>
+
+    <div class="step" id="step4">
+      <h2><i>4</i>Tenant &amp; previous baseline <span class="opt">— optional</span></h2>
       <p>A baseline is a small file this report writes at the end. Load last month's and this run
          gains a delta: what appeared, what lost its sensor, what Shodan started seeing. Without one
          the report is simply today, which is what it has always been.</p>
@@ -301,6 +350,7 @@
           from the filtered run would read as decommissioned. The report says so rather than
           showing the difference.</div>
       </div>
+    </div>
     </div>
 
     <div id="checks" style="display:none"></div>
@@ -368,6 +418,15 @@ function esc(s) {
 function jsStr(s) {
   return esc(String(s || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
 }
+
+// Four states, and the difference between the last two is the whole point:
+//   undefined    never asked
+//   null         in flight
+//   {error:true} asked, and Shodan did not answer
+//   {ports,...}  answered — including the empty answer, which is a real finding
+// Only the last is evidence. Everything that reasons about exposure asks here so
+// that an unreachable endpoint can never be read as a clean estate.
+function _idbAnswered(d) { return !!d && !d.error; }
 
 // ── Defender for Endpoint · CSV import ─────────────────────────────────────
 // The API path stays the sanctioned one. This is for the engagement where you
@@ -541,79 +600,6 @@ function _frontendKind(name, assoc) {
 // One source of truth, so the label and the count cannot drift apart.
 function _looksFrontend(name, assoc) { return !!_frontendKind(name, assoc); }
 
-// One row per public IP, whichever file it came from — the report reads as a
-// single inventory rather than three tables the reader has to join by eye.
-function _surfaceRows(s) {
-  const rows = [
-    ...s.covered.map(c => ({
-      ip: c.ip, src: c.src === 'onprem' ? 'onprem' : 'azure',
-      // The address resource is the host name with "-pip" bolted on, which is
-      // noise in every row. Stripped for display only — the snapshot keeps the
-      // real resource name, because that is what you search Azure for.
-      name: _azureServerName(c.azName || ''), device: c.name || '',
-      sku: c.sku || '', assoc: c.assoc || '',
-      mde: /^onboard/i.test(c.onboarding) ? 'onboarded' : 'notonboarded',
-      onboarding: c.onboarding || '', exposureLevel: c.exposureLevel || '', riskScore: c.riskScore || '',
-      scanned: !!c.scanned, scannedPort: c.scannedPort || '', reason: c.reason || '',
-      shareCount: c.shareCount || 1, os: c.os || '', arc: !!c.arc,
-    })),
-    ...s.uncovered.map(u => ({
-      ip: u.ip, src: 'azure', name: _azureServerName(u.name || ''), device: '',
-      sku: u.sku || '', assoc: u.assoc || '', mde: 'none',
-      onboarding: '', exposureLevel: '', riskScore: '', os: '', arc: false,
-    })),
-  ];
-  // A Defender device is proof of a machine, so evidence outranks the name
-  // guess. Only addresses with no device fall back to inferring from the name.
-  rows.forEach(r => { r.kind = r.device ? 'machine'
-    : (_looksFrontend(r.name, r.assoc) ? 'gateway' : 'machine'); });
-  // The one real hazard in using a device's own public address: when several
-  // devices report the same one, it is the site's NAT or proxy, and scanning it
-  // tests the customer's internet breakout rather than any of those machines.
-  // This is counted from the data, not guessed from a name.
-  const perIp = new Map();
-  rows.forEach(r => { if (r.device) perIp.set(r.ip, (perIp.get(r.ip) || 0) + 1); });
-  rows.forEach(r => {
-    // Prefer the count taken across the whole export over the count of surviving
-    // rows — the excluded devices are exactly the evidence that this is a NAT.
-    const n = Math.max(r.shareCount || 1, perIp.get(r.ip) || 0);
-    if (n > 1 && r.src === 'onprem') { r.kind = 'nat'; r.natCount = n; } });
-  // Worst first, from the two things actually known before a scan.
-  //
-  // Shodan is evidence — somebody reached that port from the internet — so it
-  // outranks coverage, which is a gap rather than a finding. An observed RDP
-  // beats an unmonitored box nothing has been seen on. Coverage then breaks
-  // ties, and Defender's own exposure rating breaks those, being an opinion
-  // about the device rather than an observation about the address.
-  //
-  // With Shodan not looked up, every address scores zero there and this falls
-  // back to exactly the coverage order it had before.
-  const RK = { critical: 4, high: 3, medium: 2, low: 1 };
-  // A flat +1 for "has CVEs" put a host with a known-exploited vulnerability level
-  // with one that merely has 8443 open, and the tie then broke on IP address. The
-  // exploit signals are the strongest evidence in the report and they were the
-  // weakest term in the sort, so they carry their own weight: on CISA's
-  // known-exploited list beats everything, a high EPSS beats a port, and a CVE
-  // with neither is still worth more than nothing.
-  const shodanScore = r => { const d = IDB_CACHE[r.ip];
-    if (!d || (!(d.ports || []).length && !(d.vulns || []).length)) return 0;
-    const worst = (d.ports || []).reduce((m, p) => Math.max(m, RK[_portRisk(p)] || 0), 0);
-    const { anyKev, maxEpss } = cveExploitAgg(d.vulns || []);
-    const exploit = anyKev ? 5
-                  : (maxEpss != null && maxEpss >= 0.5) ? 4
-                  : (maxEpss != null && maxEpss >= 0.1) ? 3
-                  : (d.vulns || []).length ? 2 : 0;
-    return Math.max(worst, exploit); };
-  const covScore = r => r.kind === 'machine' && r.mde === 'none' ? 3
-                      : r.mde === 'notonboarded' ? 2
-                      : r.mde === 'none' ? 1 : 0;
-  const expScore = r => /^high$/i.test(r.exposureLevel) ? 2
-                      : /^medium$/i.test(r.exposureLevel) ? 1 : 0;
-  const score = r => shodanScore(r) * 6 + covScore(r) * 3 + expScore(r);
-  const num = ip => ip.split('.').reduce((a, o) => a * 256 + (+o || 0), 0);
-  return rows.sort((a, b) => score(b) - score(a) || num(a.ip) - num(b.ip));
-}
-
 // Shared by the preview and the import, so reading the files and committing them
 // cannot produce two different reports from the same rows.
 function _surfaceSnapFrom(p) {
@@ -682,28 +668,9 @@ function _surfaceRows(s) {
   //
   // With Shodan not looked up, every address scores zero there and this falls
   // back to exactly the coverage order it had before.
-  const RK = { critical: 4, high: 3, medium: 2, low: 1 };
-  // A flat +1 for "has CVEs" put a host with a known-exploited vulnerability level
-  // with one that merely has 8443 open, and the tie then broke on IP address. The
-  // exploit signals are the strongest evidence in the report and they were the
-  // weakest term in the sort, so they carry their own weight: on CISA's
-  // known-exploited list beats everything, a high EPSS beats a port, and a CVE
-  // with neither is still worth more than nothing.
-  const shodanScore = r => { const d = IDB_CACHE[r.ip];
-    if (!d || (!(d.ports || []).length && !(d.vulns || []).length)) return 0;
-    const worst = (d.ports || []).reduce((m, p) => Math.max(m, RK[_portRisk(p)] || 0), 0);
-    const { anyKev, maxEpss } = cveExploitAgg(d.vulns || []);
-    const exploit = anyKev ? 5
-                  : (maxEpss != null && maxEpss >= 0.5) ? 4
-                  : (maxEpss != null && maxEpss >= 0.1) ? 3
-                  : (d.vulns || []).length ? 2 : 0;
-    return Math.max(worst, exploit); };
-  const covScore = r => r.kind === 'machine' && r.mde === 'none' ? 3
-                      : r.mde === 'notonboarded' ? 2
-                      : r.mde === 'none' ? 1 : 0;
-  const expScore = r => /^high$/i.test(r.exposureLevel) ? 2
-                      : /^medium$/i.test(r.exposureLevel) ? 1 : 0;
-  const score = r => shodanScore(r) * 6 + covScore(r) * 3 + expScore(r);
+  // The three terms live at module scope, so the Exposture score and this
+  // ordering are one judgement rather than two that can drift apart.
+  const score = r => _expRaw(r);
   const num = ip => ip.split('.').reduce((a, o) => a * 256 + (+o || 0), 0);
   return rows.sort((a, b) => score(b) - score(a) || num(a.ip) - num(b.ip));
 }
@@ -885,15 +852,6 @@ function _sfMatch(r) {
 }
 
 function _sfActive() { return Object.values(_SF).some(Boolean); }
-// The Start Scan panel reports the filter/scope mismatch too, so it has to be
-// redrawn whenever the filter moves — otherwise it keeps offering a count from a
-// filter that is no longer set.
-function _surfaceRedraw() {
-  const el = document.getElementById('pane-surface');
-  if (el) el.innerHTML = buildSurfaceReport();
-  try { renderPrescanCta(); } catch (e) {}
-}
-
 // Microsoft Azure "A" mark (inline SVG) — brands the views built from the Azure
 // portal export, the way _msDefenderIcon brands the Defender ones.
 //
@@ -1002,7 +960,7 @@ function _riskStrip(t) {
   const rows = t.rows;
   // Has the Shodan pass run at all? undefined means never asked, so a Shodan tile
   // has nothing to report rather than nothing to find.
-  const asked = rows.filter(r => IDB_CACHE[r.ip] !== undefined && IDB_CACHE[r.ip] !== null).length;
+  const asked = rows.filter(r => _idbAnswered(IDB_CACHE[r.ip])).length;
   const active = _sfKpiActive();
 
   // Three states, not two. A tile used to be either "has a number" or ".nil",
@@ -1593,6 +1551,147 @@ function parseImport(mdeText, azText) {
            hadDefenderFile: rows.length > 1, looksFiltered, total };
 }
 
+// ── Exposture ───────────────────────────────────────────────────────────────
+//
+// One number for a management slide: exposure (what the internet can see) and
+// posture (what is watching it) combined.
+//
+// It is deliberately not a new opinion. The table already ranks every address by
+// shodan*6 + coverage*3 + defender-exposure, and that ordering is the considered
+// judgement of this tool — a headline score computed some other way would
+// disagree with the list printed underneath it, and the reader would be right to
+// trust neither. So the three terms are hoisted here and both the sort and the
+// score read them.
+//
+// Higher is worse, matching the exposure score in the full Sightline build. The
+// band is printed beside the number so the direction never has to be inferred.
+const _EXP_RK = { critical: 4, high: 3, medium: 2, low: 1 };
+
+/** What the internet can see: 0 (nothing observed) to 5 (known-exploited). */
+function _expShodan(r) {
+  const d = IDB_CACHE[r.ip];
+  if (!_idbAnswered(d) || (!(d.ports || []).length && !(d.vulns || []).length)) return 0;
+  const worst = (d.ports || []).reduce((m, p) => Math.max(m, _EXP_RK[_portRisk(p)] || 0), 0);
+  const { anyKev, maxEpss } = cveExploitAgg(d.vulns || []);
+  const exploit = anyKev ? 5
+                : (maxEpss != null && maxEpss >= 0.5) ? 4
+                : (maxEpss != null && maxEpss >= 0.1) ? 3
+                : (d.vulns || []).length ? 2 : 0;
+  return Math.max(worst, exploit);
+}
+/** What is watching it: 0 (a sensor reports) to 3 (a machine with none). */
+function _expCov(r) {
+  return r.kind === 'machine' && r.mde === 'none' ? 3
+       : r.mde === 'notonboarded' ? 2
+       : r.mde === 'none' ? 1 : 0;
+}
+/** Defender's own opinion of the device: 0 to 2. */
+function _expMs(r) {
+  return /^high$/i.test(r.exposureLevel) ? 2 : /^medium$/i.test(r.exposureLevel) ? 1 : 0;
+}
+const _expRaw = r => _expShodan(r) * 6 + _expCov(r) * 3 + _expMs(r);
+const _EXP_MAX = 5 * 6 + 3 * 3 + 2;
+
+const _EXP_BANDS = [
+  { max: 20,  label: 'MINIMAL',  col: '#3fb950' },
+  { max: 40,  label: 'LOW',      col: '#8bd17c' },
+  { max: 60,  label: 'MODERATE', col: '#e3b341' },
+  { max: 80,  label: 'HIGH',     col: '#ff7b72' },
+  { max: 100, label: 'CRITICAL', col: '#f85149' },
+];
+const _expBand = s => _EXP_BANDS.find(b => s <= b.max) || _EXP_BANDS[_EXP_BANDS.length - 1];
+
+// Mean and worst, blended. The mean alone lets one exposed machine vanish into a
+// crowd of clean ones; the worst alone ignores how much of the estate is in that
+// state. 60/40 is the split the full Sightline build already uses, kept the same
+// so two Blue16 reports on one desk do not need reconciling.
+const _expBlend = v => v.length ? Math.round(Math.min(100,
+  0.6 * (v.reduce((a, b) => a + b, 0) / v.length) + 0.4 * Math.max.apply(null, v))) : 0;
+
+function _exposture(t) {
+  const rows = (t && t.rows) || [];
+  if (!rows.length) return null;
+  // Gateways carry no agent and cannot be watched, so scoring them as unwatched
+  // would charge the estate for something no action could ever fix — the same
+  // exclusion the coverage percentage already makes.
+  const scored = rows.filter(r => r.kind !== 'gateway');
+  if (!scored.length) return null;
+  const asked  = rows.filter(r => _idbAnswered(IDB_CACHE[r.ip])).length;
+  const failed = rows.filter(r => (IDB_CACHE[r.ip] || {}).error).length;
+  return {
+    n: scored.length, asked: asked, failed: failed, of: rows.length,
+    score:    _expBlend(scored.map(r => _expRaw(r) / _EXP_MAX * 100)),
+    exposure: _expBlend(scored.map(r => _expShodan(r) / 5 * 100)),
+    posture:  _expBlend(scored.map(r => _expCov(r) / 3 * 100)),
+  };
+}
+
+/** The headline, with its two halves shown rather than merely asserted. */
+function _exposureCard(t, delta) {
+  const e = _exposture(t);
+  if (!e) return '';
+  const b = _expBand(e.score);
+  const half = (n, lab, why) => '<div style="min-width:132px">'
+    + '<div style="font-size:20px;font-weight:800;color:' + _expBand(n).col + ';line-height:1">' + n + '</div>'
+    + '<div style="font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);'
+    + 'font-weight:700;margin-top:3px">' + esc(lab) + '</div>'
+    + '<div style="font-size:10.5px;color:var(--dim);margin-top:2px">' + esc(why) + '</div></div>';
+
+  // The trend is the whole reason management asked. It only exists against a
+  // baseline, and a baseline written before this score existed does not carry
+  // one — that reads as "no comparison", never as "no change".
+  let trend = '';
+  if (delta && !delta.blocked && delta.scoreWas != null) {
+    const dv = e.score - delta.scoreWas;
+    trend = '<div style="margin-left:auto;text-align:right">'
+      + '<div style="font-size:15px;font-weight:800;color:'
+      + (dv === 0 ? 'var(--muted)' : dv < 0 ? '#3fb950' : '#f85149') + '">'
+      + (dv === 0 ? 'no change' : (dv < 0 ? '▼ ' : '▲ ') + Math.abs(dv)) + '</div>'
+      + '<div style="font-size:10px;color:var(--dim)">was ' + delta.scoreWas + ' on '
+      + esc(new Date(delta.at).toLocaleDateString()) + '</div></div>';
+  } else if (delta && !delta.blocked) {
+    trend = '<div style="margin-left:auto;text-align:right;font-size:10.5px;color:var(--dim);max-width:190px">'
+      + 'That baseline predates this score, so there is nothing to compare it with yet.</div>';
+  }
+
+  // The exposure half is only as good as the lookup behind it, so how much of it
+  // is actually measured is stated rather than left to be assumed from a number.
+  const shodanNote = !e.asked
+    ? '<span style="color:var(--gold)">Shodan has not answered for a single address, so the exposure '
+      + 'half is unmeasured and this is a posture score for now.</span>'
+    : e.asked < e.of
+      ? '<span style="color:var(--gold)">Shodan answered for ' + e.asked + ' of ' + e.of + ' addresses'
+        + (e.failed ? ' — ' + e.failed + ' lookup' + (e.failed === 1 ? '' : 's') + ' failed' : '')
+        + '.</span> The rest score as nothing observed, which is not the same as nothing being there, '
+        + 'so the exposure half reads low by an unknown amount.'
+      : 'Shodan answered for every address.';
+
+  return '<div style="margin-top:12px;padding:14px 16px;border-radius:10px;border:1px solid var(--border);'
+    + 'border-left:3px solid ' + b.col + ';background:linear-gradient(120deg,rgba(255,255,255,.02),transparent 60%)">'
+    + '<div style="display:flex;align-items:flex-start;gap:26px;flex-wrap:wrap">'
+    +   '<div style="min-width:150px">'
+    +     '<div style="font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);'
+    +       'font-weight:700">Exposture score</div>'
+    +     '<div style="display:flex;align-items:baseline;gap:10px;margin-top:2px">'
+    +       '<div style="font-size:40px;font-weight:800;line-height:1;color:' + b.col + '">' + e.score + '</div>'
+    +       '<div style="font-size:13px;font-weight:800;color:' + b.col + '">' + b.label + '</div></div>'
+    +     '<div style="font-size:10px;color:var(--dim);margin-top:3px">0 clean · 100 worst · '
+    +       e.n + ' address' + (e.n === 1 ? '' : 'es') + ' scored</div>'
+    +   '</div>'
+    +   half(e.exposure, 'Exposure', 'what the internet can see')
+    +   half(e.posture, 'Posture', 'what nothing is watching')
+    +   trend
+    + '</div>'
+    + '<div style="font-size:10.5px;color:var(--dim);margin-top:10px;line-height:1.6;'
+    +   'border-top:1px solid rgba(255,255,255,.06);padding-top:8px">'
+    +   'Each address scores on what Shodan observed, whether a sensor reports it, and Defender’s own '
+    +   'exposure level — the same three terms this report already sorts the table by, so the number and '
+    +   'the order beneath it cannot disagree. The estate takes 60% of the average and 40% of its worst '
+    +   'address, so one exposed machine cannot be averaged away. Gateways are excluded: nothing can be '
+    +   'onboarded to them. ' + shodanNote
+    + '</div></div>';
+}
+
 // ── Which tenant is this? ───────────────────────────────────────────────────
 //
 // A consultant runs this against several estates, and every baseline was called
@@ -1698,6 +1797,291 @@ function _tenantMatch(a, b) {
   return { known: false };
 }
 
+// ── Entra trusted locations ─────────────────────────────────────────────────
+//
+// The two CSVs answer "is this address watched". Neither can answer "is there
+// something here nobody wrote down", because one lists devices Defender already
+// manages and the other lists addresses Azure itself issued — a server that is
+// in neither is in neither file either.
+//
+// A trusted named location is the missing third claim: the organisation stating
+// that a public range belongs to it. That makes the range worth asking about,
+// and asking is still passive — Shodan already scanned these addresses, and
+// reading what it saw sends nothing to the estate. The badge at the top of the
+// page stays true.
+//
+// The hard limit is that InternetDB answers one address at a time; there is no
+// range query on the keyless endpoint, and the one that exists needs a paid key
+// and a backend, which this build does not have. So enumeration is bounded, and
+// what it will not do it says rather than quietly truncating.
+let TRUSTED_RANGES = [];      // [{name, cidr}] as parsed
+let TRUSTED_PLAN   = null;    // {lookups, skipped, total}
+let TRUSTED_STATE  = 'none';  // none | ready | sweeping | done
+let TRUSTED_HITS   = [];      // [{ip, name, cidr}] where Shodan answered with something
+
+const _TRUST_CAP = 1024;      // addresses per run, across every range
+
+const _TRUST_COLS = {
+  cidr: ['cidr', 'cidraddress', 'cidr address', 'range', 'iprange', 'ip range', 'network'],
+  name: ['name', 'displayname', 'display name', 'location', 'displayName'],
+};
+
+/** Accepts either the CSV the script writes or the raw Graph JSON, because the
+ *  no-install route through Graph Explorer produces the latter and asking
+ *  someone to reshape it by hand would be the only difficult step on the page. */
+function _parseTrustedRanges(text) {
+  const t = String(text || '').trim();
+  if (!t) return { ranges: [], note: '' };
+  return (t.charAt(0) === '{' || t.charAt(0) === '[') ? _trustedFromGraph(t) : _trustedFromCsv(t);
+}
+
+function _trustedFromGraph(t) {
+  let d;
+  try { d = JSON.parse(t); }
+  catch (e) { return { ranges: [], note: 'That looks like JSON but did not parse: ' + e.message }; }
+  const list = Array.isArray(d) ? d : (d.value || []);
+  if (!Array.isArray(list)) return { ranges: [], note: 'No namedLocations array in that JSON.' };
+  const out = [];
+  let untrusted = 0, country = 0;
+  list.forEach(loc => {
+    const ty = String((loc && loc['@odata.type']) || '');
+    if (ty.indexOf('countryNamedLocation') > -1) { country++; return; }
+    if (ty.indexOf('ipNamedLocation') < 0) return;
+    // Trusted is the whole point: an untrusted IP location is a range the tenant
+    // has an opinion about, not one it claims to own.
+    if (!loc.isTrusted) { untrusted++; return; }
+    (loc.ipRanges || []).forEach(r => {
+      if (r && r.cidrAddress) out.push({ name: String(loc.displayName || ''), cidr: String(r.cidrAddress) });
+    });
+  });
+  const skipped = [];
+  if (untrusted) skipped.push(untrusted + ' untrusted IP location' + (untrusted === 1 ? '' : 's'));
+  if (country)   skipped.push(country + ' country location' + (country === 1 ? '' : 's'));
+  return { ranges: out, note: skipped.length ? skipped.join(' and ') + ' ignored.' : '' };
+}
+
+function _trustedFromCsv(t) {
+  const rows = _csvRows(t);
+  if (rows.length < 2) return { ranges: [], note: 'No rows in that file.' };
+  const hdr = rows[0].map(h => String(h).trim().toLowerCase().replace(/^"|"$/g, ''));
+  const ci = hdr.findIndex(h => _TRUST_COLS.cidr.indexOf(h) > -1);
+  const ni = hdr.findIndex(h => _TRUST_COLS.name.indexOf(h) > -1);
+  if (ci < 0) return { ranges: [], note: 'No CIDR column in that file. Expected one of: '
+                                         + _TRUST_COLS.cidr.slice(0, 4).join(', ') + '.' };
+  const out = [];
+  rows.slice(1).forEach(r => {
+    const c = String(r[ci] || '').trim().replace(/^"|"$/g, '');
+    if (c) out.push({ name: ni >= 0 ? String(r[ni] || '').trim().replace(/^"|"$/g, '') : '', cidr: c });
+  });
+  return { ranges: out, note: '' };
+}
+
+/** Every address in an IPv4 CIDR, or a reason there are none.
+ *
+ *  Arithmetic rather than bitwise: JavaScript's bitwise operators work on signed
+ *  32-bit integers, so anything above 127.x.x.x goes negative and a /8 mask
+ *  computed that way lands in the wrong place entirely. */
+function _cidrHosts(cidr) {
+  const m = /^(\d{1,3}(?:\.\d{1,3}){3})(?:\/(\d{1,2}))?$/.exec(String(cidr || '').trim());
+  if (!m) return { hosts: [], why: 'not an IPv4 address or CIDR' };
+  const parts = m[1].split('.').map(Number);
+  if (parts.some(p => p > 255)) return { hosts: [], why: 'octet above 255' };
+  const bits = m[2] === undefined ? 32 : parseInt(m[2], 10);
+  if (bits > 32) return { hosts: [], why: 'prefix longer than /32' };
+  const base = parts[0] * 16777216 + parts[1] * 65536 + parts[2] * 256 + parts[3];
+  const size = Math.pow(2, 32 - bits);
+  if (size > _TRUST_CAP)
+    return { hosts: [], size: size,
+             why: size.toLocaleString() + ' addresses — over the ' + _TRUST_CAP.toLocaleString()
+                  + ' this run will look up' };
+  const net = Math.floor(base / size) * size;
+  const hosts = [];
+  for (let i = 0; i < size; i++) {
+    const v = net + i;
+    hosts.push([Math.floor(v / 16777216) % 256, Math.floor(v / 65536) % 256,
+                Math.floor(v / 256) % 256, v % 256].join('.'));
+  }
+  return { hosts: hosts, size: size };
+}
+
+/** What this run will actually ask about, and what it will not.
+ *
+ *  The budget is shared across ranges, so a single reasonable range does not get
+ *  starved by a huge one listed before it — and anything dropped is returned
+ *  with the reason, because a silently shortened sweep reads as a clean result. */
+function _trustedPlan(ranges) {
+  const lookups = [], skipped = [], seen = {};
+  let spent = 0;
+  ranges.forEach(r => {
+    if (r.cidr.indexOf(':') > -1) {
+      skipped.push({ name: r.name, cidr: r.cidr,
+                     why: 'IPv6 — the smallest prefix Entra accepts holds more addresses than could '
+                          + 'ever be enumerated one at a time' });
+      return;
+    }
+    const h = _cidrHosts(r.cidr);
+    if (!h.hosts.length) { skipped.push({ name: r.name, cidr: r.cidr, why: h.why }); return; }
+    if (spent + h.hosts.length > _TRUST_CAP) {
+      skipped.push({ name: r.name, cidr: r.cidr,
+                     why: 'would take this run past its ' + _TRUST_CAP.toLocaleString()
+                          + '-address budget' });
+      return;
+    }
+    spent += h.hosts.length;
+    h.hosts.forEach(ip => {
+      if (seen[ip]) return;                       // overlapping ranges are common
+      seen[ip] = 1;
+      lookups.push({ ip: ip, name: r.name, cidr: r.cidr });
+    });
+  });
+  return { lookups: lookups, skipped: skipped, total: lookups.length };
+}
+
+/** Read the pasted text, plan the sweep, and say what will happen. */
+function readTrusted() {
+  const el = document.getElementById('entra-input');
+  const st = document.getElementById('entra-state');
+  const step = document.getElementById('step3');
+  if (!el || !st) return;
+  const parsed = _parseTrustedRanges(el.value);
+  TRUSTED_RANGES = parsed.ranges;
+  TRUSTED_PLAN = TRUSTED_RANGES.length ? _trustedPlan(TRUSTED_RANGES) : null;
+  TRUSTED_STATE = (TRUSTED_PLAN && TRUSTED_PLAN.total) ? 'ready' : 'none';
+  if (step) step.classList.toggle('done', TRUSTED_STATE === 'ready');
+
+  if (!el.value.trim()) { st.innerHTML = 'No ranges loaded.'; return; }
+  if (!TRUSTED_RANGES.length) {
+    st.innerHTML = '<span style="color:var(--gold)">' + esc(parsed.note || 'No trusted IP ranges in that file.')
+                 + '</span>';
+    return;
+  }
+  const p = TRUSTED_PLAN;
+  const bits = ['<b style="color:var(--text)">' + TRUSTED_RANGES.length + ' trusted range'
+                + (TRUSTED_RANGES.length === 1 ? '' : 's') + '</b> — '
+                + p.total.toLocaleString() + ' address' + (p.total === 1 ? '' : 'es')
+                + ' to ask Shodan about when the report is built'];
+  if (parsed.note) bits.push(esc(parsed.note));
+  if (p.skipped.length)
+    bits.push('<span style="color:var(--gold)">' + p.skipped.length + ' range'
+              + (p.skipped.length === 1 ? '' : 's') + ' skipped</span> — listed in the report, '
+              + 'so nothing is dropped quietly');
+  st.innerHTML = bits.join('<br>');
+}
+
+/** Ask InternetDB about every planned address that the two files did not already
+ *  cover. Runs after the report is on screen, like the other enrichment, and
+ *  repaints when it lands. */
+/** The declared-range findings, as a report section body.
+ *
+ *  What lands here is the point of the whole third import: an address answering
+ *  inside a range the tenant declared as its own, which is in neither the
+ *  Defender export nor the Azure one. Defender does not know it because nothing
+ *  onboarded it; Azure does not know it because Azure did not issue it. It is
+ *  the machine nobody wrote down, on a range somebody did. */
+function _trustedBlock() {
+  if (TRUSTED_STATE === 'none') return '';
+  const p = TRUSTED_PLAN || { total: 0, skipped: [] };
+
+  const caveat = '<div style="font-size:10.5px;color:var(--dim);margin-top:8px;line-height:1.7">'
+    + '<b style="color:var(--muted)">Trusted is a claim, not a deed.</b> Teams add partner offices, '
+    + 'VPN egress and third-party SaaS ranges to trusted locations, so an address here sits in a '
+    + 'range your tenant <em style="font-style:normal">declared</em> — which is not always a range '
+    + 'your organisation owns. The range name is on every row so you can tell which is which before '
+    + 'acting. Nothing was sent to any of these addresses: this is what Shodan already saw.'
+    + '</div>';
+
+  if (TRUSTED_STATE === 'sweeping')
+    return '<div style="padding:10px 13px;border-radius:7px;border-left:2px solid var(--blue);'
+      + 'background:rgba(56,139,253,.06);font-size:11.5px;color:var(--muted)">'
+      + 'Asking Shodan about ' + p.total.toLocaleString() + ' address'
+      + (p.total === 1 ? '' : 'es') + ' in the declared ranges&hellip; the rest of the report is '
+      + 'complete and does not depend on this.</div>';
+
+  const skipped = (p.skipped || []).length ? '<details class="dx" style="margin-top:10px">'
+    + '<summary><b style="color:var(--gold)">' + p.skipped.length + ' range'
+    + (p.skipped.length === 1 ? '' : 's') + '</b> not swept</summary>'
+    + '<table class="dx-t"><thead><tr><th>Range</th><th>Name</th><th>Why not</th></tr></thead><tbody>'
+    + p.skipped.map(x => '<tr><td><span style="font-family:ui-monospace,monospace">' + esc(x.cidr)
+        + '</span></td><td>' + (esc(x.name) || '<span style="color:var(--dim)">&mdash;</span>')
+        + '</td><td>' + esc(x.why) + '</td></tr>').join('')
+    + '</tbody></table><div class="dx-f">Listed rather than dropped: a sweep that quietly '
+    + 'shortened itself would report a clean range it never looked at.</div></details>' : '';
+
+  if (!TRUSTED_HITS.length)
+    return '<div style="padding:10px 13px;border-radius:7px;border-left:2px solid var(--green);'
+      + 'background:rgba(63,185,80,.06);font-size:11.5px;line-height:1.7;color:var(--muted)">'
+      + '<b style="color:var(--text)">Nothing answered in the declared ranges</b> that was not '
+      + 'already in the two exports. Shodan has no record of an open port on any of the '
+      + p.total.toLocaleString() + ' address' + (p.total === 1 ? '' : 'es') + ' swept &mdash; which '
+      + 'is not proof the ranges are empty, only that Shodan has not seen anything there.'
+      + caveat + '</div>' + skipped;
+
+  const rows = TRUSTED_HITS.map(h => {
+    const d = IDB_CACHE[h.ip] || {};
+    const ports = (d.ports || []), vulns = (d.vulns || []);
+    return '<tr>'
+      + '<td><span class="ipc" onclick="surfaceIpClick(\'' + jsStr(h.ip) + '\')" '
+      +   'title="Open the address detail">' + esc(h.ip) + '</span></td>'
+      + '<td>' + (esc(h.name) || '<span style="color:var(--dim)">&mdash;</span>') + '</td>'
+      + '<td><span style="font-family:ui-monospace,monospace;color:var(--muted)">'
+      +   esc(h.cidr) + '</span></td>'
+      + '<td>' + (ports.length
+          ? ports.slice().sort((a, b) => a - b).map(pt => {
+              const rk = _portRisk(pt);
+              const c = rk === 'critical' ? 'var(--red)' : rk === 'high' ? 'var(--orange)'
+                      : rk === 'medium' ? 'var(--gold)' : 'var(--muted)';
+              return '<span style="color:' + c + '">' + pt + '</span>';
+            }).join(', ')
+          : '<span style="color:var(--dim)">none</span>') + '</td>'
+      + '<td>' + (vulns.length
+          ? '<b style="color:var(--red)">' + vulns.length + '</b>'
+          : '<span style="color:var(--dim)">&mdash;</span>') + '</td>'
+      + '</tr>';
+  }).join('');
+
+  return '<div style="padding:10px 13px;border-radius:7px;border-left:2px solid var(--red);'
+    + 'background:rgba(248,81,73,.07);font-size:11.5px;line-height:1.7;color:var(--muted)">'
+    + '<b style="color:var(--text)">' + TRUSTED_HITS.length + ' address'
+    + (TRUSTED_HITS.length === 1 ? '' : 'es') + ' answering inside a declared range, in neither '
+    + 'export.</b> Defender has no device for these and Azure did not issue them, so nothing on '
+    + 'the coverage side of this report knows they exist &mdash; but something is listening.'
+    + '</div>'
+    + '<table class="cg-table" style="margin-top:6px"><thead><tr>'
+    + '<th>Address</th><th>Trusted location</th><th>Range</th><th>Open ports</th><th>CVEs</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>'
+    + caveat + skipped;
+}
+
+async function _sweepTrusted() {
+  if (!TRUSTED_PLAN || !TRUSTED_PLAN.total || !SURFACE_SNAP) return;
+  const known = {};
+  try { _surfaceStats(SURFACE_SNAP).rows.forEach(r => { known[r.ip] = 1; }); } catch (e) { return; }
+  const todo = TRUSTED_PLAN.lookups.filter(l => !known[l.ip]);
+  if (!todo.length) { TRUSTED_STATE = 'done'; return; }
+
+  TRUSTED_STATE = 'sweeping';
+  _surfaceRedraw();
+  let done = 0;
+  // Four at a time, not six. This sweep can be hundreds of addresses where the
+  // report's own pass is dozens, and it is the same free endpoint either way.
+  await _pool(todo, async l => {
+    if (IDB_CACHE[l.ip] === undefined) IDB_CACHE[l.ip] = null;
+    try {
+      const r = await fetch('https://internetdb.shodan.io/' + encodeURIComponent(l.ip));
+      IDB_CACHE[l.ip] = r.status === 404 ? { ports: [], vulns: [] }
+                      : r.ok ? await r.json() : { error: true };
+    } catch (e) { IDB_CACHE[l.ip] = { error: true }; }
+    if (++done % 40 === 0) _surfaceRedraw();
+  }, 4);
+
+  TRUSTED_HITS = todo.filter(l => {
+    const d = IDB_CACHE[l.ip];
+    return _idbAnswered(d) && ((d.ports || []).length || (d.vulns || []).length);
+  });
+  TRUSTED_STATE = 'done';
+  _surfaceRedraw();
+}
+
 // ── Baseline: delta since the last run, with no database ────────────────────
 //
 // This tool has no backend and no store, so "what changed since last time" has
@@ -1713,7 +2097,7 @@ let _BASELINE = null;          // the loaded previous baseline, or null
 let _BASE_ERR = '';            // why the loaded file was rejected
 
 const BASE_KIND = 'blue16.blindspots.baseline';
-const BASE_VERSION = 1;
+const BASE_VERSION = 2;   // 2 adds the Exposture score; 1 still loads without a trend
 
 /** Row and column counts of each export, so two runs can be compared for scope
  *  before they are compared for content. */
@@ -1742,8 +2126,8 @@ function _baselineFrom(snap, scope) {
       // Shodan as it stood when this baseline was written. Undefined means the
       // lookup had not answered, which is not the same as "nothing open" — a
       // null here keeps those apart on the next comparison.
-      ports: d ? (d.ports || []).slice().sort((x, y) => x - y) : null,
-      cves:  d ? (d.vulns || []).length : null,
+      ports: _idbAnswered(d) ? (d.ports || []).slice().sort((x, y) => x - y) : null,
+      cves:  _idbAnswered(d) ? (d.vulns || []).length : null,
     };
   });
   return {
@@ -1751,6 +2135,7 @@ function _baselineFrom(snap, scope) {
     at: new Date(snap.at || Date.now()).toISOString(),
     tenant: (scope && scope.tenant) || { name: '', subs: [], suffix: '' },
     scope: scope,
+    exposture: (_exposture(t) || {}).score,
     totals: { total: t.total, onboard: t.onboard, discover: t.discover,
               comparable: t.comparable, pct: t.pct,
               gapHosts: t.gapHosts.length, fronts: t.fronts.length },
@@ -1866,12 +2251,12 @@ function _diffBaseline(base, snap, scope) {
     // Shodan: null means the lookup had not answered when the baseline was
     // written, so there is no "before" to compare and silence is not evidence.
     const d = IDB_CACHE[ip];
-    if (b.ports && d) {
+    if (b.ports && _idbAnswered(d)) {
       const add = (d.ports || []).filter(p => b.ports.indexOf(p) < 0);
       if (add.length) newPorts.push({ ip, r, b, ports: add.sort((x, y) => x - y),
                                       all: (d.ports || []).slice().sort((x, y) => x - y) });
     }
-    if (b.cves != null && d && (d.vulns || []).length > b.cves)
+    if (b.cves != null && _idbAnswered(d) && (d.vulns || []).length > b.cves)
       newCves.push({ ip, r, b, from: b.cves, to: (d.vulns || []).length, vulns: d.vulns || [] });
   });
 
@@ -1882,6 +2267,7 @@ function _diffBaseline(base, snap, scope) {
     ? Math.abs(scope.defenderRows - bRows) / bRows : 0;
   return {
     blocked: false, at: base.at,
+    scoreWas: (typeof base.exposture === 'number') ? base.exposture : null,
     totals: { total: t.total - base.totals.total, pct: t.pct - base.totals.pct,
               nowTotal: t.total, nowPct: t.pct,
               wasTotal: base.totals.total, wasPct: base.totals.pct },
@@ -2020,6 +2406,10 @@ function buildSurfaceReport(snap) {
   const pctCol = t.pct >= 70 ? '#3fb950' : t.pct >= 40 ? 'var(--gold)' : 'var(--red)';
 
 
+  // Numbered by a counter rather than by hand: the last header used to read
+  // `t.ghosts.length ? 3 : 2`, which is a bug waiting for the next section.
+  let _sec = 0;
+  const nx = () => ++_sec;
   const hdr = (n, txt, sub) => `<div style="margin:20px 0 8px">
     <div style="font-size:12px;font-weight:700;color:var(--text)">
       <span style="color:var(--dim);font-weight:600">${n} ·</span> ${txt}</div>
@@ -2056,7 +2446,10 @@ function buildSurfaceReport(snap) {
           onclick="closeSurfaceReport()">← Back</button>`}
     </div>
 
-    ${_deltaBlock(_diffBaseline(_BASELINE, s, _LAST_SCOPE || _scopeOf('', '', s)))}
+    ${(() => {
+      const _d = _diffBaseline(_BASELINE, s, _LAST_SCOPE || _scopeOf('', '', s));
+      return _exposureCard(t, _d) + _deltaBlock(_d);
+    })()}
 
     ${_valueHero()}
 
@@ -2071,7 +2464,7 @@ function buildSurfaceReport(snap) {
       "How to produce these two files", which is deliberately not filtered on IsInternetFacing.</span>
     </div>` : ''}
 
-    ${hdr(1, `Every public IP (${t.total})`,
+    ${hdr(nx(), `Every public IP (${t.total})`,
       'Worst first. <b>Type</b> is inferred from the resource name unless a device proves otherwise.')}
     ${(() => {
       const opts = k => { const m = new Map();
@@ -2149,6 +2542,9 @@ function buildSurfaceReport(snap) {
       ['Shodan', r => { const d = IDB_CACHE[r.ip];
         if (d === undefined) return '<span style="color:var(--dim)">—</span>';
         if (d === null) return '<span style="color:var(--dim)">…</span>';
+        if (d.error) return '<span style="color:var(--gold)" title="'
+          + esc('Shodan did not answer for this address. That is not the same as nothing being open.')
+          + '">no answer</span>';
         const ports = (d.ports || []), vulns = (d.vulns || []);
         if (!ports.length && !vulns.length) return '<span style="color:var(--dim)">nothing</span>';
         // Ports on a shared edge that Defender did not attribute to this device.
@@ -2209,7 +2605,7 @@ function buildSurfaceReport(snap) {
     ${s.hadDefenderFile ? '' : `<div style="font-size:10.5px;color:var(--gold);margin-top:6px">
       No Defender export was supplied, so no address here has been measured for coverage.</div>`}
 
-    ${t.ghosts.length ? hdr(2, `Reachable from the internet, no public IP of their own (${t.ghosts.length})`,
+    ${t.ghosts.length ? hdr(nx(), `Reachable from the internet, no public IP of their own (${t.ghosts.length})`,
       'Defender saw traffic reach these devices, but no file gives an address where it arrived. Some carry '
       + 'no public address at all; others carry only their site breakout — the address the office leaves '
       + 'by, shared with everything else there, where nothing is published. Either way there is nothing '
@@ -2230,7 +2626,10 @@ function buildSurfaceReport(snap) {
         ['Internal IP', r => r.internalIp ? mono(r.internalIp) : dim('')],
       ]) : ''}
 
-    ${hdr(t.ghosts.length ? 3 : 2, 'What this report cannot tell you', null)}
+    ${TRUSTED_STATE !== 'none' ? hdr(nx(), 'Declared trusted ranges', 'What Shodan sees inside the '
+      + 'public ranges your tenant calls its own') + _trustedBlock() : ''}
+
+    ${hdr(nx(), 'What this report cannot tell you', null)}
     <div style="padding:10px 13px;border-radius:7px;border-left:2px solid var(--blue);
       background:rgba(56,139,253,.06);font-size:11.5px;line-height:1.75;color:var(--muted)">
       <b style="color:var(--text)">Nothing here has been reached over the network.</b>
@@ -2466,6 +2865,7 @@ function readCsvs() {
   _PREVIEW_SNAP = _surfaceSnapFrom(p);
   paintMap();
   locate();
+  readTrusted();
   const n = p.devices.length, u = p.uncovered.length;
   const onb = p.devices.filter(d => /^onboard/i.test(d.onboarding)).length;
   st.style.color = 'var(--blue)';
@@ -2489,7 +2889,9 @@ function buildReport() {
   document.getElementById('page-report').hidden = false;
   window.scrollTo(0, 0);
   _surfaceRedraw();
-  enrich();                       // fills the Shodan column and the flags as it lands
+  enrich()                        // fills the Shodan column and the flags as it lands
+    .then(_sweepTrusted)          // then the declared ranges, which are the slower half
+    .catch(e => console.error('[enrich]', e));
 }
 
 function closeSurfaceReport() {
@@ -2539,6 +2941,15 @@ _SF_PRESETS.onprem = { label: 'addresses only Defender reported',
 // one large template literal, so a single bad value takes the whole thing down.
 // Showing the error beats showing nothing: it means a bug report can start with
 // the message rather than with "it went black".
+// Redrawn whenever the filter moves, not only after a load: the Start Scan panel
+// reports the filter/scope mismatch, so a stale draw keeps offering a count from
+// a filter that is no longer set.
+//
+// This was the third time a definition moved and its outdated copy stayed behind
+// shadowing nothing, so the rule from _surfaceRedrawInner below is worth
+// repeating here: when something moves, the old version has to be deleted, not
+// merely stop being called. A duplicate function declaration is silent — the
+// last one wins, and edits to the other simply do nothing.
 function _surfaceRedraw() {
   const el = document.getElementById('pane-surface');
   if (!el) return;
@@ -2663,9 +3074,12 @@ async function enrich() {
     try {
       const r = await fetch('https://internetdb.shodan.io/' + encodeURIComponent(ip));
       // 404 is InternetDB's "nothing on file", which is an answer, not a failure.
+      // Every other non-ok status is Shodan failing to answer, and recording that
+      // as an empty result would be this report telling the reader an address is
+      // clean when nobody ever looked at it.
       IDB_CACHE[ip] = r.status === 404 ? { ports: [], vulns: [] }
-                    : r.ok ? await r.json() : { ports: [], vulns: [] };
-    } catch (e) { IDB_CACHE[ip] = { ports: [], vulns: [] }; }
+                    : r.ok ? await r.json() : { error: true };
+    } catch (e) { IDB_CACHE[ip] = { error: true }; }
     if (++done % 8 === 0) _surfaceRedraw();
   });
   _shodanAt = Date.now();
@@ -2782,7 +3196,8 @@ function surfaceIpClick(ip) {
       ${row('Defender', sensor)}
       ${row('Microsoft reached it on', r.scannedPort ? esc(String(r.scannedPort)) : '')}
       ${row('Location', g ? esc([g.city, g.country].filter(Boolean).join(', ')) : '')}
-      ${row('Shodan', d === undefined || d === null ? '<span style="color:var(--dim)">not looked up</span>'
+      ${row('Shodan', d && d.error ? '<span style="color:var(--gold)">asked, no answer</span>'
+          : d === undefined || d === null ? '<span style="color:var(--dim)">not looked up</span>'
           : (d.ports || []).length || (d.vulns || []).length
             ? `${(d.ports || []).map(p => { const rk = _portRisk(p), lb = _portLabel(p);
                   const c = rk === 'critical' ? 'var(--red)' : rk === 'high' ? 'var(--orange)'
@@ -2841,6 +3256,7 @@ document.getElementById('azps').textContent = _AZ_PS;
 
 _wire('mde-file', 'mdecsv-input');
 _wire('az-file', 'azcsv-input');
+_wire('entra-file', 'entra-input');
 readCsvs();
 initMap();
 </script>
