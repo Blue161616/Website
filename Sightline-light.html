@@ -205,6 +205,23 @@
     color:var(--text);border:1px solid var(--border);border-radius:8px;padding:9px 15px;font-size:12px;
     z-index:2000;opacity:0;pointer-events:none;transition:opacity .2s}
   #toast.on{opacity:1}
+  /* Delta rows expand rather than truncating to "+4 more". */
+  .dx{border-top:1px solid rgba(255,255,255,.06);margin-top:6px}
+  .dx>summary{cursor:pointer;list-style:none;padding:6px 0;font-size:11.5px;color:var(--muted)}
+  .dx>summary::-webkit-details-marker{display:none}
+  .dx>summary::before{content:"▸ ";color:var(--dim)}
+  .dx[open]>summary::before{content:"▾ "}
+  .dx>summary:hover{color:var(--text)}
+  .dx-t{border-collapse:collapse;width:100%;margin:4px 0 8px;font-size:11px}
+  .dx-t th{text-align:left;padding:4px 10px 4px 0;font-size:9.5px;text-transform:uppercase;
+    letter-spacing:.05em;color:var(--dim);border-bottom:1px solid rgba(255,255,255,.08);font-weight:700;
+    white-space:nowrap}
+  .dx-t td{padding:5px 10px 5px 0;border-bottom:1px solid rgba(255,255,255,.04);
+    vertical-align:top;color:var(--muted)}
+  .dx-t tr:last-child td{border-bottom:none}
+  .dx-t .ipc{font-family:ui-monospace,Consolas,monospace;color:var(--blue);cursor:pointer}
+  .dx-t .ipc:hover{text-decoration:underline}
+  .dx-f{font-size:10.5px;color:var(--dim);line-height:1.65;padding:0 0 8px}
 </style>
 </head>
 <body>
@@ -263,12 +280,18 @@
     </div>
 
     <div class="step" id="step3">
-      <h2><i>3</i>Previous baseline <span style="font-weight:400;color:var(--dim);font-size:12px">— optional</span></h2>
+      <h2><i>3</i>Tenant &amp; previous baseline <span style="font-weight:400;color:var(--dim);font-size:12px">— optional</span></h2>
       <p>A baseline is a small file this report writes at the end. Load last month's and this run
          gains a delta: what appeared, what lost its sensor, what Shodan started seeing. Without one
          the report is simply today, which is what it has always been.</p>
       <div class="body">
-        <div class="pick">
+        <label style="display:block;font-size:11px;color:var(--muted);margin-bottom:5px">Tenant or engagement name</label>
+        <input type="text" id="tenant-name" spellcheck="false" autocomplete="off"
+               oninput="this.dataset.touched=1" placeholder="Contoso"
+               style="width:280px;max-width:100%;background:var(--bg2);border:1px solid var(--border);
+                      color:var(--text);padding:7px 10px;border-radius:6px;font-size:12.5px">
+        <div class="note" id="tenant-hint">Nothing in these files identifies the tenant yet.</div>
+        <div class="pick" style="margin-top:10px">
           <input type="file" accept=".json,application/json" id="base-file"
                  onchange="loadBaselineFile(this)">
         </div>
@@ -1570,6 +1593,111 @@ function parseImport(mdeText, azText) {
            hadDefenderFile: rows.length > 1, looksFiltered, total };
 }
 
+// ── Which tenant is this? ───────────────────────────────────────────────────
+//
+// A consultant runs this against several estates, and every baseline was called
+// blind-spots-baseline-<date>.json. Two of those in a downloads folder are
+// indistinguishable, and loading the wrong one compares customer A's history
+// against customer B's estate — which does not error, it just invents a delta
+// where every address appeared and every address vanished.
+//
+// So the baseline carries an identity, and it is derived from the files rather
+// than typed: a name can be wrong, a fingerprint cannot. The name is for the
+// filename and the report; the fingerprint is what the comparison actually
+// trusts.
+const _SUB_RE = /subscriptions\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/g;
+
+function _tenantFingerprint(mdeText, azText) {
+  const subs = new Set();
+  let m;
+  const both = String(mdeText || '') + '\n' + String(azText || '');
+  _SUB_RE.lastIndex = 0;
+  while ((m = _SUB_RE.exec(both)) !== null) subs.add(m[1].toLowerCase());
+
+  // The DNS suffix every device shares is the other half of the identity, and
+  // the half a Defender-only export still has.
+  const rows = _csvRows(mdeText || '');
+  const suffixes = {};
+  if (rows.length > 1) {
+    const hdr = rows[0].map(h => String(h).trim().toLowerCase().replace(/^"|"$/g, ''));
+    const i = hdr.findIndex(h => _MDE_COLS.name.includes(h));
+    if (i >= 0) rows.slice(1).forEach(r => {
+      const n = String(r[i] || '').trim().toLowerCase();
+      const dot = n.indexOf('.');
+      if (dot > 0) { const s = n.slice(dot + 1); if (s) suffixes[s] = (suffixes[s] || 0) + 1; }
+    });
+  }
+  const suffix = Object.keys(suffixes).sort((a, b) => suffixes[b] - suffixes[a])[0] || '';
+  return { subs: [...subs].sort(), suffix: suffix };
+}
+
+/** A name worth pre-filling: the shared DNS suffix reads as the organisation far
+ *  better than a subscription GUID does. Only ever a suggestion — it is an input
+ *  the operator can overwrite, because the files do not actually carry a tenant
+ *  name and guessing one confidently would be worse than asking. */
+function _guessTenantName(fp) {
+  if (fp.suffix) {
+    const parts = fp.suffix.split('.').filter(Boolean);
+    // contoso.local -> Contoso; cn.bup.ad.pvmgrp.org -> Pvmgrp
+    const core = parts.length > 1 ? parts[parts.length - 2] : parts[0];
+    return core ? core.charAt(0).toUpperCase() + core.slice(1) : '';
+  }
+  return fp.subs.length ? 'Subscription ' + fp.subs[0].slice(0, 8) : '';
+}
+
+function _tenantName() {
+  const el = document.getElementById('tenant-name');
+  return el ? (el.value || '').trim() : '';
+}
+
+/** Fill the field once, from the files, without overwriting a typed answer. */
+function _syncTenantGuess(mdeText, azText) {
+  const el = document.getElementById('tenant-name');
+  if (!el) return;
+  const fp = _tenantFingerprint(mdeText, azText);
+  if (!el.value.trim() && !el.dataset.touched) el.value = _guessTenantName(fp);
+  const hint = document.getElementById('tenant-hint');
+  if (hint) {
+    hint.innerHTML = fp.subs.length || fp.suffix
+      ? 'Recognised from the files: ' +
+        [fp.suffix ? '<code>' + esc(fp.suffix) + '</code>' : '',
+         fp.subs.length ? fp.subs.length + ' Azure subscription' + (fp.subs.length === 1 ? '' : 's') : '']
+          .filter(Boolean).join(' · ') +
+        '. Used to keep one customer&rsquo;s baseline from being compared against another&rsquo;s estate.'
+      : 'Nothing in these files identifies the tenant yet.';
+  }
+}
+
+/** Filename-safe, and recognisable in a downloads folder a month later. */
+function _slug(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '').slice(0, 40);
+}
+
+/** Do these two runs describe the same estate?
+ *
+ *  Overlap, not equality: a tenant gains and loses subscriptions between runs
+ *  and that is not a different customer. Disjoint subscription sets are, and so
+ *  is a different DNS suffix. Where neither side carries evidence this says so
+ *  rather than passing silently, because "no evidence" and "same tenant" are not
+ *  the same answer. */
+function _tenantMatch(a, b) {
+  if (!a || !b) return { known: false };
+  const as = a.subs || [], bs = b.subs || [];
+  if (as.length && bs.length) {
+    const shared = as.filter(x => bs.indexOf(x) > -1);
+    if (!shared.length) return { known: true, same: false, why: 'they share no Azure subscription' };
+    return { known: true, same: true };
+  }
+  if (a.suffix && b.suffix) {
+    if (a.suffix !== b.suffix)
+      return { known: true, same: false,
+               why: 'the device names end in ' + a.suffix + ' and ' + b.suffix };
+    return { known: true, same: true };
+  }
+  return { known: false };
+}
+
 // ── Baseline: delta since the last run, with no database ────────────────────
 //
 // This tool has no backend and no store, so "what changed since last time" has
@@ -1596,6 +1724,7 @@ function _scopeOf(mdeText, azText, snap) {
     azureRows:    Math.max(0, a.length - 1), azureCols:    (a[0] || []).length,
     hadDefenderFile: !!(snap && snap.hadDefenderFile),
     looksFiltered:   !!(snap && snap.looksFiltered),
+    tenant: Object.assign({ name: _tenantName() }, _tenantFingerprint(mdeText, azText)),
   };
 }
 
@@ -1620,6 +1749,7 @@ function _baselineFrom(snap, scope) {
   return {
     kind: BASE_KIND, version: BASE_VERSION,
     at: new Date(snap.at || Date.now()).toISOString(),
+    tenant: (scope && scope.tenant) || { name: '', subs: [], suffix: '' },
     scope: scope,
     totals: { total: t.total, onboard: t.onboard, discover: t.discover,
               comparable: t.comparable, pct: t.pct,
@@ -1634,10 +1764,11 @@ function downloadBaseline() {
     document.getElementById('mdecsv-input').value,
     document.getElementById('azcsv-input').value, SURFACE_SNAP));
   const stamp = new Date().toISOString().slice(0, 10);
+  const who = _slug(_tenantName() || (b.tenant && b.tenant.suffix) || '');
   const blob = new Blob([JSON.stringify(b, null, 1)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'blind-spots-baseline-' + stamp + '.json';
+  a.download = 'blind-spots-baseline-' + (who ? who + '-' : '') + stamp + '.json';
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   toast('Baseline saved — it holds public IPs and device names, so keep it with the engagement');
@@ -1682,7 +1813,9 @@ function _renderBaselinePick() {
   }
   if (!_BASELINE) { el.innerHTML = 'No baseline loaded — the report will show today only.'; return; }
   const d = new Date(_BASELINE.at);
-  el.innerHTML = '<span style="color:var(--green)">Baseline from ' + esc(d.toLocaleString()) +
+  const who2 = (_BASELINE.tenant && _BASELINE.tenant.name) || '';
+  el.innerHTML = '<span style="color:var(--green)">Baseline' + (who2 ? ' for ' + esc(who2) : '') +
+    ' from ' + esc(d.toLocaleString()) +
     '</span> · ' + _BASELINE.totals.total + ' addresses, ' + _BASELINE.totals.pct + '% watched' +
     ' · <a href="#" onclick="clearBaseline();return false" style="color:var(--muted)">remove</a>';
 }
@@ -1692,9 +1825,20 @@ function _renderBaselinePick() {
  *  Scope is checked before content. An unfiltered baseline against a filtered
  *  run makes every absent device look decommissioned, which is a fabricated
  *  mass-disappearance — the worst thing a trend line could report. When the two
- *  runs did not look at the same population, this refuses rather than guessing. */
+ *  runs did not look at the same population, this refuses rather than guessing.
+ *
+ *  Each changed address carries both sides with it: the row as it is now, and
+ *  the baseline entry as it was. "Gone" has no current row by definition, so
+ *  without the baseline half there would be nothing to show but an address. */
 function _diffBaseline(base, snap, scope) {
   if (!base) return null;
+  const who = _tenantMatch(base.tenant, scope && scope.tenant);
+  if (who.known && !who.same) {
+    return { blocked: true, why: 'This baseline is from a different estate — ' + who.why + '. '
+      + 'Comparing them would report every address as both appeared and disappeared, which is not a '
+      + 'change in anything. Load the baseline belonging to '
+      + ((scope.tenant && scope.tenant.name) || 'this tenant') + '.' };
+  }
   if (base.scope) {
     if (!!base.scope.looksFiltered !== !!scope.looksFiltered) {
       return { blocked: true, why: 'One of these runs used a Defender export filtered to internet-facing '
@@ -1710,24 +1854,25 @@ function _diffBaseline(base, snap, scope) {
   const now = {}; t.rows.forEach(r => { now[r.ip] = r; });
   const was = base.addresses || {};
 
-  const appeared = Object.keys(now).filter(ip => !was[ip]);
-  const gone     = Object.keys(was).filter(ip => !now[ip]);
+  const appeared = Object.keys(now).filter(ip => !was[ip]).map(ip => ({ ip, r: now[ip] }));
+  const gone     = Object.keys(was).filter(ip => !now[ip]).map(ip => ({ ip, b: was[ip] }));
   const lost = [], gained = [], newPorts = [], newCves = [];
   Object.keys(now).forEach(ip => {
     const b = was[ip]; if (!b) return;
     const r = now[ip];
     // Coverage moving the wrong way is the finding this whole file exists for.
-    if (b.mde === 'onboarded' && r.mde !== 'onboarded') lost.push({ ip, from: b.mde, to: r.mde, name: r.name || r.device });
-    if (b.mde !== 'onboarded' && r.mde === 'onboarded') gained.push({ ip, name: r.name || r.device });
+    if (b.mde === 'onboarded' && r.mde !== 'onboarded') lost.push({ ip, r, b });
+    if (b.mde !== 'onboarded' && r.mde === 'onboarded') gained.push({ ip, r, b });
     // Shodan: null means the lookup had not answered when the baseline was
     // written, so there is no "before" to compare and silence is not evidence.
     const d = IDB_CACHE[ip];
     if (b.ports && d) {
       const add = (d.ports || []).filter(p => b.ports.indexOf(p) < 0);
-      if (add.length) newPorts.push({ ip, ports: add.sort((x, y) => x - y), name: r.name || r.device });
+      if (add.length) newPorts.push({ ip, r, b, ports: add.sort((x, y) => x - y),
+                                      all: (d.ports || []).slice().sort((x, y) => x - y) });
     }
     if (b.cves != null && d && (d.vulns || []).length > b.cves)
-      newCves.push({ ip, from: b.cves, to: (d.vulns || []).length, name: r.name || r.device });
+      newCves.push({ ip, r, b, from: b.cves, to: (d.vulns || []).length, vulns: d.vulns || [] });
   });
 
   // A big swing in export size is not itself wrong, but it is worth saying so a
@@ -1745,6 +1890,29 @@ function _diffBaseline(base, snap, scope) {
   };
 }
 
+// ── Rendering the delta ─────────────────────────────────────────────────────
+// Every line expands. The summary answers "how many"; the panel underneath
+// answers "which, and what do we know about them" — which is the question a
+// list of six addresses and "+4 more" always provoked and could not settle.
+const _DX_MDE = m => m === 'onboarded' ? '<span style="color:var(--green)">watched</span>'
+  : m === 'notonboarded' ? '<span style="color:var(--gold)">in Defender, not onboarded</span>'
+  : '<span style="color:var(--red)">no sensor</span>';
+const _DX_KIND = k => k === 'gateway' ? 'gateway / WAF' : k === 'nat' ? 'shared breakout' : 'machine';
+const _DX_IP = ip => '<span class="ipc" onclick="surfaceIpClick(\'' + jsStr(ip) + '\')" '
+  + 'title="Open the address detail">' + esc(ip) + '</span>';
+const _DX_NAME = x => esc((x && (x.name || x.device)) || '') || '<span style="color:var(--dim)">—</span>';
+const _DX_DASH = v => (v === 0 || v) && String(v).length ? esc(String(v))
+  : '<span style="color:var(--dim)">—</span>';
+
+function _dxSection(head, cols, rows, foot) {
+  if (!rows.length) return '';
+  return '<details class="dx"><summary>' + head + '</summary>'
+    + '<table class="dx-t"><thead><tr>' + cols.map(c => '<th>' + esc(c) + '</th>').join('')
+    + '</tr></thead><tbody>'
+    + rows.map(r => '<tr>' + r.map(c => '<td>' + c + '</td>').join('') + '</tr>').join('')
+    + '</tbody></table>' + (foot ? '<div class="dx-f">' + foot + '</div>' : '') + '</details>';
+}
+
 function _deltaBlock(d) {
   if (!d) return '';
   const box = (accent, bg, html) => '<div style="margin-top:12px;padding:10px 13px;border-radius:8px;'
@@ -1755,35 +1923,66 @@ function _deltaBlock(d) {
 
   const when = new Date(d.at).toLocaleString();
   const sign = n => (n > 0 ? '+' : '') + n;
-  const num = (n, good) => '<b style="color:' + (n === 0 ? 'var(--muted)' : good ? '#3fb950' : 'var(--red)') + '">'
+  const num = (n, good) => '<b style="color:' + (n === 0 ? 'var(--muted)' : good ? 'var(--green)' : 'var(--red)') + '">'
     + sign(n) + '</b>';
-  const list = (arr, f) => arr.slice(0, 6).map(f).join(', ') + (arr.length > 6 ? ' +' + (arr.length - 6) + ' more' : '');
+  const cnt = (n, col) => '<b style="color:' + col + '">' + n + '</b>';
 
   const parts = [];
-  if (d.lost.length)
-    parts.push('<div style="margin-top:6px"><b style="color:var(--red)">' + d.lost.length +
-      ' lost its sensor</b> — ' + esc(list(d.lost, x => x.ip + (x.name ? ' (' + x.name + ')' : ''))) + '</div>');
-  if (d.gained.length)
-    parts.push('<div style="margin-top:6px"><b style="color:#3fb950">' + d.gained.length +
-      ' newly watched</b> — ' + esc(list(d.gained, x => x.ip)) + '</div>');
-  if (d.appeared.length)
-    parts.push('<div style="margin-top:6px"><b>' + d.appeared.length + ' new address' +
-      (d.appeared.length === 1 ? '' : 'es') + '</b> — ' + esc(list(d.appeared, ip => ip)) + '</div>');
-  if (d.gone.length)
-    parts.push('<div style="margin-top:6px"><b>' + d.gone.length + ' no longer in the export</b> — ' +
-      esc(list(d.gone, ip => ip)) +
-      '<span style="color:var(--dim)"> · decommissioned, or simply absent from today’s export; ' +
-      'these are different and the files cannot tell them apart</span></div>');
-  if (d.newPorts.length)
-    parts.push('<div style="margin-top:6px"><b style="color:var(--red)">' + d.newPorts.length +
-      ' with a port Shodan had not seen before</b> — ' +
-      esc(list(d.newPorts, x => x.ip + ':' + x.ports.join('/'))) +
-      '<span style="color:var(--dim)"> · Shodan-derived, so this can also mean it rescanned</span></div>');
-  if (d.newCves.length)
-    parts.push('<div style="margin-top:6px"><b style="color:var(--red)">' + d.newCves.length +
-      ' with more known CVEs than before</b> — ' +
-      esc(list(d.newCves, x => x.ip + ' (' + x.from + '→' + x.to + ')')) +
-      '<span style="color:var(--dim)"> · Shodan-derived</span></div>');
+
+  parts.push(_dxSection(
+    cnt(d.lost.length, 'var(--red)') + ' lost its sensor',
+    ['Address', 'Name', 'Was', 'Now', 'Kind', 'Defender exposure'],
+    d.lost.map(x => [_DX_IP(x.ip), _DX_NAME(x.r), _DX_MDE(x.b.mde), _DX_MDE(x.r.mde),
+                     _DX_KIND(x.r.kind), _DX_DASH(x.r.exposureLevel)]),
+    'An address that was reporting to Defender at the baseline and is not now. This is the '
+    + 'transition the report exists to catch: the machine is still reachable, and nothing would '
+    + 'see an intrusion on it.'));
+
+  parts.push(_dxSection(
+    cnt(d.gained.length, 'var(--green)') + ' newly watched',
+    ['Address', 'Name', 'Was', 'Now', 'Kind'],
+    d.gained.map(x => [_DX_IP(x.ip), _DX_NAME(x.r), _DX_MDE(x.b.mde), _DX_MDE(x.r.mde),
+                       _DX_KIND(x.r.kind)])));
+
+  parts.push(_dxSection(
+    cnt(d.appeared.length, 'var(--text)') + ' new address' + (d.appeared.length === 1 ? '' : 'es'),
+    ['Address', 'Source', 'Name', 'Kind', 'SKU', 'Sensor'],
+    d.appeared.map(x => [_DX_IP(x.ip), x.r.src === 'onprem' ? 'On-premises' : 'Azure',
+                         _DX_NAME(x.r), _DX_KIND(x.r.kind), _DX_DASH(x.r.sku), _DX_MDE(x.r.mde)]),
+    'In today’s exports and not in the baseline. New to the estate, or new to what was exported.'));
+
+  parts.push(_dxSection(
+    cnt(d.gone.length, 'var(--text)') + ' no longer in the export',
+    ['Address', 'Source', 'Name at baseline', 'Sensor then', 'Kind', 'Shodan then'],
+    d.gone.map(x => [_DX_IP(x.ip), x.b.src === 'onprem' ? 'On-premises' : 'Azure',
+                     _DX_NAME(x.b), _DX_MDE(x.b.mde), _DX_KIND(x.b.kind),
+                     x.b.ports == null ? '<span style="color:var(--dim)">not looked up</span>'
+                       : (x.b.ports.length ? esc(x.b.ports.join(', ')) : 'nothing open')
+                         + (x.b.cves ? ' · ' + x.b.cves + ' CVE' + (x.b.cves === 1 ? '' : 's') : '')]),
+    'Everything here is what the <b>baseline</b> recorded, because these addresses are not in '
+    + 'today’s files to ask. Decommissioned and simply absent from this export are different '
+    + 'things, and these two CSVs cannot tell them apart — an address that dropped out because '
+    + 'a subscription was not included looks identical to one that was switched off.'));
+
+  parts.push(_dxSection(
+    cnt(d.newPorts.length, 'var(--red)') + ' with a port Shodan had not seen before',
+    ['Address', 'Name', 'New', 'All open now', 'Was', 'Sensor'],
+    d.newPorts.map(x => [_DX_IP(x.ip), _DX_NAME(x.r),
+                         '<b style="color:var(--red)">' + esc(x.ports.join(', ')) + '</b>',
+                         esc(x.all.join(', ')),
+                         x.b.ports.length ? esc(x.b.ports.join(', ')) : 'nothing open',
+                         _DX_MDE(x.r.mde)]),
+    'Shodan-derived. A port appearing here can mean the estate changed <em style="font-style:normal">or</em> '
+    + 'that Shodan rescanned the address since the baseline was written — it observes on its own '
+    + 'schedule, not ours.'));
+
+  parts.push(_dxSection(
+    cnt(d.newCves.length, 'var(--red)') + ' with more known CVEs than before',
+    ['Address', 'Name', 'Was', 'Now', 'Sensor'],
+    d.newCves.map(x => [_DX_IP(x.ip), _DX_NAME(x.r), esc(String(x.from)),
+                        '<b style="color:var(--red)">' + esc(String(x.to)) + '</b>', _DX_MDE(x.r.mde)]),
+    'Shodan-derived, and the same caveat applies: a CVE count rises when Shodan learns something '
+    + 'new about a service, which is not necessarily the day the service changed.'));
 
   const head = '<b style="color:var(--text)">Since ' + esc(when) + '</b> · addresses ' +
     d.totals.wasTotal + ' → ' + d.totals.nowTotal + ' ' + num(d.totals.total, d.totals.total <= 0) +
@@ -1793,13 +1992,17 @@ function _deltaBlock(d) {
     ? '<div style="margin-top:6px;color:var(--gold)">The Defender export went from ' + d.swing.was +
       ' rows to ' + d.swing.now + '. That is a large change in what was exported, so read these ' +
       'differences as possibly about the export rather than the estate.</div>' : '';
-  const nothing = parts.length ? '' :
+  const any = parts.some(Boolean);
+  const nothing = any ? '' :
     '<div style="margin-top:6px;color:var(--muted)">No address changed side, appeared or disappeared.</div>';
+  const hint = any
+    ? '<div style="margin-top:5px;font-size:10px;color:var(--dim)">Every line opens · click an '
+      + 'address for its full detail</div>' : '';
 
   const worse = d.lost.length || d.newPorts.length || d.newCves.length;
-  return box(worse ? 'var(--red)' : '#3fb950',
+  return box(worse ? 'var(--red)' : 'var(--green)',
              worse ? 'rgba(248,81,73,.07)' : 'rgba(63,185,80,.06)',
-             head + swing + parts.join('') + nothing);
+             head + swing + hint + parts.join('') + nothing);
 }
 
 function buildSurfaceReport(snap) {
@@ -2253,6 +2456,7 @@ function readCsvs() {
     return;
   }
   _PENDING = p; go.disabled = false;
+  _syncTenantGuess(mde, az);
   // Draw the estate on the map as soon as it is readable. The map is on this
   // page, so waiting for the report to be built left it sitting empty next to a
   // status line saying 79 addresses had been read — which reads as broken, not
