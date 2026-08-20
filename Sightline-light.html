@@ -610,6 +610,7 @@ function _looksFrontend(name, assoc) { return !!_frontendKind(name, assoc); }
 function _surfaceSnapFrom(p) {
   return {
     at: Date.now(), hadDefenderFile: !!p.hadDefenderFile, looksFiltered: !!p.looksFiltered,
+    hadScanCols: !!p.hadScanCols,
     covered:   (p.devices || []).map(d => ({ ip: d.ip, name: d.name, onboarding: d.onboarding,
                  exposureLevel: d.exposureLevel, riskScore: d.riskScore, netFacing: !!d.netFacing,
                  os: d.os || '', internalIp: d.internalIp || '', id: d.id || '',
@@ -725,6 +726,11 @@ function _surfaceStats(s) {
   const owned    = rows.filter(r => r.src !== 'entra' || r.owned);
   const swept    = rows.filter(r => r.src === 'entra' && !r.owned);
   const gapHosts = owned.filter(r => r.kind === 'machine' && r.mde === 'none');
+  // The population the UNWATCHED card counts, defined once. It used to live
+  // inline in the diagram while the tiles below computed their own without the
+  // estate test -- so a tile could report 16 "unwatched and listening" under a
+  // card reading 12 unwatched, a subset larger than its superset.
+  const unwatched = rows.filter(r => _isEstate(r) && r.kind !== 'gateway' && r.mde !== 'onboarded');
   // Coverage is measured over addresses that could carry an agent, matching the
   // population mdeCoverage() uses everywhere else in the app. Gateways are the
   // only exclusion: a shared-NAT row still has a device behind it, so counting
@@ -733,7 +739,7 @@ function _surfaceStats(s) {
   // the device, and a NAT row always has one.
   const comparable = owned.filter(r => r.kind !== 'gateway').length;
   return { rows, total, basic, orphan, onboard, discover, onprem, ghosts, fronts, nats, scanned,
-           gapHosts, comparable, owned, swept,
+           gapHosts, comparable, owned, swept, unwatched,
            pct: comparable ? Math.round(onboard / comparable * 100) : 0 };
 }
 
@@ -820,11 +826,14 @@ const _SF_PRESETS = {
   // The risk strip's six, as presets rather than a separate table registered by
   // a side effect at load. One place holds every named predicate, _sfMatch
   // already knows how to run them, and both builds inherit them by extraction.
+  // _isEstate here for the same reason the diagram has it: without it these
+  // count swept addresses whose ownership is unconfirmed, which the UNWATCHED
+  // card deliberately excludes.
   blindlisten:  { label: 'unwatched and listening',
-                  fn: r => r.kind !== 'gateway' && r.mde !== 'onboarded'
+                  fn: r => _isEstate(r) && r.kind !== 'gateway' && r.mde !== 'onboarded'
                         && ((IDB_CACHE[r.ip] || {}).ports || []).length > 0 },
   blindreached: { label: 'unwatched, Microsoft reached it',
-                  fn: r => r.kind !== 'gateway' && r.mde !== 'onboarded'
+                  fn: r => _isEstate(r) && r.kind !== 'gateway' && r.mde !== 'onboarded'
                         && !!r.scanned && !!r.scannedPort },
   hirisk:       { label: 'a high-risk port exposed',
                   fn: r => ((IDB_CACHE[r.ip] || {}).ports || [])
@@ -1039,15 +1048,16 @@ let _shodanAt = null;
 // not look" rendered as "we looked and found none".
 const _RISK = [
   { k: 'blindlisten', rank: 1, from: 'nosensor',
-    lab: 'Unwatched and listening', col: '#f85149', shodan: true,
+    lab: 'No sensor, and listening', col: '#f85149', shodan: true,
     why: 'No Defender sensor, and Shodan has seen at least one port open. Nothing is '
        + 'watching, and something is answering. This is the pair neither tool tells you '
        + 'about on its own.', },
   { k: 'blindreached', rank: 2, from: 'nosensor',
-    lab: 'Unwatched, Microsoft got in', col: '#f85149',
-    why: "No Defender sensor, and Defender's own internet scanner reached the address on a "
-       + 'port. Microsoft proved it was reachable and there is no sensor on it. Comes '
-       + 'entirely from the export — no third party involved.', },
+    lab: 'Microsoft reached it, no sensor', col: '#f85149',
+    why: 'Of the addresses with no Defender sensor, how many Defender’s own internet scanner '
+       + 'reached on a port. Not a count of unwatched addresses — the diagram above has that '
+       + '— but of the ones Microsoft itself proved were reachable while nothing watched '
+       + 'them. Comes entirely from the export; no third party involved.', },
   { k: 'hirisk', rank: 3, lab: 'High-risk port exposed', col: 'var(--orange)', shodan: true,
     why: 'Shodan reports a port this tool rates critical or high — remote access, file '
        + 'sharing or a database. Their observation, from whenever their scanners last '
@@ -1077,7 +1087,12 @@ function _riskStrip(t) {
   //   clear    it ran and found none. Zero with a tick, in green: verified.
   //   hit      a finding. Severity colour, heavier numeral, clickable.
   const cards = _RISK.map(x => {
-    const pending = x.shodan && !asked;
+    // Two ways a tile can have nothing to report. Shodan not run yet, and -- the
+    // one this missed -- a Defender export with no PublicScannedIp column, where
+    // every row says "not reached" because nothing was ever asked. That was
+    // printing 0 with a tick: a verified-clean claim about an unmeasured thing.
+    const pending = (x.shodan && !asked)
+                 || (x.k === 'blindreached' && !(SURFACE_SNAP && SURFACE_SNAP.hadScanCols));
     const n = pending ? null : rows.filter(_SF_PRESETS[x.k].fn).length;
     return { x, state: pending ? 'unknown' : n ? 'hit' : 'clear', n };
   });
@@ -1103,7 +1118,9 @@ function _riskStrip(t) {
       <b${state === 'hit' ? ` style="color:${x.col}"` : ''}>${
         state === 'unknown' ? '—' : state === 'clear' ? '0 <i class="tick">✓</i>' : n}</b>
       <span>${esc(x.lab)}${on ? ' <i>✕</i>' : ''}</span>
-      <em>${x.shodan ? 'Shodan' : x.k === 'blindreached' ? 'Defender scan' : 'from the export'}</em>
+      <em>${x.from === 'nosensor' && state !== 'unknown'
+              ? `of the ${t.unwatched.length} unwatched &middot; ` : ''}${
+            x.shodan ? 'Shodan' : x.k === 'blindreached' ? 'Defender scan' : 'from the export'}</em>
     </div>`;
   }).join('');
 
@@ -1191,7 +1208,7 @@ function _valueHero() {
     { k: 'sensor',   y: 58,  lab: 'WATCHED',           sub: 'a sensor is reporting',
       col: GREEN, rows: t.rows.filter(isOk), ico: 'ok' },
     { k: 'nosensor', y: 150, lab: 'UNWATCHED',         sub: 'nothing would see an intrusion',
-      col: RED,   rows: t.rows.filter(r => !isGw(r) && !isSw(r) && r.mde !== 'onboarded'), ico: 'eye' },
+      col: RED,   rows: t.unwatched, ico: 'eye' },
     { k: 'gateway',  y: 242, lab: 'NO AGENT EXPECTED', sub: 'gateway, WAF or bastion',
       col: STEEL, rows: t.rows.filter(r => isGw(r) && !isSw(r)), ico: 'gw' },
     // Its own outcome rather than a larger UNWATCHED: these are unwatched, but
@@ -1690,7 +1707,11 @@ function parseImport(mdeText, azText) {
                               .map(([ip, a]) => ({ ip, name: a.name, sku: a.sku, ver: a.ver,
                                                    assoc: a.assoc, azLink: a.link }));
   const total = devices.length + uncovered.length;
-  return { devices, uncovered, noAddress: skipped, egressOnly,
+  // Whether the export even carries Microsoft's scan result. Without the column
+  // every row reads "not reached", which is indistinguishable from "reached
+  // nothing" unless the difference is recorded here.
+  const hadScanCols = idx.scannedIp !== undefined;
+  return { devices, uncovered, noAddress: skipped, egressOnly, hadScanCols,
            hadDefenderFile: rows.length > 1, looksFiltered, total };
 }
 
