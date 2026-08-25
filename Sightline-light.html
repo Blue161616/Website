@@ -99,6 +99,25 @@
   .pick input[type=file]{margin-bottom:0}
   .pick .btn{font-size:10px;padding:4px 10px}
   .note{font-size:10px;color:var(--dim);line-height:1.65;margin:0 0 8px}
+
+  /* Step 3's range list. A real tenant declares 150-250 named locations and
+     every one of them wants a decision, so the list is a pane of its own: 200
+     rows in the flow pushed the Build button several screens below the fold,
+     which read as the step having no end rather than as a long list. Capped
+     here, filterable, and the two links claim or release whatever the filter is
+     showing — which is how one site's worth gets ticked in one go. */
+  .rl-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:9px 0 5px}
+  .rl-bar input{flex:1 1 150px;min-width:0;background:var(--bg);border:1px solid var(--border);
+    color:var(--text);padding:4px 8px;border-radius:5px;font-size:10.5px}
+  .rl-bar input:focus{outline:none;border-color:var(--blue)}
+  .rl-bar a{color:#58a6ff;cursor:pointer;font-size:10.5px;white-space:nowrap}
+  .rl-count{font-size:10.5px;color:var(--muted);margin:0 0 5px}
+  .rl-list{max-height:min(38vh,300px);overflow-y:auto;overscroll-behavior:contain;
+    border:1px solid var(--border);border-radius:7px;background:var(--bg);padding:3px 10px}
+  .rl-list::-webkit-scrollbar{width:9px}
+  .rl-list::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:5px}
+  .rl-none{padding:9px 0;font-size:10.5px;color:var(--dim)}
+
   /* One block per file, so "which file is wrong" never has to be inferred. */
   .hero{border:1px solid var(--border);border-radius:10px;background:
     radial-gradient(ellipse 70% 120% at 50% 0%,rgba(56,139,253,.08),transparent 70%),var(--bg2);
@@ -664,8 +683,9 @@ function _surfaceRows(s) {
       mde: 'none', onboarding: '', exposureLevel: '', riskScore: '', os: '',
       arc: false, scanned: false, scannedPort: '', reason: '', shareCount: 1,
       kind: 'machine', trustedName: h.name || '', trustedCidr: h.cidr || '',
-      // Confirmed-ours ranges are estate; the rest are findings without a claim.
-      owned: _rangeIsOurs(h.cidr),
+      // Confirmed as ours — by the address, or by its range — it is estate;
+      // the rest are findings without a claim.
+      owned: _addrIsOurs(h.ip, h.cidr),
     });
   });
 
@@ -1931,14 +1951,69 @@ let TRUSTED_HITS   = [];      // [{ip, name, cidr}] where Shodan answered with s
 // Keyed by CIDR rather than by name, because the name is what people rewrite.
 const _OWN_KEY = 'blue16.blindspots.ownedRanges';
 
-let TRUSTED_OWNED = {};
+// The same question one level down, asked when there is finally something to
+// answer it with.
+//
+// A range has to be judged before the sweep runs, which is the worst moment to
+// judge it: a /24 with a name half the tenant recognises, and no idea which of
+// its 254 addresses will turn out to answer. Afterwards there are three
+// addresses with ports beside them, and those are answerable. So an address may
+// carry its own claim, which overrides its range in both directions — a claimed
+// range can still hold one leased box that is somebody else's.
+//
+// Absent means unanswered, which reads through to the range. Kept in its own
+// key so neither kind of answer can be mistaken for the other.
+const _OWN_IP_KEY = 'blue16.blindspots.ownedAddrs';
+
+/** The remembered answers, or none. Both stores were written and never read
+ *  back, so "asked once and remembered" only held until the tab was reloaded.
+ *  A corrupt or hand-edited entry returns empty rather than taking the page
+ *  down with it. */
+function _readOwn(key) {
+  try {
+    const v = JSON.parse(localStorage.getItem(key) || '{}');
+    return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {};
+  } catch (e) { return {}; }
+}
+
+let TRUSTED_OWNED = _readOwn(_OWN_KEY);
+
+let TRUSTED_OWNED_IP = _readOwn(_OWN_IP_KEY);
 
 function _saveOwned() {
-  try { localStorage.setItem(_OWN_KEY, JSON.stringify(TRUSTED_OWNED)); } catch (e) {}
+  try {
+    localStorage.setItem(_OWN_KEY, JSON.stringify(TRUSTED_OWNED));
+    localStorage.setItem(_OWN_IP_KEY, JSON.stringify(TRUSTED_OWNED_IP));
+  } catch (e) {}
 }
 
 /** Is this range one the operator has confirmed as theirs? */
 function _rangeIsOurs(cidr) { return !!TRUSTED_OWNED[String(cidr || '')]; }
+
+/** Ownership of one swept address: its own answer where it has been given one,
+ *  and its range's answer otherwise. */
+function _addrIsOurs(ip, cidr) {
+  const v = TRUSTED_OWNED_IP[String(ip || '')];
+  return v === undefined ? _rangeIsOurs(cidr) : !!v;
+}
+
+/** Whether the answer above was given about this address or inherited from its
+ *  range — so a badge can say which, rather than showing a claim nobody made. */
+function _addrOwnFrom(ip) {
+  return TRUSTED_OWNED_IP[String(ip || '')] === undefined ? 'range' : 'address';
+}
+
+/** Answer for one address, from wherever it is listed after the sweep. */
+function toggleAddrOwned(ip, on) {
+  const k = String(ip || '');
+  if (on === null) delete TRUSTED_OWNED_IP[k]; else TRUSTED_OWNED_IP[k] = on ? 1 : 0;
+  _saveOwned();
+  // Same staleness the range ticks cause: promoting an address changes the
+  // coverage population, so the table, the score and the map all have to agree
+  // again. Both builds define these; neither defines both.
+  if (typeof _surfaceRedraw === 'function') _surfaceRedraw();
+  if (typeof paintMap === 'function') paintMap();
+}
 
 const _TRUST_CAP = 1024;      // addresses per run, across every range
 
@@ -2058,16 +2133,19 @@ function _trustedPlan(ranges) {
   return { lookups: lookups, skipped: skipped, total: lookups.length };
 }
 
-/** Ask InternetDB about every planned address that the two files did not already
- *  cover. Runs after the report is on screen, like the other enrichment, and
- *  repaints when it lands. */
-/** The declared-range findings, as a report section body.
+/** Which planned addresses came back with something on them.
  *
- *  What lands here is the point of the whole third import: an address answering
- *  inside a range the tenant declared as its own, which is in neither the
- *  Defender export nor the Azure one. Defender does not know it because nothing
- *  onboarded it; Azure does not know it because Azure did not issue it. It is
- *  the machine nobody wrote down, on a range somebody did. */
+ *  The full app asks its backend for a whole batch and the light build asks
+ *  InternetDB one address at a time, because one of them has no backend. That is
+ *  a difference in transport and must not become a difference in findings, so
+ *  both fill IDB_CACHE and then call this. */
+function _trustedHits(lookups) {
+  return (lookups || []).filter(l => {
+    const d = IDB_CACHE[l.ip];
+    return _idbAnswered(d) && ((d.ports || []).length || (d.vulns || []).length);
+  });
+}
+
 function _trustedBlock() {
   if (TRUSTED_STATE === 'none') return '';
   const p = TRUSTED_PLAN || { total: 0, skipped: [] };
@@ -2076,7 +2154,8 @@ function _trustedBlock() {
     + '<b style="color:var(--muted)">Trusted is a claim, not a deed.</b> Tenants trust ranges they do '
     + 'not own: partner offices, a branch ISP block, sometimes an entire country. So a swept address '
     + 'is reported but counts towards nothing &mdash; not coverage, not the score &mdash; until you '
-    + 'tick its range as yours on the import page. Nothing was sent to any of these addresses; this '
+    + 'confirm it, either as a range on the import page or as a single address once the sweep has '
+    + 'said which ones answered. Nothing was sent to any of these addresses; this '
     + 'is what Shodan already saw.</div>';
 
   if (TRUSTED_STATE === 'sweeping')
@@ -2100,8 +2179,18 @@ function _trustedBlock() {
   // range in the name column. Repeating them here was the same data twice, so
   // this section keeps only what that table cannot carry: how much was looked
   // at, what was refused, and what the result does and does not mean.
+  // Loaded but not yet asked. Without this the next branch reports "nothing
+  // answered", which is a clean verdict on a sweep that has not run.
+  if (TRUSTED_STATE === 'ready')
+    return '<div style="padding:10px 13px;border-radius:7px;border-left:2px solid var(--blue);'
+      + 'background:rgba(56,139,253,.06);font-size:11.5px;line-height:1.7;color:var(--muted)">'
+      + '<b style="color:var(--text)">' + (TRUSTED_RANGES || []).length + ' declared range'
+      + ((TRUSTED_RANGES || []).length === 1 ? '' : 's') + ' loaded, ' + p.total.toLocaleString()
+      + ' address' + (p.total === 1 ? '' : 'es') + ' to ask about.</b> Nothing has been asked yet, '
+      + 'so nothing here is a result.' + caveat + skipped;
+
   const hits = TRUSTED_HITS.length;
-  const ours = TRUSTED_HITS.filter(h => _rangeIsOurs(h.cidr)).length;
+  const ours = TRUSTED_HITS.filter(h => _addrIsOurs(h.ip, h.cidr)).length;
 
   const head = hits
     ? '<div style="padding:10px 13px;border-radius:7px;border-left:2px solid '
@@ -2111,14 +2200,15 @@ function _trustedBlock() {
       + '<b style="color:var(--text)">' + hits + ' address' + (hits === 1 ? '' : 'es')
       + ' answering inside a declared range, in neither export.</b> '
       + (ours === hits
-          ? 'Every range they came from is confirmed as yours, so they count as estate: unmanaged '
+          ? 'Every one of them is confirmed as yours, so they count as estate: unmanaged '
             + 'machines nothing is watching.'
           : ours
-            ? ours + (ours === 1 ? ' of them sits' : ' of them sit') + ' in a range you have confirmed '
-              + 'as yours and ' + (ours === 1 ? 'counts' : 'count') + ' towards coverage; the rest are '
+            ? ours + (ours === 1 ? ' of them is' : ' of them are') + ' confirmed as yours and '
+              + (ours === 1 ? 'counts' : 'count') + ' towards coverage; the rest are '
               + 'findings without a confirmed owner.'
-            : 'None of their ranges is confirmed as yours yet, so they count towards nothing. '
-              + 'They are in the table above, marked Unverified.')
+            : 'None of them is confirmed as yours yet, so they count towards nothing. '
+              + 'They are in the table above, marked Unverified &mdash; tick one there, or below, '
+              + 'to claim it.')
       + '</div>'
     : '<div style="padding:10px 13px;border-radius:7px;border-left:2px solid var(--green);'
       + 'background:rgba(63,185,80,.06);font-size:11.5px;line-height:1.7;color:var(--muted)">'
@@ -2127,7 +2217,45 @@ function _trustedBlock() {
       + p.total.toLocaleString() + ' address' + (p.total === 1 ? '' : 'es') + ' swept &mdash; which '
       + 'is not proof the ranges are empty, only that Shodan has not seen anything there.</div>';
 
-  return head + caveat + skipped;
+  // One row per address that answered, which is the list the range ticks could
+  // not be: before the sweep there was nothing to point at. Ticked here, an
+  // address counts on its own without claiming the rest of its range; unticked
+  // inside a claimed range, only that address is left out.
+  const perAddr = hits ? '<details class="dx" style="margin-top:10px" open>'
+    + '<summary><b style="color:var(--text)">Confirm ' + (hits === 1 ? 'this address'
+      : 'these ' + hits + ' addresses') + '</b> one at a time</summary>'
+    + '<div style="font-size:10.5px;color:var(--dim);line-height:1.7;padding:1px 0 7px">'
+    + 'Ticked, the address counts towards coverage and the score on its own, whatever its range says. '
+    + 'Unticked inside a range you claimed, only that address is left out. Left alone, it follows its '
+    + 'range.</div>'
+    + '<div style="max-height:min(34vh,300px);overflow-y:auto">'
+    + TRUSTED_HITS.map(h => {
+        const mine  = _addrIsOurs(h.ip, h.cidr);
+        const own   = _addrOwnFrom(h.ip) === 'address';
+        const d     = IDB_CACHE[h.ip] || {};
+        const ports = (d.ports || []).slice(0, 8).join(', ');
+        // Dotted quads only — _trustedPlan skips v6 — so this needs no regex.
+        const id    = 'ownip-' + String(h.ip).split('.').join('-');
+        return '<label for="' + id + '" style="display:flex;align-items:center;gap:8px;padding:4px 0;'
+          + 'font-size:11px;cursor:pointer">'
+          + '<input type="checkbox" id="' + id + '" ' + (mine ? 'checked ' : '')
+          +   'onchange="toggleAddrOwned(\'' + jsStr(h.ip) + '\', this.checked)" '
+          +   'style="accent-color:var(--blue);flex-shrink:0">'
+          + '<span style="font-family:ui-monospace,monospace;color:var(--text);flex-shrink:0">'
+          +   esc(h.ip) + '</span>'
+          + '<span style="font-family:ui-monospace,monospace;color:var(--dim);flex-shrink:0">'
+          +   esc(h.cidr || '') + '</span>'
+          + '<span style="color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
+          +   esc(h.name || '') + (ports ? ' &middot; ' + esc(ports) : '') + '</span>'
+          + '<span style="margin-left:auto;flex-shrink:0;font-size:10px;color:'
+          +   (mine ? 'var(--green)' : own ? 'var(--dim)' : 'var(--gold)') + '">'
+          +   (mine ? (own ? 'ours' : 'ours &middot; via range') : own ? 'not ours' : 'unverified')
+          + '</span></label>';
+      }).join('')
+    + '</div><div class="dx-f">An answer given here is remembered against the address, so it survives '
+    + 'the range being ticked or cleared later.</div></details>' : '';
+
+  return head + perAddr + caveat + skipped;
 }
 
 // The Entra ring, for the addresses found only inside a declared range.
@@ -2232,7 +2360,12 @@ function _scopeOf(mdeText, azText, snap) {
   };
 }
 
-// ── CSV parse, lifted verbatim from scanner.html's runMdeCsvImport ─────────
+// The CSV parse, as a function of its two inputs rather than of the DOM.
+// It used to live inside a CSV-import tab, and the light build's generator cut it
+// out with a line-span and five string substitutions, which is a lot of machinery
+// to keep pointing at a moving target. Owning it as a function means the extractor
+// simply lifts it, and there is one parser rather than one parser and a recipe for
+// deriving another.
 // Only the two DOM reads became parameters. Every join, exclusion and count
 // below is the full app's, so the two builds cannot report different estates
 // from the same pair of files.
@@ -2443,7 +2576,7 @@ function buildSurfaceReport(snap) {
       <div style="font-size:11px;font-weight:700;letter-spacing:.08em;color:var(--muted);
         text-transform:uppercase;margin-bottom:10px;display:flex;align-items:center;
         gap:6px">${_azureIcon(13)} Blind Spots</div>
-      Import the two portal exports on the <strong>Defender CSV</strong> tab to see this. It reports
+      Import the Microsoft data to see this. It reports
       what is addressable against what Defender is watching, before any scan.</div>`;
   }
   const t = _surfaceStats(s);
@@ -2469,15 +2602,6 @@ function buildSurfaceReport(snap) {
 
   return `<div style="padding:18px 18px 26px">
     <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">
-      <div style="font-size:13px;font-weight:700;color:var(--text);display:inline-flex;
-        align-items:center;gap:6px">${_azureIcon(14)} Blind Spots</div>
-      <span style="font-size:9.5px;font-weight:700;padding:2px 7px;border-radius:20px;flex-shrink:0;
-        color:#3fb950;background:rgba(63,185,80,.1);border:1px solid rgba(63,185,80,.3)"
-        title="${esc('No packet has been sent to any address in this report — nothing here needs a scan window '
-          + 'or a change request.' + (t.rows.some(r => IDB_CACHE[r.ip] !== undefined)
-          ? ' The Shodan column is their scan, not ours; asking for it sent these addresses to Shodan, '
-            + 'but nothing to the estate.' : ''))}">
-        ● Passive · no traffic to the estate</span>
       <div style="flex:1;min-width:160px">
         <div style="font-size:10.5px;color:var(--muted)">Every internet-facing address in these two exports, and whether
           a Defender sensor is watching it</div>
@@ -2548,15 +2672,19 @@ function buildSurfaceReport(snap) {
         ? `<span style="color:#8b74e0;display:inline-flex;align-items:center;gap:5px"
              title="${esc('Found by asking Shodan about ' + (r.trustedCidr || 'a trusted range')
                + (r.trustedName ? ' — ' + r.trustedName : '') + '. In neither export. ' + (r.owned
-                 ? 'This range is confirmed as yours, so it counts towards coverage.'
+                 ? 'Confirmed as yours, so it counts towards coverage.'
                  : 'Ownership unconfirmed, so it is reported but counts towards nothing.'))}"
-             >${_ICO_ENTRA}Entra${r.owned
-               ? ` <span style="padding:0 4px;border-radius:3px;font-size:9px;font-weight:700;
-                    color:#3fb950;background:rgba(63,185,80,.14);border:1px solid rgba(63,185,80,.3)"
-                    >Ours</span>`
-               : ` <span style="padding:0 4px;border-radius:3px;font-size:9px;font-weight:700;
-                    color:#e3b341;background:rgba(227,179,65,.13);border:1px solid rgba(227,179,65,.3)"
-                    >Unverified</span>`}</span>`
+             >${_ICO_ENTRA}Entra <span onclick="toggleAddrOwned('${jsStr(r.ip)}', ${!r.owned})"
+                  title="${esc(r.owned
+                    ? 'Click to say this address is not yours. It stops counting towards coverage, '
+                      + 'and the rest of its range is left as it is.'
+                    : 'Click to confirm this address is yours. It starts counting towards coverage on '
+                      + 'its own, without claiming the rest of its range.')}"
+                  style="padding:0 4px;border-radius:3px;font-size:9px;font-weight:700;cursor:pointer;
+                   color:${r.owned ? '#3fb950' : '#e3b341'};
+                   background:${r.owned ? 'rgba(63,185,80,.14)' : 'rgba(227,179,65,.13)'};
+                   border:1px solid ${r.owned ? 'rgba(63,185,80,.3)' : 'rgba(227,179,65,.3)'}"
+                  >${r.owned ? 'Ours' : 'Unverified'}</span></span>`
         : r.src === 'onprem'
         ? `<span style="color:var(--gold);display:inline-flex;align-items:center;gap:5px"
              title="${esc(r.arc
@@ -3412,50 +3540,133 @@ function toggleRangeOwned(cidr, on) {
   const k = String(cidr || '');
   if (on) TRUSTED_OWNED[k] = 1; else delete TRUSTED_OWNED[k];
   _saveOwned();
-  _renderRangeList();
+  _renderRangeBody();
   // Promoting a range changes the coverage population, so anything already
   // drawn from it is now stale — the report, the map and the score all read the
   // same rows.
   if (SURFACE_SNAP) { _surfaceRedraw(); paintMap(); }
 }
 
-/** One row per range, with the claim the operator is making about it. */
-function _renderRangeList() {
-  const el = document.getElementById('entra-ranges');
-  if (!el) return;
-  if (!TRUSTED_RANGES.length) { el.innerHTML = ''; return; }
-  // Distinct CIDRs, keeping the first name seen for each.
-  const seen = {}, list = [];
+// What the filter box holds. Kept out of the DOM read path so the list can be
+// redrawn without asking an input that may not exist yet.
+let _RL_Q = '';
+
+function rangeListFilter(q) { _RL_Q = String(q || ''); _renderRangeBody(); }
+
+/** Claim or release every range the filter is showing.
+ *
+ *  This is what the filter box is for on a tenant with 194 locations: type the
+ *  site name, see the eight ranges that belong to it, claim them in one click.
+ *  Skipped ranges are left alone either way — nothing was looked at in them,
+ *  so there is nothing to claim. */
+function rangeListSetShown(on) {
+  let n = 0;
+  _rangeRows().forEach(r => {
+    if (r.off || !_rlMatch(r)) return;
+    if (on) { if (!TRUSTED_OWNED[r.cidr]) { TRUSTED_OWNED[r.cidr] = 1; n++; } }
+    else if (TRUSTED_OWNED[r.cidr]) { delete TRUSTED_OWNED[r.cidr]; n++; }
+  });
+  if (!n) return;
+  _saveOwned();
+  _renderRangeBody();
+  if (SURFACE_SNAP) { _surfaceRedraw(); paintMap(); }
+}
+
+/** Distinct CIDRs, first name seen wins, carrying the reason each was skipped
+ *  if it was. One pass, so the list, the counts and the bulk actions cannot
+ *  disagree about what is on screen. */
+function _rangeRows() {
+  const skipped = {};
+  ((TRUSTED_PLAN && TRUSTED_PLAN.skipped) || []).forEach(x => { skipped[x.cidr] = x.why; });
+  const seen = {}, out = [];
   TRUSTED_RANGES.forEach(r => {
     if (seen[r.cidr]) return;
     seen[r.cidr] = 1;
-    list.push(r);
+    out.push({ cidr: r.cidr, name: r.name || '', off: skipped[r.cidr] || '' });
   });
-  const skipped = {};
-  ((TRUSTED_PLAN && TRUSTED_PLAN.skipped) || []).forEach(x => { skipped[x.cidr] = x.why; });
+  return out;
+}
 
-  el.innerHTML = '<div style="font-size:10.5px;color:var(--muted);margin:9px 0 5px">'
-    + 'Tick a range your organisation <b style="color:var(--text)">owns</b>. Ticked, its addresses '
-    + 'count towards coverage and the score like any other asset; left clear, they are reported as '
-    + 'findings whose ownership nobody has confirmed.</div>'
-    + list.map(r => {
-        const off = skipped[r.cidr];
-        const id = 'own-' + r.cidr.replace(/[^a-z0-9]/gi, '-');
-        return '<label for="' + id + '" style="display:flex;align-items:center;gap:8px;padding:4px 0;'
-          + 'font-size:11px;' + (off ? 'opacity:.5' : 'cursor:pointer') + '">'
-          + '<input type="checkbox" id="' + id + '" ' + (off ? 'disabled ' : '')
-          +   (_rangeIsOurs(r.cidr) ? 'checked ' : '')
-          +   'onchange="toggleRangeOwned(\'' + jsStr(r.cidr) + '\', this.checked)" '
-          +   'style="accent-color:var(--blue);flex-shrink:0">'
-          + '<span style="font-family:ui-monospace,monospace;color:var(--text);flex-shrink:0">'
-          +   esc(r.cidr) + '</span>'
-          + '<span style="color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
-          +   esc(r.name || '') + '</span>'
-          + '<span style="margin-left:auto;flex-shrink:0;font-size:10px;color:'
-          +   (off ? 'var(--dim)' : _rangeIsOurs(r.cidr) ? 'var(--green)' : 'var(--gold)') + '">'
-          +   (off ? 'not swept' : _rangeIsOurs(r.cidr) ? 'ours' : 'unverified') + '</span>'
-          + '</label>';
-      }).join('');
+function _rlMatch(r) {
+  const q = _RL_Q.trim().toLowerCase();
+  return !q || (r.cidr + ' ' + r.name).toLowerCase().indexOf(q) > -1;
+}
+
+/** The range picker: a fixed-height pane rather than 194 rows in the page flow.
+ *
+ *  The chrome is built once and only the body is redrawn, for two reasons that
+ *  both bite at this size: rewriting the bar on every keystroke takes the caret
+ *  out of its own filter box, and rewriting the list on every tick throws the
+ *  scroll position back to the top, which loses the reader's place halfway down
+ *  a list they are working through. */
+function _renderRangeList() {
+  const el = document.getElementById('entra-ranges');
+  if (!el) return;
+  if (!TRUSTED_RANGES.length) { el.innerHTML = ''; _RL_Q = ''; return; }
+  if (!document.getElementById('rl-list')) {
+    _RL_Q = '';
+    el.innerHTML =
+        '<div class="note" style="margin:9px 0 5px">Tick a range your organisation '
+      +   '<b style="color:var(--text)">owns</b>. Ticked, its addresses count towards coverage and '
+      +   'the score like any other asset; left clear, they are reported as findings whose ownership '
+      +   'nobody has confirmed. Whatever is left undecided here can still be settled one address at '
+      +   'a time in the report, once the sweep has said which ones answer.</div>'
+      + '<div class="rl-bar">'
+      +   '<input type="search" id="rl-q" spellcheck="false" autocomplete="off"'
+      +     ' placeholder="Filter by name or CIDR" oninput="rangeListFilter(this.value)">'
+      +   '<a onclick="rangeListSetShown(true)" title="Tick every range the filter is showing"'
+      +     '>Tick shown</a>'
+      +   '<a onclick="rangeListSetShown(false)" title="Clear every range the filter is showing"'
+      +     '>Clear shown</a>'
+      + '</div>'
+      + '<div class="rl-count" id="rl-count"></div>'
+      + '<div class="rl-list" id="rl-list"></div>';
+  }
+  _renderRangeBody();
+}
+
+/** One row per range, with the claim the operator is making about it. */
+function _renderRangeBody() {
+  const list = document.getElementById('rl-list');
+  const cnt  = document.getElementById('rl-count');
+  if (!list) return;
+  const all    = _rangeRows();
+  const shown  = all.filter(_rlMatch);
+  const ticked = all.filter(r => _rangeIsOurs(r.cidr)).length;
+
+  // "distinct", because the file can name the same CIDR from two locations and
+  // this list holds one row each — so the 194 the status line above reports and
+  // the 184 rows here are both true, and saying only "184 ranges" reads as one
+  // of them being wrong.
+  const noun = all.length < TRUSTED_RANGES.length ? ' distinct range' : ' range';
+  if (cnt) cnt.innerHTML =
+      (shown.length === all.length
+        ? all.length + noun + (all.length === 1 ? '' : 's')
+        : shown.length + ' of ' + all.length + ' shown')
+    + ' \u00b7 <b style="color:' + (ticked ? 'var(--green)' : 'var(--gold)') + '">'
+    + ticked + ' ticked as ours</b>';
+
+  const top = list.scrollTop;
+  list.innerHTML = shown.length ? shown.map(r => {
+      const id = 'own-' + r.cidr.split('.').join('-').split('/').join('_');
+      return '<label for="' + id + '" style="display:flex;align-items:center;gap:8px;padding:4px 0;'
+        + 'font-size:11px;' + (r.off ? 'opacity:.5' : 'cursor:pointer') + '"'
+        + (r.off ? ' title="' + esc(r.off) + '"' : '') + '>'
+        + '<input type="checkbox" id="' + id + '" ' + (r.off ? 'disabled ' : '')
+        +   (_rangeIsOurs(r.cidr) ? 'checked ' : '')
+        +   'onchange="toggleRangeOwned(\'' + jsStr(r.cidr) + '\', this.checked)" '
+        +   'style="accent-color:var(--blue);flex-shrink:0">'
+        + '<span style="font-family:ui-monospace,monospace;color:var(--text);flex-shrink:0">'
+        +   esc(r.cidr) + '</span>'
+        + '<span style="color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
+        +   esc(r.name) + '</span>'
+        + '<span style="margin-left:auto;flex-shrink:0;font-size:10px;color:'
+        +   (r.off ? 'var(--dim)' : _rangeIsOurs(r.cidr) ? 'var(--green)' : 'var(--gold)') + '">'
+        +   (r.off ? 'not swept' : _rangeIsOurs(r.cidr) ? 'ours' : 'unverified') + '</span>'
+        + '</label>';
+    }).join('')
+    : '<div class="rl-none">Nothing here matches \u201c' + esc(_RL_Q.trim()) + '\u201d.</div>';
+  list.scrollTop = top;
 }
 
 /** Read the pasted text, plan the sweep, and say what will happen. */
@@ -3512,10 +3723,9 @@ async function _sweepTrusted() {
     if (++done % 40 === 0) _surfaceRedraw();
   }, 4);
 
-  TRUSTED_HITS = todo.filter(l => {
-    const d = IDB_CACHE[l.ip];
-    return _idbAnswered(d) && ((d.ports || []).length || (d.vulns || []).length);
-  });
+  // Shared with the full app's batched sweep, so the two transports cannot
+  // disagree about what counts as a finding.
+  TRUSTED_HITS = _trustedHits(todo);
   TRUSTED_STATE = 'done';
   _surfaceRedraw();
 }
