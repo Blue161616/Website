@@ -566,7 +566,7 @@
       <h2 style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
         <span><span data-icon="agentid"></span>Highest-risk combination</span>
         <span style="display:flex;align-items:center;gap:12px">
-          <span class="helpdot" tabindex="0">?<span class="helptip"><b>Why this compound:</b> a blueprint’s own grants are inert — what matters is the fleet it can mint and what those agents inherit. So the chain starts at blast radius (does it have agents at all), adds whether its granted permissions actually <i>reach</i> them through the inheritable conduit, then the two escalators: a client secret is a copyable key that impersonates the whole fleet, and multi-tenancy means the blueprint is reachable from other tenants.<br><br><b>How to read it:</b> left to right as one AND. The big number is how many blueprints carry that factor <i>and every factor before it</i>, so it can only fall; the small number is how many carry that factor anywhere in the estate. Colour is the severity the chain has reached; a green zero means the AND leaves nobody behind. <b>Click a card</b> to scope the table to its cohort.</span></span>
+          <span class="helpdot" tabindex="0">?<span class="helptip"><b>Why this compound:</b> the blueprint is the security boundary. It holds the credential and can create and impersonate every agent identity beneath it, so compromising one blueprint credential compromises the whole fleet it minted. The chain follows that: how many agents it has minted → whether its granted permissions actually <i>reach</i> them through the inheritable conduit (a blueprint’s own grants are inert) → whether that inherited access is high-impact → and finally the credential in front of it. It ends at the client secret because that is the thing that gets stolen.<br><br><b>How to read it:</b> left to right as one AND. The big number is how many blueprints carry that factor <i>and every factor before it</i>, so it can only fall; the small number is how many carry that factor anywhere in the estate. Colour is the severity the chain has reached; a green zero means the AND leaves nobody behind. <b>Click a card</b> to scope the table to its cohort.</span></span>
           <span class="expander" id="comboToggle">hide ▴</span>
         </span>
       </h2>
@@ -1982,19 +1982,28 @@ function renderKpis() {
 // escalators. Each step narrows the cohort of the step before it, so this is a funnel and not a
 // set of overlapping tallies: the big number is "survives everything to the left", the small one
 // is "carries this factor at all".
+// This tool has no per-permission severity table, so "high privilege" is built from the two
+// signals riskOf already scores most heavily for exactly this reason: unbounded inheritance
+// (every agent gets ALL of a resource's permissions, including ones granted later), or a
+// high-impact permission that the conduit genuinely carries to the fleet.
+const HIGH_IMPACT_RX = /^(mail\.send|mail\.readwrite(\.all)?|files\.readwrite\.all|sites\.readwrite\.all|directory\.readwrite\.all|user\.readwrite\.all|group\.readwrite\.all|application\.readwrite\.all|approleassignment\.readwrite\.all|rolemanagement\.readwrite\.directory)$/i;
+function highPrivReach(bp) {
+  if (inheritHasAll(bp)) return true;
+  return conduitCarries(bp) && (consentOf(bp).app || []).some(a => HIGH_IMPACT_RX.test((a.role || "").trim()));
+}
 const COMBO = [
-  { k: "agents", title: "Agent identities",
-    why: "The blueprint has actually minted agents, so there is a blast radius to talk about. A blueprint with no agents can still be a cleanup item, but nothing is acting under it today.",
-    test: bp => agentCount(bp) > 0 },
-  { k: "reach", title: "Granted → agents",
-    why: "Application permissions are granted AND carried to every agent by the inheritable conduit. This is the difference between a permission sitting inert on a principal and one that every agent in the fleet can exercise.",
+  { k: "fleet", title: "Multiple agent identities",
+    why: "The blueprint has minted more than one agent. This is what makes it a boundary rather than an app: it holds the credential and can create and impersonate every identity beneath it, so the fan-out is the multiplier on everything to the right.",
+    test: bp => agentCount(bp) > 1 },
+  { k: "inherited", title: "Inherited app permissions",
+    why: "Application permissions are granted AND carried to every agent by the inheritable conduit. A blueprint's own grants are inert — this is the step that turns them into something the fleet can actually exercise.",
     test: bp => grantsReachAgents(bp) },
+  { k: "highpriv", title: "High-privilege reach", opt: true,
+    why: "And what they inherit is high-impact: either the conduit is allAllowed (every agent gets all of the resource's permissions, including ones granted later) or a mail / files / directory write permission is being carried to the fleet.",
+    test: bp => highPrivReach(bp) },
   { k: "secret", title: "Client secret", opt: true,
-    why: "A copyable string is the key to that whole fleet. Whoever has it is every agent the blueprint minted, with everything those agents inherit.",
-    test: bp => credCounts(bp).secret > 0 },
-  { k: "multi", title: "Multi-tenant", opt: true,
-    why: "And it is reachable from other tenants — the consent-phishing surface, where a single admin consent elsewhere hands out the same fleet again.",
-    test: bp => !tenancy(bp.signInAudience).single }
+    why: "And the key in front of all of it is a copyable string. Compromise the blueprint credential and you are every agent it ever minted, with everything they inherit — which is why this is the end of the chain rather than the start.",
+    test: bp => credCounts(bp).secret > 0 }
 ];
 function comboTest(i) { const upto = COMBO.slice(0, i + 1); return bp => upto.every(c => c.test(bp)); }
 // Rebuilt only when the underlying set changes. Ticking a facet must not replay the entrance
@@ -2035,7 +2044,7 @@ function renderCombo() {
     });
     host.innerHTML = html;
     $("comboVerdict").innerHTML = last.n > 0
-      ? `<b class="cv-hot">${last.n} ${bp(last.n)}</b> satisf${last.n === 1 ? "ies" : "y"} the whole AND, covering <b>${last.agents}</b> agent identit${last.agents === 1 ? "y" : "ies"} — a fleet with real inherited permissions, keyed by a copyable string, reachable from other tenants. Start there, then work leftwards.`
+      ? `<b class="cv-hot">${last.n} ${bp(last.n)}</b> satisf${last.n === 1 ? "ies" : "y"} the whole AND, covering <b>${last.agents}</b> agent identit${last.agents === 1 ? "y" : "ies"} — a fleet holding high-impact inherited permissions behind a copyable key. Compromise that one secret and you are every agent it minted. Start there, then work leftwards.`
       : (deepest
           ? `No blueprint satisfies the whole AND. It breaks after <b>${escapeHtml(deepest.c.title.toLowerCase())}</b>, where <b>${deepest.n} ${bp(deepest.n)}</b> ${deepest.n === 1 ? "is" : "are"} still in, covering <b>${deepest.agents}</b> agent identit${deepest.agents === 1 ? "y" : "ies"} — that is the cohort to keep from picking up the next factor.`
           : `<b class="cv-ok">Nothing enters the chain.</b> No blueprint has minted an agent identity yet.`);
