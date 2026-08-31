@@ -2073,6 +2073,20 @@
   }
   // Entra ID's clientCredentialType enum, in the wording the portal's sign-in details use for it.
   var SIGNIN_CRED_LABEL = { clientSecret: 'Client secret', certificate: 'Certificate', clientAssertion: 'Client assertion', federatedIdentityCredential: 'Federated credential', managedIdentity: 'Managed identity' };
+  // One sign-in event's credential, split into the KIND Entra ID was shown and WHICH key that was. Either half can be
+  // missing — a delegated leg reports type 'none', and older events carry an id with no type. clientCredentialType is
+  // an evolvable enum, so an unrecognised value is shown raw rather than dropped.
+  function signInCred(s){
+    var t = s.clientCredentialType;
+    return { type: SIGNIN_CRED_LABEL[t] || (t && t !== 'none' ? t : ''),
+             id: s.servicePrincipalCredentialKeyId || s.servicePrincipalCredentialThumbprint || s.federatedCredentialId || '' };
+  }
+  function credHtml(c){
+    var short = c.id ? escHtml(String(c.id).slice(0,8)) + '…' : '';
+    return c.type && short ? escHtml(c.type) + ' · <span class="mono">' + short + '</span>'
+         : c.type ? escHtml(c.type)
+         : short ? '<span class="mono">' + short + '</span>' : '—';
+  }
   // On-demand: recent service-principal (app-only) sign-ins for one app — timestamp / IP / resource / result / the
   // credential (its type, plus the KeyId or cert thumbprint) that authenticated. Pulled only when the user asks, to
   // avoid a per-app audit query for the whole tenant. Proves USAGE even for an external app whose key you cannot read.
@@ -2088,26 +2102,49 @@
       var flt = "appId eq '" + r.appId + "' and (signInEventTypes/any(t: t eq 'servicePrincipal'))";
       var resp = await graphGet('https://graph.microsoft.com/beta/auditLogs/signIns?$filter=' + encodeURIComponent(flt) + '&$top=25', token);
       var rows = resp.value || [];
-      if(!rows.length){ slot.innerHTML = '<p class="dmuted" style="margin:7px 0 0">No service-principal sign-ins for this app in the retained window (~30 days) — it has not authenticated recently (or sign-in logs are not retained; needs Entra ID P1/P2).</p>'; if(btn) btn.remove(); return; }
+      if(!rows.length){
+        // An empty log does not contradict a last-seen date — they are different stores. Where the scan already proved
+        // the app authenticated, say which source to believe instead of claiming the app has been idle.
+        var seen = appOnlyLast(r);
+        slot.innerHTML = seen
+          ? '<p class="dmuted" style="margin:7px 0 0">No sign-in events, even though the activity report has this app authenticating app-only on <b>' + escHtml(fmtUtc(seen)) + '</b>. Two different stores: <code>servicePrincipalSignInActivities</code> keeps a last-seen watermark per service principal, while the log keeps individual events only for its retention window (7 days on Entra ID Free, 30 on P1/P2) and omits whole categories — managed-identity sign-ins go to their own log, and first-party app-only activity for internal Microsoft jobs is never written. The line above is the stronger evidence; what is lost here is only <i>which credential</i> it used.</p>'
+          : '<p class="dmuted" style="margin:7px 0 0">No service-principal sign-ins for this app in the retained window (~30 days) — it has not authenticated recently (or sign-in logs are not retained; needs Entra ID P1/P2).</p>';
+        if(btn) btn.remove(); return;
+      }
       var body = rows.map(function(s){
         var when = s.createdDateTime ? escHtml(new Date(s.createdDateTime).toISOString().slice(0,16).replace('T',' ')) : '—';
         var ok = s.status && s.status.errorCode === 0;
         var result = ok ? '<span style="color:var(--green)">success</span>' : '<span style="color:var(--red)">' + escHtml((s.status && (s.status.failureReason || ('error ' + s.status.errorCode))) || 'failed') + '</span>';
-        // clientCredentialType is the KIND of credential Entra ID was shown; the KeyId / thumbprint / FIC id is WHICH one.
-        // Either half can be missing — a delegated leg reports type 'none', and older events carry an id with no type.
-        var credType = SIGNIN_CRED_LABEL[s.clientCredentialType]
-          || (s.clientCredentialType && s.clientCredentialType !== 'none' ? s.clientCredentialType : '');
-        var credId = s.servicePrincipalCredentialKeyId || s.servicePrincipalCredentialThumbprint || s.federatedCredentialId || '';
-        var credShort = credId ? escHtml(String(credId).slice(0,8)) + '…' : '';
-        var cred = credType && credShort ? escHtml(credType) + ' · <span class="mono">' + credShort + '</span>'
-                 : credType ? escHtml(credType)
-                 : credShort ? '<span class="mono">' + credShort + '</span>' : '—';
-        return '<tr><td class="mono">' + when + '</td><td class="mono">' + escHtml(s.ipAddress || '—') + '</td><td>' + escHtml(s.resourceDisplayName || '—') + '</td><td>' + result + '</td><td style="font-size:10px" title="' + escHtml(credId || '') + '">' + cred + '</td></tr>';
+        var c = signInCred(s);
+        return '<tr><td class="mono">' + when + '</td><td class="mono">' + escHtml(s.ipAddress || '—') + '</td><td>' + escHtml(s.resourceDisplayName || '—') + '</td><td>' + result + '</td><td style="font-size:10px" title="' + escHtml(c.id || '') + '">' + credHtml(c) + '</td></tr>';
       }).join('');
       slot.innerHTML = '<div style="margin-top:8px;overflow-x:auto"><table class="mini-table"><thead><tr><th>Time (UTC)</th><th>IP</th><th>Resource</th><th>Result</th><th>Credential</th></tr></thead><tbody>' + body + '</tbody></table></div>'
         + '<p class="dmuted" style="margin:5px 0 0">Up to 25 most-recent app-only sign-ins. <b>Credential</b> = the credential type Entra ID was shown, then the KeyId / cert thumbprint / federated-credential id that authenticated — proves <i>which</i> key acted, even for an external app whose key you can\'t read. Hover a row for the full id.</p>';
       if(btn) btn.remove();
     } catch(e){ slot.innerHTML = '<p class="dmuted" style="margin:7px 0 0">Could not load sign-ins — ' + escHtml(e.message || String(e)) + '</p>'; if(btn){ btn.disabled = false; btn.textContent = 'Retry →'; } }
+  }
+  // The scan already knows an app authenticated app-only (servicePrincipalSignInActivities gives the date); this says
+  // WITH WHAT. One $top=1 query per app, fired when its panel opens — the same lazy pattern as loadAssigned, and the
+  // reason it isn't part of the tenant-wide scan. The log is returned newest-first, so row 0 is the latest sign-in.
+  async function loadLastCred(r, d){
+    try {
+      var token = await optionalAuditToken(); if(!token) throw new Error('AuditLog.Read.All not consented');
+      var flt = "appId eq '" + r.appId + "' and (signInEventTypes/any(t: t eq 'servicePrincipal'))";
+      var resp = await graphGet('https://graph.microsoft.com/beta/auditLogs/signIns?$filter=' + encodeURIComponent(flt) + '&$top=1', token);
+      var s = (resp.value || [])[0];
+      r._lastCred = s ? signInCred(s) : null;
+    } catch(e){ r._lastCred = null; r._lastCredError = e.message || String(e); }
+    var slot = d ? d.querySelector('.lastcred-slot[data-lastcred="' + r.appId + '"]') : null;
+    if(slot && slot.isConnected) slot.innerHTML = lastCredHtml(r);
+  }
+  // Sign-in activity reaches back further than the sign-in LOG does, so an app last seen months ago is known to have
+  // authenticated while no event survives to say with what. That is a different answer from "the event named no key".
+  function lastCredHtml(r){
+    if(r._lastCred === undefined) return '<span class="spinner"></span> <span class="dmuted">reading the credential it used…</span>';
+    if(r._lastCredError) return '<span class="dmuted">Credential unknown — ' + escHtml(r._lastCredError) + '</span>';
+    if(!r._lastCred) return '<span class="dmuted">No sign-in event survives to name the credential — the log holds 7 days on Entra ID Free, 30 on P1/P2.</span>';
+    if(!r._lastCred.type && !r._lastCred.id) return '<span class="dmuted">That sign-in recorded no client credential.</span>';
+    return 'Authenticated with <b title="' + escHtml(r._lastCred.id || '') + '">' + credHtml(r._lastCred) + '</b>.';
   }
   function buildDetailPanel(r){
     // Attack paths (MITRE / escalation) are built from LIVE scopes only — a grant against a retired API is inert,
@@ -2203,6 +2240,7 @@
     if(del) return { when: del, kind: 'deleg' };
     return null;
   }
+  function appOnlyLast(r){ var a = r.signInActivity; return (a && a.applicationAuthenticationClientSignInActivity && a.applicationAuthenticationClientSignInActivity.lastSignInDateTime) || null; }
   function daysAgo(iso){ return Math.floor((Date.now() - new Date(iso).getTime()) / 86400000); }
   function lastUsedCellHtml(r){
     if(cache.auditAvailable !== true) return '';   // usage detection off → don't clutter the column
@@ -2224,15 +2262,15 @@
           + 'Until then, use the portal link below.</div>';
     } else {
       var a = r.signInActivity;
-      var appOnly = a && a.applicationAuthenticationClientSignInActivity && a.applicationAuthenticationClientSignInActivity.lastSignInDateTime;
+      var appOnly = appOnlyLast(r);
       var deleg   = a && a.delegatedClientSignInActivity && a.delegatedClientSignInActivity.lastSignInDateTime;
       var lines = [];
-      if(appOnly) lines.push('<li><span style="color:var(--green);font-weight:600">✓ Authenticated app-only</span> (client credentials) — last <b>' + escHtml(fmtUtc(appOnly)) + '</b>. This app has <b>used its key</b> in your tenant.</li>');
+      if(appOnly) lines.push('<li><span style="color:var(--green);font-weight:600">✓ Authenticated app-only</span> (client credentials) — last <b>' + escHtml(fmtUtc(appOnly)) + '</b>. This app has <b>used its key</b> in your tenant. <span class="lastcred-slot" data-lastcred="' + escHtml(r.appId) + '">' + lastCredHtml(r) + '</span></li>');
       else lines.push('<li><span style="color:var(--muted)">No app-only authentication recorded</span> in the retained window — dormant, or it last ran before the window. <span class="dmuted">(Absence is not proof it never ran.)</span></li>');
       if(deleg) lines.push('<li>Delegated sign-in (acting for a user) last <b>' + escHtml(fmtUtc(deleg)) + '</b>.</li>');
       det = '<div class="notice notice-info" style="margin:0 0 9px"><b>Usage detection — live</b> <span class="dmuted">(from <code>servicePrincipalSignInActivities</code>, verified this scan)</span>'
           + '<ul class="dlist" style="margin:5px 0 0">' + lines.join('') + '</ul>'
-          + '<div style="margin-top:8px"><button class="btn-mini" data-signins="' + escHtml(r.appId) + '::' + escHtml(r.id) + '">Load recent service-principal sign-ins →</button> <span class="dmuted">on-demand: timestamp · IP · resource · credential KeyId</span></div>'
+          + '<div style="margin-top:8px"><button class="btn-mini" data-signins="' + escHtml(r.appId) + '::' + escHtml(r.id) + '">Load recent service-principal sign-ins →</button> <span class="dmuted">on-demand: timestamp · IP · resource · credential</span></div>'
           + '<div class="signins-slot" data-slot="' + escHtml(r.appId) + '"></div></div>';
     }
     return det + '<ul class="dlist">'
@@ -2251,6 +2289,7 @@
     if(!d.getAttribute('data-built') && r){ d.firstChild.innerHTML = buildDetailPanel(r); d.setAttribute('data-built','1'); }
     d.classList.remove('hidden'); if(main) main.querySelector('.chev').textContent = '▾';
     if(r && r.appRoleAssignmentRequired === true && r._assignedTo === undefined) loadAssigned(r, d);
+    if(r && cache.auditAvailable === true && appOnlyLast(r) && r._lastCred === undefined) loadLastCred(r, d);
   }
 
   // -------------------- CSV --------------------
