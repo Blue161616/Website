@@ -499,7 +499,8 @@
     <div class="row-actions" style="margin-bottom:18px">
       <button id="btn-refresh">Re-run scan</button>
       <span style="flex:1"></span>
-      <button id="btn-csv" class="secondary" style="padding:7px 14px">Export CSV</button>
+      <button id="btn-csv" class="secondary" style="padding:7px 14px" title="One row per application, stamped with the scan date and tenant — every app in the tenant regardless of the filters on this page. Append the exports to build a trend.">Export CSV</button>
+      <button id="btn-csv-view" class="secondary" style="padding:7px 14px" title="The same columns, but only the applications matching the filters currently applied. The file records which filters those were, so it is never mistaken for a full scan.">Export view</button>
     </div>
 
     <div class="kpi-head" id="kpiHead"></div>
@@ -2553,26 +2554,103 @@
   }
 
   // -------------------- CSV --------------------
-  function exportCsv(){
-    var rows = filtered();
-    var cols = ['riskLevel','riskScore','displayName','appId','tenancy','microsoftFirstParty','directoryRoles','created','lastAuthenticated','lastAuthType','assignmentRequired','verifiedPublisher','publicClient','implicitGrant','riskyRedirect','delegatedPermissions','appPermissions','secrets','certs','fic','msDisabled','owners','riskReasons','portalUrl'];
-    var lines = [cols.join(',')];
+  // The export is a FACT TABLE, not a screenshot of the table: one row per app per scan, keyed by
+  // (scanTime, tenantId, appId), so appending exports gives a trend without any further processing. Three things
+  // make that work and each was missing before:
+  //   • the scan is stamped IN the data, not just in the filename — concatenated files keep their time axis;
+  //   • the default export is the whole tenant, and the scope it was taken over is a column, so two files are
+  //     never silently incomparable (the old export was whatever the filters happened to be, unrecorded);
+  //   • every factor the KPIs and the AND-chain are computed from is its own boolean or number, so each headline
+  //     figure is reproducible in a pivot instead of being re-derived by string-matching the permission text.
+  // chainDepth is the compound in one number: how many of the four AND-chain factors an app satisfies from the
+  // left. >= 2 is the standing key; 4 is the whole chain. Disabled apps score 0, as they do in the card.
+  function chainDepth(r){
+    if(!comboLive(r)) return 0;
+    var d = 0;
+    for(var i = 0; i < COMBO.length; i++){ if(!COMBO[i].test(r)) break; d++; }
+    return d;
+  }
+  // What the rows were narrowed by, in the file itself — a view export that does not say so is a full scan with
+  // apps quietly missing.
+  function activeFilterDesc(){
+    var parts = [], q = el('q').value.trim();
+    if(q) parts.push('search="' + q + '"');
+    FACETS.forEach(function(g){
+      var st = facet[g.id], on = Object.keys(st.on);
+      if(!on.length && st.mode === 'any') return;
+      parts.push(g.id + (st.mode === 'any' ? '' : '[' + st.mode + ']') + '=' + on.join('+'));
+    });
+    if(tileFilter) parts.push('card-scope');
+    return parts.join(' ; ');
+  }
+  var CSV_COLS = [
+    // scan keys
+    'scanDate','scanTime','tenantId','exportScope','publisherFilter','rowFilters',
+    // identity
+    'appId','displayName','createdDate','accountEnabled','msDisabled','owners',
+    // risk
+    'riskLevel','riskScore','riskWeight','chainDepth','riskReasons',
+    // tenancy / publisher
+    'tenancyClass','isExternal','microsoftFirstParty','audienceLabel','consumerAccounts',
+    'publisherName','verifiedPublisher','unverifiedPublisher',
+    // permissions
+    'permScore','hasAppPermissions','hasHighPrivAppPermission','hasDelegatedPermissions','allPrincipalsConsent',
+    'appPermissions','delegatedPermissions','directoryRoles','dirRoleTakeover',
+    // auth config
+    'assignmentRequired','publicClient','implicitGrant','riskyRedirect','tokenTheft',
+    // credentials
+    'secretCount','certCount','ficCount','credExpired','credExpiring','secrets','certs','fic',
+    // usage
+    'lastAuthenticated','lastAuthType','portalUrl'
+  ];
+  function exportCsv(scope){
+    var viewOnly = scope === 'view';
+    // "all" deliberately ignores the publisher select and every facet: the fact table is the estate, and the
+    // filters are a reading aid for the screen, not a property of the scan.
+    var rows = viewOnly ? filtered()
+      : (cache.results || []).slice().sort(function(a, b){
+          return (b.riskScore||0) - (a.riskScore||0) || (b.riskWeight||0) - (a.riskWeight||0)
+            || String(a.displayName).localeCompare(String(b.displayName)); });
+    var when = new Date(cache.scannedAt || Date.now());
+    var scanDate = when.toISOString().slice(0, 10), scanTime = when.toISOString();
+    var tid = (account && (account.tenantId || (account.idTokenClaims && account.idTokenClaims.tid))) || '';
+    var msftF = el('f-msft').value;
+    var pubFilter = viewOnly ? (msftF === 'no' ? 'non-microsoft' : msftF === 'yes' ? 'microsoft-first-party' : 'all') : 'all';
+    var rowFilters = viewOnly ? activeFilterDesc() : '';
+    var lines = [CSV_COLS.join(',')];
     rows.forEach(function(r){
+      var f = r.factors || {};
       var perms = (r.delegatedDetail||[]).map(function(d){ return d.consentType + ' ' + d.resourceName + ': ' + d.scopes; }).join(' | ');
-      var appPerms = (r.appPermissions||[]).map(function(p){ return p.resourceName + ': ' + (p.roleValue||p.roleName); }).join(' | ');
+      var appPerms = (r.appPermissions||[]).map(function(pp){ return pp.resourceName + ': ' + (pp.roleValue||pp.roleName); }).join(' | ');
       var secrets = (r.passwordCreds||[]).map(function(c){ return (c.displayName||'secret') + (c.endDateTime?' exp:'+c.endDateTime.slice(0,10):''); }).join(' | ');
       var certs = (r.keyCreds||[]).map(function(c){ return (c.displayName||'cert') + (c.endDateTime?' exp:'+c.endDateTime.slice(0,10):''); }).join(' | ');
-      var fic = (r.fic||[]).map(function(c){ return (c.name||'') + ' iss:' + (c.issuer||'') + ' sub:' + (c.subject||''); }).join(' | ');
+      var ficTxt = (r.fic||[]).map(function(c){ return (c.name||'') + ' iss:' + (c.issuer||'') + ' sub:' + (c.subject||''); }).join(' | ');
       var owners = (r.owners||[]).map(function(o){ return o.displayName||o.upn||'?'; }).join(' | ');
-      var _la = lastActive(r);
-      var row = [RISK_LABELS[r.riskScore||1], (r.riskWeight||0), r.displayName, r.appId, r.audienceLabel, r.isFirstPartyMicrosoft, dirRoleNames(r), (r.createdDateTime ? new Date(r.createdDateTime).toISOString().slice(0,10) : ''), (_la ? _la.when.slice(0,10) : (cache.auditAvailable===true ? 'not-seen' : '')), (_la ? (_la.kind==='app'?'app-only':'delegated') : ''), (r.appRoleAssignmentRequired === true), r.isVerifiedPublisher, r.factors.publicClient, r.factors.implicitGrant, r.factors.riskyRedirect, perms, appPerms, secrets, certs, fic, r.factors.msDisabled, owners, (r.riskReasons||[]).join(' ; '), r.portalUrl];
-      lines.push(row.map(function(v){ if(v==null) v=''; v=String(v).replace(/"/g,'""'); return /[,"\n]/.test(v)?'"'+v+'"':v; }).join(','));
+      var tenancyClass = r.isFirstPartyMicrosoft ? 'microsoft' : f.multiExternal ? 'multi-external' : f.multiInternal ? 'multi-internal' : 'single';
+      var la = lastActive(r);
+      lines.push([
+        scanDate, scanTime, tid, (viewOnly ? 'current-view' : 'all-apps'), pubFilter, rowFilters,
+        r.appId, r.displayName, (r.createdDateTime ? new Date(r.createdDateTime).toISOString().slice(0,10) : ''),
+        (r.accountEnabled !== false), !!f.msDisabled, owners,
+        RISK_LABELS[r.riskScore||1], (r.riskScore||1), (r.riskWeight||0), chainDepth(r), (r.riskReasons||[]).join(' ; '),
+        tenancyClass, (r.isExternal === true), !!r.isFirstPartyMicrosoft, r.audienceLabel, (r.audienceConsumer === true),
+        (r.publisherName || ''), (r.isVerifiedPublisher === true), !!f.unverifiedPublisher,
+        (r.permScore||1), !!f.appPerms, !!f.appPermsHigh, !!f.delegPerms, !!f.allPrincipals,
+        appPerms, perms, dirRoleNames(r), !!f.dirRoleTakeover,
+        (r.appRoleAssignmentRequired === true), !!f.publicClient, !!f.implicitGrant, !!f.riskyRedirect, !!f.tokenTheft,
+        (r.passwordCreds||[]).length, (r.keyCreds||[]).length, (r.fic||[]).length, !!f.credExpired, !!f.credExpiring,
+        secrets, certs, ficTxt,
+        (la ? la.when.slice(0,10) : (cache.auditAvailable === true ? 'not-seen' : '')),
+        (la ? (la.kind === 'app' ? 'app-only' : 'delegated') : ''),
+        r.portalUrl
+      ].map(function(v){ if(v == null) v = ''; v = String(v).replace(/"/g, '""'); return /[,"\n]/.test(v) ? '"' + v + '"' : v; }).join(','));
     });
-    var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([lines.join('\n')], {type:'text/csv'}));
-    a.download = 'entra-app-security-' + new Date().toISOString().slice(0,10) + '.csv'; a.click();
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([lines.join('\n')], { type:'text/csv' }));
+    a.download = 'entra-app-posture-' + scanDate + (viewOnly ? '-view' : '') + '.csv';
+    a.click();
     setTimeout(function(){ URL.revokeObjectURL(a.href); }, 2000);
   }
-
   // -------------------- Manage URIs modal --------------------
   function openManageModal(r){
     el('modal-title').textContent = r.displayName; el('modal-appid').textContent = r.appId;
@@ -2638,7 +2716,8 @@
   el('btn-signin').addEventListener('click', signIn);
   el('btn-signout').addEventListener('click', signOut);
   el('btn-refresh').addEventListener('click', runAudit);
-  el('btn-csv').addEventListener('click', exportCsv);
+  el('btn-csv').addEventListener('click', function(){ exportCsv('all'); });
+  el('btn-csv-view').addEventListener('click', function(){ exportCsv('view'); });
   el('q').addEventListener('input', renderTable);
   el('f-msft').addEventListener('change', function(){ activeCard = null; render(); });
   // Delegated once on the document: the facet bar and the posture bars both rebuild their own contents on every
