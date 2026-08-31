@@ -233,6 +233,27 @@
   .kpi-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--kc); flex-shrink: 0; }
   .kpi-ico { font-size: 15px; line-height: 1; color: var(--kc); flex-shrink: 0; }
   .kpi-l { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-top: 5px; line-height: 1.2; }
+  /* Movement since the previous scan. Direction is the whole point, so the arrow is coloured by
+     what it means for posture (up on a risk count is bad) rather than by the sign of the number. */
+  .kpi-d { font-size: 12.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .kpi-d.up { color: var(--red); }
+  .kpi-d.down { color: var(--green); }
+  .kpi-d.flat { color: var(--muted); opacity: .55; font-weight: 600; }
+  .chg { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 16px; font-size: 12.5px; color: var(--muted); }
+  .chgchip { display: inline-flex; align-items: baseline; gap: 6px; padding: 3px 11px; border-radius: 12px; border: 1px solid var(--border); background: var(--card); }
+  .chgchip.live { cursor: pointer; }
+  .chgchip.live:hover { border-color: var(--accent); }
+  .chgchip.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .chgchip b { font-variant-numeric: tabular-nums; font-size: 13px; }
+  .chgchip.nil { opacity: .5; }
+  .chgchip.new b { color: var(--accent); }
+  .chgchip.worse b { color: var(--red); }
+  .chgchip.better b { color: var(--green); }
+  /* Row marker: the delta is only useful if you can see which rows it is talking about. */
+  .b-chg { font-size: 10px; padding: 1px 6px; border-radius: 4px; font-weight: 700; margin-left: 5px; vertical-align: 1px; }
+  .b-chg-new { background: var(--cert-bg); color: var(--accent-dark); }
+  .b-chg-worse { background: var(--red-bg); color: var(--red); }
+  .b-chg-better { background: var(--green-bg); color: var(--green); }
   .kpi-s { font-size: 10.5px; color: var(--muted); opacity: .75; margin-top: 2px; line-height: 1.2; min-height: 13px; }
   /* Hover breakdown: the number says how many, this says what they are made of — without spending a click. */
   .kpi-pop { position: absolute; z-index: 30; left: 10px; top: calc(100% - 8px); min-width: 218px; padding: 11px 13px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); box-shadow: var(--shadow); font-size: 12px; opacity: 0; visibility: hidden; transform: translateY(-5px); transition: opacity .13s, transform .13s, visibility .13s; }
@@ -505,6 +526,7 @@
 
     <div class="kpi-head" id="kpiHead"></div>
     <div class="kpis" id="kpis"></div>
+    <div class="chg" id="kpiChange"></div>
 
     <div id="notices"></div>
 
@@ -1710,6 +1732,7 @@
 
       cache.scannedAt = Date.now();
       cache.results = results;
+      rollBaseline();
       setStatus('Scan complete — ' + results.length + ' enterprise app(s) inventoried, ' + enrichCount + ' deep-scanned.');
       // With results on screen the connect card has nothing left to say — its two live controls (status, sign out)
       // are in the header, and re-running the scan is a button on the results themselves.
@@ -1735,7 +1758,7 @@
   }
   function facetActive(g){ var st = facet[g.id]; return st.mode !== 'any' || g.opts.some(function(o){ return st.on[o.k]; }); }
   function anyFacetActive(){ return FACETS.some(facetActive) || !!tileFilter; }
-  function clearFacets(){ FACETS.forEach(function(g){ facet[g.id] = { mode:'any', on:{} }; }); tileFilter = null; activeKpi = null; }
+  function clearFacets(){ FACETS.forEach(function(g){ facet[g.id] = { mode:'any', on:{} }; }); tileFilter = null; activeKpi = null; activeChg = null; }
   function filtered(){
     var q = el('q').value.toLowerCase().trim(), rows = baseSet();
     if(q) rows = rows.filter(function(r){
@@ -1887,7 +1910,7 @@
       // appears in the table and the drawer says so on every row.
       + (cache.auditAvailable === true ? ''
           : '<div class="notice notice-warn"><b>Usage detection is OFF</b> — a consent scan shows what an app <i>can</i> do; grant <code>AuditLog.Read.All</code> (admin consent) to also read what it <i>has</i> done (whether it authenticated app-only, and with which credential). ' + (cache.auditError ? '<span class="mono">(' + escHtml(cache.auditError) + ')</span> — may also indicate the tenant lacks Entra ID P1/P2 for sign-in logs.' : 'Without it, the detail drawer falls back to a portal deep-link.') + '</div>');
-    renderKpis(); renderFacets(); renderRiskChips(); renderCombo(); renderTable();
+    renderKpis(); renderChange(); renderFacets(); renderRiskChips(); renderCombo(); renderTable();
   }
   var MODE_HINT = { any:'OR — an app matching any ticked option', all:'AND — an app must carry every ticked option', only:'Exactly the ticked set, and nothing else in this group. Tick nothing to ask for apps carrying none of them.' };
   function modesHtml(id){
@@ -1911,6 +1934,97 @@
           }).join('')
         + '</div>';
     }).join('') + (anyFacetActive() ? '<button class="facet-clear" id="facetClear">Clear filters</button>' : '');
+  }
+
+  // -------------------- Movement since the previous scan --------------------
+  // The estate total is the number people quote, and it is the one that hides the most: five apps
+  // remediated and five new ones is a flat headline and a busy month. So each scan leaves a
+  // fingerprint behind and the next one says what actually moved.
+  //
+  // Held in this browser only — there is no backend, and a posture scan is not something to ship
+  // somewhere on the user's behalf. The fingerprint is deliberately thin: per app, its risk band,
+  // its position in the AND-chain, which KPI cohorts it was in, and whether it is Microsoft
+  // first-party (so a previous count can be recomputed under whichever publisher filter is active
+  // now, instead of being frozen at whatever was on screen when the scan ran).
+  var BASELINE_KEY = 'era_baseline_v1';
+  // A baseline younger than this is not replaced: re-running the scan three times in an afternoon
+  // should keep comparing against this morning, not against the run a minute ago.
+  var BASELINE_MIN_AGE_MS = 4 * 3600 * 1000;
+  function kpiMask(r){ var m = 0; KPI_DEFS.forEach(function(d, i){ if(d.test(r)) m |= (1 << i); }); return m; }
+  function snapshotApps(rows){
+    var m = {};
+    rows.forEach(function(r){ if(r.appId) m[r.appId] = [r.riskScore || 1, chainDepth(r), kpiMask(r), r.isFirstPartyMicrosoft ? 1 : 0]; });
+    return m;
+  }
+  function loadBaseline(){ try { return JSON.parse(localStorage.getItem(BASELINE_KEY) || 'null'); } catch(e){ return null; } }
+  function saveBaseline(o){ try { localStorage.setItem(BASELINE_KEY, JSON.stringify(o)); } catch(e){} }   // quota / private mode
+  // Called once per completed scan, before render: adopt the stored snapshot as the comparison
+  // point, then leave the current one behind for next time.
+  function rollBaseline(){
+    var tid = (account && (account.tenantId || (account.idTokenClaims && account.idTokenClaims.tid))) || '';
+    var prev = loadBaseline();
+    // A snapshot from a different tenant is not a baseline, it is a different estate.
+    cache.baseline = (prev && prev.tenantId === tid && prev.apps) ? prev : null;
+    if(!prev || prev.tenantId !== tid || (cache.scannedAt - (prev.t || 0)) >= BASELINE_MIN_AGE_MS)
+      saveBaseline({ v:1, tenantId: tid, t: cache.scannedAt, apps: snapshotApps(cache.results || []) });
+  }
+  // How one app moved. Bands and chain depth are the two axes worth reporting: both are ordinal,
+  // both are visible on this page, and a change in either is something a person did or allowed.
+  function appDelta(r){
+    var b = cache.baseline; if(!b) return null;
+    var was = b.apps[r.appId];
+    if(!was) return 'new';
+    var d = chainDepth(r), rs = r.riskScore || 1;
+    if(rs > was[0] || d > was[1]) return 'worse';
+    if(rs < was[0] || d < was[1]) return 'better';
+    return 'same';
+  }
+  function deltaGroups(){
+    var b = cache.baseline; if(!b) return null;
+    var rows = baseSet(), g = { new:[], worse:[], better:[], gone:0 };
+    rows.forEach(function(r){ var d = appDelta(r); if(d && d !== 'same') g[d].push(r.appId); });
+    // Removed apps are counted, not listed — they are not in the table to scope to.
+    var msftF = el('f-msft').value, live = {};
+    (cache.results || []).forEach(function(r){ live[r.appId] = 1; });
+    Object.keys(b.apps).forEach(function(id){
+      var ms = b.apps[id][3] === 1;
+      if(msftF === 'no' && ms) return;
+      if(msftF === 'yes' && !ms) return;
+      if(!live[id]) g.gone++;
+    });
+    return g;
+  }
+  // The previous count for one KPI, recomputed under the publisher filter that is active now.
+  function baselineKpiCount(i){
+    var b = cache.baseline; if(!b) return null;
+    var msftF = el('f-msft').value, n = 0;
+    Object.keys(b.apps).forEach(function(id){
+      var a = b.apps[id], ms = a[3] === 1;
+      if(msftF === 'no' && ms) return;
+      if(msftF === 'yes' && !ms) return;
+      if(a[2] & (1 << i)) n++;
+    });
+    return n;
+  }
+  function stamp(t){ var d = new Date(t); return d.toLocaleDateString(undefined, { day:'numeric', month:'short' }) + ' ' + d.toLocaleTimeString(undefined, { hour:'2-digit', minute:'2-digit' }); }
+  var activeChg = null;
+  function renderChange(){
+    var host = el('kpiChange'), b = cache.baseline;
+    if(!b){
+      host.innerHTML = '<span>First scan in this browser \u2014 nothing to compare against yet. The next scan will say what moved.</span>';
+      return;
+    }
+    var g = deltaGroups();
+    var chip = function(kind, n, label, tip){
+      var live = n > 0 && kind !== 'gone';
+      return '<span class="chgchip ' + kind + (n ? '' : ' nil') + (live ? ' live' : '') + (activeChg === kind ? ' on' : '')
+        + '"' + (live ? ' data-chg="' + kind + '"' : '') + ' title="' + escHtml(tip) + '"><b>' + n + '</b> ' + escHtml(label) + '</span>';
+    };
+    host.innerHTML = '<span>Since <b>' + escHtml(stamp(b.t)) + '</b></span>'
+      + chip('new', g.new.length, 'new', 'Applications present now that were not in the previous scan. Click to list them.')
+      + chip('worse', g.worse.length, 'worsened', 'Applications that moved up a risk band, or further along the AND-chain, since the previous scan. Click to list them.')
+      + chip('better', g.better.length, 'improved', 'Applications that moved down a risk band, or back along the AND-chain. Click to list them.')
+      + chip('gone', g.gone, 'no longer present', 'Applications in the previous scan that are absent now \u2014 removed, or no longer matching the publisher filter. They are not in the table, so there is nothing to scope to.');
   }
 
   // -------------------- Executive strip --------------------
@@ -1978,13 +2092,21 @@
     var b = baseSet(), app = function(n){ return n === 1 ? 'app' : 'apps'; };
     var cell = function(d){
       var cohort = b.filter(d.test), n = cohort.length;
+      // Direction is read as posture, not arithmetic: more apps in a risk cohort is worse, fewer
+      // is better, and the one cell where that is inverted (Healthy has no equivalent here) would
+      // need its own rule if it existed.
+      var was = baselineKpiCount(KPI_DEFS.indexOf(d)), dv = was == null ? null : n - was;
+      var dHtml = dv == null ? '' : '<span class="kpi-d ' + (dv > 0 ? 'up' : dv < 0 ? 'down' : 'flat') + '" title="'
+        + escHtml(dv === 0 ? 'Unchanged since the previous scan (' + stamp(cache.baseline.t) + ').'
+                           : (dv > 0 ? 'Up ' : 'Down ') + Math.abs(dv) + ' since the previous scan (' + stamp(cache.baseline.t) + '), when it was ' + was + '.') + '">'
+        + (dv > 0 ? '\u25b2' + dv : dv < 0 ? '\u25bc' + Math.abs(dv) : '\u2013') + '</span>';
       var mark = d.ico ? '<span class="kpi-ico">' + d.ico + '</span>' : '<span class="kpi-dot"></span>';
       var pop = '<div class="kpi-pop"><div class="h">' + escHtml(d.label) + ' \u00b7 ' + n + ' ' + app(n) + '</div>'
         + d.parts.map(function(x){ var c = cohort.filter(x.t).length;
             return '<div class="r' + (c ? '' : ' nil') + '"><span>' + escHtml(x.l) + '</span><b>' + c + '</b></div>'; }).join('')
         + '<div class="f">View applications \u2192</div></div>';
       return '<div class="kpi' + (activeKpi === d.id ? ' on' : '') + '" data-kpi="' + d.id + '" style="--kc:' + d.kc + '" title="' + escHtml(d.tip) + '">'
-        + '<div class="kpi-n">' + mark + n + '</div>'
+        + '<div class="kpi-n">' + mark + n + dHtml + '</div>'
         + '<div class="kpi-l">' + escHtml(d.label) + '</div>'
         + '<div class="kpi-s">' + escHtml(d.sub || '') + '</div>'
         + pop + '</div>';
@@ -2092,6 +2214,17 @@
     host.querySelectorAll('[data-combo]').forEach(function(c){ c.classList.toggle('active', activeCard === 'combo' + c.getAttribute('data-combo')); });
   }
 
+  // Marks a row that moved since the previous scan, so the counts above are traceable to rows.
+  var CHG_BADGE = {
+    new:    { cls:'b-chg-new',    txt:'new',    tip:'Not present in the previous scan.' },
+    worse:  { cls:'b-chg-worse',  txt:'worse',  tip:'Moved up a risk band, or further along the AND-chain, since the previous scan.' },
+    better: { cls:'b-chg-better', txt:'better', tip:'Moved down a risk band, or back along the AND-chain, since the previous scan.' }
+  };
+  function chgBadge(r){
+    var d = appDelta(r), c = d && CHG_BADGE[d];
+    return c ? ' <span class="b-chg ' + c.cls + '" title="' + escHtml(c.tip + ' Baseline: ' + stamp(cache.baseline.t) + '.') + '">' + c.txt + '</span>' : '';
+  }
+
   function credPills(r){
     var html = '', pw = credState(r.passwordCreds), kc = credState(r.keyCreds);
     if(r.passwordCreds && r.passwordCreds.length) html += '<span class="cred-pill ' + (pw.expired?'expired':pw.expiring?'expiring':'') + '">' + r.passwordCreds.length + ' secret' + (r.passwordCreds.length>1?'s':'') + (pw.expired?' ('+pw.expired+' expired)':pw.expiring?' (expiring)':'') + '</span>';
@@ -2192,7 +2325,7 @@
       var creds = credPills(r) || '<span style="color:var(--muted)">—</span>';
       return '<tr class="main" data-row="' + escHtml(r.id) + '" tabindex="0" aria-label="' + escHtml(r.displayName) + ' — expand for details">'
         + '<td class="chev">▸</td>'
-        + '<td><span class="badge risk-' + rs + '" title="Risk band ' + RISK_LABELS[rs] + ' · weighted score ' + (r.riskWeight||0) + '/100 — the band sorts first, the score orders rows within the band by how much risk signal is present.">' + RISK_LABELS[rs] + ' <span class="riskw">· ' + (r.riskWeight||0) + '</span></span>' + (flags ? '<div style="margin-top:4px">' + flags + '</div>' : '') + '</td>'
+        + '<td><span class="badge risk-' + rs + '" title="Risk band ' + RISK_LABELS[rs] + ' · weighted score ' + (r.riskWeight||0) + '/100 — the band sorts first, the score orders rows within the band by how much risk signal is present.">' + RISK_LABELS[rs] + ' <span class="riskw">· ' + (r.riskWeight||0) + '</span></span>' + chgBadge(r) + (flags ? '<div style="margin-top:4px">' + flags + '</div>' : '') + '</td>'
         + '<td><div class="name"><a href="' + escHtml(r.portalUrl) + '" target="_blank" rel="noopener" title="Open the Enterprise application (service principal) in Entra">' + escHtml(r.displayName) + '</a></div><div class="appid">' + escHtml(r.appId) + '</div></td>'
         + '<td>' + tenancyBadge(r) + '</td>'
         + '<td>' + creds + '</td>'
@@ -2731,6 +2864,11 @@
     if(cc){ var ci = parseInt(cc.getAttribute('data-combo'), 10); clearFacets();
       activeCard = 'combo' + ci;
       tileFilter = { test: ci < 0 ? comboLive : comboTest(ci) };
+      render(); return; }
+    var ch = e.target.closest ? e.target.closest('[data-chg]') : null;
+    if(ch){ var kind = ch.getAttribute('data-chg'), wasC = activeChg === kind;
+      clearFacets(); activeCard = null; activeKpi = null;
+      if(!wasC){ activeChg = kind; tileFilter = { test:function(r){ return appDelta(r) === kind; } }; }
       render(); return; }
     var kp = e.target.closest ? e.target.closest('[data-kpi]') : null;
     if(kp){ var kid = kp.getAttribute('data-kpi'), wasK = activeKpi === kid;
