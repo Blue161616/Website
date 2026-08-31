@@ -2071,9 +2071,13 @@
       if(slot.isConnected) slot.innerHTML = renderAssigned(principals);
     } catch(e){ r._assignedTo = []; if(slot.isConnected) slot.innerHTML = '<p class="dmuted">Could not load assigned principals — ' + escHtml(e.message || String(e)) + '</p>'; }
   }
+  // Entra ID's clientCredentialType enum, in the wording the portal's sign-in details use for it.
+  var SIGNIN_CRED_LABEL = { clientSecret: 'Client secret', certificate: 'Certificate', clientAssertion: 'Client assertion', federatedIdentityCredential: 'Federated credential', managedIdentity: 'Managed identity' };
   // On-demand: recent service-principal (app-only) sign-ins for one app — timestamp / IP / resource / result / the
-  // credential (secret KeyId or cert thumbprint) that authenticated. Pulled only when the user asks, to avoid firing a
-  // per-app audit query for the whole tenant. Proves USAGE even for an external app whose key you cannot read.
+  // credential (its type, plus the KeyId or cert thumbprint) that authenticated. Pulled only when the user asks, to
+  // avoid a per-app audit query for the whole tenant. Proves USAGE even for an external app whose key you cannot read.
+  // Hardcoded to /beta, not GBASE: v1.0 signIns only carries interactive user sign-ins, so it rejects the
+  // signInEventTypes filter outright — service-principal events and the credential fields live on beta alone.
   async function loadSignIns(r, d, btn){
     var slot = d ? d.querySelector('.signins-slot[data-slot="' + r.appId + '"]') : null;
     if(!slot) return;
@@ -2082,18 +2086,26 @@
     try {
       var token = await optionalAuditToken(); if(!token) throw new Error('AuditLog.Read.All not consented');
       var flt = "appId eq '" + r.appId + "' and (signInEventTypes/any(t: t eq 'servicePrincipal'))";
-      var resp = await graphGet('https://graph.microsoft.com/v1.0/auditLogs/signIns?$filter=' + encodeURIComponent(flt) + '&$top=25', token);
+      var resp = await graphGet('https://graph.microsoft.com/beta/auditLogs/signIns?$filter=' + encodeURIComponent(flt) + '&$top=25', token);
       var rows = resp.value || [];
       if(!rows.length){ slot.innerHTML = '<p class="dmuted" style="margin:7px 0 0">No service-principal sign-ins for this app in the retained window (~30 days) — it has not authenticated recently (or sign-in logs are not retained; needs Entra ID P1/P2).</p>'; if(btn) btn.remove(); return; }
       var body = rows.map(function(s){
         var when = s.createdDateTime ? escHtml(new Date(s.createdDateTime).toISOString().slice(0,16).replace('T',' ')) : '—';
         var ok = s.status && s.status.errorCode === 0;
         var result = ok ? '<span style="color:var(--green)">success</span>' : '<span style="color:var(--red)">' + escHtml((s.status && (s.status.failureReason || ('error ' + s.status.errorCode))) || 'failed') + '</span>';
-        var cred = s.servicePrincipalCredentialKeyId || s.servicePrincipalCredentialThumbprint || '';
-        return '<tr><td class="mono">' + when + '</td><td class="mono">' + escHtml(s.ipAddress || '—') + '</td><td>' + escHtml(s.resourceDisplayName || '—') + '</td><td>' + result + '</td><td class="mono" style="font-size:10px" title="' + escHtml(cred || '') + '">' + escHtml(cred ? String(cred).slice(0,8) + '…' : '—') + '</td></tr>';
+        // clientCredentialType is the KIND of credential Entra ID was shown; the KeyId / thumbprint / FIC id is WHICH one.
+        // Either half can be missing — a delegated leg reports type 'none', and older events carry an id with no type.
+        var credType = SIGNIN_CRED_LABEL[s.clientCredentialType]
+          || (s.clientCredentialType && s.clientCredentialType !== 'none' ? s.clientCredentialType : '');
+        var credId = s.servicePrincipalCredentialKeyId || s.servicePrincipalCredentialThumbprint || s.federatedCredentialId || '';
+        var credShort = credId ? escHtml(String(credId).slice(0,8)) + '…' : '';
+        var cred = credType && credShort ? escHtml(credType) + ' · <span class="mono">' + credShort + '</span>'
+                 : credType ? escHtml(credType)
+                 : credShort ? '<span class="mono">' + credShort + '</span>' : '—';
+        return '<tr><td class="mono">' + when + '</td><td class="mono">' + escHtml(s.ipAddress || '—') + '</td><td>' + escHtml(s.resourceDisplayName || '—') + '</td><td>' + result + '</td><td style="font-size:10px" title="' + escHtml(credId || '') + '">' + cred + '</td></tr>';
       }).join('');
       slot.innerHTML = '<div style="margin-top:8px;overflow-x:auto"><table class="mini-table"><thead><tr><th>Time (UTC)</th><th>IP</th><th>Resource</th><th>Result</th><th>Credential</th></tr></thead><tbody>' + body + '</tbody></table></div>'
-        + '<p class="dmuted" style="margin:5px 0 0">Up to 25 most-recent app-only sign-ins. <b>Credential</b> = the secret KeyId / cert thumbprint that authenticated — proves <i>which</i> key acted, even for an external app whose key you can\'t read.</p>';
+        + '<p class="dmuted" style="margin:5px 0 0">Up to 25 most-recent app-only sign-ins. <b>Credential</b> = the credential type Entra ID was shown, then the KeyId / cert thumbprint / federated-credential id that authenticated — proves <i>which</i> key acted, even for an external app whose key you can\'t read. Hover a row for the full id.</p>';
       if(btn) btn.remove();
     } catch(e){ slot.innerHTML = '<p class="dmuted" style="margin:7px 0 0">Could not load sign-ins — ' + escHtml(e.message || String(e)) + '</p>'; if(btn){ btn.disabled = false; btn.textContent = 'Retry →'; } }
   }
