@@ -287,6 +287,12 @@
   .spinner { display: inline-block; width: 15px; height: 15px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -3px; margin-right: 6px; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .hidden { display: none; }
+  /* Demo mode. Loud on purpose: a synthetic tenant shown to a customer has to announce itself, and
+     saying so out loud is worth more credibility than it costs. */
+  .demobar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 9px 28px; background: var(--amber-bg); color: var(--amber); border-bottom: 1px solid var(--border); font-size: 12.5px; font-weight: 600; }
+  .demobar .tag { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; padding: 2px 8px; border-radius: 4px; background: var(--amber); color: var(--on-red); }
+  .demobar .n { font-weight: 400; opacity: .95; }
+  .demobar a { color: inherit; }
   a { color: var(--accent); }
   .expander { cursor: pointer; user-select: none; color: var(--accent); font-weight: 600; font-size: 12px; }
   /* Highest-risk combination — a funnel of cards, each one narrowing the cohort to its left. The entrance is
@@ -418,6 +424,10 @@
   </div>
 </header>
 
+<div class="demobar hidden" id="demoBar">
+  <span class="tag">Demo data</span>
+  <span class="n">A synthetic tenant, not a real one — no sign-in, nothing fetched from Graph. Every number below is generated, and scored by exactly the same rules a real scan uses. <a href="?">Leave demo mode</a></span>
+</div>
 <main>
   <section class="card" id="configCard">
     <div id="connectForm">
@@ -511,6 +521,7 @@
     </div>
     <div class="row-actions">
       <button id="btn-signin">Sign in</button>
+      <a href="?demo=1" class="expander" style="align-self:center;text-decoration:none">or explore with demo data →</a>
     </div>
   </section>
 
@@ -1514,6 +1525,130 @@
     return RW_BASE[lvl] + Math.min(RW_SPAN[lvl], Math.max(0, pts));
   }
 
+  // -------------------- Demo tenant --------------------
+  // ?demo=1 loads a synthetic tenant instead of signing in: no MSAL, no Graph, no consent. It exists
+  // for showing the tool to someone who is not going to hand over their tenant on the spot, and for
+  // rehearsing the walkthrough with numbers that do not move between runs.
+  //
+  // The records carry the same INPUT fields a scan produces and are then run through the real
+  // computePermScore / computeFactors / computeRisk / computeRiskWeight. Nothing about the scoring
+  // is faked, so what a demo shows about how a finding is rated is true of a real tenant too.
+  var DEMO = /[?&]demo(=1)?(&|$)/.test(location.search);
+  var GRAPH_ID = '00000003-0000-0000-c000-000000000000', AADGRAPH_ID = '00000002-0000-0000-c000-000000000000';
+  function demoApps(){
+    var out = [], n = 0;
+    var days = function(d){ return new Date(Date.now() - d * 86400000).toISOString(); };
+    function app(o){
+      n++;
+      var r = {
+        id: 'sp-' + n, appId: 'de300000-0000-4000-8000-' + String(100000000000 + n),
+        displayName: o.name, publisherName: o.publisher || (o.ms ? 'Microsoft Services' : 'Contoso Partners Ltd'),
+        isFirstPartyMicrosoft: !!o.ms, appOwnerOrganizationId: o.ext ? 'ffffffff-1111-2222-3333-444444444444' : 'demo-tenant',
+        signInAudience: o.aud || 'AzureADMyOrg', localApp: !o.ext, appObjId: o.ext ? null : 'app-' + n,
+        accountEnabled: o.off ? false : true, disabledByMicrosoft: !!o.msDisabled,
+        isVerifiedPublisher: !!o.verified, verifiedPublisherName: o.verified ? 'Contoso Partners Ltd' : null,
+        appRoleAssignmentRequired: o.assign === true, allowPublicClient: !!o.publicClient,
+        implicitGrant: !!o.implicit, redirectUris: o.uris || [],
+        createdDateTime: days(o.age || 400), owners: o.owners === false ? [] : [{ displayName: 'Priya Nair', upn: 'priya@demo.local' }],
+        passwordCreds: o.secret ? [{ displayName: 'client-secret', startDateTime: days(400), endDateTime: o.secretExpired ? days(30) : days(-300) }] : [],
+        keyCreds: o.cert ? [{ displayName: 'signing-cert', startDateTime: days(400), endDateTime: days(-500) }] : [],
+        fic: o.fic ? [{ name: 'gh-oidc', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:contoso/deploy:ref:refs/heads/main', audiences: ['api://AzureADTokenExchange'] }] : [],
+        directoryRoles: o.roles || [],
+        appPermissions: (o.app || []).map(function(v){
+          var retired = !!o.retiredApi;
+          return { resourceName: retired ? 'Azure Active Directory Graph' : 'Microsoft Graph', resourceAppId: retired ? AADGRAPH_ID : GRAPH_ID, retired: retired, roleName: v, roleValue: v };
+        }),
+        delegatedDetail: (o.deleg || []).map(function(v){
+          return { resourceName: 'Microsoft Graph', resourceAppId: GRAPH_ID, retired: false, scopes: v, consentType: o.allPrincipals === false ? 'Principal' : 'AllPrincipals', principalCount: o.allPrincipals === false ? 3 : null };
+        }),
+        portalUrl: 'https://entra.microsoft.com/'
+      };
+      r.allScopes = (o.app || []).concat((o.deleg || []).join(', ').split(', ').filter(Boolean));
+      r.liveScopes = o.retiredApi ? [] : r.allScopes.slice();
+      r.caps = (typeof computeReconCaps === 'function') ? computeReconCaps(r.liveScopes) : [];
+      out.push(r);
+      return r;
+    }
+    // ---- the story apps: one per shape the tool is built to find ----
+    app({ name:'Contoso Invoice Sync', ext:true, aud:'AzureADMultipleOrgs', app:['Mail.ReadWrite','Files.ReadWrite.All'], secret:true, owners:false, deleg:['User.Read'] });
+    app({ name:'Acme Analytics Connector', ext:true, aud:'AzureADMultipleOrgs', verified:true, app:['User.Read.All'], deleg:['User.Read'] });
+    app({ name:'Mailbox Copilot Connector', app:['Mail.ReadWrite'], deleg:['Mail.Read, offline_access'], publicClient:true, secret:true, owners:false });
+    app({ name:'Internal_AccessScope', ext:true, aud:'AzureADMultipleOrgs', msDisabled:true, off:true, owners:false, age:3600 });
+    app({ name:'Legacy Reporting Job', app:['Directory.ReadWrite.All'], secret:true, secretExpired:true, owners:false });
+    app({ name:'Tenant Admin Automation', app:['User.Read.All'], secret:true, roles:[{ name:'Global Administrator', tier:0, scoped:false }] });
+    app({ name:'Mail Archive Service', app:['Exchange.ManageAsApp'], cert:true, roles:[{ name:'Exchange Administrator', tier:1, scoped:false }] });
+    app({ name:'Field Service Mobile', publicClient:true, deleg:['Mail.Read, Files.Read.All, offline_access'], uris:['https://fieldsvc.demo.local/auth'] });
+    app({ name:'Partner Portal SSO', ext:true, aud:'AzureADMultipleOrgs', implicit:true, uris:['https://*.partner-demo.local/cb','http://portal.partner-demo.local/cb'], deleg:['User.Read, email'] });
+    app({ name:'Payroll Export (legacy)', app:['Directory.Read.All'], retiredApi:true, secret:true, secretExpired:true, owners:false });
+    app({ name:'Deployment Pipeline', app:['Application.ReadWrite.OwnedBy'], fic:true, assign:true });
+    app({ name:'Consumer Feedback Widget', ext:true, aud:'AzureADandPersonalMicrosoftAccount', deleg:['User.Read'], owners:false });
+    // ---- filler: the long tail every tenant actually has ----
+    var VERBS = ['Sync','Portal','Reporting','Connector','Dashboard','Bot','Export','Gateway','Scheduler','Insights','Archive','Notifier'];
+    var AREAS = ['Finance','HR','Sales','Field','Legal','Facilities','Support','Logistics','Marketing','Quality','Security','Procurement'];
+    for(var i = 0; out.length < 96; i++){
+      var name = AREAS[i % AREAS.length] + ' ' + VERBS[(i * 7) % VERBS.length] + ' ' + (1 + Math.floor(i / 12));
+      app({ name: name, ext: i % 5 === 0, aud: i % 5 === 0 ? 'AzureADMultipleOrgs' : 'AzureADMyOrg',
+            verified: i % 17 === 0, assign: i % 16 === 0, owners: i % 3 !== 0,
+            deleg: [i % 6 === 0 ? 'User.Read, Mail.Read' : 'User.Read'],
+            app: i % 11 === 0 ? ['User.Read.All'] : null,
+            secret: i % 4 === 0, secretExpired: i % 12 === 0, cert: i % 9 === 0, fic: i % 13 === 0,
+            publicClient: i % 31 === 0, implicit: i % 29 === 0,
+            uris: i % 23 === 0 ? ['http://legacy.demo.local/cb'] : [],
+            age: 60 + (i * 13) % 1200 });
+    }
+    // ---- Microsoft first-party, so the publisher filter has something to do ----
+    ['Microsoft Teams','Microsoft Office','Windows Azure Service Management API','Microsoft Graph Command Line Tools',
+     'Office 365 Exchange Online','Microsoft Intune','Power BI Service','Azure Portal','Microsoft 365 Security and Compliance Center',
+     'Microsoft Information Protection API','Dynamics 365','Microsoft Purview'].forEach(function(nm, i){
+      app({ name: nm, ms:true, verified:true, aud:'AzureADMultipleOrgs', ext:true,
+            deleg:['User.Read'], app: i % 4 === 0 ? ['Directory.Read.All'] : null, age: 1800 });
+    });
+    return out;
+  }
+  // The same enrichment the audit applies once the fetching is done, so demo rows are scored by the
+  // real rules rather than carrying hand-written verdicts.
+  function demoScore(results){
+    results.forEach(function(r){
+      r.isExternal = r.appOwnerOrganizationId !== 'demo-tenant';
+      var aud = r.isExternal ? AUDIENCE_INFO['_inferred'] : (AUDIENCE_INFO[r.signInAudience] || AUDIENCE_INFO['AzureADMyOrg']);
+      r.tenancy = aud.tenancy; r.audienceLabel = aud.label; r.audienceTip = aud.tip; r.audienceConsumer = aud.consumer;
+      r.tenancyRank = r.tenancy === 'single' ? 0 : (r.audienceConsumer ? 2 : 1);
+      r.permScore = computePermScore(r);
+      r.inertPermScore = computeInertPermScore(r);
+      r.hasRetiredGrant = (r.delegatedDetail||[]).some(function(d){ return d.retired; }) || (r.appPermissions||[]).some(function(p){ return p.retired && p.roleName !== 'Default access'; });
+      r.factors = computeFactors(r);
+      r.riskScore = computeRisk(r);
+      r.riskWeight = computeRiskWeight(r, r.riskScore);
+    });
+    return results;
+  }
+  // A demo with an empty "since last scan" line loses the argument the deltas exist to make, so the
+  // demo baseline is seeded with a plausible previous month: a few apps better, a few worse, a
+  // couple that were not there before, one that has gone.
+  function demoBaseline(results){
+    var apps = {};
+    results.forEach(function(r, i){
+      if(i % 29 === 3) return;                                  // \u2192 "new" now
+      var depth = chainDepth(r), band = r.riskScore || 1;
+      if(i % 17 === 5) { band = Math.max(1, band - 1); }        // \u2192 worsened since
+      else if(i % 13 === 2) { band = Math.min(4, band + 1); }   // \u2192 improved since
+      if(i % 23 === 7 && depth > 0) depth = depth - 1;          // \u2192 moved further along the chain
+      apps[r.appId] = [band, depth, kpiMask(r), r.isFirstPartyMicrosoft ? 1 : 0];
+    });
+    apps['de300000-0000-4000-8000-100000000999'] = [3, 1, 0, 0];   // present last month, gone now
+    return { v:1, tenantId:'demo', t: Date.now() - 26 * 86400000, apps: apps };
+  }
+  function startDemo(){
+    el('demoBar').classList.remove('hidden');
+    el('who').innerHTML = 'Demo tenant \u2014 <strong>contoso.demo</strong>';
+    cache.results = demoScore(demoApps());
+    cache.scannedAt = Date.now() - 4 * 60000;
+    cache.rolesAvailable = true; cache.auditAvailable = true;
+    cache.baseline = demoBaseline(cache.results);
+    hide('configCard'); show('results'); render();
+    setStatus('Demo data \u2014 ' + cache.results.length + ' enterprise app(s), nothing fetched.');
+  }
+
   // -------------------- Audit --------------------
   async function runAudit(){
     clearError(); el('btn-refresh').disabled = true; setStatus('Acquiring token…', false, true);
@@ -1949,7 +2084,7 @@
   // its position in the AND-chain, which KPI cohorts it was in, and whether it is Microsoft
   // first-party (so a previous count can be recomputed under whichever publisher filter is active
   // now, instead of being frozen at whatever was on screen when the scan ran).
-  var BASELINE_KEY = 'era_baseline_v1';
+  var BASELINE_KEY = DEMO ? 'era_baseline_demo_v1' : 'era_baseline_v1';
   // A baseline younger than this is not replaced: re-running the scan three times in an afternoon
   // should keep comparing against this morning, not against the run a minute ago.
   var BASELINE_MIN_AGE_MS = 4 * 3600 * 1000;
@@ -2846,6 +2981,9 @@
       el('err-box').innerHTML = '<div class="notice notice-warn">This page is served from <code>' + escHtml(REDIRECT_URI) + '</code>. Microsoft Entra rejects this as a redirect URI (AADSTS500111 — invalid scheme). Open it over <b>https://</b> or <b>http://localhost:&lt;port&gt;</b> — not <code>file://</code>.</div>';
     }
   })();
+  // Demo mode never touches MSAL, and it keeps its own baseline so a demo run cannot overwrite the
+  // comparison point of a real scan in this browser.
+  if(DEMO){ startDemo(); }
   // Restore saved config (client ID / tenant / graph version).
   ['client','tenant','graphver'].forEach(function(k){ var v = localStorage.getItem('erav4_'+k); if(v) el('cfg-'+k).value = v; });
   if(!el('cfg-tenant').value) el('cfg-tenant').value = 'organizations';

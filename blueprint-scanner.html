@@ -352,6 +352,12 @@
   .spinner { display: inline-block; width: 15px; height: 15px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -3px; margin-right: 6px; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .hidden { display: none; }
+  /* Demo mode. Loud on purpose: a synthetic tenant shown to a customer has to announce itself, and
+     saying so out loud is worth more credibility than it costs. */
+  .demobar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 9px 28px; background: var(--amber-bg); color: var(--amber); border-bottom: 1px solid var(--border); font-size: 12.5px; font-weight: 600; }
+  .demobar .tag { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; padding: 2px 8px; border-radius: 4px; background: var(--amber); color: var(--on-red); }
+  .demobar .n { font-weight: 400; opacity: .95; }
+  .demobar a { color: inherit; }
   a { color: var(--accent); }
   .notice { border: 1px solid var(--border); border-left-width: 3px; border-radius: 6px;
             padding: 9px 12px; margin: 0 0 10px; font-size: 12.5px; line-height: 1.5; color: var(--text); }
@@ -411,6 +417,10 @@
   </div>
 </header>
 
+<div class="demobar hidden" id="demoBar">
+  <span class="tag">Demo data</span>
+  <span class="n">A synthetic tenant, not a real one — no sign-in, nothing fetched from Graph. Every number below is generated, and scored by exactly the same rules a real scan uses. <a href="?">Leave demo mode</a></span>
+</div>
 <main>
   <!-- Configuration / sign-in -->
   <section class="card" id="configCard">
@@ -531,6 +541,7 @@
     </div><!-- /connectForm -->
     <div class="row-actions">
       <button id="signInBtn">Sign in</button>
+      <a href="?demo=1" class="expander" style="align-self:center;text-decoration:none">or explore with demo data →</a>
     </div>
   </section>
 
@@ -3097,6 +3108,89 @@ $("blastToggle").addEventListener("click", () => {
 });
 // The picker only changes which blueprint is drawn, so it repaints the panel and nothing else.
 $("blastSel").addEventListener("change", () => { blastSel = $("blastSel").value; renderBlast(); });
+
+// ---- demo tenant ----
+// ?demo=1 builds a synthetic estate instead of signing in: no MSAL, no Graph, no consent. The
+// records carry the same fields a real load produces and go through render() untouched, so the
+// bands, the blast radius and the facet counts are all computed by the real rules.
+const DEMO = /[?&]demo(=1)?(&|$)/.test(location.search);
+function demoTenant() {
+  const days = d => new Date(Date.now() - d * 86400000).toISOString();
+  const GRAPH = "00000003-0000-0000-c000-000000000000";
+  const secret = (n, expired) => Array.from({ length: n }, (_, k) => ({
+    displayName: "secret-" + (k + 1), startDateTime: days(400), endDateTime: expired ? days(20) : days(-260) }));
+  const conduit = o => [Object.assign({ resource: "Microsoft Graph", resourceAppId: GRAPH,
+    scopesKind: "none", rolesKind: "none", scopesList: [], rolesList: [] }, o)];
+  const perm = (name, type, blocked) => ({ name, type: type || "application", resource: "Microsoft Graph", blocked: !!blocked });
+  let n = 0;
+  const bps = [], byBlueprint = {};
+  function bp(o) {
+    n++;
+    const id = "bp-" + n, appId = "de400000-0000-4000-8000-" + String(200000000000 + n);
+    const b = {
+      id: o.ext ? null : id, appId, displayName: o.name, _principalId: "sp-" + n,
+      signInAudience: o.multi ? "AzureADMultipleOrgs" : "AzureADMyOrg",
+      passwordCredentials: o.secrets ? secret(o.secrets, o.expired) : [],
+      keyCredentials: o.cert ? [{ displayName: "cert", startDateTime: days(400), endDateTime: days(-500) }] : [],
+      federatedIdentityCredentials: o.fic ? [{ name: "gh-oidc", issuer: "https://token.actions.githubusercontent.com", subject: "repo:contoso/agents:ref:refs/heads/main" }] : [],
+      web: { redirectUris: o.uris || [] }, spa: { redirectUris: [] }, publicClient: { redirectUris: [] },
+      _perms: o.perms || [], _owners: o.owners === false ? [] : [{ name: "Priya Nair", upn: "priya@demo.local" }],
+      _external: !!o.ext, _ownerIsMicrosoft: !!o.ms, _ownerName: o.ext ? (o.ms ? "Microsoft" : "Acme Agents Ltd") : null,
+      _assignmentRequired: o.open ? false : true, appRoles: o.roles || [],
+      _consent: { delegated: [], app: (o.granted || []).map(v => ({ role: v })) },
+      _inherit: o.conduit ? conduit(o.conduit) : [], _accountEnabled: true,
+      _risk: o.atRisk ? { state: "atRisk", level: "high" } : null,
+      _ca: { covered: true, policies: [{ name: "Require MFA for workload identities", state: "enabled", excluded: false, byFilter: false }] }
+    };
+    bps.push(b);
+    byBlueprint[appId] = Array.from({ length: o.agents || 0 }, (_, k) => ({
+      id: "ag-" + n + "-" + k, displayName: (o.agentName || o.name.split(" ")[0]) + "-Agent-" + String(k + 1).padStart(2, "0"),
+      _risk: (o.riskyAgents || 0) > k ? { state: "atRisk", level: "medium" } : null,
+      _ca: { covered: (o.uncovered || 0) <= k, policies: (o.uncovered || 0) > k ? [] : [{ name: "Require MFA for workload identities", state: "enabled", excluded: false, byFilter: false }] },
+      signInActivity: { lastSignInDateTime: (o.dormant || 0) > k ? days(120) : days(2 + k) }
+    }));
+    return b;
+  }
+  // ---- the story blueprints ----
+  bp({ name: "LAB-Blueprint", secrets: 4, agents: 7, riskyAgents: 1, uncovered: 2, dormant: 2,
+       granted: ["Mail.Send", "Files.ReadWrite.All"], conduit: { scopesKind: "all", rolesKind: "all" },
+       perms: [perm("Mail.Send"), perm("Files.ReadWrite.All"), perm("User.Read.All")], open: true, roles: [{ value: "Agent.Run", displayName: "Run agent" }] });
+  bp({ name: "Contoso Service Desk", secrets: 1, agents: 12, dormant: 12, granted: ["User.Read.All"],
+       conduit: { rolesKind: "enumerated", rolesList: ["User.Read.All"] }, perms: [perm("User.Read.All")], owners: false });
+  bp({ name: "Finance Reconciler", cert: true, agents: 4, granted: ["Files.ReadWrite.All"],
+       conduit: { rolesKind: "enumerated" }, perms: [perm("Files.ReadWrite.All")] });
+  bp({ name: "Acme Copilot Extension", ext: true, multi: true, agents: 9, atRisk: true, riskyAgents: 2,
+       perms: [], granted: ["Mail.Read"] });
+  bp({ name: "HR Onboarding Bot", fic: true, agents: 3, granted: ["User.Read.All"], conduit: { rolesKind: "enumerated" },
+       perms: [perm("User.Read.All"), perm("Directory.ReadWrite.All", "application", true)] });
+  bp({ name: "Legacy Ticket Sync", secrets: 2, expired: true, agents: 0, perms: [perm("Mail.Read")], owners: false });
+  bp({ name: "Microsoft 365 Copilot", ext: true, ms: true, multi: true, agents: 14, perms: [] });
+  bp({ name: "Warehouse Scheduler", secrets: 1, agents: 2, uncovered: 2, perms: [perm("Calendars.ReadWrite")],
+       granted: ["Calendars.ReadWrite"], conduit: { rolesKind: "enumerated" }, uris: ["http://scheduler.demo.local/cb"] });
+  // ---- the long tail ----
+  const AREAS = ["Finance", "HR", "Sales", "Field", "Legal", "Support", "Logistics", "Quality", "Security", "Procurement"];
+  for (let i = 0; bps.length < 51; i++) {
+    bp({ name: AREAS[i % AREAS.length] + " Assistant " + (1 + Math.floor(i / 10)),
+         secrets: i % 3 === 0 ? 1 : 0, expired: i % 11 === 0, cert: i % 7 === 0, fic: i % 5 === 0,
+         multi: i % 9 === 0, ext: i % 13 === 0, owners: i % 4 !== 0, open: i % 17 === 0,
+         agents: i % 6 === 0 ? 0 : (i % 5) + 1, dormant: i % 8 === 0 ? 2 : 0, uncovered: i % 10 === 0 ? 1 : 0,
+         perms: i % 4 === 0 ? [perm("User.Read.All")] : [],
+         granted: i % 4 === 0 ? ["User.Read.All"] : null,
+         conduit: i % 4 === 0 ? { rolesKind: "enumerated" } : null });
+  }
+  return { bps, byBlueprint };
+}
+function startDemo() {
+  $("demoBar").classList.remove("hidden");
+  $("who").innerHTML = "Demo tenant \u2014 <b>contoso.demo</b>";
+  riskAvailable = true; signInAvailable = true; caAvailable = true;
+  const d = demoTenant();
+  render(d.bps, d.byBlueprint, Object.values(d.byBlueprint).reduce((a, x) => a + x.length, 0));
+  $("configCard").classList.add("hidden");
+  $("results").classList.remove("hidden");
+  setStatus("Demo data \u2014 " + d.bps.length + " blueprints, nothing fetched.");
+}
+if (DEMO) startDemo();
 
 // ---- wire up ----
 $("signInBtn").addEventListener("click", signIn);
