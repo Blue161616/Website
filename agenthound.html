@@ -993,7 +993,12 @@ async function afterAuth() {
       name: o.displayName || 'tenant',
       domain: ((o.verifiedDomains || []).find(d => d.isDefault) || {}).name || '',
     };
-  } catch (e) { S.tenant = { name: 'tenant', id: '', domain: '' }; }
+  } catch (e) {
+    /* Losing our own directory ID is not cosmetic: every "is this homed
+       somewhere else" comparison needs it, so record the failure rather than
+       letting those checks quietly answer "no". */
+    S.tenant = { name: 'tenant', id: '', domain: '', error: e.message || String(e) };
+  }
   renderAuthLive();
   toast('Signed in as ' + (S.account && S.account.username || 'user') +
         (S.tenant && S.tenant.name ? ' · ' + S.tenant.name : ''), 'ok');
@@ -1022,7 +1027,11 @@ function renderAuthLive() {
   el.innerHTML =
     '<div class="chip g" style="margin-right:6px"><span class="dot ok"></span>' +
       esc(S.account && S.account.username || 'signed in') + '</div>' +
-    (S.tenant && S.tenant.name ? '<div class="chip b">' + esc(S.tenant.name) + '</div> ' : '') +
+    (S.tenant && S.tenant.id
+      ? '<div class="chip b">' + esc(S.tenant.name) + '</div> '
+      : S.tenant
+        ? '<div class="chip y" title="' + esc(S.tenant.error || '') + '">tenant ID not read</div> '
+        : '') +
     '<div class="chip">token ' + mins + 'm left</div>';
 }
 
@@ -1371,20 +1380,39 @@ function buildModel() {
   const appByAppId = new Map();
   (raw.applications || []).forEach(a => appByAppId.set(a.appId, a));
 
+  /* Two independent tenancy signals, because they fail in different ways.
+     appOwnerOrganizationId says who homes the object, but reading it as
+     "external" needs our own tenant id — which we do not have when the
+     organization read was denied. signInAudience says whether the app admits
+     other tenants at all, and is a fact carried on the object itself, so it
+     survives that gap. A multi-tenant blueprint principal is how a third-party
+     agent enters your tenant in the first place, so it has to be caught by
+     whichever of the two signals is available. */
+  const ourTenant = (S.tenant && S.tenant.id) || null;
+  const MULTI_AUD = /AzureADMultipleOrgs|AzureADandPersonalMicrosoftAccount/i;
+  const tenancy = (sp, app) => {
+    const owner = sp.appOwnerOrganizationId || null;
+    const audience = sp.signInAudience || (app && app.signInAudience) || null;
+    return {
+      ownerOrg: owner,
+      external: !!(owner && ourTenant && owner !== ourTenant),
+      multiTenant: !!(audience && MULTI_AUD.test(audience)),
+      audience,
+      tenancyKnown: !!ourTenant,
+    };
+  };
+
   (raw.blueprints || []).forEach(bp => {
     const app = appByAppId.get(bp.appId) || {};
-    node(bp.id, 'blueprint', bp.displayName || 'blueprint', {
+    node(bp.id, 'blueprint', bp.displayName || 'blueprint', Object.assign({
       appId: bp.appId,
       enabled: bp.accountEnabled !== false,
       created: bp.createdDateTime || app.createdDateTime,
-      external: !!(bp.appOwnerOrganizationId && S.tenant && S.tenant.id &&
-                   bp.appOwnerOrganizationId !== S.tenant.id),
-      ownerOrg: bp.appOwnerOrganizationId,
       secrets: (app.passwordCredentials || bp.passwordCredentials || []),
       certs: (app.keyCredentials || bp.keyCredentials || []),
       disabledByMs: bp.disabledByMicrosoftStatus,
       perms: [], roles: [], owners: [], sponsors: [], groups: [],
-    });
+    }, tenancy(bp, app)));
   });
 
   /* Anything that can hold a grant needs the arrays a grant is pushed into —
@@ -1403,7 +1431,7 @@ function buildModel() {
   const agents = [];
   (raw.agents || []).forEach(a => {
     const app = appByAppId.get(a.appId) || {};
-    const n = node(a.id, 'agent', a.displayName || 'agent', {
+    const n = node(a.id, 'agent', a.displayName || 'agent', Object.assign({
       appId: a.appId,
       enabled: a.accountEnabled !== false,
       created: a.createdDateTime,
@@ -1413,10 +1441,8 @@ function buildModel() {
       secrets: (a.passwordCredentials || app.passwordCredentials || []),
       certs: (a.keyCredentials || app.keyCredentials || []),
       disabledByMs: a.disabledByMicrosoftStatus,
-      external: !!(a.appOwnerOrganizationId && S.tenant && S.tenant.id &&
-                   a.appOwnerOrganizationId !== S.tenant.id),
       perms: [], roles: [], owners: [], sponsors: [], groups: [],
-    });
+    }, tenancy(a, app)));
     agents.push(n);
     if (a.agentIdentityBlueprintId) {
       const bp = spByAppId.get(a.agentIdentityBlueprintId);
@@ -1842,21 +1868,32 @@ const RULES = [
     })),
   },
   {
-    id: 'AH-012', name: 'Agent from an external publisher holds tenant permissions', sev: 'high',
-    cat: 'supplychain', needs: ['agents'], refs: ['ASI-09', 'MITRE T1195'],
-    desc: 'The identity is homed in another tenant. Its blueprint, its code and its update cadence ' +
-          'are outside your control, but its permissions are inside yours.',
-    run: m => m.agents.filter(a => a.props.external && a.props.perms.length).map(a => ({
-      agent: a,
-      sev: sevRank(a.props.worstSev) >= 3 ? 'crit' : 'high',
-      title: a.label + ' is published from an external tenant',
-      evidence: 'publisher tenant: ' + (a.props.ownerOrg || 'unknown') +
-        '\npermissions held: ' + a.props.perms.length +
-        '\nhighest severity: ' + (a.props.worstSev || 'low'),
-      path: ['external tenant', 'PUBLISHES', a.label],
-      fix: 'Verify the publisher, pin the blueprint version, and hold third-party agents to a lower ' +
-           'permission ceiling than the ones you build.',
-    })),
+    id: 'AH-012', name: 'External or multi-tenant identity holds tenant permissions', sev: 'high',
+    cat: 'supplychain', needs: ['agents', 'blueprints'], refs: ['ASI-09', 'MITRE T1195'],
+    desc: 'The identity is homed in another tenant, or its blueprint admits other tenants. Its code ' +
+          'and its update cadence are outside your control, but its permissions are inside yours.',
+    /* Blueprint principals are the point of entry for a third-party agent, so
+       they are examined alongside the agent identities they mint. */
+    run: m => Array.from(m.nodes.values())
+      .filter(n => (n.type === 'agent' || n.type === 'blueprint') &&
+                   (n.props.external || n.props.multiTenant) &&
+                   (n.props.perms || []).length)
+      .map(n => ({
+        agent: n,
+        sev: sevRank(n.props.worstSev) >= 3 ? 'crit' : 'high',
+        title: n.label + (n.props.external
+          ? ' is published from an external tenant'
+          : ' is a multi-tenant identity'),
+        evidence: 'kind: ' + (n.type === 'blueprint' ? 'blueprint principal' : 'agent identity') +
+          '\npublisher tenant: ' + (n.props.ownerOrg || 'unknown') +
+          '\nsignInAudience: ' + (n.props.audience || 'not returned') +
+          (n.props.tenancyKnown ? '' : '\n(our own tenant ID was not read — "external" undecided)') +
+          '\npermissions held: ' + n.props.perms.length +
+          '\nhighest severity: ' + (n.props.worstSev || 'low'),
+        path: [n.props.external ? 'external tenant' : 'other tenants', 'PUBLISH', n.label],
+        fix: 'Verify the publisher, pin the blueprint version, and hold third-party agents to a lower ' +
+             'permission ceiling than the ones you build.',
+      })),
   },
   {
     id: 'AH-013', name: 'Two agents share a display name', sev: 'high', cat: 'sprawl',
@@ -3155,7 +3192,9 @@ function nodeTip(n) {
       : (p.sponsors || []).length ? p.sponsors.map(o => o.name).join(', ') + ' (sponsor)'
       : 'none — nobody accountable']);
     if (p.score != null) rows.push(['Risk score', p.score + ' / 100']);
-    if (p.external) rows.push(['Publisher', 'external tenant']);
+    if (p.external || p.multiTenant) rows.push(['Tenancy',
+      [p.external ? 'homed in ' + (p.ownerOrg || 'another tenant') : null,
+       p.multiTenant ? 'multi-tenant' : null].filter(Boolean).join(' · ')]);
   } else if (n.type === 'permission') {
     rows.push(['Kind', p.kind || '—']);
     rows.push(['Resource', p.resource || '—']);
@@ -3285,13 +3324,37 @@ const QUERIES = [
     cols: ['Agent', 'Owned by', 'Human owner'],
     run: m => m.agents.filter(a => a.props.owners.length && a.props.owners.every(o => o.isAgent))
       .map(a => [a.label, a.props.owners.map(o => o.name).join(', '), 'none']) },
-  { id: 'Q11', group: 'Supply chain', sev: 'high', name: 'Externally published agents',
-    desc: 'Agent identities homed in another tenant, holding permissions in yours.',
+  { id: 'Q11', group: 'Supply chain', sev: 'high', name: 'External and multi-tenant agent identities',
+    desc: 'Blueprint principals and agent identities that are homed in another tenant, or whose ' +
+          'blueprint admits other tenants. The multi-tenant blueprint principal is how a third-party ' +
+          'agent enters your tenant at all, so it is listed alongside the identities it mints.',
     refs: ['T1195'],
-    api: 'GET /servicePrincipals/microsoft.graph.agentIdentity?$select=appOwnerOrganizationId',
-    cols: ['Agent', 'Publisher tenant', 'Permissions', 'Highest severity'],
-    run: m => m.agents.filter(a => a.props.external)
-      .map(a => [a.label, a.props.ownerOrg || 'unknown', a.props.perms.length, a.props.worstSev]) },
+    api: 'GET /servicePrincipals/microsoft.graph.agentIdentityBlueprintPrincipal' +
+         '?$select=displayName,appOwnerOrganizationId,signInAudience\n' +
+         'GET /servicePrincipals/microsoft.graph.agentIdentity' +
+         '?$select=displayName,appOwnerOrganizationId,signInAudience',
+    cols: ['Identity', 'Kind', 'Tenancy', 'Publisher tenant', 'Permissions', 'Highest severity'],
+    /* Without our own directory ID, "homed elsewhere" is undecidable — say so
+       rather than returning a confident zero. */
+    note: () => (S.tenant && S.tenant.id) ? null
+      : 'This tenant\'s own directory ID was not read, so "homed elsewhere" cannot be decided for ' +
+        'any object. Only the multi-tenant flag carried on each identity is shown below. Re-run ' +
+        'collection with Directory.Read.All consented to complete this query.',
+    run: m => Array.from(m.nodes.values())
+      .filter(n => (n.type === 'agent' || n.type === 'blueprint') &&
+                   (n.props.external || n.props.multiTenant))
+      .sort((a, b) => (b.type === 'blueprint') - (a.type === 'blueprint') ||
+                      a.label.localeCompare(b.label))
+      .map(n => [
+        n.label,
+        n.type === 'blueprint' ? 'blueprint principal' : 'agent identity',
+        [n.props.external ? 'homed elsewhere' : null,
+         n.props.multiTenant ? 'multi-tenant (' + (n.props.audience || 'audience unknown') + ')' : null]
+          .filter(Boolean).join(' · ') || 'single tenant',
+        n.props.ownerOrg || 'unknown',
+        (n.props.perms || []).length,
+        n.props.worstSev || '—',
+      ]) },
   { id: 'Q12', group: 'Supply chain', sev: 'med', name: 'Blueprints and their child agents',
     desc: 'Which template mints which agents — the inheritance an attacker only has to poison once.',
     api: 'GET /servicePrincipals/microsoft.graph.agentIdentityBlueprintPrincipal',
@@ -3374,9 +3437,16 @@ function runQuery(q, host) {
   }
   let rows = [];
   let err = null;
+  let note = null;
   try { rows = q.run(S.model) || []; } catch (e) { err = e.message; }
+  /* A query that cannot fully decide its own question says so above the rows,
+     so a short result is never mistaken for a complete one. */
+  try { note = q.note ? q.note(S.model) : null; } catch (e) { note = null; }
   host.innerHTML = '<div class="dsec"><div class="dt">Microsoft Graph request</div>' +
       '<pre class="code">' + esc(q.api) + '</pre></div>' +
+    (note ? '<div class="banner" style="margin-bottom:13px">' + ic('warn') +
+      '<div><div class="t">Query cannot fully decide this</div>' +
+      '<div class="d">' + esc(note) + '</div></div></div>' : '') +
     '<div class="dsec"><div class="dt">Matched rows · ' + rows.length + '</div>' +
     (err ? '<div class="ev">' + esc(err) + '</div>'
      : rows.length
@@ -3482,6 +3552,9 @@ function loadDemo() {
     servicePrincipalType: 'Application', accountEnabled: true,
     createdDateTime: iso(-320 + n * 9),
     appOwnerOrganizationId: ext ? gid('ffff0000', 9) : gid('7e5a0000', 1),
+    /* An external publisher's blueprint principal is multi-tenant by
+       definition — that is what let it into this tenant. */
+    signInAudience: ext ? 'AzureADMultipleOrgs' : 'AzureADMyOrg',
     passwordCredentials: n === 2
       ? [{ displayName: 'ci-secret', startDateTime: iso(-400), endDateTime: iso(330) }] : [],
     keyCredentials: [],
