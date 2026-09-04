@@ -719,6 +719,8 @@ const S = {
   collectedAt: null,
   view: 'dashboard',
   lens: 'topology',
+  dim: '2d',                    // explorer projection: '2d' or '3d'
+  hover: null,
   filters: { sev: new Set(), cat: new Set(), q: '', group: 'none', tab: 'all' },
 };
 
@@ -2638,13 +2640,27 @@ const NODE_STYLE = {
 const edgeColor = e => ({ crit: '#ff5b57', high: '#ff9147', med: '#ffc44d' })[e.sev] || '#2f4763';
 
 function renderLensbar() {
+  const dimBtn = (d, l) => '<button class="lens' + (S.dim === d ? ' on' : '') +
+    '" data-dim="' + d + '">' + l + '</button>';
   $('#lensbar').innerHTML = '<span class="lb">LENS</span>' + LENSES.map(l =>
     '<button class="lens' + (S.lens === l.id ? ' on' : '') + '" data-l="' + l.id + '">' +
     ic(l.icon) + l.label + '</button>').join('') +
-    (S.focus ? '<button class="lens" data-l="__clear" style="margin-left:auto">Clear focus ✕</button>' : '');
+    '<span style="margin-left:auto;display:flex;gap:5px;align-items:center">' +
+      (S.focus ? '<button class="lens" data-l="__clear">Clear focus ✕</button>' : '') +
+      '<span class="lb" style="margin:0 2px 0 6px">VIEW</span>' +
+      dimBtn('2d', '2D') + dimBtn('3d', '3D') +
+      '<button class="lens" data-act="reset" title="Recentre the view">Recentre</button>' +
+    '</span>';
   $$('#lensbar .lens').forEach(b => {
     b.onclick = () => {
-      if (b.dataset.l === '__clear') { S.focus = null; } else { S.lens = b.dataset.l; }
+      if (b.dataset.act === 'reset') { fitCamera(); paint(); return; }
+      if (b.dataset.dim) {
+        if (S.dim === b.dataset.dim) return;
+        S.dim = b.dataset.dim;
+        try { localStorage.setItem('ah_dim', S.dim); } catch (err) {}
+      }
+      else if (b.dataset.l === '__clear') { S.focus = null; }
+      else { S.lens = b.dataset.l; }
       drawGraph();
     };
   });
@@ -2674,15 +2690,30 @@ function lensSubgraph() {
   return { nodes, edges };
 }
 
-/* A small deterministic force layout. No dependency, no animation loop:
-   settle it once, then draw — a graph that stops moving is a graph you can read. */
-function layout(nodes, edges, W, H) {
+/* ── layout ────────────────────────────────────────────────────────────────
+   One force model, run in two or three dimensions. No animation loop: settle
+   it once, then draw — a graph that stops moving is a graph you can read. The
+   third axis is not decoration. At a hundred-plus nodes a plane has nowhere
+   left to put anything, so clusters that are genuinely separate get pushed
+   into each other and the picture stops meaning anything. Depth gives the
+   layout somewhere to put them, and rotating separates what overlaps.
+   ────────────────────────────────────────────────────────────────────────── */
+function layoutForce(nodes, edges, dims, span) {
   const n = nodes.length;
   if (!n) return;
+  const D = dims === 3 ? 3 : 2;
   const pos = nodes.map((nd, i) => {
-    const ang = (i / n) * Math.PI * 2;
-    const rad = Math.min(W, H) * (0.18 + 0.26 * ((i % 5) / 5));
-    return { x: W / 2 + Math.cos(ang) * rad, y: H / 2 + Math.sin(ang) * rad, vx: 0, vy: 0 };
+    /* Seed on a sphere (or ring) rather than at random: a symmetric start
+       settles to a symmetric layout instead of a different blob each time. */
+    const gold = Math.PI * (3 - Math.sqrt(5));
+    const t = i / Math.max(1, n - 1);
+    if (D === 3) {
+      const y = 1 - t * 2, r = Math.sqrt(Math.max(0, 1 - y * y)), th = gold * i;
+      return { x: Math.cos(th) * r * span, y: y * span, z: Math.sin(th) * r * span,
+               vx: 0, vy: 0, vz: 0 };
+    }
+    const ang = t * Math.PI * 2, rad = span * (0.45 + 0.55 * ((i % 5) / 5));
+    return { x: Math.cos(ang) * rad, y: Math.sin(ang) * rad, z: 0, vx: 0, vy: 0, vz: 0 };
   });
   const idx = new Map(nodes.map((nd, i) => [nd.id, i]));
   const links = edges.map(e => [idx.get(e.src), idx.get(e.dst)])
@@ -2690,44 +2721,225 @@ function layout(nodes, edges, W, H) {
   const deg = new Array(n).fill(0);
   links.forEach(([a, b]) => { deg[a]++; deg[b]++; });
 
-  const iters = n > 220 ? 180 : 320;
-  const K = Math.sqrt((W * H) / Math.max(1, n)) * 0.62;
+  const iters = n > 260 ? 200 : n > 120 ? 280 : 340;
+  /* Ideal separation. In 3D the same node count has a volume to spread through
+     rather than an area, so the constant that keeps 2D readable would leave a
+     3D layout collapsed — hence the cube root. */
+  const K = D === 3
+    ? Math.pow((span * span * span * 8) / Math.max(1, n), 1 / 3) * 0.72
+    : Math.sqrt((span * span * 4) / Math.max(1, n)) * 0.62;
+  const cut = K * K * 30;
+
   for (let it = 0; it < iters; it++) {
     const t = 1 - it / iters;
-    /* repulsion */
     for (let i = 0; i < n; i++) {
       for (let j = i + 1; j < n; j++) {
         let dx = pos[i].x - pos[j].x, dy = pos[i].y - pos[j].y;
-        let d2 = dx * dx + dy * dy;
-        if (d2 < 1) { dx = (Math.random() - .5) * 2; dy = (Math.random() - .5) * 2; d2 = 4; }
-        if (d2 > K * K * 26) continue;
-        const f = (K * K) / d2;
-        const d = Math.sqrt(d2);
+        let dz = D === 3 ? pos[i].z - pos[j].z : 0;
+        let d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < 1) {
+          dx = Math.random() - .5; dy = Math.random() - .5;
+          dz = D === 3 ? Math.random() - .5 : 0; d2 = 4;
+        }
+        if (d2 > cut) continue;
+        const d = Math.sqrt(d2), f = (K * K) / d2;
         pos[i].vx += (dx / d) * f; pos[i].vy += (dy / d) * f;
         pos[j].vx -= (dx / d) * f; pos[j].vy -= (dy / d) * f;
+        if (D === 3) { pos[i].vz += (dz / d) * f; pos[j].vz -= (dz / d) * f; }
       }
     }
-    /* springs */
     links.forEach(([a, b]) => {
       const dx = pos[b].x - pos[a].x, dy = pos[b].y - pos[a].y;
-      const d = Math.max(1, Math.hypot(dx, dy));
+      const dz = D === 3 ? pos[b].z - pos[a].z : 0;
+      const d = Math.max(1, Math.sqrt(dx * dx + dy * dy + dz * dz));
       const f = (d - K * 1.5) * 0.08;
       pos[a].vx += (dx / d) * f; pos[a].vy += (dy / d) * f;
       pos[b].vx -= (dx / d) * f; pos[b].vy -= (dy / d) * f;
+      if (D === 3) { pos[a].vz += (dz / d) * f; pos[b].vz -= (dz / d) * f; }
     });
-    /* gravity toward centre, weaker for well-connected nodes so hubs sit inside */
     for (let i = 0; i < n; i++) {
-      pos[i].vx += (W / 2 - pos[i].x) * 0.006 * (1 + 1 / (1 + deg[i]));
-      pos[i].vy += (H / 2 - pos[i].y) * 0.006 * (1 + 1 / (1 + deg[i]));
-      pos[i].x += Math.max(-28, Math.min(28, pos[i].vx * t));
-      pos[i].y += Math.max(-28, Math.min(28, pos[i].vy * t));
-      pos[i].vx *= 0.72; pos[i].vy *= 0.72;
+      /* Gravity toward the origin, weaker on well-connected nodes so hubs
+         settle inside and leaves drift out where their labels have room. */
+      const g = 0.006 * (1 + 1 / (1 + deg[i]));
+      pos[i].vx -= pos[i].x * g; pos[i].vy -= pos[i].y * g;
+      if (D === 3) pos[i].vz -= pos[i].z * g;
+      const cap = 30;
+      pos[i].x += Math.max(-cap, Math.min(cap, pos[i].vx * t));
+      pos[i].y += Math.max(-cap, Math.min(cap, pos[i].vy * t));
+      if (D === 3) pos[i].z += Math.max(-cap, Math.min(cap, pos[i].vz * t));
+      pos[i].vx *= 0.72; pos[i].vy *= 0.72; pos[i].vz *= 0.72;
     }
   }
-  nodes.forEach((nd, i) => { nd.x = pos[i].x; nd.y = pos[i].y; });
+  nodes.forEach((nd, i) => { nd.x = pos[i].x; nd.y = pos[i].y; nd.z = D === 3 ? pos[i].z : 0; });
 }
 
+/* ── camera ────────────────────────────────────────────────────────────── */
+const SCENE = { nodes: [], edges: [], byId: new Map(), W: 1200, H: 760, radius: 600 };
 let VIEWBOX = { x: 0, y: 0, w: 1200, h: 760 };
+const CAM = { yaw: 0.65, pitch: 0.3, dist: 1900, focal: 900, px: 0, py: 0 };
+
+function fitCamera() {
+  if (S.dim === '3d') {
+    CAM.yaw = 0.65; CAM.pitch = 0.3; CAM.px = 0; CAM.py = 0;
+    CAM.dist = Math.max(700, SCENE.radius * 2.6);
+    /* Focal length is chosen so the layout's bounding sphere lands inside the
+       frame at the starting distance. Without this the projection is scale-
+       free and a big graph simply shoots off the edges. */
+    CAM.focal = 0.46 * Math.min(SCENE.W, SCENE.H) * CAM.dist / Math.max(1, SCENE.radius);
+  } else {
+    const ns = SCENE.nodes;
+    if (!ns.length) return;
+    const xs = ns.map(n => n.x), ys = ns.map(n => n.y), pad = 90;
+    VIEWBOX = {
+      x: Math.min.apply(null, xs) - pad, y: Math.min.apply(null, ys) - pad,
+      w: (Math.max.apply(null, xs) - Math.min.apply(null, xs)) + pad * 2,
+      h: (Math.max.apply(null, ys) - Math.min.apply(null, ys)) + pad * 2,
+    };
+  }
+}
+
+/* Yaw, then pitch, then a perspective divide. Nodes behind the camera plane
+   are clamped rather than inverted, so nothing ever flips through the origin. */
+function project(p) {
+  const cy = Math.cos(CAM.yaw), sy = Math.sin(CAM.yaw);
+  const x1 = p.x * cy - p.z * sy;
+  const z1 = p.x * sy + p.z * cy;
+  const cp = Math.cos(CAM.pitch), sp = Math.sin(CAM.pitch);
+  const y1 = p.y * cp - z1 * sp;
+  const z2 = p.y * sp + z1 * cp;
+  const depth = z2 + CAM.dist;
+  const f = CAM.focal / Math.max(CAM.dist * 0.18, depth);
+  return { x: x1 * f + SCENE.W / 2 + CAM.px, y: y1 * f + SCENE.H / 2 + CAM.py, f, depth };
+}
+
+/* ── paint ─────────────────────────────────────────────────────────────────
+   Called on every orbit frame, so it rebuilds the SVG and nothing else. All
+   the panel work stays in drawGraph, which runs once per lens change.
+   ────────────────────────────────────────────────────────────────────────── */
+let paintQueued = false;
+function paintSoon() {
+  if (paintQueued) return;
+  paintQueued = true;
+  requestAnimationFrame(() => { paintQueued = false; paint(); });
+}
+
+function paint() {
+  const svg = $('#gsvg');
+  const three = S.dim === '3d';
+  const nodes = SCENE.nodes, edges = SCENE.edges;
+  if (!nodes.length) return;
+
+  const P = new Map();
+  nodes.forEach(n => {
+    P.set(n.id, three ? project(n) : { x: n.x, y: n.y, f: 1, depth: 0 });
+  });
+  /* Depth fog: far nodes recede instead of competing. In 2D everything is at
+     the same distance, so the whole scene stays at full strength. */
+  const fog = d => three
+    ? Math.max(0.26, Math.min(1, 1.5 - d / (CAM.dist * 1.55)))
+    : 1;
+
+  const defs = '<defs>' + ['#ff5b57', '#ff9147', '#ffc44d', '#2f4763'].map((c, i) =>
+    '<marker id="ar' + i + '" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" ' +
+    'markerHeight="6" orient="auto"><path d="M0 0 10 5 0 10z" fill="' + c + '"/></marker>').join('') +
+    '<filter id="glow"><feGaussianBlur stdDeviation="4" result="b"/>' +
+    '<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>';
+
+  const arrowIdx = c => ({ '#ff5b57': 0, '#ff9147': 1, '#ffc44d': 2 })[c] != null
+    ? ({ '#ff5b57': 0, '#ff9147': 1, '#ffc44d': 2 })[c] : 3;
+
+  /* Painter's algorithm: furthest first, so near nodes occlude far ones and
+     the eye gets the depth cue it needs to read the third axis at all. */
+  const drawEdges = edges.map(e => {
+    const a = P.get(e.src), b = P.get(e.dst);
+    if (!a || !b) return null;
+    return { e, a, b, depth: (a.depth + b.depth) / 2 };
+  }).filter(Boolean);
+  const drawNodes = nodes.map(n => ({ n, p: P.get(n.id) }));
+  if (three) {
+    drawEdges.sort((u, v) => v.depth - u.depth);
+    drawNodes.sort((u, v) => v.p.depth - u.p.depth);
+  }
+
+  const edgeSvg = drawEdges.map(({ e, a, b }) => {
+    const c = edgeColor(e);
+    const hot = sevRank(e.sev) >= 2;
+    const op = fog(Math.min(a.depth, b.depth)) * (hot ? .85 : .42);
+    const d = three
+      /* Straight in 3D — a curve read through a perspective divide looks like
+         a different shape from every angle, which is worse than no curve. */
+      ? 'M' + a.x.toFixed(1) + ' ' + a.y.toFixed(1) + ' L' + b.x.toFixed(1) + ' ' + b.y.toFixed(1)
+      : 'M' + a.x.toFixed(1) + ' ' + a.y.toFixed(1) + ' Q' +
+        ((a.x + b.x) / 2).toFixed(1) + ' ' +
+        ((a.y + b.y) / 2 - Math.hypot(b.x - a.x, b.y - a.y) * 0.12).toFixed(1) + ' ' +
+        b.x.toFixed(1) + ' ' + b.y.toFixed(1);
+    return '<path class="ge" data-t="' + esc(e.type) + '" d="' + d + '" fill="none" stroke="' + c +
+      '" stroke-width="' + (hot ? 1.9 : 1.15) + '" opacity="' + op.toFixed(2) +
+      '" marker-end="url(#ar' + arrowIdx(c) + ')"/>';
+  }).join('');
+
+  /* Size and opacity first, so the label pass can measure real boxes. */
+  drawNodes.forEach(d => {
+    const st = NODE_STYLE[d.n.type] || NODE_STYLE.principal;
+    const base = st.r * (d.n.type === 'agent'
+      ? (1 + Math.min(.5, (d.n.props.score || 0) / 160)) : 1);
+    /* Size relative to a node at the centre of the scene, so depth reads as
+       nearer-and-larger rather than shrinking the whole graph to specks. */
+    d.r = Math.max(3.5, base * (three ? 0.78 * d.p.f / (CAM.focal / CAM.dist) : 1));
+    d.op = fog(d.p.depth);
+    d.hovered = S.hover === d.n.id;
+  });
+
+  /* Label pass. Rank culling in drawGraph decides which labels are worth
+     showing; this decides which of those actually fit. Nearest first, and a
+     label that would land on one already placed is dropped rather than
+     overprinted — two labels on top of each other read as neither. */
+  const placed = [];
+  for (let i = drawNodes.length - 1; i >= 0; i--) {
+    const d = drawNodes[i], n = d.n;
+    d.show = false;
+    if (!(n.$label || d.hovered || n.id === S.focus)) continue;
+    if (!(d.op > 0.5 || d.hovered)) continue;
+    const text = n.label.length > 22 ? n.label.slice(0, 21) + '…' : n.label;
+    const w = text.length * 6.6, h = 24;
+    const box = { x: d.p.x - w / 2, y: d.p.y + d.r + 4, x2: d.p.x + w / 2, y2: d.p.y + d.r + 4 + h };
+    const clash = placed.some(q =>
+      !(box.x > q.x2 || box.x2 < q.x || box.y > q.y2 || box.y2 < q.y));
+    if (clash && !d.hovered && n.id !== S.focus) continue;
+    placed.push(box);
+    d.show = true;
+    d.text = text;
+  }
+
+  const nodeSvg = drawNodes.map(d => {
+    const n = d.n, p = d.p, r = d.r, op = d.op, hovered = d.hovered;
+    const st = NODE_STYLE[n.type] || NODE_STYLE.principal;
+    const danger = n.type === 'agent' && sevRank(n.props.worstSev || 'low') >= 3;
+    const showLabel = d.show;
+    const label = d.text || '';
+    return '<g class="gn" data-id="' + esc(n.id) + '" transform="translate(' + p.x.toFixed(1) +
+        ',' + p.y.toFixed(1) + ')" style="cursor:pointer" opacity="' + op.toFixed(2) + '">' +
+      (danger ? '<circle r="' + (r + 6) + '" fill="none" stroke="#ff5b57" stroke-width="1.2" opacity=".45"/>' : '') +
+      (hovered ? '<circle r="' + (r + 11) + '" fill="none" stroke="#6fb0ff" stroke-width="1.6" opacity=".9"/>' : '') +
+      '<circle r="' + r.toFixed(1) + '" fill="#0a0f16" stroke="' + st.c + '" stroke-width="' +
+        (hovered ? 2.6 : 2) + '"' + (danger ? ' filter="url(#glow)"' : '') + '/>' +
+      '<circle r="' + (r * .42).toFixed(1) + '" fill="' + st.c + '" opacity=".85"/>' +
+      (showLabel
+        ? '<text y="' + (r + 14).toFixed(1) + '" text-anchor="middle" fill="#dce6f2" ' +
+          'style="font:600 11px var(--mono);pointer-events:none;paint-order:stroke" ' +
+          'stroke="#05070b" stroke-width="3.5">' + esc(label) + '</text>' +
+          '<text y="' + (r + 25).toFixed(1) + '" text-anchor="middle" fill="#4a5a70" ' +
+          'style="font:600 8px var(--mono);letter-spacing:.14em;pointer-events:none">' +
+          esc(st.l.toUpperCase()) + '</text>'
+        : '') +
+      '</g>';
+  }).join('');
+
+  svg.setAttribute('viewBox', three
+    ? '0 0 ' + SCENE.W + ' ' + SCENE.H
+    : [VIEWBOX.x, VIEWBOX.y, VIEWBOX.w, VIEWBOX.h].join(' '));
+  svg.innerHTML = defs + '<g id="gwrap">' + edgeSvg + nodeSvg + '</g>';
+}
 
 function drawGraph() {
   renderLensbar();
@@ -2738,7 +2950,7 @@ function drawGraph() {
   $('#ov-lens').innerHTML =
     '<div class="ot"><span>' + esc(lens.label.toUpperCase()) + ' LENS</span>' +
       '<span class="tag ' + (nodes.length ? 'low' : 'none') + ' pl">' +
-      (nodes.length ? 'active' : 'empty') + '</span></div>' +
+      (nodes.length ? (S.dim === '3d' ? '3D' : '2D') : 'empty') + '</span></div>' +
     '<div class="big">' + edges.length + '</div><div class="cap">visible edges</div>' +
     '<div class="cap" style="margin-top:7px">across ' + nodes.length + ' nodes</div>' +
     '<div class="txt">' + esc(lens.blurb) + '</div>';
@@ -2753,7 +2965,9 @@ function drawGraph() {
   }
 
   if (!nodes.length) {
-    svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" fill="#4a5a70" ' +
+    SCENE.nodes = []; SCENE.edges = []; SCENE.byId = new Map();
+    svg.setAttribute('viewBox', '0 0 1200 760');
+    svg.innerHTML = '<text x="600" y="380" text-anchor="middle" fill="#4a5a70" ' +
       'style="font:600 12px var(--mono);letter-spacing:.12em">' +
       (S.model ? 'NO EDGES IN THIS LENS' : 'NO GRAPH LOADED') + '</text>';
     $('#ov-legend').innerHTML = '';
@@ -2761,60 +2975,42 @@ function drawGraph() {
     return;
   }
 
-  const W = 1200, H = 760;
-  layout(nodes, edges, W, H);
+  /* degree drives both the layout and which labels survive */
+  const deg = new Map(nodes.map(n => [n.id, 0]));
+  edges.forEach(e => {
+    if (deg.has(e.src)) deg.set(e.src, deg.get(e.src) + 1);
+    if (deg.has(e.dst)) deg.set(e.dst, deg.get(e.dst) + 1);
+  });
+  const budget = nodes.length <= 45 ? nodes.length : Math.max(18, Math.round(nodes.length * 0.16));
+  const ranked = nodes.slice().sort((a, b) =>
+    (deg.get(b.id) - deg.get(a.id)) || (b.props.score || 0) - (a.props.score || 0));
+  const labelled = new Set(ranked.slice(0, budget).map(n => n.id));
+  nodes.forEach(n => {
+    /* Sinks and roles are few and they are the point of the picture, so they
+       keep their label whatever their degree. */
+    n.$label = labelled.has(n.id) || n.type === 'sink' || n.type === 'role';
+    n.$deg = deg.get(n.id) || 0;
+  });
 
-  /* fit */
-  const xs = nodes.map(n => n.x), ys = nodes.map(n => n.y);
-  const pad = 90;
-  VIEWBOX = {
-    x: Math.min.apply(null, xs) - pad, y: Math.min.apply(null, ys) - pad,
-    w: (Math.max.apply(null, xs) - Math.min.apply(null, xs)) + pad * 2,
-    h: (Math.max.apply(null, ys) - Math.min.apply(null, ys)) + pad * 2,
-  };
-  const byId = new Map(nodes.map(n => [n.id, n]));
+  const span = Math.min(1400, 320 + nodes.length * 7);
+  layoutForce(nodes, edges, S.dim === '3d' ? 3 : 2, span);
 
-  const defs = '<defs>' + ['#ff5b57', '#ff9147', '#ffc44d', '#2f4763'].map((c, i) =>
-    '<marker id="ar' + i + '" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" ' +
-    'markerHeight="6" orient="auto"><path d="M0 0 10 5 0 10z" fill="' + c + '"/></marker>').join('') +
-    '<filter id="glow"><feGaussianBlur stdDeviation="4" result="b"/>' +
-    '<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>';
-
-  const arrowIdx = c => ({ '#ff5b57': 0, '#ff9147': 1, '#ffc44d': 2 })[c] != null ?
-    ({ '#ff5b57': 0, '#ff9147': 1, '#ffc44d': 2 })[c] : 3;
-
-  const edgeSvg = edges.map(e => {
-    const a = byId.get(e.src), b = byId.get(e.dst);
-    if (!a || !b) return '';
-    const c = edgeColor(e);
-    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2 - Math.hypot(b.x - a.x, b.y - a.y) * 0.12;
-    return '<g class="ge" data-t="' + esc(e.type) + '">' +
-      '<path d="M' + a.x.toFixed(1) + ' ' + a.y.toFixed(1) + ' Q' + mx.toFixed(1) + ' ' +
-        my.toFixed(1) + ' ' + b.x.toFixed(1) + ' ' + b.y.toFixed(1) + '" fill="none" stroke="' + c +
-        '" stroke-width="' + (sevRank(e.sev) >= 2 ? 1.9 : 1.2) + '" opacity="' +
-        (sevRank(e.sev) >= 2 ? .85 : .5) + '" marker-end="url(#ar' + arrowIdx(c) + ')"/></g>';
-  }).join('');
-
-  const nodeSvg = nodes.map(n => {
-    const st = NODE_STYLE[n.type] || NODE_STYLE.principal;
-    const r = st.r * (n.type === 'agent' ? (1 + Math.min(.5, (n.props.score || 0) / 160)) : 1);
-    const danger = n.type === 'agent' && sevRank(n.props.worstSev || 'low') >= 3;
-    const label = n.label.length > 22 ? n.label.slice(0, 21) + '…' : n.label;
-    return '<g class="gn" data-id="' + esc(n.id) + '" transform="translate(' + n.x.toFixed(1) + ',' +
-        n.y.toFixed(1) + ')" style="cursor:pointer">' +
-      (danger ? '<circle r="' + (r + 7) + '" fill="none" stroke="#ff5b57" stroke-width="1.2" opacity=".4"/>' : '') +
-      '<circle r="' + r + '" fill="#0a0f16" stroke="' + st.c + '" stroke-width="2" ' +
-        (danger ? 'filter="url(#glow)"' : '') + '/>' +
-      '<circle r="' + (r * .42) + '" fill="' + st.c + '" opacity=".85"/>' +
-      '<text y="' + (r + 15) + '" text-anchor="middle" fill="#dce6f2" ' +
-        'style="font:600 11px var(--mono);pointer-events:none">' + esc(label) + '</text>' +
-      '<text y="' + (r + 27) + '" text-anchor="middle" fill="#4a5a70" ' +
-        'style="font:600 8px var(--mono);letter-spacing:.14em;pointer-events:none">' +
-        esc(st.l.toUpperCase()) + '</text></g>';
-  }).join('');
-
-  svg.setAttribute('viewBox', [VIEWBOX.x, VIEWBOX.y, VIEWBOX.w, VIEWBOX.h].join(' '));
-  svg.innerHTML = defs + '<g id="gwrap">' + edgeSvg + nodeSvg + '</g>';
+  if (S.dim !== '3d') {
+    /* the 2D path keeps its old screen-space coordinates */
+    nodes.forEach(n => { n.x += SCENE.W / 2; n.y += SCENE.H / 2; });
+  }
+  SCENE.nodes = nodes;
+  SCENE.edges = edges;
+  SCENE.byId = new Map(nodes.map(n => [n.id, n]));
+  /* Distance from the origin drives the 3D camera pull-back. In 2D the nodes
+     have already been shifted into screen space, so this is measured before
+     that shift for 3D and is simply unused for 2D. */
+  SCENE.radius = S.dim === '3d'
+    ? (Math.max.apply(null, nodes.map(n =>
+        Math.sqrt(n.x * n.x + n.y * n.y + n.z * n.z))) || 600)
+    : 600;
+  fitCamera();
+  paint();
 
   /* legend */
   const types = Array.from(new Set(nodes.map(n => n.type)));
@@ -2831,57 +3027,98 @@ function drawGraph() {
   /* stat line */
   const edgeTypes = {};
   edges.forEach(e => { edgeTypes[e.type] = (edgeTypes[e.type] || 0) + 1; });
+  const hidden = nodes.length - nodes.filter(n => n.$label).length;
   $('#gstat').innerHTML =
     '<span><b>' + esc(lens.label) + '</b> lens</span>' +
     '<span><b>' + nodes.length + '</b> nodes</span>' +
     '<span><b>' + edges.length + '</b> edges</span>' +
     '<span><b>' + Object.keys(edgeTypes).length + '</b> relationship types</span>' +
+    (hidden > 0 ? '<span><b>' + hidden + '</b> labels hidden · hover to read</span>' : '') +
     (S.focus ? '<span style="color:var(--blue-b)">focused on ' +
       esc((S.model.nodes.get(S.focus) || {}).label || '') + '</span>' : '') +
-    '<span class="push">drag to pan · scroll to zoom · hover a node to inspect</span>';
+    '<span class="push">' + (S.dim === '3d'
+      ? 'drag to orbit · shift-drag to pan · scroll to zoom · click a node to focus'
+      : 'drag to pan · scroll to zoom · click a node to focus') + '</span>';
 
-  wireCanvas(byId);
+  wireCanvas();
 }
 
-function wireCanvas(byId) {
+function wireCanvas() {
   const svg = $('#gsvg'), tip = $('#nodetip'), wrap = $('#canvas');
-  let dragging = false, sx = 0, sy = 0, vb = Object.assign({}, VIEWBOX);
+  let mode = null, sx = 0, sy = 0, moved = 0;
+  let vb = null, cam0 = null;
 
   svg.onpointerdown = e => {
-    dragging = true; sx = e.clientX; sy = e.clientY;
+    sx = e.clientX; sy = e.clientY; moved = 0;
+    mode = (S.dim === '3d' && !e.shiftKey && e.button === 0) ? 'orbit' : 'pan';
     vb = Object.assign({}, VIEWBOX);
-    svg.classList.add('drag'); svg.setPointerCapture(e.pointerId);
+    cam0 = Object.assign({}, CAM);
+    svg.classList.add('drag');
+    try { svg.setPointerCapture(e.pointerId); } catch (err) {}
   };
+
   svg.onpointermove = e => {
-    if (dragging) {
-      const rect = svg.getBoundingClientRect();
-      VIEWBOX.x = vb.x - (e.clientX - sx) * (vb.w / rect.width);
-      VIEWBOX.y = vb.y - (e.clientY - sy) * (vb.h / rect.height);
-      svg.setAttribute('viewBox', [VIEWBOX.x, VIEWBOX.y, VIEWBOX.w, VIEWBOX.h].join(' '));
+    if (mode) {
+      const dx = e.clientX - sx, dy = e.clientY - sy;
+      moved = Math.max(moved, Math.abs(dx) + Math.abs(dy));
+      if (mode === 'orbit') {
+        CAM.yaw = cam0.yaw + dx * 0.007;
+        /* Clamp short of the poles: past vertical the scene rolls over and
+           every depth cue you just built up inverts. */
+        CAM.pitch = Math.max(-1.35, Math.min(1.35, cam0.pitch + dy * 0.007));
+        paintSoon();
+      } else if (S.dim === '3d') {
+        const rect = svg.getBoundingClientRect();
+        CAM.px = cam0.px + dx * (SCENE.W / rect.width);
+        CAM.py = cam0.py + dy * (SCENE.H / rect.height);
+        paintSoon();
+      } else {
+        const rect = svg.getBoundingClientRect();
+        VIEWBOX.x = vb.x - dx * (vb.w / rect.width);
+        VIEWBOX.y = vb.y - dy * (vb.h / rect.height);
+        svg.setAttribute('viewBox', [VIEWBOX.x, VIEWBOX.y, VIEWBOX.w, VIEWBOX.h].join(' '));
+      }
       return;
     }
     const g = e.target.closest && e.target.closest('.gn');
-    if (!g) { tip.classList.remove('on'); return; }
-    const n = byId.get(g.dataset.id);
+    if (!g) {
+      if (S.hover) { S.hover = null; paintSoon(); }
+      tip.classList.remove('on');
+      return;
+    }
+    const n = SCENE.byId.get(g.dataset.id);
     if (!n) return;
+    if (S.hover !== n.id) { S.hover = n.id; paintSoon(); }
     tip.innerHTML = nodeTip(n);
     const r = wrap.getBoundingClientRect();
     let x = e.clientX - r.left + 16, y = e.clientY - r.top + 14;
     if (x > r.width - 310) x = r.width - 310;
-    if (y > r.height - 190) y = r.height - 190;
+    if (y > r.height - 200) y = r.height - 200;
     tip.style.left = x + 'px'; tip.style.top = y + 'px';
     tip.classList.add('on');
   };
+
   const stop = e => {
-    dragging = false; svg.classList.remove('drag');
+    mode = null;
+    svg.classList.remove('drag');
     try { svg.releasePointerCapture(e.pointerId); } catch (err) {}
   };
-  svg.onpointerup = stop; svg.onpointercancel = stop;
-  svg.onpointerleave = () => { tip.classList.remove('on'); };
+  svg.onpointerup = stop;
+  svg.onpointercancel = stop;
+  svg.onpointerleave = () => {
+    tip.classList.remove('on');
+    if (S.hover) { S.hover = null; paintSoon(); }
+  };
+
   svg.onwheel = e => {
     e.preventDefault();
-    const rect = svg.getBoundingClientRect();
     const k = e.deltaY > 0 ? 1.12 : 0.89;
+    if (S.dim === '3d') {
+      CAM.dist = Math.max(220, Math.min(14000, CAM.dist * k));
+      paintSoon();
+      return;
+    }
+    const rect = svg.getBoundingClientRect();
     const mx = VIEWBOX.x + ((e.clientX - rect.left) / rect.width) * VIEWBOX.w;
     const my = VIEWBOX.y + ((e.clientY - rect.top) / rect.height) * VIEWBOX.h;
     VIEWBOX.w = Math.max(180, Math.min(9000, VIEWBOX.w * k));
@@ -2890,10 +3127,13 @@ function wireCanvas(byId) {
     VIEWBOX.y = my - ((e.clientY - rect.top) / rect.height) * VIEWBOX.h;
     svg.setAttribute('viewBox', [VIEWBOX.x, VIEWBOX.y, VIEWBOX.w, VIEWBOX.h].join(' '));
   };
+
   svg.onclick = e => {
+    /* An orbit that ends on a node is not a click on it. */
+    if (moved > 6) return;
     const g = e.target.closest && e.target.closest('.gn');
     if (!g) return;
-    const n = byId.get(g.dataset.id);
+    const n = SCENE.byId.get(g.dataset.id);
     if (n && (n.type === 'agent' || n.type === 'blueprint')) {
       S.focus = S.focus === n.id ? null : n.id;
       drawGraph();
@@ -3457,6 +3697,7 @@ function boot() {
   $('#in-client').value = localStorage.getItem('ah_client') || '';
   $('#in-tenant').value = localStorage.getItem('ah_tenant') || '';
   $('#redir-uri').textContent = redirectUri();
+  S.dim = localStorage.getItem('ah_dim') === '3d' ? '3d' : '2d';
 
   $('#btn-signin').onclick = signIn;
   $('#btn-signout').onclick = signOut;
