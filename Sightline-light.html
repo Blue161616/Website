@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Blind Spots — internet-facing assets Microsoft Defender isn't watching</title>
+<title>Exposure Intelligence — internet-facing assets Microsoft Defender isn't watching</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       onerror="this.onerror=null;this.href='https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css'">
 <style>
@@ -258,7 +258,7 @@
 <header class="header">
   <span class="brand-lockup" title="Blue16 Cybersecurity"><em>Blue</em>16</span>
   <span style="font-size:12px;color:var(--muted);font-weight:600">
-    <span class="brand-name">Blind Spots</span></span>
+    <span class="brand-name">Exposure Intelligence</span></span>
   <span class="pill">● Passive · sends no traffic to the estate</span>
   <span style="flex:1"></span>
   <button class="btn btn-secondary" style="font-size:10px;padding:4px 10px"
@@ -416,7 +416,7 @@ $rows | Export-Csv -NoTypeInformation -Encoding UTF8 .\entra-trusted-locations.c
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js'"></script>
 <script>
-// Blue16 Blind Spots — internet-facing assets Microsoft Defender is not watching
+// Blue16 Exposure Intelligence — internet-facing assets Microsoft Defender is not watching
 //
 // One file, no backend, no scanner. Load the two Microsoft portal exports and
 // it reports what is addressable against what Defender is actually watching.
@@ -1509,6 +1509,51 @@ const _expBand = s => _EXP_BANDS.find(b => s <= b.max) || _EXP_BANDS[_EXP_BANDS.
 const _expBlend = v => v.length ? Math.round(Math.min(100,
   0.6 * (v.reduce((a, b) => a + b, 0) / v.length) + 0.4 * Math.max.apply(null, v))) : 0;
 
+// ── Per-address risk and confidence, for the table ──────────────────────────
+//
+// Risk is the row's own share of the Exposture score: the same three terms,
+// scaled to 100, so the number printed on a row and the order the table sorts
+// by cannot disagree. It is printed rather than only sorted by because a reader
+// comparing two rows should see the distance between them, not only which one
+// comes first.
+function _surfaceRisk(r) {
+  return Math.round(_expRaw(r) / _EXP_MAX * 100);
+}
+
+// Confidence is how much of a row is evidence and how much is inference. It is
+// not a probability — nothing here was sampled — it is a ledger, and every term
+// that moves it is named, so 40% reads as "an address in a declared range that
+// nobody has claimed and nothing corroborates", never as a number to be trusted
+// on its own. The ceiling is 99: a device in one export and an address in the
+// other is as sure as this gets, and it is still two files rather than the box.
+function _surfaceConfidence(r) {
+  const why = [];
+  let c;
+  if (r.src === 'entra') {
+    c = r.owned ? 70 : 35;
+    why.push(r.owned
+      ? 'Inside a declared trusted range, confirmed as yours (+)'
+      : 'Inside a declared trusted range, ownership unconfirmed (−)');
+    why.push('In neither export — no resource and no device names it (−)');
+  } else if (r.src === 'onprem') {
+    c = r.kind === 'nat' ? 55 : 85;
+    why.push('A Defender device reports this as its public address (+)');
+    if (r.kind === 'nat')
+      why.push(`${r.natCount} devices report the same address, so it is the site’s, not this one’s (−)`);
+  } else {
+    c = r.device ? 90 : 70;
+    why.push('Listed in the Azure public-IP export (+)');
+    why.push(r.device
+      ? 'A Defender device is attached to it (+)'
+      : 'No Defender device — type inferred from the resource name (−)');
+  }
+  if (_idbAnswered(IDB_CACHE[r.ip])) { c += 5; why.push('Shodan answered for it (+)'); }
+  if (r.scanned && r.scannedPort) {
+    c += 5; why.push(`Defender’s own scan reached it on ${r.scannedPort} (+)`);
+  }
+  return { pct: Math.max(5, Math.min(99, c)), why };
+}
+
 function _exposture(t) {
   const rows = (t && t.rows) || [];
   if (!rows.length) return null;
@@ -2576,7 +2621,7 @@ function buildSurfaceReport(snap) {
     return `<div style="padding:22px 18px;font-size:12px;color:var(--muted);line-height:1.8">
       <div style="font-size:11px;font-weight:700;letter-spacing:.08em;color:var(--muted);
         text-transform:uppercase;margin-bottom:10px;display:flex;align-items:center;
-        gap:6px">${_azureIcon(13)} Blind Spots</div>
+        gap:6px">${_azureIcon(13)} Exposure Intelligence</div>
       Import the Microsoft data to see this. It reports
       what is addressable against what Defender is watching, before any scan.</div>`;
   }
@@ -2635,7 +2680,8 @@ function buildSurfaceReport(snap) {
     </div>` : ''}
 
     ${hdr(nx(), `Every public IP (${t.total})`,
-      'Worst first. <b>Type</b> is inferred from the resource name unless a device proves otherwise.')}
+      'Worst first. <b>Risk</b> is the address’s share of the Exposture score; <b>Confidence</b> is how much '
+      + 'of the row is evidence rather than inference. Hover either for the terms.')}
     ${(() => {
       const opts = k => { const m = new Map();
         t.rows.forEach(r => { const v = _surfaceFacets(r)[k]; m.set(v, (m.get(v) || 0) + 1); });
@@ -2663,12 +2709,59 @@ function buildSurfaceReport(snap) {
             esc(_SF_PRESETS[_SF.preset].label)}</b>` : ''}.
         <a onclick="surfaceClearFilters()" style="color:#58a6ff;cursor:pointer">Show all</a>.</div>` : ''}
     ${rowsHtml(t.rows.filter(_sfMatch), [
+      // The row's own share of the Exposture score, so the number printed and
+      // the order the table sorts by are one judgement. A reader comparing two
+      // rows should see the distance, not only which comes first.
+      ['Risk', r => { const n = _surfaceRisk(r), b = _expBand(n);
+        return `<span style="display:inline-flex;align-items:center;gap:6px;font-weight:700;color:${b.col}"
+          title="${esc(`${b.label} — ${n} of 100. Shodan ${_expShodan(r)}/5 · watching ${_expCov(r)}/3 · `
+            + `Defender exposure ${_expMs(r)}/2 — the three terms the Exposture score and this table's `
+            + 'order are built from.')}"
+          ><span style="width:9px;height:9px;border-radius:50%;background:${b.col};flex-shrink:0"></span>${n}</span>`; }],
+      
+      // Device first, because a device is proof; resource name second; and a
+      // swept address, which has neither, says Unknown — with the range it came
+      // out of beside it, since that is the only thing that lets a reader judge
+      // whether it is theirs. The type inference and SKU that used to be columns
+      // ride along as a tag and a tooltip: they still filter, they just no
+      // longer cost a column each.
       ['Public IP', r => (typeof geoFlag === 'function' ? geoFlag(r.ip) : '')
         + `<a onclick="surfaceIpClick('${jsStr(r.ip)}')"
           title="${esc('Open ' + r.ip + ' \u2014 what the two exports and Shodan know about it')}"
           style="font-family:ui-monospace,monospace;cursor:pointer;color:#58a6ff;
                  border-bottom:1px dotted rgba(88,166,255,.5)">${esc(r.ip)}</a>`],
-      
+      ['Asset', r => {
+        const meta = [r.sku ? 'SKU ' + r.sku : '', r.os ? 'OS ' + r.os : ''].filter(Boolean).join(' · ');
+        const main = r.src === 'entra'
+          ? '<span style="color:var(--dim)">Unknown</span>'
+            + (r.trustedCidr
+                ? ` <span style="color:var(--dim);font-family:ui-monospace,monospace"
+                    title="${esc('Answered inside the declared range ' + r.trustedCidr
+                      + (r.trustedName ? ' — ' + r.trustedName : '') + '. In neither export.')}"
+                    >${esc(r.trustedCidr)}</span>`
+                : '')
+          : r.device
+          ? `<span title="${esc(meta)}">${esc(r.device)}</span>` + (r.name && r.name !== r.device
+              ? ` <span style="color:var(--dim)">${esc(r.name)}</span>` : '')
+          : r.name
+          ? `<span title="${esc(meta)}">${esc(r.name)}</span>`
+          : '<span style="color:var(--dim)">Unknown</span>';
+        // A shared address named after one device reads as that device's address.
+        // It is the site's, and the other devices behind it are the reason it is
+        // flagged — so they are named here rather than only in a tooltip.
+        return main
+          + (r.kind === 'nat' && r.natCount > 1
+              ? ` <span style="color:var(--gold);font-size:9.5px"
+                   title="${esc(`${r.natCount} devices in this export report ${r.ip} as their public address, `
+                     + 'so it belongs to the site rather than to this device. Scanning it tests the internet '
+                     + 'breakout, not the machine.')}">+${r.natCount - 1} behind it</span>` : '')
+          + (r.kind === 'gateway'
+              ? ` <span style="color:var(--dim);font-size:9.5px"
+                   title="Inferred from the resource name — Azure's export carries no resource type">${
+                   esc(_frontendKind(r.name, r.assoc) || 'gateway')}<span style="opacity:.6">?</span></span>` : '')
+          + (r.os ? ` <span style="color:var(--muted);font-size:9.5px"
+               title="${esc('Reported by Defender: ' + r.os)}">${esc(_osFamily(r.os))}</span>` : '');
+      }],
       ['Source', r => r.src === 'entra'
         ? `<span style="color:#8b74e0;display:inline-flex;align-items:center;gap:5px"
              title="${esc('Found by asking Shodan about ' + (r.trustedCidr || 'a trusted range')
@@ -2698,102 +2791,77 @@ function buildSurfaceReport(snap) {
                     >Arc</span>` : ''}</span>`
         : `<span style="color:var(--muted);display:inline-flex;align-items:center;gap:5px"
              title="From the Azure public-IP export">${_ICO_AZ}Azure</span>`],
-      // A swept address has no device and no resource, so the name column would
-      // be a dash on every one of them. What is actually known is which declared
-      // range it came out of, which is the only thing that lets a reader judge
-      // whether it is theirs — so that goes here rather than in a second table.
-      ['Name', r => (r.src === 'entra'
-          ? (r.trustedName ? esc(r.trustedName) : '<span style="color:var(--dim)">unnamed location</span>')
-            + (r.trustedCidr
-                ? ` <span style="color:var(--dim);font-family:ui-monospace,monospace">${esc(r.trustedCidr)}</span>`
-                : '')
-          : r.device
-          ? esc(r.device) + (r.name && r.name !== r.device
-              ? ` <span style="color:var(--dim)">${esc(r.name)}</span>` : '')
-          : dim(r.name))
-        // A shared address named after one device reads as that device's address.
-        // It is the site's, and the other devices behind it are the reason it is
-        // flagged — so they are named here rather than only in a Type tooltip.
-        + (r.kind === 'nat' && r.natCount > 1
-            ? ` <span style="color:var(--gold);font-size:9.5px"
-                 title="${esc(`${r.natCount} devices in this export report ${r.ip} as their public address, `
-                   + 'so it belongs to the site rather than to this device. Scanning it tests the internet '
-                   + 'breakout, not the machine.')}">+${r.natCount - 1} behind it</span>` : '')
-        + (r.os ? ` <span style="color:var(--muted);font-size:9.5px"
-             title="${esc('Reported by Defender: ' + r.os)}">${esc(_osFamily(r.os))}</span>` : '')],
-      ['Type', r => r.kind === 'nat'
-        ? `<span style="color:var(--gold)" title="${esc(`${r.natCount} devices report this same address, so it is a site NAT or proxy — scanning it tests the internet breakout, not any one machine`)}">NAT · ${r.natCount} devices</span>`
-        : r.kind === 'gateway'
-        ? `<span style="color:var(--dim)" title="Inferred from the resource name — Azure's export carries no resource type">${
-            esc(_frontendKind(r.name, r.assoc) || 'gateway')}<span style="opacity:.6">?</span></span>`
-        : '<span style="color:var(--text)">machine</span>'],
-      ['SKU', r => r.sku ? (/^basic$/i.test(r.sku)
-        ? `<span style="color:var(--gold)">${esc(r.sku)}</span>` : esc(r.sku)) : dim('')],
-      // Shodan's own last scan, not ours. Empty until the operator asks for it,
-      // because asking means handing this address list to a third party.
-      // On a shared edge, only the port Microsoft attributed belongs to the named
-      // device. Anything else Shodan sees there is published through the same
-      // firewall to something else — or is the firewall itself — and printing it
-      // beside one device's name reads as that device's port.
-      ['Shodan', r => { const d = IDB_CACHE[r.ip];
-        if (d === undefined) return '<span style="color:var(--dim)">—</span>';
-        if (d === null) return '<span style="color:var(--dim)">…</span>';
-        const ports = (d.ports || []), vulns = (d.vulns || []);
-        if (!ports.length && !vulns.length) return '<span style="color:var(--dim)">nothing</span>';
-        // Ports on a shared edge that Defender did not attribute to this device.
-        const orphan = r.kind === 'nat'
-          ? ports.filter(pt => String(pt) !== String(r.scannedPort)) : [];
-        return `<a href="https://www.shodan.io/host/${esc(r.ip)}" target="_blank" rel="noopener"
-            style="color:inherit;text-decoration:none" title="${esc(
-              (ports.length ? 'Ports Shodan last saw open: ' + ports.join(', ') : 'No open ports in Shodan')
-              + (orphan.length ? ` · ${orphan.join(', ')} ${orphan.length === 1 ? 'is' : 'are'} published `
-                 + `through this shared edge but not attributed to ${r.device || 'this device'} — `
-                 + 'it forwards somewhere else, or it is the firewall itself' : '')
-              + (vulns.length ? ' · CVEs: ' + vulns.slice(0, 8).join(', ')
-                 + (vulns.length > 8 ? ' +' + (vulns.length - 8) : '') : ''))}">
-          ${ports.length ? ports.slice(0, 5).map(pt => { const rk = _portRisk(pt);
-              const col = rk === 'critical' ? 'var(--red)' : rk === 'high' ? 'var(--orange)'
-                        : rk === 'medium' ? 'var(--gold)' : 'var(--muted)';
-              const lbl = _portLabel(pt);
-              return `<span style="color:${col}${rk === 'critical' || rk === 'high'
-                ? ';font-weight:700' : ''}" title="${esc(lbl ? `${pt} — ${lbl}${rk ? ' · ' + rk : ''}`
-                : String(pt))}">${pt}</span>`; }).join(' ')
-            + (ports.length > 5 ? ` <span style="color:var(--dim)">+${ports.length - 5}</span>` : '') : ''}
-          ${orphan.length ? `<span style="color:var(--gold);font-size:9px;font-weight:700"
-            > ${orphan.length} unattributed</span>` : ''}
-          ${vulns.length ? `<span style="color:var(--red);font-weight:700"> ${vulns.length} CVE</span>` : ''}
-        </a>`; }],
-      // The column is headed Defender, so "No device" spelled out on every row is
-      // the header again in smaller type. A glyph scans down 46 rows in one look;
-      // the words move to the tooltip, where they are read once.
+      // Every port something has reached from the internet: Shodan's last
+      // observation and the port Microsoft's own scanner got in on, merged, so
+      // one cell answers "what is open" whoever saw it. Empty until Shodan is
+      // asked, because asking hands the address list to a third party. On a
+      // shared edge only the port Defender attributed belongs to the named
+      // device; the rest are published through the same firewall to something
+      // else and are marked as such rather than credited to this row.
+      ['Exposure', r => { const d = IDB_CACHE[r.ip];
+        const shodan = new Set((_idbAnswered(d) ? (d.ports || []) : []).map(String));
+        const ms = (r.scanned && r.scannedPort) ? String(r.scannedPort) : '';
+        const ports = [...new Set([...shodan, ...(ms ? [ms] : [])])].sort((a, b) => +a - +b);
+        if (!ports.length) {
+          if (d === undefined) return '<span style="color:var(--dim)" title="Shodan not asked yet">—</span>';
+          if (d === null) return '<span style="color:var(--dim)">…</span>';
+          if (d && d.error) return '<span style="color:var(--gold)" title="The Shodan lookup failed — unmeasured, not clean">?</span>';
+          return '<span style="color:var(--dim)" title="Shodan saw no open port, and Defender reached none">nothing</span>';
+        }
+        const orphan = r.kind === 'nat' ? ports.filter(p => p !== ms) : [];
+        const cell = ports.slice(0, 6).map(p => { const rk = _portRisk(p);
+          const col = rk === 'critical' ? 'var(--red)' : rk === 'high' ? 'var(--orange)'
+                    : rk === 'medium' ? 'var(--gold)' : 'var(--muted)';
+          const lbl = _portLabel(p);
+          const who = shodan.has(p) && p === ms ? 'Shodan and Defender’s own scan'
+                    : shodan.has(p) ? 'Shodan' : 'Defender’s own scan';
+          return `<span style="color:${col}${rk === 'critical' || rk === 'high' ? ';font-weight:700' : ''}"
+            title="${esc(`${p}${lbl ? ' — ' + lbl : ''}${rk ? ' · ' + rk : ''} · seen by ${who}`)}">${p}</span>`;
+        }).join('<span style="color:var(--dim)">/</span>');
+        return cell
+          + (ports.length > 6 ? ` <span style="color:var(--dim)">+${ports.length - 6}</span>` : '')
+          + (orphan.length ? ` <span style="color:var(--gold);font-size:9px;font-weight:700"
+              title="${esc(`${orphan.join(', ')} ${orphan.length === 1 ? 'is' : 'are'} published through this `
+                + `shared edge but not attributed to ${r.device || 'this device'} — it forwards somewhere `
+                + 'else, or it is the firewall itself')}">${orphan.length} unattributed</span>` : '');
+      }],
+      // One glyph per row; the words move to the tooltip, where they are read
+      // once. Four states, not two: a device Defender knows but no sensor reports
+      // is neither watched nor absent, and a gateway is not expected to carry an
+      // agent at all — flattening those into a cross would say "unwatched" about
+      // an address nothing could ever watch.
       [_ICO_MDE + ' Defender', r => {
-        const glyph = r.mde === 'onboarded'
-          ? '<span style="color:#3fb950" title="Onboarded — an active Defender sensor is reporting">✓</span>'
+        const rb = _reasonBadge(r.reason, r.scannedPort);
+        const why = rb ? ' · ' + rb.tip : '';
+        return r.mde === 'onboarded'
+          ? `<span style="color:#3fb950;font-weight:700"
+               title="${esc('Onboarded — an active Defender sensor is reporting' + why)}">✓</span>`
           : r.mde === 'notonboarded'
-            ? `<span style="color:var(--gold)" title="${esc('Defender knows this device but no sensor is reporting — '
-                + (r.onboarding || 'not onboarded'))}">⚠</span>`
+            ? `<span style="color:var(--gold);font-weight:700"
+                 title="${esc('Defender knows this device but no sensor is reporting — '
+                   + (r.onboarding || 'not onboarded') + why)}">⚠</span>`
             : r.kind === 'gateway'
               ? '<span style="color:var(--dim)" title="No agent is expected on a gateway, WAF or bastion">–</span>'
-              : '<span style="color:var(--red)" title="No Defender device in this export">✗</span>';
-        // The port Microsoft's own scanner got in on, beside the glyph because
-        // that is whose observation it is. Independent of the glyph: a device can
-        // be unmonitored and still have been reached.
-        const rb = _reasonBadge(r.reason, r.scannedPort);
-        if (!r.scanned || !r.scannedPort) {
-          // No port, but Defender still had a reason. Saying which stops "no
-          // port" from reading as "nothing known".
-          return rb ? `${glyph} <span style="color:${rb.col};font-size:9px;font-weight:700"
-            title="${esc(rb.tip)}">${rb.short}</span>` : glyph;
-        }
-        const pt = r.scannedPort, rk = _portRisk(pt), lbl = _portLabel(pt);
-        const col = rk === 'critical' ? 'var(--red)' : rk === 'high' ? 'var(--orange)'
-                  : rk === 'medium' ? 'var(--gold)' : 'var(--muted)';
-        return `${glyph} <span style="color:${col};font-weight:700;font-size:10px"
-          title="${esc('Microsoft scanned this address from the internet and reached it on port ' + pt
-            + (lbl ? ' (' + lbl + ')' : '') + '. That is Defender reporting its own scan — it is why the '
-            + 'device is flagged internet-facing, and it is not traffic this tool sent.')}">${esc(pt)}</span>${
-          rb ? ` <span style="color:${rb.col};font-size:9px;font-weight:700"
-            title="${esc(rb.tip)}">${rb.short}</span>` : ''}`; }],
+              : `<span style="color:var(--red);font-weight:700"
+                   title="${esc('No Defender device in this export' + why)}">✗</span>`; }],
+      // Shodan's CVE count for the address. A dash is "not asked", never zero.
+      ['CVEs', r => { const d = IDB_CACHE[r.ip];
+        if (d === undefined) return '<span style="color:var(--dim)" title="Shodan not asked yet">—</span>';
+        if (d === null) return '<span style="color:var(--dim)">…</span>';
+        if (d.error) return '<span style="color:var(--gold)" title="The Shodan lookup failed — unmeasured, not clean">?</span>';
+        const v = d.vulns || [];
+        if (!v.length) return '<span style="color:var(--dim)">0</span>';
+        const { anyKev } = cveExploitAgg(v);
+        return `<a href="https://www.shodan.io/host/${esc(r.ip)}" target="_blank" rel="noopener"
+          style="color:var(--red);font-weight:700;text-decoration:none"
+          title="${esc(v.slice(0, 8).join(', ') + (v.length > 8 ? ' +' + (v.length - 8) : '')
+            + (anyKev ? ' · at least one is in CISA KEV' : ''))}">${v.length}${
+          anyKev ? ' <span style="font-size:9px">KEV</span>' : ''}</a>`; }],
+      // How much of the row is evidence and how much is inference — a ledger,
+      // not a probability, and every entry in it is in the tooltip.
+      ['Confidence', r => { const c = _surfaceConfidence(r);
+        const col = c.pct >= 80 ? '#3fb950' : c.pct >= 55 ? 'var(--gold)' : 'var(--orange)';
+        return `<span style="color:${col};font-weight:700" title="${esc(c.why.join('\n'))}">${c.pct}%</span>`; }],
     ])}
     ${s.hadDefenderFile ? '' : `<div style="font-size:10.5px;color:var(--gold);margin-top:6px">
       No Defender export was supplied, so no address here has been measured for coverage.</div>`}
@@ -3451,7 +3519,7 @@ _wire('entra-file', 'entra-input');
 readCsvs();
 initMap();
 
-// ── Blind Spots: baseline, tenant and trusted ranges ──────────────
+// ── Exposure Intelligence: baseline, tenant and trusted ranges ────
 //
 // The half bound to this page: ids that exist only on its import screen. The
 // arithmetic behind it is lifted from scanner.html.
@@ -3484,7 +3552,7 @@ function downloadBaseline() {
   const blob = new Blob([JSON.stringify(b, null, 1)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'blind-spots-baseline-' + (who ? who + '-' : '') + stamp + '.json';
+  a.download = 'exposure-intelligence-baseline-' + (who ? who + '-' : '') + stamp + '.json';
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   toast('Baseline saved — it holds public IPs and device names, so keep it with the engagement');
@@ -3500,7 +3568,7 @@ function loadBaselineFile(input) {
     _BASELINE = null; _BASE_ERR = '';
     try {
       const j = JSON.parse(e.target.result);
-      if (!j || j.kind !== BASE_KIND) throw new Error('not a Blind Spots baseline file');
+      if (!j || j.kind !== BASE_KIND) throw new Error('not an Exposure Intelligence baseline file');
       if (j.version > BASE_VERSION) throw new Error('written by a newer build of this tool');
       if (!j.addresses) throw new Error('no addresses in it');
       _BASELINE = j;
