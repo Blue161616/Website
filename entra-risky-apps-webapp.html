@@ -438,7 +438,7 @@
           <label for="cfg-client">Application (client) ID</label>
           <input id="cfg-client" placeholder="00000000-0000-0000-0000-000000000000" spellcheck="false" autocomplete="off">
           <div class="hint">A <b>SPA</b> app registration with delegated, <b>read-only</b> permissions —
-            the two required and three optional scopes are listed below.</div>
+            the two required and four optional scopes are listed below.</div>
         </div>
         <div>
           <label for="cfg-tenant">Directory (tenant) ID or domain</label>
@@ -495,6 +495,8 @@
                 <td class="why">Entra <b>directory roles held by service principals</b> — the authorisation behind a capability permission like <code>Exchange.ManageAsApp</code>, which does nothing without it</td></tr>
             <tr><td class="api"><code>AuditLog.Read.All</code></td>
                 <td class="why">usage detection — whether and when each app actually authenticated app-only, and with which credential (sign-in logs need Entra ID P1/P2)</td></tr>
+            <tr><td class="api"><code>Organization.Read.All</code></td>
+                <td class="why"><b>Microsoft Entra Workload ID</b> licence check — reads the tenant&#39;s subscribed SKUs to tell whether Workload ID Premium (<code>AAD_WRKLDID_P2</code>) is present. Premium is tenant-level: one active unit unlocks risky workload identities and Conditional Access for workload identities, without being assigned to anything</td></tr>
             <tr><td class="api"><code>Application.ReadWrite.All</code></td>
                 <td class="why">only to edit an app&#39;s redirect URIs from the detail drawer</td></tr>
           </table>
@@ -536,6 +538,7 @@
       <button id="btn-csv-view" class="secondary" style="padding:7px 14px" title="The same columns, but only the applications matching the filters currently applied. The file records which filters those were, so it is never mistaken for a full scan.">Export view</button>
     </div>
 
+    <div id="licenseBar"></div>
     <div class="kpi-head" id="kpiHead"></div>
     <div class="kpis" id="kpis"></div>
     <div class="chg" id="kpiChange"></div>
@@ -716,6 +719,34 @@
   // portal deep-link + a "grant this scope" hint.
   var AUDIT_SCOPE = 'https://graph.microsoft.com/AuditLog.Read.All';
   async function optionalAuditToken(){ try { return (await msalInstance.acquireTokenSilent({ account: account, scopes: [AUDIT_SCOPE] })).accessToken; } catch(e){ return null; } }
+  // Optional (graceful-degrade): Microsoft Entra Workload ID LICENCE check. Workload ID Premium is a standalone SKU
+  // (Workload_Identities_P2, service plan AAD_WRKLDID_P2) and it is tenant-level — one active unit in subscribedSkus
+  // unlocks risky workload identities and Conditional Access for workload identities for every service principal,
+  // whether or not the unit is "assigned". So the test is: any SKU whose service plans include a Workload ID plan
+  // that provisioned successfully, on a SKU that is Enabled (or Warning = grace period) with at least one unit.
+  // Requested silently; without Organization.Read.All the bar says "not checked" rather than "not licensed".
+  var LICENSE_SCOPE = 'https://graph.microsoft.com/Organization.Read.All';
+  async function optionalLicenseToken(){ try { return (await msalInstance.acquireTokenSilent({ account: account, scopes: [LICENSE_SCOPE] })).accessToken; } catch(e){ return null; } }
+  var WORKLOAD_ID_PLANS = {
+    '7dc0e92d-bf15-401d-907e-0884efe7c760': 'AAD_WRKLDID_P2', // Microsoft Entra Workload ID (Premium)
+    '84c289f0-efcb-486f-8581-07f44fc9efad': 'AAD_WRKLDID_P1'  // Workload ID P1 (bundled in the _CN SKU)
+  };
+  // Reduce a subscribedSkus page to the licence verdict. A pure function so the demo can call it too.
+  function workloadLicenseFrom(skus){
+    var hits = [];
+    (skus || []).forEach(function(sku){
+      var st = String(sku.capabilityStatus || '');
+      var units = (sku.prepaidUnits && (sku.prepaidUnits.enabled || 0)) || 0;
+      (sku.servicePlans || []).forEach(function(pl){
+        var id = String(pl.servicePlanId || '').toLowerCase(), nm = String(pl.servicePlanName || '');
+        if(!(WORKLOAD_ID_PLANS[id] || /^AAD_WRKLDID_P[12]$/i.test(nm))) return;
+        hits.push({ sku: sku.skuPartNumber || sku.skuId, plan: nm || WORKLOAD_ID_PLANS[id], status: st, provisioning: String(pl.provisioningStatus || ''), enabled: units, consumed: sku.consumedUnits || 0,
+                    live: /^(Enabled|Warning)$/.test(st) && /^Success$/i.test(pl.provisioningStatus || '') && units > 0 });
+      });
+    });
+    var live = hits.filter(function(h){ return h.live; });
+    return { available: live.length > 0, hits: hits, best: live[0] || hits[0] || null };
+  }
   var MS_TENANT = 'f8cdef31-a31e-4b4a-93e4-5f571e91255a';
   // Microsoft-owned tenants that publish first-party apps. Apps owned by any of these are shown as "Microsoft".
   //   f8cdef31… = Microsoft Services, 72f988bf… = Microsoft corporate — the two canonical ones.
@@ -1645,6 +1676,7 @@
     cache.results = demoScore(demoApps());
     cache.scannedAt = Date.now() - 4 * 60000;
     cache.rolesAvailable = true; cache.auditAvailable = true;
+    cache.workloadLicense = workloadLicenseFrom([{ skuPartNumber:'Workload_Identities_P2', capabilityStatus:'Enabled', consumedUnits:0, prepaidUnits:{ enabled:1 }, servicePlans:[{ servicePlanId:'7dc0e92d-bf15-401d-907e-0884efe7c760', servicePlanName:'AAD_WRKLDID_P2', provisioningStatus:'Success' }] }]);
     cache.baseline = demoBaseline(cache.results);
     hide('configCard'); show('results'); render();
     setStatus('Demo data \u2014 ' + cache.results.length + ' enterprise app(s), nothing fetched.');
@@ -1676,6 +1708,17 @@
       // wide call; index by principalId where the principal is a service principal. This surfaces the Entra admin role
       // on the app itself (e.g. Exchange Administrator behind Exchange.ManageAsApp) — the authorisation a Graph app
       // permission alone doesn't show. Degrades gracefully: no scope → feature absent + a notice.
+      // Workload ID LICENCE (optional — Organization.Read.All). One small call; the verdict is shown above the KPIs.
+      cache.workloadLicense = null;
+      var licToken = await optionalLicenseToken();
+      if(licToken){
+        try {
+          setStatus('Checking Microsoft Entra Workload ID licence…', false, true);
+          var skus = await graphGetAllPages(GBASE + '/subscribedSkus?$select=' + encodeURIComponent('skuId,skuPartNumber,capabilityStatus,consumedUnits,prepaidUnits,servicePlans'), licToken);
+          cache.workloadLicense = workloadLicenseFrom(skus);
+        } catch(e){ cache.workloadLicense = { available: null, error: (e && e.message) || String(e) }; }
+      }
+
       var dirRolesBySpId = {}; cache.rolesAvailable = false; cache.rolesError = null;
       var roleToken = await optionalRoleToken();
       if(roleToken){
@@ -2041,7 +2084,24 @@
   var facet = {};
   FACETS.forEach(function(g){ facet[g.id] = { mode:'any', on:{} }; });
 
+  // Microsoft Entra Workload ID licence — one line at the very top of the results, before any number. Three states:
+  // licensed (green), not licensed (warn: the Premium signals do not exist in this tenant), not checked (info: the
+  // scope is missing or the call failed — never reported as "not licensed").
+  function renderLicenseBar(){
+    var L = cache.workloadLicense, h;
+    if(L && L.available === true){
+      var b = L.best;
+      h = '<div class="notice notice-ok"><b>Microsoft Entra Workload ID licence: present</b> — <code>' + escHtml(b.sku) + '</code> / <code>' + escHtml(b.plan) + '</code>, ' + escHtml(String(b.status)) + ', ' + b.enabled + ' unit' + (b.enabled === 1 ? '' : 's') + ' (' + b.consumed + ' assigned). Premium is tenant-level, so an unassigned unit still unlocks risky workload identities and Conditional Access for workload identities.</div>';
+    } else if(L && L.available === false){
+      var stale = L.best ? ' A <code>' + escHtml(L.best.sku) + '</code> SKU exists but is ' + escHtml(L.best.status || 'not active') + (L.best.enabled ? '' : ' with 0 units') + '.' : '';
+      h = '<div class="notice notice-warn"><b>Microsoft Entra Workload ID licence: not found</b> — no active Workload ID Premium SKU (<code>AAD_WRKLDID_P2</code>) in this tenant.' + stale + ' Risky workload identities and Conditional Access for workload identities are not available here; everything on this page still applies, since it is built from consent and credential data.</div>';
+    } else {
+      h = '<div class="notice notice-info"><b>Microsoft Entra Workload ID licence: not checked</b> — grant <code>Organization.Read.All</code> (admin consent) to this app registration to read the tenant\'s subscribed SKUs.' + (L && L.error ? ' <span class="mono">(' + escHtml(L.error) + ')</span>' : '') + '</div>';
+    }
+    el('licenseBar').innerHTML = h;
+  }
   function render(){
+    renderLicenseBar();
     el('notices').innerHTML = (cache.rolesAvailable === false ? '<div class="notice notice-warn"><b>Directory roles held by service principals were not read</b> — grant <code>RoleManagement.Read.Directory</code> (admin consent) to this app registration to reveal Entra admin roles assigned to apps. This is the authorisation behind capability permissions like <code>Exchange.ManageAsApp</code>, which is inert without a role such as Exchange Administrator on the SP.' + (cache.rolesError ? ' <span class="mono">(' + escHtml(cache.rolesError) + ')</span>' : '') + '</div>' : '')
       // Only the OFF state earns a banner, the same way the directory-roles one above does. These two are all that
       // is left on this bar, and both say the same kind of thing: a permission the scan does not have, and the
