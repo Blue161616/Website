@@ -730,7 +730,29 @@
   // that provisioned successfully, on a SKU that is Enabled (or Warning = grace period) with at least one unit.
   // Requested silently; without Organization.Read.All the bar says "not checked" rather than "not licensed".
   var LICENSE_SCOPE = 'https://graph.microsoft.com/Organization.Read.All';
-  async function optionalLicenseToken(){ try { return (await msalInstance.acquireTokenSilent({ account: account, scopes: [LICENSE_SCOPE] })).accessToken; } catch(e){ return null; } }
+  // The scopes a Graph token actually carries (its scp claim) — what a "required scopes are missing" 403 is about.
+  function tokenScopes(tok){
+    try { var b = tok.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'); return (JSON.parse(decodeURIComponent(escape(atob(b)))).scp || '').split(' ').filter(Boolean); } catch(e){ return []; }
+  }
+  // One optional read: a silent token for ONE scope, then fn(token). Consent granted after the session started can
+  // leave MSAL holding a token minted before it, so a 403 that names missing scopes is retried once with a token
+  // forced past the cache. If that fails too, the error names the scopes the token really carried, so the notice
+  // says whether this is consent, cache, or role. Returns { skipped } with no token, { value, token } on success,
+  // { error } otherwise.
+  async function optionalRead(scope, fn){
+    var get = async function(force){ try { return (await msalInstance.acquireTokenSilent({ account: account, scopes: [scope], forceRefresh: !!force })).accessToken; } catch(e){ return null; } };
+    var tok = await get(false); if(!tok) return { skipped: true };
+    try { return { value: await fn(tok), token: tok }; }
+    catch(e){
+      var msg = (e && e.message) || String(e);
+      if(/scopes are missing|AccessDenied|\b403\b/i.test(msg)){
+        var t2 = await get(true);
+        if(t2 && t2 !== tok){ try { return { value: await fn(t2), token: t2 }; } catch(e2){ msg = (e2 && e2.message) || String(e2); tok = t2; } }
+      }
+      var have = tokenScopes(tok), short = scope.replace('https://graph.microsoft.com/', '');
+      return { error: msg + ' — token scopes: ' + (have.join(' ') || '(none readable)') + (have.indexOf(short) >= 0 ? ' — the scope IS in the token, so this is the signed-in account\'s directory role, not consent' : ' — ' + short + ' is NOT in the token; sign out and back in to drop the cached token, and check admin consent') };
+    }
+  }
   var WORKLOAD_ID_PLANS = {
     '7dc0e92d-bf15-401d-907e-0884efe7c760': 'AAD_WRKLDID_P2', // Microsoft Entra Workload ID (Premium)
     '84c289f0-efcb-486f-8581-07f44fc9efad': 'AAD_WRKLDID_P1'  // Workload ID P1 (bundled in the _CN SKU)
@@ -756,13 +778,11 @@
   // sign-ins. Needs the Workload ID Premium licence; without it the API refuses or returns "hidden". Requested
   // silently; the signed-in account also needs Global Reader or Security Reader for the call to succeed.
   var RISK_SCOPE = 'https://graph.microsoft.com/IdentityRiskyServicePrincipal.Read.All';
-  async function optionalRiskToken(){ try { return (await msalInstance.acquireTokenSilent({ account: account, scopes: [RISK_SCOPE] })).accessToken; } catch(e){ return null; } }
   // Optional (graceful-degrade): CONDITIONAL ACCESS FOR WORKLOAD IDENTITIES. One tenant-wide read of the policies;
   // the ones whose clientApplications condition names service principals are the ones that can act on an app's
   // own sign-in (block on risk, block outside trusted locations). Only single-tenant service principals registered
   // in this tenant are reachable by such policies — multi-tenant, Microsoft and managed identities are not.
   var CA_SCOPE = 'https://graph.microsoft.com/Policy.Read.ConditionalAccess';
-  async function optionalCaToken(){ try { return (await msalInstance.acquireTokenSilent({ account: account, scopes: [CA_SCOPE] })).accessToken; } catch(e){ return null; } }
   // Reduce the tenant's policies to the workload-identity ones, in the shape the coverage test needs.
   function workloadPoliciesFrom(policies){
     var out = [], lc = function(x){ return String(x || '').toLowerCase(); };
@@ -1801,38 +1821,26 @@
       // permission alone doesn't show. Degrades gracefully: no scope → feature absent + a notice.
       // Workload ID LICENCE (optional — Organization.Read.All). One small call; the verdict is shown above the KPIs.
       cache.workloadLicense = null;
-      var licToken = await optionalLicenseToken();
-      if(licToken){
-        try {
-          setStatus('Checking Microsoft Entra Workload ID licence…', false, true);
-          var skus = await graphGetAllPages(GBASE + '/subscribedSkus?$select=' + encodeURIComponent('skuId,skuPartNumber,capabilityStatus,consumedUnits,prepaidUnits,servicePlans'), licToken);
-          cache.workloadLicense = workloadLicenseFrom(skus);
-        } catch(e){ cache.workloadLicense = { available: null, error: (e && e.message) || String(e) }; }
-      }
+      setStatus('Checking Microsoft Entra Workload ID licence…', false, true);
+      var licRead = await optionalRead(LICENSE_SCOPE, function(t){ return graphGetAllPages(GBASE + '/subscribedSkus?$select=' + encodeURIComponent('skuId,skuPartNumber,capabilityStatus,consumedUnits,prepaidUnits,servicePlans'), t); });
+      if(licRead.value) cache.workloadLicense = workloadLicenseFrom(licRead.value);
+      else if(licRead.error) cache.workloadLicense = { available: null, error: licRead.error };
 
       // RISKY WORKLOAD IDENTITIES (optional — IdentityRiskyServicePrincipal.Read.All; needs the Workload ID licence).
       var riskBySpId = {}; cache.wiRiskAvailable = false; cache.wiRiskError = null;
-      var riskToken = await optionalRiskToken();
-      if(riskToken){
-        try {
-          setStatus('Reading risky workload identities…', false, true);
-          var risky = await graphGetAllPages(GBASE + '/identityProtection/riskyServicePrincipals?$select=' + encodeURIComponent('id,appId,riskState,riskLevel,riskDetail,riskLastUpdatedDateTime,isProcessing') + '&$top=500', riskToken, function(n){ setStatus('Reading risky workload identities… ' + n, false, true); });
-          risky.forEach(function(x){ riskBySpId[String(x.id).toLowerCase()] = { state: x.riskState || 'none', level: x.riskLevel || 'none', detail: x.riskDetail || 'none', updated: x.riskLastUpdatedDateTime || null, processing: !!x.isProcessing }; });
-          cache.wiRiskAvailable = true;
-        } catch(e){ cache.wiRiskError = (e && e.message) || String(e); }
-      }
+      setStatus('Reading risky workload identities…', false, true);
+      var riskRead = await optionalRead(RISK_SCOPE, function(t){ return graphGetAllPages(GBASE + '/identityProtection/riskyServicePrincipals?$select=' + encodeURIComponent('id,appId,riskState,riskLevel,riskDetail,riskLastUpdatedDateTime,isProcessing') + '&$top=500', t, function(n){ setStatus('Reading risky workload identities… ' + n, false, true); }); });
+      if(riskRead.value){
+        riskRead.value.forEach(function(x){ riskBySpId[String(x.id).toLowerCase()] = { state: x.riskState || 'none', level: x.riskLevel || 'none', detail: x.riskDetail || 'none', updated: x.riskLastUpdatedDateTime || null, processing: !!x.isProcessing }; });
+        cache.wiRiskAvailable = true;
+      } else if(riskRead.error) cache.wiRiskError = riskRead.error;
       // CONDITIONAL ACCESS FOR WORKLOAD IDENTITIES (optional — Policy.Read.ConditionalAccess). One call; each row
       // is then matched against the policies that name service principals.
       cache.wiPolicies = []; cache.caAvailable = false; cache.caError = null;
-      var caToken = await optionalCaToken();
-      if(caToken){
-        try {
-          setStatus('Reading Conditional Access policies for workload identities…', false, true);
-          var pols = await graphGetAllPages(GBASE + '/identity/conditionalAccess/policies?$select=' + encodeURIComponent('id,displayName,state,conditions,grantControls'), caToken);
-          cache.wiPolicies = workloadPoliciesFrom(pols);
-          cache.caAvailable = true;
-        } catch(e){ cache.caError = (e && e.message) || String(e); }
-      }
+      setStatus('Reading Conditional Access policies for workload identities…', false, true);
+      var caRead = await optionalRead(CA_SCOPE, function(t){ return graphGetAllPages(GBASE + '/identity/conditionalAccess/policies?$select=' + encodeURIComponent('id,displayName,state,conditions,grantControls'), t); });
+      if(caRead.value){ cache.wiPolicies = workloadPoliciesFrom(caRead.value); cache.caAvailable = true; }
+      else if(caRead.error) cache.caError = caRead.error;
 
       var dirRolesBySpId = {}; cache.rolesAvailable = false; cache.rolesError = null;
       var roleToken = await optionalRoleToken();
