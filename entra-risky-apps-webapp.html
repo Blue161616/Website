@@ -438,7 +438,7 @@
           <label for="cfg-client">Application (client) ID</label>
           <input id="cfg-client" placeholder="00000000-0000-0000-0000-000000000000" spellcheck="false" autocomplete="off">
           <div class="hint">A <b>SPA</b> app registration with delegated, <b>read-only</b> permissions —
-            the two required and four optional scopes are listed below.</div>
+            the two required and six optional scopes are listed below.</div>
         </div>
         <div>
           <label for="cfg-tenant">Directory (tenant) ID or domain</label>
@@ -497,6 +497,10 @@
                 <td class="why">usage detection — whether and when each app actually authenticated app-only, and with which credential (sign-in logs need Entra ID P1/P2)</td></tr>
             <tr><td class="api"><code>Organization.Read.All</code></td>
                 <td class="why"><b>Microsoft Entra Workload ID</b> licence check — reads the tenant&#39;s subscribed SKUs to tell whether Workload ID Premium (<code>AAD_WRKLDID_P2</code>) is present. Premium is tenant-level: one active unit unlocks risky workload identities and Conditional Access for workload identities, without being assigned to anything</td></tr>
+            <tr><td class="api"><code>IdentityRiskyServicePrincipal.Read.All</code></td>
+                <td class="why"><b>Risky workload identities</b> — what Entra ID Protection has concluded about each service principal (risk state, level, detail). Needs the Workload ID licence above; the signed-in account needs Global Reader or Security Reader</td></tr>
+            <tr><td class="api"><code>Policy.Read.ConditionalAccess</code></td>
+                <td class="why"><b>Conditional Access for workload identities</b> — which enabled or report-only policies include each service principal, and which single-tenant apps no policy covers. Multi-tenant and Microsoft apps are outside what such policies can reach</td></tr>
             <tr><td class="api"><code>Application.ReadWrite.All</code></td>
                 <td class="why">only to edit an app&#39;s redirect URIs from the detail drawer</td></tr>
           </table>
@@ -747,6 +751,49 @@
     var live = hits.filter(function(h){ return h.live; });
     return { available: live.length > 0, hits: hits, best: live[0] || hits[0] || null };
   }
+  // Optional (graceful-degrade): RISKY WORKLOAD IDENTITIES. Entra ID Protection's verdict on each service principal
+  // (riskState / riskLevel / riskDetail) — leaked credentials, anomalous service-principal activity, suspicious
+  // sign-ins. Needs the Workload ID Premium licence; without it the API refuses or returns "hidden". Requested
+  // silently; the signed-in account also needs Global Reader or Security Reader for the call to succeed.
+  var RISK_SCOPE = 'https://graph.microsoft.com/IdentityRiskyServicePrincipal.Read.All';
+  async function optionalRiskToken(){ try { return (await msalInstance.acquireTokenSilent({ account: account, scopes: [RISK_SCOPE] })).accessToken; } catch(e){ return null; } }
+  // Optional (graceful-degrade): CONDITIONAL ACCESS FOR WORKLOAD IDENTITIES. One tenant-wide read of the policies;
+  // the ones whose clientApplications condition names service principals are the ones that can act on an app's
+  // own sign-in (block on risk, block outside trusted locations). Only single-tenant service principals registered
+  // in this tenant are reachable by such policies — multi-tenant, Microsoft and managed identities are not.
+  var CA_SCOPE = 'https://graph.microsoft.com/Policy.Read.ConditionalAccess';
+  async function optionalCaToken(){ try { return (await msalInstance.acquireTokenSilent({ account: account, scopes: [CA_SCOPE] })).accessToken; } catch(e){ return null; } }
+  // Reduce the tenant's policies to the workload-identity ones, in the shape the coverage test needs.
+  function workloadPoliciesFrom(policies){
+    var out = [], lc = function(x){ return String(x || '').toLowerCase(); };
+    (policies || []).forEach(function(p){
+      var c = p.conditions || {}, ca = c.clientApplications || {};
+      var inc = ca.includeServicePrincipals || [], exc = ca.excludeServicePrincipals || [];
+      if(!inc.length && !ca.servicePrincipalFilter) return;
+      var st = String(p.state || '');
+      out.push({ id: p.id, name: p.displayName || '(unnamed policy)', state: st,
+        enforced: st === 'enabled', reportOnly: st === 'enabledForReportingButNotEnforced',
+        all: inc.indexOf('ServicePrincipalsInMyTenant') >= 0, include: inc.map(lc), exclude: exc.map(lc),
+        filter: !!ca.servicePrincipalFilter, riskLevels: c.servicePrincipalRiskLevels || [],
+        locations: !!(c.locations && (c.locations.includeLocations || []).length),
+        block: ((p.grantControls || {}).builtInControls || []).indexOf('block') >= 0 });
+    });
+    return out;
+  }
+  // Which workload-identity policies name one service principal. Explicit membership only: a policy that selects
+  // by servicePrincipalFilter (custom security attributes) cannot be evaluated here, so it is listed as
+  // filter-based rather than counted either way.
+  function caCoverageFor(spId){
+    var id = String(spId || '').toLowerCase(), cov = { enforced: [], reportOnly: [], disabled: [], filtered: [] };
+    (cache.wiPolicies || []).forEach(function(p){
+      if(p.exclude.indexOf(id) >= 0) return;
+      if(!(p.all || p.include.indexOf(id) >= 0)){ if(p.filter) cov.filtered.push(p); return; }
+      (p.enforced ? cov.enforced : p.reportOnly ? cov.reportOnly : cov.disabled).push(p);
+    });
+    return cov;
+  }
+  function policyKind(p){ var k = []; if(p.riskLevels.length) k.push('risk ' + p.riskLevels.join('/')); if(p.locations) k.push('location'); if(!k.length) k.push('every sign-in'); return (p.block ? 'block on ' : 'grant on ') + k.join(' + '); }
+  function policyNames(list){ return (list || []).map(function(p){ return p.name; }).join(', '); }
   var MS_TENANT = 'f8cdef31-a31e-4b4a-93e4-5f571e91255a';
   // Microsoft-owned tenants that publish first-party apps. Apps owned by any of these are shown as "Microsoft".
   //   f8cdef31… = Microsoft Services, 72f988bf… = Microsoft corporate — the two canonical ones.
@@ -1424,6 +1471,19 @@
     f.dirRoleTakeover = dr.some(function(x){ return x.tier === 0 && !x.scoped; });
     f.dirRoleHigh = !f.dirRoleTakeover && dr.some(function(x){ return x.tier === 1 || (x.tier === 0 && x.scoped); });
     f.dirRoleScopedT0 = !f.dirRoleTakeover && dr.some(function(x){ return x.tier === 0 && x.scoped; });
+    // Workload ID Protection + Conditional Access for workload identities. Risk is Entra's verdict on the service
+    // principal; coverage is whether an ENFORCED policy names it. Coverage is only a meaningful question for a
+    // single-tenant app registered here — multi-tenant, Microsoft and disabled apps are outside what these
+    // policies reach, so those read "not applicable", never "uncovered".
+    var wr = r.wiRisk || {};
+    f.wiCompromised = wr.state === 'confirmedCompromised';
+    f.wiAtRisk = f.wiCompromised || wr.state === 'atRisk';
+    var cc = r.caCoverage || { enforced: [], reportOnly: [], disabled: [], filtered: [] };
+    f.caEligible = !!(r.localApp && r.tenancy === 'single' && !r.isFirstPartyMicrosoft && r.accountEnabled !== false);
+    f.caEnforced = cc.enforced.length > 0;
+    f.caReportOnly = !f.caEnforced && cc.reportOnly.length > 0;
+    f.caUncovered = f.caEligible && cache.caAvailable === true && !f.caEnforced;
+    f.caRiskBlock = cc.enforced.some(function(p){ return p.block && p.riskLevels.length > 0; });
     return f;
   }
   function computeRisk(r){
@@ -1523,6 +1583,27 @@
       lvl = Math.max(lvl, 3);
       reasons.unshift('⚠ VERIFY THE PUBLISHER FIRST — the display name references “' + f.brand + '”, a known vendor, but the publisher is UNVERIFIED and the app is externally registered. A display name is attacker-controlled; naming a malicious app after a trusted vendor is the classic consent-phishing lure (name collision / brand impersonation). The name proves nothing — confirm the real publisher and owner tenant before trusting or re-consenting. (This depends on publisher metadata being read correctly; if every app shows unverified, the metadata query is the problem, not this app.)');
     }
+    // Conditional Access for workload identities — the one control that acts on the app's OWN sign-in. Coverage
+    // never lowers a level (a risk-only policy does nothing to a clean-looking request from a stolen key), and its
+    // absence never raises one: it is the missing control that gets named, not a new exposure.
+    if(cache.caAvailable === true){
+      var cc = r.caCoverage || { enforced: [], reportOnly: [] };
+      if(f.caEnforced) reasons.push('Covered by Conditional Access for workload identities — ' + cc.enforced.map(function(p){ return escHtml(p.name) + ' (' + policyKind(p) + ')'; }).join(', ') + '. It only acts on what its conditions name: a risk-based policy waits for ID Protection to raise risk, a location policy only cares where the request comes from.');
+      else if(f.caReportOnly && f.caEligible) reasons.push('Only REPORT-ONLY Conditional Access includes this service principal — ' + escHtml(policyNames(cc.reportOnly)) + '. It evaluates and logs, and enforces nothing; turn it on for it to act.');
+      else if(f.caUncovered) reasons.push('No enforced Conditional Access policy for workload identities includes this service principal' + (f.appPerms ? ', and it holds application permissions — a risk- or location-based block policy is the one control that can stop its client credential being used from where, or in the state, it should not be' : '') + '. A single-tenant app registered here is exactly what these policies can reach.');
+    }
+    // Entra ID Protection's verdict on the workload identity itself goes to the TOP: this is not a shape that could
+    // be abused, it is Microsoft saying the credential is being abused, or was.
+    var wr = r.wiRisk || {};
+    if(f.wiCompromised){
+      lvl = 4;
+      reasons.unshift('⚠ CONFIRMED COMPROMISED in Entra ID Protection' + (wr.updated ? ' (' + escHtml(String(wr.updated).slice(0, 10)) + ')' : '') + ' — an administrator confirmed this workload identity was compromised. Rotate every credential, review what it did with the permissions below, and keep it disabled until that is done.');
+    } else if(f.wiAtRisk){
+      lvl = Math.max(lvl, wr.level === 'high' ? 4 : 3);
+      reasons.unshift('⚠ AT RISK in Entra ID Protection — risk level ' + escHtml(wr.level || 'unknown') + (wr.detail && wr.detail !== 'none' ? ', detail ' + escHtml(wr.detail) : '') + (wr.updated ? ', updated ' + escHtml(String(wr.updated).slice(0, 10)) : '') + '. Microsoft\'s detections (leaked credentials, anomalous service-principal activity, suspicious sign-ins) flagged this identity'
+        + (f.caRiskBlock ? '; an enforced risk-based Conditional Access policy blocks it at the risk levels it names.'
+          : (cache.caAvailable === true ? ', and NO enforced risk-based Conditional Access policy would block it — nothing stops the credential being used while the investigation waits.' : '.')));
+    }
     r.riskReasons = reasons;
     return Math.max(1, lvl);
   }
@@ -1586,6 +1667,7 @@
         keyCreds: o.cert ? [{ displayName: 'signing-cert', startDateTime: days(400), endDateTime: days(-500) }] : [],
         fic: o.fic ? [{ name: 'gh-oidc', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:contoso/deploy:ref:refs/heads/main', audiences: ['api://AzureADTokenExchange'] }] : [],
         directoryRoles: o.roles || [],
+        wiRisk: o.wiRisk ? { state: o.wiRisk === 'compromised' ? 'confirmedCompromised' : 'atRisk', level: o.wiLevel || 'high', detail: o.wiRisk === 'compromised' ? 'adminConfirmedServicePrincipalCompromised' : 'none', updated: days(3), processing: false } : null,
         appPermissions: (o.app || []).map(function(v){
           var retired = !!o.retiredApi;
           return { resourceName: retired ? 'Azure Active Directory Graph' : 'Microsoft Graph', resourceAppId: retired ? AADGRAPH_ID : GRAPH_ID, retired: retired, roleName: v, roleValue: v };
@@ -1607,11 +1689,11 @@
     app({ name:'Mailbox Copilot Connector', app:['Mail.ReadWrite'], deleg:['Mail.Read, offline_access'], publicClient:true, secret:true, owners:false });
     app({ name:'Internal_AccessScope', ext:true, aud:'AzureADMultipleOrgs', msDisabled:true, off:true, owners:false, age:3600 });
     app({ name:'Legacy Reporting Job', app:['Directory.ReadWrite.All'], secret:true, secretExpired:true, owners:false });
-    app({ name:'Tenant Admin Automation', app:['User.Read.All'], secret:true, roles:[{ name:'Global Administrator', tier:0, scoped:false }] });
+    app({ name:'Tenant Admin Automation', app:['User.Read.All'], secret:true, roles:[{ name:'Global Administrator', tier:0, scoped:false }], wiRisk:'atRisk', wiLevel:'high' });
     app({ name:'Mail Archive Service', app:['Exchange.ManageAsApp'], cert:true, roles:[{ name:'Exchange Administrator', tier:1, scoped:false }] });
     app({ name:'Field Service Mobile', publicClient:true, deleg:['Mail.Read, Files.Read.All, offline_access'], uris:['https://fieldsvc.demo.local/auth'] });
     app({ name:'Partner Portal SSO', ext:true, aud:'AzureADMultipleOrgs', implicit:true, uris:['https://*.partner-demo.local/cb','http://portal.partner-demo.local/cb'], deleg:['User.Read, email'] });
-    app({ name:'Payroll Export (legacy)', app:['Directory.Read.All'], retiredApi:true, secret:true, secretExpired:true, owners:false });
+    app({ name:'Payroll Export (legacy)', app:['Directory.Read.All'], retiredApi:true, secret:true, secretExpired:true, owners:false, wiRisk:'atRisk', wiLevel:'medium' });
     app({ name:'Deployment Pipeline', app:['Application.ReadWrite.OwnedBy'], fic:true, assign:true });
     app({ name:'Consumer Feedback Widget', ext:true, aud:'AzureADandPersonalMicrosoftAccount', deleg:['User.Read'], owners:false });
     // ---- filler: the long tail every tenant actually has ----
@@ -1648,6 +1730,7 @@
       r.permScore = computePermScore(r);
       r.inertPermScore = computeInertPermScore(r);
       r.hasRetiredGrant = (r.delegatedDetail||[]).some(function(d){ return d.retired; }) || (r.appPermissions||[]).some(function(p){ return p.retired && p.roleName !== 'Default access'; });
+      r.caCoverage = caCoverageFor(r.id);
       r.factors = computeFactors(r);
       r.riskScore = computeRisk(r);
       r.riskWeight = computeRiskWeight(r, r.riskScore);
@@ -1673,6 +1756,14 @@
   function startDemo(){
     el('demoBar').classList.remove('hidden');
     el('who').innerHTML = 'Demo tenant \u2014 <strong>contoso.demo</strong>';
+    // One enforced risk policy on a quarter of the fleet, one report-only location policy on all of it — so the
+    // demo has covered, report-only and uncovered apps at once. Set before scoring: coverage is read during it.
+    var demoSel = []; for(var di = 1; di <= 120; di += 4) demoSel.push('sp-' + di);
+    cache.wiRiskAvailable = true; cache.caAvailable = true;
+    cache.wiPolicies = workloadPoliciesFrom([
+      { id:'demo-p1', displayName:'Block high-risk workload identities', state:'enabled', conditions:{ clientApplications:{ includeServicePrincipals: demoSel, excludeServicePrincipals:[] }, servicePrincipalRiskLevels:['high'] }, grantControls:{ builtInControls:['block'] } },
+      { id:'demo-p2', displayName:'Service principals: trusted locations only', state:'enabledForReportingButNotEnforced', conditions:{ clientApplications:{ includeServicePrincipals:['ServicePrincipalsInMyTenant'], excludeServicePrincipals:[] }, locations:{ includeLocations:['All'], excludeLocations:['AllTrusted'] } }, grantControls:{ builtInControls:['block'] } }
+    ]);
     cache.results = demoScore(demoApps());
     cache.scannedAt = Date.now() - 4 * 60000;
     cache.rolesAvailable = true; cache.auditAvailable = true;
@@ -1717,6 +1808,30 @@
           var skus = await graphGetAllPages(GBASE + '/subscribedSkus?$select=' + encodeURIComponent('skuId,skuPartNumber,capabilityStatus,consumedUnits,prepaidUnits,servicePlans'), licToken);
           cache.workloadLicense = workloadLicenseFrom(skus);
         } catch(e){ cache.workloadLicense = { available: null, error: (e && e.message) || String(e) }; }
+      }
+
+      // RISKY WORKLOAD IDENTITIES (optional — IdentityRiskyServicePrincipal.Read.All; needs the Workload ID licence).
+      var riskBySpId = {}; cache.wiRiskAvailable = false; cache.wiRiskError = null;
+      var riskToken = await optionalRiskToken();
+      if(riskToken){
+        try {
+          setStatus('Reading risky workload identities…', false, true);
+          var risky = await graphGetAllPages(GBASE + '/identityProtection/riskyServicePrincipals?$select=' + encodeURIComponent('id,appId,riskState,riskLevel,riskDetail,riskLastUpdatedDateTime,isProcessing') + '&$top=500', riskToken, function(n){ setStatus('Reading risky workload identities… ' + n, false, true); });
+          risky.forEach(function(x){ riskBySpId[String(x.id).toLowerCase()] = { state: x.riskState || 'none', level: x.riskLevel || 'none', detail: x.riskDetail || 'none', updated: x.riskLastUpdatedDateTime || null, processing: !!x.isProcessing }; });
+          cache.wiRiskAvailable = true;
+        } catch(e){ cache.wiRiskError = (e && e.message) || String(e); }
+      }
+      // CONDITIONAL ACCESS FOR WORKLOAD IDENTITIES (optional — Policy.Read.ConditionalAccess). One call; each row
+      // is then matched against the policies that name service principals.
+      cache.wiPolicies = []; cache.caAvailable = false; cache.caError = null;
+      var caToken = await optionalCaToken();
+      if(caToken){
+        try {
+          setStatus('Reading Conditional Access policies for workload identities…', false, true);
+          var pols = await graphGetAllPages(GBASE + '/identity/conditionalAccess/policies?$select=' + encodeURIComponent('id,displayName,state,conditions,grantControls'), caToken);
+          cache.wiPolicies = workloadPoliciesFrom(pols);
+          cache.caAvailable = true;
+        } catch(e){ cache.caError = (e && e.message) || String(e); }
       }
 
       var dirRolesBySpId = {}; cache.rolesAvailable = false; cache.rolesError = null;
@@ -1790,6 +1905,8 @@
           id: sp.id, appId: sp.appId, displayName: sp.displayName, publisherName: sp.publisherName,
           directoryRoles: dirRolesBySpId[sp.id] || [],
           signInActivity: signInActByAppId[(sp.appId||'').toLowerCase()] || null,
+          wiRisk: riskBySpId[String(sp.id).toLowerCase()] || null,
+          caCoverage: caCoverageFor(sp.id),
           accountEnabled: sp.accountEnabled, appOwnerOrganizationId: sp.appOwnerOrganizationId,
           isFirstPartyMicrosoft: isMsFirstParty(sp), firstPartyByAppId: !MS_TENANTS[sp.appOwnerOrganizationId] && !!MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()], firstPartyByVerifiedMs: !MS_TENANTS[sp.appOwnerOrganizationId] && !MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()] && isVerifiedMicrosoft(sp), createdDateTime: sp.createdDateTime,
           appRoleAssignmentRequired: sp.appRoleAssignmentRequired, _hasGrant: hasGrant,
@@ -2033,6 +2150,21 @@
       { k:'expired', label:'Expired present', sev:'med',
         tip:'An <b>expired</b> secret or certificate is still attached. It cannot authenticate, so it is not live exposure \u2014 it is stale trust and a sign nobody is maintaining this registration. Remove it, and check whether the app is still needed at all.',
         test:function(r){ return !!r.factors.credExpired; } } ]},
+    // What Entra itself concluded about the workload identity, and whether a policy would act on it. Both need the
+    // Workload ID licence and their own scope; with either missing the options simply match nothing.
+    { id:'wi', label:'Workload ID', tip:'Entra ID Protection risk on the service principal, and Conditional Access for workload identities. Needs the Microsoft Entra Workload ID licence plus <code>IdentityRiskyServicePrincipal.Read.All</code> and <code>Policy.Read.ConditionalAccess</code>. Coverage is only asked of single-tenant apps registered here \u2014 the only kind these policies can reach.', opts:[
+      { k:'atRisk', label:'At risk (ID Protection)', sev:'high',
+        tip:'Entra ID Protection has this service principal <b>at risk or confirmed compromised</b> \u2014 leaked credentials, anomalous activity or suspicious sign-ins. Not a shape that could be abused; a verdict that it is being.',
+        test:function(r){ return !!r.factors.wiAtRisk; } },
+      { k:'caCovered', label:'CA enforced',
+        tip:'An <b>enabled</b> Conditional Access policy for workload identities includes this service principal. Read the policy: a risk-only policy acts only once ID Protection raises risk.',
+        test:function(r){ return !!r.factors.caEnforced && !!r.factors.caEligible; } },
+      { k:'caReport', label:'CA report-only', sev:'med',
+        tip:'Only a <b>report-only</b> policy includes it. It evaluates and logs, and enforces nothing.',
+        test:function(r){ return !!r.factors.caReportOnly && !!r.factors.caEligible; } },
+      { k:'caNone', label:'CA not covered', sev:'high',
+        tip:'A <b>single-tenant app registered here</b> \u2014 the kind these policies can reach \u2014 that no enforced policy includes. Its client credential can be used from anywhere, at any risk level, and nothing at sign-in will stop it.',
+        test:function(r){ return !!r.factors.caUncovered; } } ]},
     { id:'risk', label:'Risk level', chips:true, opts:[
       { k:'4', label:'Critical', test:function(r){ return r.riskScore === 4; } },
       { k:'3', label:'High',     test:function(r){ return r.riskScore === 3; } },
@@ -2109,7 +2241,19 @@
       // appears in the table and the drawer says so on every row.
       + (cache.auditAvailable === true ? ''
           : '<div class="notice notice-warn"><b>Usage detection is OFF</b> — a consent scan shows what an app <i>can</i> do; grant <code>AuditLog.Read.All</code> (admin consent) to also read what it <i>has</i> done (whether it authenticated app-only, and with which credential). ' + (cache.auditError ? '<span class="mono">(' + escHtml(cache.auditError) + ')</span> — may also indicate the tenant lacks Entra ID P1/P2 for sign-in logs.' : 'Without it, the detail drawer falls back to a portal deep-link.') + '</div>');
+    el('notices').innerHTML += workloadNoticesHtml();
     renderKpis(); renderChange(); renderFacets(); renderRiskChips(); renderCombo(); renderTable();
+  }
+  // The two Workload ID reads follow the same rule as the bars above: only the state that costs you a result earns a
+  // banner. With the licence absent there is one line, since both reads need it and two warnings would nag.
+  function workloadNoticesHtml(){
+    var L = cache.workloadLicense;
+    if(L && L.available === false) return '<div class="notice notice-info"><b>Risky workload identities and Conditional Access for workload identities were not assessed</b> — both need the Microsoft Entra Workload ID licence, which this tenant does not have.</div>';
+    var h = '';
+    if(cache.wiRiskAvailable !== true) h += '<div class="notice notice-warn"><b>Risky workload identities were not read</b> — grant <code>IdentityRiskyServicePrincipal.Read.All</code> (admin consent) to this app registration to see which service principals Entra ID Protection has flagged. The signed-in account needs Global Reader or Security Reader.' + (cache.wiRiskError ? ' <span class="mono">(' + escHtml(cache.wiRiskError) + ')</span>' : '') + '</div>';
+    if(cache.caAvailable !== true) h += '<div class="notice notice-warn"><b>Conditional Access for workload identities was not read</b> — grant <code>Policy.Read.ConditionalAccess</code> (admin consent) to this app registration to see which single-tenant apps an enforced policy covers, and which none does.' + (cache.caError ? ' <span class="mono">(' + escHtml(cache.caError) + ')</span>' : '') + '</div>';
+    else if(!(cache.wiPolicies || []).length) h += '<div class="notice notice-warn"><b>No Conditional Access policy targets workload identities</b> — every single-tenant app registered here is uncovered. A risk-based block policy for service principals is the one control that acts on a stolen client credential at sign-in.</div>';
+    return h;
   }
   var MODE_HINT = { any:'OR — an app matching any ticked option', all:'AND — an app must carry every ticked option', only:'Exactly the ticked set, and nothing else in this group. Tick nothing to ask for apps carrying none of them.' };
   function modesHtml(id){
@@ -2481,8 +2625,32 @@
       }).join('') + '</ul>'
       + ((r.factors.dirRoleTakeover || r.factors.dirRoleHigh) ? '<p class="dmuted" style="margin-top:6px">A directory role on the app itself is the <b>authorisation</b> behind capability permissions — e.g. <code>Exchange.ManageAsApp</code> only acts once the SP holds Exchange Administrator. Treat this app’s credential as an admin credential; right-size the role or scope it to an administrative unit.</p>' : '');
   }
+  function workloadIdHtml(r){
+    var f = r.factors || {}, out = '', L = cache.workloadLicense, w = r.wiRisk;
+    if(L && L.available === false) return '<p class="dmuted">Microsoft Entra Workload ID Premium is not licensed in this tenant, so there is no ID Protection verdict and no Conditional Access for workload identities to report.</p>';
+    if(cache.wiRiskAvailable !== true) out += '<p class="dmuted">Risky workload identities not read — grant <code>IdentityRiskyServicePrincipal.Read.All</code> to this app registration (the signed-in account needs Global Reader or Security Reader).' + (cache.wiRiskError ? ' <span class="mono">(' + escHtml(cache.wiRiskError) + ')</span>' : '') + '</p>';
+    else if(!w || !f.wiAtRisk) out += '<p><b>ID Protection:</b> ' + (w ? 'risk state <span class="mono">' + escHtml(w.state) + '</span>' + (w.updated ? ' (' + escHtml(String(w.updated).slice(0, 10)) + ')' : '') + ' — no live risk' : 'no risk recorded for this service principal') + '.</p>';
+    else out += '<p><b>ID Protection:</b> <span class="' + (f.wiCompromised || w.level === 'high' ? 'sc4' : 'sc3') + '">' + escHtml(w.state) + ' · ' + escHtml(w.level) + '</span>' + (w.detail && w.detail !== 'none' ? ' · ' + escHtml(w.detail) : '') + (w.updated ? ' · updated ' + escHtml(String(w.updated).slice(0, 10)) : '') + (w.processing ? ' · still processing' : '') + '. <a href="https://entra.microsoft.com/#view/Microsoft_AAD_IAM/IdentityProtectionMenuBlade/~/RiskyServicePrincipals" target="_blank" rel="noopener">Open Risky workload identities →</a></p>';
+    if(cache.caAvailable !== true) return out + '<p class="dmuted">Conditional Access policies not read — grant <code>Policy.Read.ConditionalAccess</code> to this app registration.' + (cache.caError ? ' <span class="mono">(' + escHtml(cache.caError) + ')</span>' : '') + '</p>';
+    var cc = r.caCoverage || { enforced: [], reportOnly: [], disabled: [], filtered: [] };
+    var li = function(p){ return '<li>' + escHtml(p.name) + ' <span class="dmuted">— ' + escHtml(policyKind(p)) + (p.all ? ', all service principals in the tenant' : ', selected service principals') + '</span></li>'; };
+    if(!f.caEligible){
+      return out + '<p><b>Conditional Access for workload identities:</b> <span class="dmuted">not applicable — these policies only reach single-tenant service principals registered in your tenant, and this is ' + (r.isFirstPartyMicrosoft ? 'a Microsoft app' : r.tenancy !== 'single' ? 'a multi-tenant app' : r.accountEnabled === false ? 'disabled' : 'not registered here') + '.' + (cc.enforced.length ? ' A tenant-wide policy names it anyway (' + escHtml(policyNames(cc.enforced)) + '), but it is not evaluated for it.' : '') + '</span></p>';
+    }
+    out += '<p><b>Conditional Access for workload identities:</b> ' + (f.caEnforced ? '<span style="color:var(--green);font-weight:600">covered</span>' : f.caReportOnly ? '<span class="sc3">report-only</span>' : '<span class="sc4">not covered</span>') + '</p>';
+    if(cc.enforced.length) out += '<ul class="dlist">' + cc.enforced.map(li).join('') + '</ul>';
+    if(cc.reportOnly.length) out += '<p class="dmuted" style="margin-top:6px">Report-only (not enforced):</p><ul class="dlist">' + cc.reportOnly.map(li).join('') + '</ul>';
+    if(cc.disabled.length) out += '<p class="dmuted" style="margin-top:6px">Disabled: ' + escHtml(policyNames(cc.disabled)) + '</p>';
+    if(cc.filtered.length) out += '<p class="dmuted" style="margin-top:6px">Filter-based (custom security attributes, not evaluated here): ' + escHtml(policyNames(cc.filtered)) + '</p>';
+    if(!cc.enforced.length && !cc.reportOnly.length && !cc.filtered.length){
+      var n = (cache.wiPolicies || []).length;
+      out += '<p class="dmuted">' + (n ? 'None of the ' + n + ' workload-identity ' + (n === 1 ? 'policy' : 'policies') + ' in the tenant includes it.' : 'The tenant has no Conditional Access policy targeting workload identities at all.') + ' <a href="https://entra.microsoft.com/#view/Microsoft_AAD_ConditionalAccess/ConditionalAccessBlade/~/Policies" target="_blank" rel="noopener">Open Conditional Access →</a></p>';
+    }
+    return out;
+  }
   function riskFlags(r){
     var f = '';
+    if(r.factors.wiAtRisk) f += '<span class="badge b-msdisabled" title="Entra ID Protection: ' + escHtml((r.wiRisk||{}).state || '') + ' · ' + escHtml((r.wiRisk||{}).level || '') + '. Microsoft\'s own detections flagged this workload identity.">' + (r.factors.wiCompromised ? 'compromised' : 'at risk') + '</span>';
     if(r.factors.msImpersonation) f += '<span class="badge b-msdisabled" title="Claims to be Microsoft but is NOT registered in a Microsoft tenant and has no verified Microsoft publisher — the owner tenant is the fact an attacker can\'t fake. High-confidence impersonation of the most-abused brand; treat as malicious until the owner tenant is confirmed Microsoft.">⚠ Microsoft impersonation</span>';
     else if(r.factors.brandUnverified) f += '<span class="badge b-msdisabled" title="Display name claims “' + escHtml(r.factors.brand) + '” but the publisher is UNVERIFIED and the app is external — the name can\'t be trusted. Verify the real publisher / owner tenant before trusting (possible brand impersonation / consent-phishing lure).">⚠ Unverified “' + escHtml(r.factors.brand) + '” name</span>';
     if(r.factors.dirRoleTakeover) f += '<span class="badge b-msdisabled" title="This service principal is assigned a TENANT-TAKEOVER-class Entra directory role (Global Administrator / Privileged Role Administrator / Application Administrator class) — a role on the app itself, independent of its Graph permissions. Whoever holds the app credential wields this role.">⚠ Directory role: ' + escHtml(dirRoleNames(r)) + '</span>';
@@ -2801,6 +2969,7 @@
       + '</div></div>'
       + '<div class="dsec"><div class="dhead">Did they use the credential? — sign-in evidence <span class="dmuted" style="font-weight:400">— whether the application permissions above were actually exercised</span></div>' + signInEvidenceHtml(r) + '</div>'
       + '<div class="dsec"><div class="dhead">Directory roles held by this app <span class="dmuted" style="font-weight:400">— the authorisation behind capability permissions (e.g. Exchange.ManageAsApp)</span></div>' + dirRolesHtml(r) + '</div>'
+      + '<div class="dsec"><div class="dhead">Workload ID Protection &amp; Conditional Access <span class="dmuted" style="font-weight:400">— what Entra concluded about this identity, and which policy would act on its sign-in</span></div>' + workloadIdHtml(r) + '</div>'
       + '<div class="dcols2">'
       +   '<div class="dsec"><div class="dhead">Auth configuration</div>' + authHtml + '</div>'
       +   '<div class="dsec"><div class="dhead">Tenancy &amp; publisher</div>' + tenHtml + '</div>'
@@ -2927,6 +3096,8 @@
     // permissions
     'permScore','hasAppPermissions','hasHighPrivAppPermission','hasDelegatedPermissions','allPrincipalsConsent',
     'appPermissions','delegatedPermissions','directoryRoles','dirRoleTakeover',
+    // workload id protection / conditional access for workload identities
+    'wiRiskState','wiRiskLevel','wiRiskDetail','caWorkloadEligible','caEnforcedPolicies','caReportOnlyPolicies',
     // auth config
     'assignmentRequired','publicClient','implicitGrant','riskyRedirect','tokenTheft',
     // credentials
@@ -2968,6 +3139,8 @@
         (r.publisherName || ''), (r.isVerifiedPublisher === true), !!f.unverifiedPublisher,
         (r.permScore||1), !!f.appPerms, !!f.appPermsHigh, !!f.delegPerms, !!f.allPrincipals,
         appPerms, perms, dirRoleNames(r), !!f.dirRoleTakeover,
+        (r.wiRisk ? r.wiRisk.state : (cache.wiRiskAvailable === true ? 'none' : '')), (r.wiRisk ? r.wiRisk.level : ''), (r.wiRisk ? r.wiRisk.detail : ''),
+        !!f.caEligible, policyNames((r.caCoverage || {}).enforced), policyNames((r.caCoverage || {}).reportOnly),
         (r.appRoleAssignmentRequired === true), !!f.publicClient, !!f.implicitGrant, !!f.riskyRedirect, !!f.tokenTheft,
         (r.passwordCreds||[]).length, (r.keyCreds||[]).length, (r.fic||[]).length, !!f.credExpired, !!f.credExpiring,
         secrets, certs, ficTxt,
