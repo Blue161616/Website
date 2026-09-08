@@ -760,7 +760,7 @@ function skuName(part) {
   if (/^AAD_PREMIUM_P2$/i.test(s)) return "Entra ID P2";
   if (/IDENTITY_THREAT_PROTECTION/i.test(s)) return "Microsoft 365 E5 Security";
   if (/ENTRA_SUITE|Entra_Suite/i.test(s)) return "Entra Suite";
-  return s;
+  return s.replace(/_/g, " ").toLowerCase().split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ").replace("No Teams", "(no Teams)");
 }
 function p2From(skus) {
   const via = [];
@@ -778,6 +778,29 @@ const PIMPOL_SCOPES = ["RoleManagementPolicy.Read.Directory"];
 async function optionalToken(scopes) {
   try { return (await msalInstance.acquireTokenSilent({ scopes, account })).accessToken; }
   catch { return null; }
+}
+// The scopes a Graph token actually carries (its scp claim) — what a "required scopes are missing" 403 is about.
+function tokenScopes(tok) {
+  try { const b = tok.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"); return (JSON.parse(decodeURIComponent(escape(atob(b)))).scp || "").split(" ").filter(Boolean); } catch { return []; }
+}
+// One optional read that explains itself. Consent granted after the session started leaves MSAL holding a token
+// minted before it, so a 403 that names missing scopes is retried once with a token forced past the cache. Returns
+// { value } on success, otherwise { error } with the reason: no token at all, the scope missing from the token, or
+// the scope present (then it is the account's role or the call itself, not consent).
+async function optionalRead(scopes, fn) {
+  const get = async force => { try { return (await msalInstance.acquireTokenSilent({ scopes, account, forceRefresh: !!force })).accessToken; } catch (e) { return { err: (e && (e.errorCode || e.message)) || String(e) }; } };
+  let tok = await get(false);
+  if (!tok || tok.err) return { error: "No token for " + scopes.join(" ") + " could be acquired silently (" + ((tok && tok.err) || "unknown") + ") — admin consent is missing, or the sign-in predates it: sign out and back in." };
+  try { return { value: await fn(tok) }; }
+  catch (e) {
+    let msg = (e && e.message) || String(e);
+    if (/scopes are missing|AccessDenied|\b403\b/i.test(msg)) {
+      const t2 = await get(true);
+      if (t2 && !t2.err && t2 !== tok) { try { return { value: await fn(t2) }; } catch (e2) { msg = (e2 && e2.message) || String(e2); tok = t2; } }
+    }
+    const have = tokenScopes(tok), want = scopes[0];
+    return { error: msg + " — token scopes: " + (have.join(" ") || "(none readable)") + (have.indexOf(want) >= 0 ? " — the scope IS in the token, so consent and cache are fine; Graph wants a different permission for this call, or the signed-in account lacks a directory role that can read it" : " — " + want + " is NOT in the token; sign out and back in to drop the cached token, and check admin consent") };
+  }
 }
 
 // Which registered methods are phishing-resistant. userRegistrationDetails.methodsRegistered strings vary
@@ -1066,14 +1089,9 @@ async function analyze() {
     }
 
     // 3b · Entra ID P2 licence (optional — Organization.Read.All) ------------------
-    MODEL.p2 = null;
-    const licToken = await optionalToken(LIC_SCOPES);
-    if (licToken) {
-      try {
-        setStatus("Checking the Entra ID P2 licence…", false, true);
-        MODEL.p2 = p2From(await graphGetAll(base + "/subscribedSkus?$select=skuId,skuPartNumber,capabilityStatus,consumedUnits,prepaidUnits,servicePlans", licToken));
-      } catch (e) { MODEL.p2 = { available: null, error: e.message || String(e) }; }
-    }
+    setStatus("Checking the Entra ID P2 licence…", false, true);
+    const licRead = await optionalRead(LIC_SCOPES, t => graphGetAll(base + "/subscribedSkus?$select=skuId,skuPartNumber,capabilityStatus,consumedUnits,prepaidUnits,servicePlans", t));
+    MODEL.p2 = licRead.value ? p2From(licRead.value) : { available: null, error: licRead.error };
 
     // 4 · Identity Protection risky users (optional — IdentityRiskyUser.Read.All) --
     MODEL.riskAvailable = false;
@@ -1640,7 +1658,7 @@ function renderKpis() {
       ? '<span class="lic-chip" title="' + escapeHtml("Entra ID P2 (service plan AAD_PREMIUM_P2) is present through " + L.via.map(v => v.name + " (" + v.sku + ": " + v.seats + " seats, " + v.assigned + " assigned)").join(", ") + ". P2 is per user: Identity Protection and risk-based Conditional Access only apply to accounts holding a seat.") + '">\u2713 Entra ID P2 via ' + escapeHtml([...new Set(L.via.map(v => v.name))].join(", ")) + ' \u00b7 ' + L.seats + " seat" + (L.seats === 1 ? "" : "s") + ", " + L.assigned + " assigned</span>"
       : L.available === false
         ? '<span class="lic-chip warn" title="No subscribed SKU carries the AAD_PREMIUM_P2 service plan. Identity Protection, risk-based Conditional Access and PIM need it: standalone Entra ID P2, Microsoft 365 E5 or E7, or EMS E5.">Entra ID P2: not found</span>'
-        : '<span class="lic-chip off" title="' + escapeHtml(L.error || "") + '">Entra ID P2: not checked</span>';
+        : '<span class="lic-chip off" title="' + escapeHtml(L.error || "") + '">Entra ID P2: ' + (/No token/.test(L.error || "") ? "not checked" : "check failed") + ' \u2014 hover for why</span>';
 }
 
 // ============================ highest-risk combination ============================
