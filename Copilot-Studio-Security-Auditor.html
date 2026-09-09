@@ -324,31 +324,7 @@ const URL_RX   = /url["'\s]*[:=]["'\s]*(https?:\/\/[^\s"'\\}]+)/ig;
 const MODEL_RX = /modelNameHint["':\s=]+([A-Za-z0-9_.\-]+)/i;
 function extractModel(s){ const m=MODEL_RX.exec(s||''); return m?m[1]:null; }
 
-// ── Guardrail (Preview) ─────────────────────────────────────────────────────
-// Copilot Studio shows a per-agent Guardrail with a name (e.g. Microsoft.DefaultV2)
-// and two lists: risks it has controls for, and risks it does not. An agent with
-// none inherits its model's default, which the portal states outright.
-//
-// The field name is not documented and the feature is in preview, so several
-// spellings are tried rather than one guessed. What matters more than the guessing
-// is the fallback: a regex that matches nothing means "we could not read it", NOT
-// "the agent has no guardrail", and those must not produce the same finding. The
-// caller decides which it was by looking at whether ANY agent in the environment
-// parsed — see the guardrail block in scanEnvironment.
-const GUARDRAIL_RX = [
-  /"guardrail(?:Name|Id)?"\s*:\s*"([^"]{2,120})"/i,
-  /"guardrail"\s*:\s*\{[^}]*?"(?:name|id|displayName)"\s*:\s*"([^"]{2,120})"/i,
-  /guardrail(?:Name|Id)["':\s=]+([A-Za-z0-9_.\-]{2,120})/i
-];
-function extractGuardrail(s){
-  if (!s) return null;
-  for (const rx of GUARDRAIL_RX){ const m = rx.exec(s); if (m && m[1]) return m[1]; }
-  return null;
-}
-/** True when the blob mentions guardrails at all — tells "absent" from "unparsed". */
-function mentionsGuardrail(s){ return !!s && /guardrail/i.test(s); }
-
-// ── Agent capabilities: Tools · Knowledge · Memory · Guardrail ──────────────
+// ── Agent capabilities: Tools · Knowledge · Memory ──────────────────────────
 // The four blocks the Copilot Studio agent page shows. All are read out of the
 // same JSON the model and orchestration flags come from, and all carry the same
 // caveat: two of them are Preview and none of the field names are documented.
@@ -356,7 +332,10 @@ function mentionsGuardrail(s){ return !!s && /guardrail/i.test(s); }
 // So every one is tri-state, never boolean. `true` and `false` are claims about
 // the agent; `null` means the scan could not tell, which is a claim about the
 // scan. Collapsing null into false would turn "we did not recognise the schema"
-// into "this agent has no guardrail" — a clean bill of health nobody earned.
+// into "this agent has no memory configured" — a clean bill of health nobody earned.
+// Guardrails are NOT read here: they are an Azure AI Foundry construct assigned to
+// agents and model deployments, and they are assessed in
+// azure-ai-foundry-security-posture.html against the RAI policy that backs them.
 const TOOL_PATTERNS = [
   [/grounding\s*with\s*bing|bingcustomsearch|"bing(search|grounding)"|searchandsummarizecontent/i, 'Web search (Grounding with Bing)'],
   [/"?connectorid"?\s*[:=]\s*"[^"]*sharepointonline/i, 'SharePoint'],
@@ -383,10 +362,8 @@ function agentCapabilities(blobs){
   let memory = null;
   const mm = /"(?:memory|memoryEnabled|longTermMemory|conversationMemory)"\s*:\s*(true|false|\{)/i.exec(s);
   if (mm) memory = mm[1] === 'false' ? false : true;
-  const guardrail = extractGuardrail(s);
   return {
-    tools, knowledge, memory, guardrail,
-    guardrailSeen: mentionsGuardrail(s),   // schema recognised even if the name was not
+    tools, knowledge, memory,
     sawAny: !!s
   };
 }
@@ -485,27 +462,23 @@ async function scanEnvironment(orgUrl, opts){
     else               add('Info','AI Model',x.name, x.model+' · '+mi.vendor, ex);
   });
 
-  // 3a) Agent capabilities — Tools · Knowledge · Memory · Guardrail
+  // 3a) Agent capabilities — Tools · Knowledge · Memory
   //
   // One inventory line per agent so the four blocks on the agent page are visible
   // without opening each agent, plus findings for the two that carry risk on their
   // own: web-search grounding sends data outside the Azure compliance boundary
-  // (the portal says so in its own banner), and an unassigned guardrail means the
-  // agent runs on whatever its model happens to default to.
+  // (the portal says so in its own banner).
   const caps = {};
   bots.forEach(b => { caps[b.botid] = agentCapabilities(capBlobs[b.botid]); });
-  let guardrailParsed = 0, guardrailSeen = 0;
-  bots.forEach(b => { const c = caps[b.botid]; if (c.guardrail) guardrailParsed++; if (c.guardrailSeen) guardrailSeen++; });
 
   bots.forEach(b => {
     const c = caps[b.botid], parts = [];
     parts.push('Tools: '     + (c.tools.length     ? c.tools.join(', ')     : 'none detected'));
     parts.push('Knowledge: ' + (c.knowledge.length ? c.knowledge.join(', ') : 'none detected'));
     parts.push('Memory: '    + (c.memory === null ? 'not stated' : c.memory ? 'on' : 'off'));
-    parts.push('Guardrail: ' + (c.guardrail || (c.guardrailSeen ? 'present, name unread' : 'not stated')));
     add('Info','Agent Capabilities', b.name, parts.join(' · '),
       { Tools: c.tools.join('; '), Knowledge: c.knowledge.join('; '),
-        Memory: c.memory === null ? '' : String(c.memory), Guardrail: c.guardrail || '' });
+        Memory: c.memory === null ? '' : String(c.memory) });
 
     if (c.tools.some(t => /Grounding with Bing/.test(t)))
       add('Medium','Web Search Grounding', b.name,
@@ -514,23 +487,7 @@ async function scanEnvironment(orgUrl, opts){
         'with the query. Scope it to curated internal knowledge unless public grounding is genuinely required.',
         { OutsideComplianceBoundary: true });
 
-    // Only claimable once at least one agent parsed — otherwise every agent would
-    // be reported as unguarded on the strength of a regex that never matched.
-    if (guardrailParsed && !c.guardrail)
-      add('Low','Guardrail Not Assigned', b.name,
-        'No guardrail is assigned to this agent, so it inherits its model\'s default. Guardrails are what ' +
-        'carry the controls for jailbreak, indirect prompt injection, sensitive-data leakage and task drift; ' +
-        'inheriting means those are whatever the model ships with rather than what you chose.');
   });
-
-  // The honest fallback. If nothing parsed anywhere, that is a statement about this
-  // scanner and not about the tenant, and it is reported once rather than as a
-  // finding against every agent.
-  if (bots.length && !guardrailParsed)
-    add('Info','Guardrail Not Readable','(environment)',
-      guardrailSeen
-        ? 'Agent JSON mentions guardrails but none matched a known field shape, so no guardrail name could be read. This is a gap in this scanner, not a finding about the agents.'
-        : 'No guardrail data was found in the agent JSON. Guardrail is in preview and its field name is undocumented — treat guardrail coverage as unassessed here, not as absent.');
 
   // 3b) Compliance · EU Data Boundary
   //
@@ -785,8 +742,8 @@ const ANTHROPIC_US=[39.5,-98.35];   // geographic center of the contiguous US �
 function ensureMap(){
   if(_map || typeof L==='undefined') return _map;
   document.getElementById('mapPanel').classList.remove('hidden');
-  _map=L.map('leafletmap',{attributionControl:false,scrollWheelZoom:false}).setView([30,15],2);
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{subdomains:'abcd',maxZoom:19}).addTo(_map);
+  _map=L.map('leafletmap',{attributionControl:true,scrollWheelZoom:false}).setView([30,15],2);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png?key=cb1_33wx_1_fb2c0a1aa9a5ce58e9fe1aab',{subdomains:'abcd',maxZoom:19,attribution:'© OpenStreetMap · © CARTO'}).addTo(_map);
   _regionLayer=L.layerGroup().addTo(_map);
   return _map;
 }
