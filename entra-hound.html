@@ -165,6 +165,13 @@
   .toplist li:hover { border-color: var(--accent); }
   .toplist .bar { height: 4px; border-radius: 2px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); margin-top: 5px; }
 
+  /* ---------- coverage ---------- */
+  .cov { margin-top: 12px; border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: 10px; padding: 10px 14px; background: rgba(255,193,94,.05); font-size: 12.5px; }
+  .cov.ok { border-left-color: var(--ok); background: rgba(94,230,176,.05); }
+  .cov b { font: 700 11px/1 var(--label); letter-spacing: .18em; text-transform: uppercase; color: var(--warn); display: block; margin-bottom: 4px; } .cov.ok b { color: var(--ok); }
+  .cov .u { color: var(--ink); } .cov .u i { font-style: normal; color: var(--muted); }
+  .analysis.gap { border-style: dashed; } .analysis .c.unk { color: var(--warn); } .analysis .g { font: 600 10.5px/1.3 var(--label); letter-spacing: .08em; text-transform: uppercase; color: var(--warn); margin-top: 4px; }
+  .unk-tag { display: inline-block; font: 700 10px/1 var(--label); letter-spacing: .12em; text-transform: uppercase; color: var(--warn); border: 1px dashed rgba(255,193,94,.6); border-radius: 999px; padding: 4px 8px; margin: 1px 4px 1px 0; }
   /* ---------- paths ---------- */
   .analyses { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; }
   .analysis { text-align: left; background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px; padding: 11px 13px; cursor: pointer; color: var(--ink); font-family: var(--body); transition: border-color .2s; display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
@@ -651,6 +658,7 @@
             <div class="sevbar" id="sevbar"></div>
             <div class="legendline"><span><i style="background:var(--crit)"></i>Critical</span><span><i style="background:var(--bad)"></i>High</span><span><i style="background:var(--warn)"></i>Medium</span><span><i style="background:var(--accent)"></i>Low</span><span><i style="background:var(--muted)"></i>Info</span></div>
             <p class="intro" id="scoreWhy" style="margin:12px 0 0;font-size:12.5px"></p>
+            <div id="coverage"></div>
           </div>
         </div>
       </div>
@@ -1689,6 +1697,66 @@ EH.findings = (function(){
   }
   return { run: run, REMEDIATION: R };
 })();
+/* -------------------- coverage: what the graph could not see -------------------- */
+// A missing edge because collection was denied is a different thing from an edge that does not exist. Every
+// source that did not come back maps to the edges, analyses, findings and node sections it blinds, and every
+// conclusion the UI draws carries that caveat with it.
+EH.coverage = (function(){
+  var IMPACT = {
+    groups: { what: 'group membership and ownership', edges: ['MemberOf', 'OwnerOf'], analyses: ['groupown', 'pim', 'users'], findings: ['NestedPrivilegedGroup', 'PrivilegedGroupOwner', 'RoleAssignableGroupExposure'], types: ['user', 'guest', 'group'] },
+    groupMembers: { what: 'group members (nesting, role-holding groups)', edges: ['MemberOf'], analyses: ['groupown', 'pim', 'users', 'guests'], findings: ['NestedPrivilegedGroup'], types: ['user', 'guest', 'group'] },
+    apps: { what: 'app registrations, their owners and credentials', edges: ['OwnerOf', 'RunsAs'], analyses: ['appown', 'federation', 'credmod'], findings: ['AppOwnedByLowPriv', 'LongLivedSecret', 'ExpiredCredential', 'CredExpiringSoon', 'NoAppOwner', 'MultipleAppOwners', 'OrphanApp'], types: ['app', 'user', 'guest'] },
+    fics: { what: 'federated identity credentials', edges: ['FederatedWith'], analyses: ['federation', 'external'], findings: ['FederatedCredential', 'BroadFederation'], types: ['app', 'issuer'] },
+    sps: { what: 'service principals and their owners', edges: ['OwnerOf', 'RunsAs', 'HasApplicationPermission'], analyses: ['privapps', 'workloads', 'oauth', 'appown'], findings: ['SPOwnedByLowPriv', 'AppDangerousPerms', 'PrivilegedSPSecret'], types: ['sp', 'mi', 'app'] },
+    resourceSps: { what: 'resource API role catalogues (permission names)', edges: ['HasApplicationPermission'], analyses: ['privapps', 'oauth', 'workloads'], findings: ['AppDangerousPerms'], types: ['sp', 'mi', 'agent', 'permission'] },
+    appRoleAssignments: { what: 'application permissions granted to workloads', edges: ['HasApplicationPermission'], analyses: ['privapps', 'oauth', 'workloads', 'credmod'], findings: ['AppDangerousPerms', 'AgentPrivilege'], types: ['sp', 'mi', 'agent', 'app', 'permission'] },
+    oauthGrants: { what: 'delegated consent (OAuth2 permission grants)', edges: ['HasDelegatedPermission'], analyses: ['oauth'], findings: ['RiskyOAuthConsent', 'DangerousDelegated'], types: ['sp', 'permission'] },
+    directoryRoles: { what: 'active directory role assignments', edges: ['AssignedRole'], analyses: ['ga', 'pra', 'caa', 'apa', 'auth', 'pwreset'], findings: ['PermanentPrivilegedRole', 'ExcessivePrivilege', 'PrivilegedGuest', 'SyncedPrivileged'], types: ['user', 'guest', 'group', 'sp', 'role'] },
+    roleMembers: { what: 'who holds each directory role', edges: ['AssignedRole'], analyses: ['ga', 'pra', 'caa', 'apa', 'auth', 'pwreset'], findings: ['PermanentPrivilegedRole', 'ExcessivePrivilege', 'PrivilegedGuest'], types: ['user', 'guest', 'group', 'sp', 'role'] },
+    roleDefinitions: { what: 'role definitions (custom roles, isPrivileged)', edges: ['AssignedRole', 'ScopedRole'], analyses: [], findings: [], types: ['role'] },
+    roleAssignments: { what: 'AU-scoped role assignments', edges: ['ScopedRole'], analyses: ['pwreset'], findings: [], types: ['role', 'au'] },
+    roleEligible: { what: 'PIM eligible assignments', edges: ['EligibleRole'], analyses: ['pim'], findings: ['PimEligible'], types: ['user', 'guest', 'group', 'role'] },
+    roleActivePim: { what: 'PIM time-bound active assignments', edges: [], analyses: [], findings: ['PermanentPrivilegedRole'], types: ['user', 'role'] },
+    aus: { what: 'administrative units', edges: ['MemberOfAU', 'ScopedRole'], analyses: [], findings: [], types: ['au'] },
+    auMembers: { what: 'administrative unit members', edges: ['MemberOfAU'], analyses: ['pwreset'], findings: [], types: ['au', 'user'] },
+    auScoped: { what: 'AU-scoped role members', edges: ['ScopedRole'], analyses: ['pwreset'], findings: [], types: ['au', 'role'] },
+    devices: { what: 'devices and registered owners', edges: ['RegisteredOwnerOf'], analyses: [], findings: [], types: ['device', 'user'] },
+    caPolicies: { what: 'Conditional Access coverage and exclusions', edges: ['ExcludedFrom'], analyses: [], findings: ['CAExclusion', 'PrivilegedNotCovered', 'LegacyAuth'], types: ['user', 'guest', 'policy'], risk: 'MFA / Conditional Access protection of path sources is unknown' },
+    authz: { what: 'authorization policy (user consent, app registration, guest invites)', edges: [], analyses: [], findings: ['WeakAuthConfig'], types: ['tenant'] },
+    secdef: { what: 'security defaults', edges: [], analyses: [], findings: ['WeakAuthConfig', 'PrivilegedNotCovered'], types: ['tenant', 'user'] },
+    xtapDefault: { what: 'cross-tenant access defaults', edges: [], analyses: [], findings: ['PartnerTrust'], types: ['tenant'] },
+    xtapPartners: { what: 'partner tenants and inbound trust', edges: ['TrustedBy'], analyses: ['external'], findings: ['PartnerTrust'], types: ['partner', 'tenant'] },
+    authStrengths: { what: 'authentication strengths', edges: [], analyses: [], findings: [], types: ['policy'] },
+    signins: { what: 'sign-in activity (dormancy)', edges: [], analyses: [], findings: ['DormantPrivileged', 'OrphanApp'], types: ['user', 'guest'], risk: 'dormant accounts cannot be told from active ones' },
+    regDetails: { what: 'MFA registration per user', edges: [], analyses: [], findings: ['PrivilegedNoMfa', 'PimEligible'], types: ['user', 'guest'], risk: 'whether a path source has MFA is unknown' },
+    blueprints: { what: 'agent identity blueprints', edges: ['CanBecome', 'FederatedWith'], analyses: ['agents'], findings: ['AgentPrivilege'], types: ['blueprint', 'agent'] },
+    bpPrincipals: { what: 'agent blueprint principals', edges: ['CanBecome'], analyses: ['agents'], findings: ['AgentPrivilege'], types: ['blueprint'] },
+    agents: { what: 'agent identities', edges: ['CreatedFrom', 'HasApplicationPermission'], analyses: ['agents'], findings: ['AgentPrivilege'], types: ['agent'] },
+    agentOwners: { what: 'agent / blueprint owners and sponsors', edges: ['OwnerOf', 'SponsorOf'], analyses: ['agents', 'appown'], findings: ['AgentPrivilege'], types: ['agent', 'blueprint'] }
+  };
+  // state: collector state {key: {st, detail}}; raw.demo → everything seen.
+  function gaps(raw, state){
+    if(!raw || raw.demo) return [];
+    var all = EH.collector.SOURCES.concat(EH.collector.PHASE2), out = [];
+    all.forEach(function(src){
+      var st = state[src.key]; if(!st || st.st === 'ok') return;
+      var imp = IMPACT[src.key] || { what: src.label.toLowerCase(), edges: [], analyses: [], findings: [], types: [] };
+      var perm = EH.auth.GROUPS[src.group].label + (src.alt ? ' or ' + EH.auth.GROUPS[src.alt].label : '');
+      var reason = st.st === 'skip' ? (/not consented/.test(st.detail) ? 'permission not consented' : st.detail || 'skipped') : 'collection failed: ' + st.detail;
+      out.push({ key: src.key, label: src.label, state: st.st, reason: reason, permission: perm, what: imp.what, edges: imp.edges, analyses: imp.analyses, findings: imp.findings, types: imp.types, risk: imp.risk || null });
+    });
+    return out;
+  }
+  function summary(raw, state){
+    var all = EH.collector.SOURCES.concat(EH.collector.PHASE2), g = gaps(raw, state);
+    var ok = all.length - g.length;
+    return { total: all.length, ok: ok, gaps: g, unknown: g.map(function(x){ return x.what; }) };
+  }
+  function forAnalysis(g, key){ return g.filter(function(x){ return x.analyses.indexOf(key) >= 0; }); }
+  function forType(g, type){ return g.filter(function(x){ return x.types.indexOf(type) >= 0; }); }
+  function forFinding(g, kind){ return g.filter(function(x){ return x.findings.indexOf(kind) >= 0; }); }
+  return { IMPACT: IMPACT, gaps: gaps, summary: summary, forAnalysis: forAnalysis, forType: forType, forFinding: forFinding };
+})();
 </script>
 <script>
 /* -------------------- analyses (attack path dashboard definitions) -------------------- */
@@ -1752,6 +1820,9 @@ EH.ui = (function(){
     S.paths.sort(function(a, b){ return b.risk.score - a.risk.score || a.len - b.len; });
     stage('findings'); await tick();
     S.findings = EH.findings.run(S.g, S.paths);
+    // what the graph could not see rides along as findings, so the gap is in the same list as the conclusions
+    S.cov = EH.coverage.summary(S.raw, EH.collector.state());
+    S.cov.gaps.forEach(function(gp){ S.findings.push({ id: 'CollectionGap:' + gp.key, kind: 'CollectionGap', sev: 'Informational', title: 'Collection gap: ' + gp.what, node: 'tenant', evidence: gp.label + ' — ' + gp.reason + '. Invisible until collected: ' + (gp.edges.length ? gp.edges.join(', ') + ' edges' : 'no graph edges') + (gp.analyses.length ? '; analyses: ' + gp.analyses.join(', ') : '') + (gp.findings.length ? '; findings: ' + gp.findings.join(', ') : '') + (gp.risk ? '; ' + gp.risk : '') + '.', remediation: ['Grant ' + gp.permission + ' to the app registration (admin consent) and re-collect.', 'Until then read every "0" in the affected analyses as "unknown", not "none".'] }); });
     S.exposure = EH.risk.exposure(S.g, S.paths, S.findings);
     stage('render'); await tick();
     renderAll(); stage('done');
@@ -1782,6 +1853,9 @@ EH.ui = (function(){
     var c = x.components;
     // big number = the real count; subtitle = what it is made of and its 0-100 contribution to the score
     el('scoreTiles').innerHTML = [['Attack paths', x.paths, c.paths, 'critical ' + x.crit + ' · high ' + x.high, 'paths'], ['Weak Tier-0 accounts', x.weakTier0, c.priv, 'of ' + x.tier0 + ' tier-0 (no MFA, CA gap, synced, guest)', 'query:nodes type:identity tier0'], ['Dangerous permissions', x.perm0 + x.perm1, c.perms, x.perm0 + ' tier-0 · ' + x.perm1 + ' high-impact workloads', 'permissions'], ['Findings', S.findings.length, c.findings, 'critical ' + x.fc + ' · high ' + x.fh, 'findings'], ['Guests with a path', x.guestPaths, c.guests, 'to any critical asset', 'paths:guests']].map(function(t){ return '<button type="button" class="tile" data-go="' + esc(t[4]) + '"><div class="n ' + (t[2] >= 60 ? 'bad' : t[2] >= 30 ? 'warn' : 'ok') + '">' + t[1] + '</div><div class="l">' + t[0] + '</div><div class="s">' + esc(t[3]) + ' · score ' + t[2] + '</div></button>'; }).join('');
+    (function(){ var c = S.cov || { total: 0, ok: 0, gaps: [] }, box = el('coverage');
+      if(!c.gaps.length) box.innerHTML = '<div class="cov ok"><b>Coverage</b><span class="u">Graph built from all ' + c.total + ' sources' + (S.raw.demo ? ' (demo data)' : '') + ' — a missing edge means the edge does not exist.</span></div>';
+      else box.innerHTML = '<div class="cov"><b>Coverage · ' + c.ok + ' of ' + c.total + ' sources · score is a lower bound</b><span class="u">Not collected: ' + c.gaps.map(function(g){ return esc(g.what) + ' <i>(' + esc(g.permission) + ')</i>'; }).join(' · ') + '. A missing edge in these areas means <i>not looked at</i>, not <i>does not exist</i>.</span></div>'; })();
     el('scoreWhy').textContent = 'Score = 35% attack paths + 20% Tier-0 account hygiene + 15% dangerous permissions + 20% findings + 10% guest reach. It measures reachable privilege, not configuration noise: fixing a choke point drops it faster than closing ten informational findings.';
     var sevs = ['Critical', 'High', 'Medium', 'Low', 'Informational'], counts = {}; S.findings.forEach(function(f){ counts[f.sev] = (counts[f.sev] || 0) + 1; }); S.paths.forEach(function(p){ counts['p' + p.risk.severity] = (counts['p' + p.risk.severity] || 0) + 1; });
     var tot = S.findings.length || 1, cols = { Critical: 'var(--crit)', High: 'var(--bad)', Medium: 'var(--warn)', Low: 'var(--accent)', Informational: 'var(--muted)' };
@@ -1822,7 +1896,7 @@ EH.ui = (function(){
     S.analysisCache[key] = paths; return paths;
   }
   function renderAnalyses(){
-    el('analyses').innerHTML = EH.analyses.LIST.map(function(a){ var ps = runAnalysis(a, false), crit = ps.filter(function(p){ return p.risk.severity === 'Critical'; }).length; return '<button type="button" class="analysis' + (S.activeAnalysis === a.key ? ' active' : '') + '" data-a="' + a.key + '"><div><div class="t">' + esc(a.title) + '</div><div class="d">' + esc(a.desc) + '</div></div><div class="c ' + (ps.length ? (crit ? 'crit' : '') : 'zero') + '">' + ps.length + '</div></button>'; }).join('');
+    el('analyses').innerHTML = EH.analyses.LIST.map(function(a){ var ps = runAnalysis(a, false), crit = ps.filter(function(p){ return p.risk.severity === 'Critical'; }).length; var gp = EH.coverage.forAnalysis((S.cov || { gaps: [] }).gaps, a.key); return '<button type="button" class="analysis' + (S.activeAnalysis === a.key ? ' active' : '') + (gp.length ? ' gap' : '') + '" data-a="' + a.key + '" title="' + (gp.length ? esc('Partial: ' + gp.map(function(g){ return g.what; }).join('; ') + ' not collected') : '') + '"><div><div class="t">' + esc(a.title) + '</div><div class="d">' + esc(a.desc) + '</div>' + (gp.length ? '<div class="g">' + (ps.length ? 'partial' : 'unknown') + ' · ' + esc(gp[0].what) + (gp.length > 1 ? ' +' + (gp.length - 1) : '') + ' not collected</div>' : '') + '</div><div class="c ' + (gp.length ? 'unk' : ps.length ? (crit ? 'crit' : '') : 'zero') + '">' + ps.length + (gp.length ? '?' : '') + '</div></button>'; }).join('');
   }
   function showAnalysis(key){
     var a = EH.analyses.LIST.filter(function(x){ return x.key === key; })[0]; S.activeAnalysis = key;
@@ -2078,6 +2152,7 @@ EH.ui = (function(){
     if(to.length) sec('Attack paths to this node (' + S.paths.filter(function(p){ return p.target === id; }).length + ')', to.map(function(p){ return pathCard(p, true); }).join(''));
     if(through) sec('Choke point', '<div class="notice info">' + through + ' attack paths pass through this node.</div>');
     var fs = S.findings.filter(function(f){ return f.node === id; }); if(fs.length) sec('Findings', fs.map(findingCard).join(''));
+    var ngaps = EH.coverage.forType((S.cov || { gaps: [] }).gaps, n.type); if(ngaps.length) sec('Not collected for this object', '<div>' + ngaps.map(function(gp){ return '<span class="unk-tag" title="' + esc(gp.permission) + '">' + esc(gp.what) + '</span>'; }).join('') + '<div style="color:var(--muted);font-size:12px;margin-top:6px">Empty sections above may be unknown rather than empty. Permissions: ' + esc(U.uniq(ngaps.map(function(gp){ return gp.permission; })).join(', ')) + '.</div></div>');
     sec('Inbound relationships (' + inE.length + ')', rels(inE, 'in') || '<div class="count">none</div>'); sec('Outbound relationships (' + outE.length + ')', rels(outE, 'out') || '<div class="count">none</div>');
     var rawObj = {}; Object.keys(n.props).forEach(function(k){ if(k !== 'roles' && k !== 'caps') rawObj[k] = n.props[k]; });
     sec('Raw object', '<pre>' + esc(JSON.stringify(rawObj, null, 2)) + '</pre>');
@@ -2196,7 +2271,7 @@ EH.ui = (function(){
     var g = S.g, name = U.slug((S.raw.org && S.raw.org.displayName) || 'tenant') + '-' + new Date().toISOString().slice(0, 10), rows;
     function pathRow(p){ return { severity: p.risk.severity, score: p.risk.score, hops: p.len, source: N(p.source).label, sourceType: N(p.source).type, target: N(p.target).label, targetType: N(p.target).type, path: p.nodes.map(function(id, i){ return N(id).label + (i < p.edges.length ? ' -[' + p.edges[i].k + (p.edges[i].m !== 'DIRECT' ? ':' + p.edges[i].m : '') + ']-> ' : ''); }).join(''), modes: p.modes.join('|'), factors: p.risk.why.join('|'), sourceId: p.source, targetId: p.target }; }
     switch(kind){
-      case 'json': { var nodes = []; g.nodes.forEach(function(n){ var o = { id: n.id, type: n.type, label: n.label, sub: n.sub, tier: n.tier, critical: n.critical, flags: n.flags }; nodes.push(o); }); U.download('entrahound-' + name + '.json', JSON.stringify({ tool: 'EntraHound', version: 1, collectedAt: S.raw.collectedAt, tenant: S.raw.org ? { id: S.raw.org.id, displayName: S.raw.org.displayName } : null, exposure: S.exposure, findings: S.findings, attackPaths: S.paths.map(pathRow), graph: { nodes: nodes, edges: g.edges }, criticalAssets: nodes.filter(function(n){ return n.critical; }), collection: { sources: EH.collector.state(), scopes: S.raw.scopes, log: EH.graph.log }, raw: S.raw }, null, 1), 'application/json'); break; }
+      case 'json': { var nodes = []; g.nodes.forEach(function(n){ var o = { id: n.id, type: n.type, label: n.label, sub: n.sub, tier: n.tier, critical: n.critical, flags: n.flags }; nodes.push(o); }); U.download('entrahound-' + name + '.json', JSON.stringify({ tool: 'EntraHound', version: 1, collectedAt: S.raw.collectedAt, tenant: S.raw.org ? { id: S.raw.org.id, displayName: S.raw.org.displayName } : null, exposure: S.exposure, findings: S.findings, attackPaths: S.paths.map(pathRow), graph: { nodes: nodes, edges: g.edges }, criticalAssets: nodes.filter(function(n){ return n.critical; }), collection: { sources: EH.collector.state(), scopes: S.raw.scopes, coverage: S.cov, log: EH.graph.log }, raw: S.raw }, null, 1), 'application/json'); break; }
       case 'findings': rows = S.findings.map(function(f){ var n = f.node ? N(f.node) : null; return { severity: f.sev, kind: f.kind, title: f.title, object: n ? n.label : '', objectType: n ? n.type : '', objectId: f.node, evidence: f.evidence, remediation: f.remediation.join(' | ') }; }); U.download('entrahound-findings-' + name + '.csv', U.csv(rows, ['severity', 'kind', 'title', 'object', 'objectType', 'objectId', 'evidence', 'remediation']), 'text/csv'); break;
       case 'paths': rows = S.paths.map(pathRow); U.download('entrahound-paths-' + name + '.csv', U.csv(rows, ['severity', 'score', 'hops', 'source', 'sourceType', 'target', 'targetType', 'path', 'modes', 'factors', 'sourceId', 'targetId']), 'text/csv'); break;
       case 'identities': rows = (g.byType.user || []).concat(g.byType.guest || [], g.byType.sp || [], g.byType.mi || [], g.byType.agent || []).map(function(n){ return { type: n.type, name: n.label, detail: n.sub, id: n.id, tier: n.flags.roleTier != null ? n.flags.roleTier : n.flags.permTier, privileged: !!n.flags.privileged, critical: n.critical, guest: !!n.flags.guest, disabled: !!n.flags.disabled, synced: !!n.flags.synced, mfa: n.flags.mfa, caProtected: n.flags.caProtected, caExcluded: !!n.flags.caExcluded, dormant: !!n.flags.dormant, roles: Object.keys(n.props.roles || {}).map(function(r){ return N(r).label; }).join('|'), pathsToCritical: S.paths.filter(function(p){ return p.source === n.id; }).length }; }); U.download('entrahound-identities-' + name + '.csv', U.csv(rows, Object.keys(rows[0] || { type: 1 })), 'text/csv'); break;
@@ -2215,6 +2290,8 @@ EH.ui = (function(){
     h += '<p class="muted">EntraHound · Blue16 · attack path &amp; identity exposure report · ' + new Date().toLocaleString() + (S.raw.demo ? ' · DEMO DATA' : '') + '</p><h1>' + esc(tn) + '</h1>';
     h += '<p><span class="score">' + x.score + '</span> <b>Identity exposure score · grade ' + x.grade + '</b><br><span class="muted">35% attack paths · 20% Tier-0 hygiene · 15% dangerous permissions · 20% findings · 10% guest reach</span></p>';
     h += '<table><tr><th>Identities</th><th>Privileged</th><th>Guests</th><th>Apps</th><th>Service principals</th><th>Managed identities</th><th>Agents</th><th>Critical paths</th><th>High paths</th><th>Findings</th></tr><tr><td>' + [(g.byType.user || []).length + (g.byType.guest || []).length, (g.byType.user || []).concat(g.byType.guest || []).filter(function(n){ return n.flags.privileged; }).length, (g.byType.guest || []).length, (g.byType.app || []).length, (g.byType.sp || []).length, (g.byType.mi || []).length, (g.byType.agent || []).length + (g.byType.blueprint || []).length, x.crit, x.high, S.findings.length].join('</td><td>') + '</td></tr></table>';
+    var cv = S.cov || { total: 0, ok: 0, gaps: [] };
+    h += '<h2>Coverage</h2>' + (cv.gaps.length ? '<p><b>' + cv.ok + ' of ' + cv.total + ' sources collected — every count below is a lower bound.</b></p><table><tr><th>Not collected</th><th>Why</th><th>Permission</th><th>Blind to</th></tr>' + cv.gaps.map(function(g){ return '<tr><td>' + esc(g.what) + '</td><td>' + esc(g.reason) + '</td><td>' + esc(g.permission) + '</td><td>' + esc((g.edges.concat(g.analyses, g.findings)).join(', ') || '—') + '</td></tr>'; }).join('') + '</table>' : '<p>All ' + cv.total + ' sources collected' + (S.raw.demo ? ' (demo data)' : '') + ': a missing edge means the edge does not exist.</p>');
     h += '<h2>Top attack paths</h2>' + S.paths.slice(0, 40).map(function(p){ return '<p><span class="sev ' + p.risk.severity + '">' + p.risk.severity + ' ' + p.risk.score + '</span> <span class="chain">' + p.nodes.map(function(id, i){ return esc(N(id).label) + (i < p.edges.length ? ' —' + p.edges[i].k + (p.edges[i].m !== 'DIRECT' ? '(' + p.edges[i].m + ')' : '') + '→ ' : ''); }).join('') + '</span>' + (p.risk.why.length ? '<br><span class="muted">' + esc(p.risk.why.join(' · ')) + '</span>' : '') + '</p>'; }).join('');
     h += '<h2>Findings</h2><table><tr><th>Severity</th><th>Finding</th><th>Object</th><th>Evidence</th><th>Remediation</th></tr>' + S.findings.map(function(f){ var n = f.node ? N(f.node) : null; return '<tr><td><span class="sev ' + f.sev + '">' + f.sev + '</span></td><td>' + esc(f.title) + '</td><td>' + (n ? esc(n.label) + '<br><span class="muted">' + esc(n.sub) + '</span>' : '') + '</td><td>' + esc(f.evidence) + '</td><td><ul>' + f.remediation.map(function(r){ return '<li>' + esc(r) + '</li>'; }).join('') + '</ul></td></tr>'; }).join('') + '</table>';
     var cs = []; g.nodes.forEach(function(n){ if(n.critical) cs.push(n); });
