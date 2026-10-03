@@ -145,6 +145,26 @@ covered by Conditional Access, legacy authentication not blocked, weak tenant
 authorization settings, partner trust, agent identities without owner or with
 Tier-0 permissions. Every finding and every attack path carries remediation.
 
+## Coverage: unknown is not the same as none
+
+A missing edge because collection was denied is a different thing from an
+edge that does not exist. Every source that did not come back (permission not
+consented, endpoint not available, Graph error) is mapped to the edges,
+analyses, findings and node sections it blinds, and that caveat travels with
+every conclusion:
+
+- **Dashboard** — a coverage line under the score: "N of M sources · score is
+  a lower bound · not collected: PIM eligible assignments
+  (RoleManagement.Read.Directory) · …".
+- **Attack path analyses** — a card whose inputs were not collected shows a
+  dashed border, `106?` instead of `106`, and "partial · … not collected"; a
+  zero there reads as *unknown*, not *none*.
+- **Findings** — one *Informational* `CollectionGap` finding per missing
+  source, naming what is invisible and which permission fixes it.
+- **Detail panel** — a "Not collected for this object" section, so an empty
+  section above it is not mistaken for an empty answer.
+- **Report and JSON export** — the coverage table comes first, before any path.
+
 ## Explorer, query, export
 
 - **Graph explorer** (Cytoscape): search, type filters, expand, shortest path
