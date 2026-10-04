@@ -62,6 +62,10 @@
   .tabs { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; margin-bottom: 14px; }
   .tab { text-align: left; padding: 13px 14px; line-height: 1.35; border-radius: 10px; }
   .tab small { display: block; color: var(--muted); font-weight: 400; font-size: 12px; margin-top: 4px; }
+  .tabcount { float: right; font-size: 12px; font-weight: 600; color: var(--muted); }
+  .tabcount .hot { color: var(--danger); }
+  .tabcount .spin { display: inline-block; width: 10px; height: 10px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -1px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .tab[aria-selected=true] { border-color: var(--danger); background: rgba(255,90,95,.08); }
 
   /* status tiles */
@@ -261,11 +265,6 @@
       <div class="fwire f-w3 r3" id="w3-agent"><i></i></div>
       <div class="fnode f-out r3" id="out-agent" data-key="agent"><span class="k"><span>Agents · Outcome</span></span><b>—</b><small>&nbsp;</small></div>
     </div>
-    <div class="cov-notes">
-      <div id="note-user"></div>
-      <div id="note-sp"></div>
-      <div id="note-agent"></div>
-    </div>
     <div class="cov-actions">
       <button id="btnCheckCov" class="small">Check policies &amp; licences</button>
       <span class="muted" id="covStatus">Sign in to read your Conditional Access policies (<code>Policy.Read.All</code>) and licences (<code>LicenseAssignment.Read.All</code>).</span>
@@ -276,9 +275,9 @@
   <section class="panel" aria-labelledby="listTitle">
     <h2 id="listTitle" class="visually-hidden" style="display:none">Identities</h2>
     <div class="tabs" role="tablist" aria-label="Identity type">
-      <button class="tab" role="tab" data-type="user" aria-selected="true">Users<small>v1.0 riskyUsers</small></button>
-      <button class="tab" role="tab" data-type="sp" aria-selected="false">Workload identities<small>v1.0 riskyServicePrincipals</small></button>
-      <button class="tab" role="tab" data-type="agent" aria-selected="false">Agents<small>beta riskyAgents · preview</small></button>
+      <button class="tab" role="tab" data-type="user" aria-selected="true">Users <span class="tabcount" id="tc-user"></span><small>v1.0 riskyUsers</small></button>
+      <button class="tab" role="tab" data-type="sp" aria-selected="false">Workload identities <span class="tabcount" id="tc-sp"></span><small>v1.0 riskyServicePrincipals</small></button>
+      <button class="tab" role="tab" data-type="agent" aria-selected="false">Agents <span class="tabcount" id="tc-agent"></span><small>beta riskyAgents · preview</small></button>
     </div>
 
     <div class="tiles" id="tiles" role="group" aria-label="ID Protection status"></div>
@@ -296,7 +295,7 @@
           <option value="none">No current risk</option>
         </select></div>
       <div class="row">
-        <button id="btnLoad" class="primary">Load</button>
+        <button id="btnLoad">Reload</button>
         <button id="btnRefreshRisk" disabled>Refresh status</button>
       </div>
     </div>
@@ -597,14 +596,35 @@
     };
   }
 
-  async function loadType(t) {
+  const inflight = {};
+  function tabCount(t) {
+    const st = state[t], box = $("tc-" + t); box.innerHTML = "";
+    if (inflight[t]) { box.append(el("span", "spin")); return; }
+    if (!st.loaded) return;
+    const all = Array.from(st.items.values()).filter(it => t !== "sp" || !it.outOfScope || !!it.risk);
+    const risky = all.filter(isRisky).length;
+    box.append(document.createTextNode(all.length.toLocaleString()));
+    if (risky) { box.append(document.createTextNode(" · ")); box.append(el("span", "hot", risky + " at risk")); }
+  }
+  function loadType(t) {
+    if (!inflight[t]) inflight[t] = doLoad(t).finally(() => { inflight[t] = null; tabCount(t); });
+    tabCount(t);
+    return inflight[t];
+  }
+  async function loadAll() {
+    // current tab first so the table fills fastest; others follow in the background
+    const order = [type].concat(["user", "sp", "agent"].filter(t => t !== type));
+    for (const t of order) await loadType(t);
+  }
+  async function doLoad(t) {
     const cfg = TYPES[t], st = state[t];
-    $("btnLoad").disabled = true;
-    $("listStatus").textContent = "Loading " + cfg.noun + "…";
+    const status = msg => { if (t === type) $("listStatus").textContent = msg; };
+    if (t === type) $("btnLoad").disabled = true;
+    status("Loading " + cfg.noun + "…");
     try {
       const tok = await token(cfg.scopes);
       const [dir, risky] = await Promise.allSettled([
-        gall(cfg.dirUrl, tok, null, DIR_CAP, n => { $("listStatus").textContent = "Loading " + cfg.noun + "… " + n.toLocaleString(); }),
+        gall(cfg.dirUrl, tok, null, DIR_CAP, n => status("Loading " + cfg.noun + "… " + n.toLocaleString())),
         gall(cfg.riskyUrl, tok, cfg.riskyHeaders)
       ]);
       st.items = new Map();
@@ -625,8 +645,7 @@
     } catch (e) {
       log("Load failed: " + (e.message || e), "err");
     } finally {
-      $("btnLoad").disabled = false;
-      shown = PAGE; render();
+      if (t === type) { $("btnLoad").disabled = false; shown = PAGE; render(); }
     }
   }
 
@@ -650,6 +669,7 @@
       const risky = await gall(cfg.riskyUrl, tok, cfg.riskyHeaders);
       state[type].items.forEach(it => it.risk = null);
       risky.items.forEach(r => mergeRisky(type, r));
+      tabCount(type);
       log("Status refreshed: " + risky.items.length + " " + cfg.noun + " known to ID Protection", "ok");
       render();
     } catch (e) { log("Refresh failed: " + (e.message || e), "err"); }
@@ -713,7 +733,7 @@
     const items = Array.from(st.items.values()).filter(matches)
       .sort((a, b) => (isRisky(b) - isRisky(a)) || (a.name || "").localeCompare(b.name || ""));
     const tb = $("rows"); tb.innerHTML = "";
-    if (!st.loaded) { tb.append(rowMsg("No data loaded. Press Load.")); }
+    if (!st.loaded) { tb.append(rowMsg("Sign in to load identities.")); }
     else if (!items.length) { tb.append(rowMsg("No identities match the current filter.")); }
     items.slice(0, shown).forEach(it => tb.append(rowFor(it)));
     $("btnMore").hidden = items.length <= shown;
@@ -721,7 +741,7 @@
     const all = items.length;
     $("listStatus").textContent = st.loaded
       ? all.toLocaleString() + " shown of " + st.items.size.toLocaleString() + " loaded" + (st.truncated ? " · directory capped, use Search directory for others" : "")
-      : "Sign in and press Load.";
+      : "Sign in to load identities.";
     const q = $("q").value.trim();
     $("btnServerSearch").hidden = !(st.loaded && st.truncated && q.length >= 2 && TYPES[type].searchUrl);
     $("fpWrap").hidden = type !== "sp";
@@ -766,7 +786,8 @@
   }
   document.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => {
     setType(b.dataset.type);
-    if (account && !state[type].loaded) loadType(type);
+    if (inflight[type]) $("listStatus").textContent = "Loading " + TYPES[type].noun + "…";
+    else if (account && !state[type].loaded) loadType(type);
   }));
   $("btnLoad").addEventListener("click", () => loadType(type));
   $("btnRefreshRisk").addEventListener("click", refreshRisk);
@@ -977,11 +998,9 @@
     out.querySelector("b").textContent = o.outTitle;
     out.querySelector("small").textContent = o.outSub || "";
     dot.className = "st-" + o.status;
-    const note = $("note-" + key); note.innerHTML = "";
-    if ((o.notes || []).length) {
-      note.append(el("b", null, LANE_LABEL[key]));
-      o.notes.forEach((n, i) => note.append(el("span", n.warn ? "w" : null, (i ? " · " : "") + n.text)));
-    }
+    const notes = o.notes || [], warns = notes.filter(n => n.warn).length;
+    ca.title = notes.map(n => "• " + n.text).join("\n");
+    if (warns) ca.querySelector("small").textContent += " · ⚠ " + warns + " warning" + (warns > 1 ? "s" : "") + " (hover)";
   }
 
   function licChips(key, html) { const box = $("lic-" + key); box.innerHTML = ""; html.forEach(([t, cls]) => box.append(el("span", "chip " + (cls || ""), t))); }
@@ -1020,7 +1039,7 @@
     notes.push({ text: L.note });
     setLane(key, {
       status, caStatus: best.state === "enabled" ? "ok" : "warn",
-      caTitle: best.displayName, caSub: stateLbl + " · " + L.scope(c) + " · levels " + normLevels(L.levels(c)).join("/"),
+      caTitle: best.displayName, caSub: stateLbl + " · " + L.scope(c) + " · levels " + normLevels(L.levels(c)).join("/") + (matches.length > 1 ? " · +" + (matches.length - 1) + " more" : ""),
       outTitle: best.state === "enabled" ? g.text : best.state === "enabledForReportingButNotEnforced" ? "Logged only (report-only)" : "Not enforced (policy off)",
       outSub: best.state === "enabled" ? (g.strong ? "enforced at next token request" : "does not remediate a compromised identity") : "switch the policy On to enforce",
       notes
@@ -1070,7 +1089,7 @@
   function afterSignIn() {
     if (!account) return;
     $("regPanel").hidden = true; $("btnRegToggle").hidden = false;
-    if (!coverageChecked) { coverageChecked = true; checkCoverage(); }
+    if (!coverageChecked) { coverageChecked = true; loadAll(); checkCoverage(); }
   }
 
   // ---------- init ----------
