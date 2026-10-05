@@ -992,7 +992,7 @@ async function optionalRead(scopes, fn) {
     if (tokenExpired()) return { error: expiredMsg() };
     if (!scopes.every(tokenHas)) return { error: "No token for " + scopes.join(" ") + " — the pasted token does not carry it (" + (tokenPerms(extClaims).join(" ") || "no permissions readable") + "). Grant it to the identity, mint a new token, sign out and paste it." };
     try { return { value: await fn(extToken) }; }
-    catch (e) { return { error: ((e && e.message) || String(e)) + " — " + scopes[0] + " IS in the pasted token, so Graph wants a different permission for this call." }; }
+    catch (e) { return { error: tokenExpired() ? expiredMsg() : ((e && e.message) || String(e)) + " — " + scopes[0] + " IS in the pasted token, so Graph wants a different permission for this call." }; }
   }
   const get = async force => { try { return (await msalInstance.acquireTokenSilent({ scopes, account, forceRefresh: !!force })).accessToken; } catch (e) { return { err: (e && (e.errorCode || e.message)) || String(e) }; } };
   let tok = await get(false);
@@ -1026,6 +1026,8 @@ async function graphGetAll(url, accessToken) {
   while (next) {
     const resp = await fetch(next, { headers: { Authorization: "Bearer " + accessToken, ConsistencyLevel: "eventual" } });
     if (!resp.ok) {
+      // A pasted token cannot be refreshed, so expiry mid-scan gets its own message instead of a bare 401.
+      if (resp.status === 401 && authMode === "token" && tokenExpired()) throw new Error(expiredMsg());
       let detail = ""; try { detail = (await resp.json()).error?.message || ""; } catch {}
       throw new Error("HTTP " + resp.status + " on " + next.replace(graphBase(), "") + (detail ? " — " + detail : ""));
     }
@@ -1345,7 +1347,9 @@ async function analyze() {
     MODEL.generatedAt = new Date();
     computeStats();
     render();
-    setStatus("Scan complete — " + list.length + " member account(s) scored.");
+    // A pasted token that ran out part-way leaves the later optional reads empty — say so rather than "complete".
+    if (authMode === "token" && tokenExpired()) setStatus("Scan incomplete — " + expiredMsg(), true);
+    else setStatus("Scan complete — " + list.length + " member account(s) scored.");
   } catch (e) {
     setStatus("Error: " + (e.message || e), true);
   } finally {
@@ -1594,7 +1598,10 @@ function renderNotices() {
   if (!MODEL.riskAvailable && !noP2) n.push('<div class="notice notice-warn">Identity Protection risk not read — grant <code>IdentityRiskyUser.Read.All</code> (Entra ID P2) to fold each user’s risk state into the score.' + (MODEL.riskError ? ' <span class="mono">(' + escapeHtml(MODEL.riskError) + ')</span>' : "") + '</div>');
   if (MODEL.caAvailable && MODEL.legacyOpen) n.push('<div class="notice notice-warn">Legacy authentication is <b>not blocked</b> tenant-wide — password-only sign-in bypasses MFA for every account below. Block it via Conditional Access.</div>');
   if (!MODEL.approvalAvailable) n.push('<div class="notice notice-warn">PIM activation policy not read — grant <code>RoleManagementPolicy.Read.Directory</code> to detect which eligible roles require <b>approval</b> to activate. Without it, every eligible role is scored as self-activatable (worst case).' + (MODEL.approvalError ? ' <span class="mono">(' + escapeHtml(MODEL.approvalError) + ')</span>' : "") + '</div>');
-  if (!MODEL.mfaAvailable || !MODEL.caAvailable || !MODEL.riskAvailable || !MODEL.approvalAvailable || !(MODEL.p2 && MODEL.p2.available != null))
+  const anyMissing = !MODEL.mfaAvailable || !MODEL.caAvailable || !MODEL.riskAvailable || !MODEL.approvalAvailable || !(MODEL.p2 && MODEL.p2.available != null);
+  if (anyMissing && authMode === "token")
+    n.push('<div class="notice notice-info">Missing an optional permission above? A pasted token carries only what it was minted with (<span class="mono">' + escapeHtml(tokenPerms(extClaims).join(" ") || "none readable") + '</span>). Grant the permission to that identity — as an <b>Application</b> permission for an app-only or managed-identity token — mint a new token, sign out and paste it.</div>');
+  else if (anyMissing)
     n.push('<div class="notice notice-info">Missing an optional permission above? Consent lives in the tenant of the account you signed in with, not in the tenant that registered this app. <a data-grant="1" style="cursor:pointer;font-weight:600">Grant the optional permissions \u2192</a> opens one consent prompt for all of them; an admin can consent on behalf of the organisation, and the scan runs again.</div>');
   $("notices").innerHTML = n.join("");
 }
@@ -1867,7 +1874,7 @@ function renderKpis() {
       : L.available === false
         ? '<span class="lic-chip warn" title="No subscribed SKU carries the AAD_PREMIUM_P2 service plan. Identity Protection, risk-based Conditional Access and PIM need it: standalone Entra ID P2, Microsoft 365 E5 or E7, or EMS E5.">Entra ID P2: not found</span>'
         : '<span class="lic-chip off" title="' + escapeHtml(L.error || "") + '">Entra ID P2: ' + (/No token/.test(L.error || "") ? "not checked" : "check failed") + ' \u2014 hover for why</span>'
-          + (/No token/.test(L.error || "") ? ' <a class="lic-grant" data-grant="1" title="Opens a consent prompt for every optional permission in the tenant you signed in to. An admin can consent on behalf of the organisation; the scan then runs again.">grant access \u2192</a>' : "");
+          + (/No token/.test(L.error || "") && authMode !== "token" ? ' <a class="lic-grant" data-grant="1" title="Opens a consent prompt for every optional permission in the tenant you signed in to. An admin can consent on behalf of the organisation; the scan then runs again.">grant access \u2192</a>' : "");
 }
 
 // ============================ highest-risk combination ============================
@@ -2142,7 +2149,14 @@ function triggerDownload(blob, name) {
 
 // ---- wiring ----
 $("signInBtn").addEventListener("click", signIn);
+$("tokenBtn").addEventListener("click", useToken);
 $("signOutBtn").addEventListener("click", signOut);
+document.querySelectorAll("[data-auth]").forEach((b) => b.addEventListener("click", () => showAuthTab(b.getAttribute("data-auth"))));
+$("accessToken").addEventListener("input", renderTokenInfo);
+// One Graph version, two selects: the token panel's mirrors the interactive one (graphBase reads #graphVer).
+$("graphVerTok").value = $("graphVer").value;
+$("graphVerTok").addEventListener("change", () => { $("graphVer").value = $("graphVerTok").value; });
+$("graphVer").addEventListener("change", () => { $("graphVerTok").value = $("graphVer").value; });
 $("loadBtn").addEventListener("click", analyze);
 $("exportCsv").addEventListener("click", exportCsv);
 $("exportJson").addEventListener("click", exportJson);

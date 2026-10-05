@@ -147,6 +147,8 @@
     background: var(--input-bg); color: var(--text); font-family: 'Cascadia Code', Consolas, monospace; font-size: 11px; resize: vertical; }
   textarea#tokenInput:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
   #tokenInfo.err { color: var(--red); }
+  /* In token mode only the Graph version is left in the grid — don't stretch it across the card. */
+  #authToken:not(.hidden) ~ .grid { max-width: 340px; margin-top: 14px; }
   /* Setup steps — same treatment as the other tools in the suite, so a
      permission list reads as a checklist rather than as a paragraph. */
   .setup { border: 1px solid var(--border); border-radius: 8px; margin-top: 14px;
@@ -491,10 +493,11 @@
           <div class="sb">
             <div class="st">How to mint one</div>
             <ul>
-              <li><b>Certificate (app-only)</b>: <code>Connect-MgGraph -ClientId &lt;id&gt; -TenantId &lt;tid&gt; -CertificateThumbprint &lt;thumb&gt;</code>,
+              <li><b>Certificate (app-only)</b>: <code>Connect-MgGraph -ClientId &lt;id&gt; -TenantId &lt;tid&gt; -CertificateThumbprint &lt;thumb&gt;</code>
+                then <code>(Invoke-MgGraphRequest -Uri &#39;v1.0/organization&#39; -OutputType HttpResponseMessage).RequestMessage.Headers.Authorization.Parameter</code>;
                 or with Azure CLI <code>az login --service-principal -u &lt;id&gt; -p &lt;cert.pem&gt; --tenant &lt;tid&gt;</code>.</li>
               <li><b>Managed identity</b> (Azure VM, App Service, Function): <code>az login --identity</code>.</li>
-              <li>Then <code>az account get-access-token --resource-type ms-graph --query accessToken -o tsv</code>.</li>
+              <li>With Azure CLI, then <code>az account get-access-token --resource-type ms-graph --query accessToken -o tsv</code>.</li>
             </ul>
           </div>
         </div>
@@ -1026,6 +1029,8 @@ function onSignedIn() {
 }
 
 async function token() {
+  // A pasted token is handed over as-is for the required scopes; Graph answers 403 if it falls short.
+  if (pasted) return pastedToken();
   try {
     const r = await msalInstance.acquireTokenSilent({ scopes: SCOPES, account });
     return r.accessToken;
@@ -1056,6 +1061,9 @@ let workloadIdPremium = null;   // inferred: risk data returned as "hidden" => n
 let pendingScopes   = [];       // optional scopes the "grant access" link should request
 
 async function elevatedToken(scopes) {
+  // Token mode: the pasted token if it carries the scope, else null — the same "not consented"
+  // outcome a failed silent request gives, so the feature degrades exactly as it does signed in.
+  if (pasted) return scopes.every(s => tokenHas(s)) ? pastedToken() : null;
   try { return (await msalInstance.acquireTokenSilent({ scopes, account })).accessToken; }
   catch { return null; }
 }
@@ -1064,6 +1072,7 @@ async function elevatedToken(scopes) {
 // explicitly asked to delete, so a consent prompt at that moment is expected rather than a
 // surprise. Returns null if consent is declined or the app registration lacks the permission.
 async function writeToken(scopes) {
+  if (pasted) return null;   // a pasted token is used read-only; doDelete says so before getting here
   try { return (await msalInstance.acquireTokenSilent({ scopes, account })).accessToken; }
   catch {
     try { return (await msalInstance.acquireTokenPopup({ scopes, account })).accessToken; }
@@ -1817,7 +1826,8 @@ async function loadBlueprints() {
     } catch (e) {
       principalWarn = " · blueprint-principal lookup failed (externally-owned blueprints may be hidden)";
     }
-    mergePrincipals(blueprints, principals, account && account.tenantId);
+    // An app-only token has no account — its tid claim names the tenant it was minted for.
+    mergePrincipals(blueprints, principals, pasted ? pasted.claims.tid : (account && account.tenantId));
 
     setStatus("Verifying owner tenants…", false, true);
     await loadTenantInfo(blueprints, base, at);
@@ -1862,12 +1872,17 @@ async function loadBlueprints() {
       + " and " + plural(agents.length, "agent identity", "agent identities") + "." + principalWarn;
     if (workloadIdPremium === false)
       msg += " Risk details are hidden — this tenant appears to lack Workload ID Premium.";
-    if (gaps.length)
+    // A pasted token can't be consented up from here: name what to grant and re-mint instead.
+    if (gaps.length && pasted)
+      msg += ` <span title="Not in the token: ${escapeHtml(pendingScopes.join(", "))}">`
+        + gaps.map(g => g.label).join(", ") + " not loaded</span> — grant "
+        + escapeHtml(pendingScopes.join(", ")) + " to the identity and mint a new token";
+    else if (gaps.length)
       msg += ` <span title="Needs consent for: ${escapeHtml(pendingScopes.join(", "))}">`
         + gaps.map(g => g.label).join(", ") + " not loaded</span> — "
         + `<a href="#" id="grantBtn">grant access</a>`;
     setStatus(msg);
-    if (gaps.length) $("grantBtn").addEventListener("click", e => { e.preventDefault(); grantElevated(); });
+    if (gaps.length && !pasted) $("grantBtn").addEventListener("click", e => { e.preventDefault(); grantElevated(); });
   } catch (e) {
     setStatus("Load failed: " + escapeHtml(e.message || String(e)), true);
   }
@@ -1876,7 +1891,7 @@ async function loadBlueprints() {
 // Ask for the optional scopes interactively. Silent acquisition can't surface a consent prompt, so
 // a tenant that has only just added (or not yet admin-consented) these permissions needs one click.
 async function grantElevated() {
-  if (!pendingScopes.length) return;
+  if (!pendingScopes.length || pasted) return;   // never a popup in token mode
   try {
     setStatus("Requesting consent…", false, true);
     await msalInstance.acquireTokenPopup({ scopes: pendingScopes, account });
@@ -2715,7 +2730,9 @@ async function loadAgentGrants(row, ulEl, agents) {
       } catch { a._grants = []; }
     }));
     row._grantsDone = true;
-  } catch { /* leave for a retry on next expand */ }
+  } catch (e) {   // leave for a retry on next expand; an expired pasted token says so
+    if (pasted) setStatus(escapeHtml(e.message || String(e)), true);
+  }
   row._grantsBusy = false;
   ulEl.innerHTML = agents.map(agentLine).join("");
 }
@@ -3218,6 +3235,7 @@ function agentDeletePlan(agent, bp) {
 }
 
 function openDeleteModal(plan) {
+  if (pasted) { setStatus("Deleting is off with a pasted token — sign out and sign in interactively to delete.", true); return; }
   delTarget = plan;
   $("delTitle").textContent = plan.title;
   $("delConfirmLabel").textContent = plan.confirmLabel;
@@ -3236,6 +3254,11 @@ function closeDeleteModal() { $("delModal").classList.add("hidden"); delTarget =
 async function doDelete() {
   if (!delTarget) return;
   const plan = delTarget;
+  if (pasted) {   // the token path is read-only, whatever roles the token happens to carry
+    $("delStatus").className = "err";
+    $("delStatus").textContent = "Deleting is off with a pasted token — sign out and sign in interactively to delete.";
+    return;
+  }
   $("delGo").disabled = true;
   $("delStatus").className = "";
   $("delStatus").innerHTML = '<span class="spinner"></span>Requesting write consent…';
@@ -3406,6 +3429,10 @@ if (DEMO) startDemo();
 
 // ---- wire up ----
 $("signInBtn").addEventListener("click", signIn);
+$("tokenBtn").addEventListener("click", useToken);
+$("tokenInput").addEventListener("input", renderTokenInfo);
+document.querySelectorAll(".auth-tabs [data-auth]").forEach(b =>
+  b.addEventListener("click", () => showAuthTab(b.getAttribute("data-auth"))));
 $("signOutBtn").addEventListener("click", signOut);
 $("loadBtn").addEventListener("click", loadBlueprints);
 

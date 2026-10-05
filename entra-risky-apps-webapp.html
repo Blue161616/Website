@@ -1261,6 +1261,8 @@
   function publisherLabel(r){ return r.isFirstPartyMicrosoft ? (ICON_MS + 'Microsoft') : escHtml(r.publisherName || '—'); }
 
   var msalInstance = null, account = null, writeToken = null;
+  // Access-token mode: a Graph token pasted by the user, and its decoded claims. Memory only — never persisted.
+  var extToken = null, extClaims = null;
   var cache = { results: null };
   var sortState = { key: 'riskScore', dir: -1 };
   var activeCard = null, tileFilter = null;
@@ -1330,6 +1332,7 @@
       if(!(await ensureInstance())) return;
       var result = await msalInstance.loginPopup({ scopes: GRAPH_SCOPES, prompt: 'select_account' });
       account = result.account; msalInstance.setActiveAccount(account);
+      extToken = null; extClaims = null;   // an interactive session replaces any pasted token
       el('who').innerHTML = 'Signed in as <strong>' + escHtml(account.username) + '</strong>';
       // Hide the sign-in button after connecting (the config card shows just "who" + Sign out). Re-running the scan
       // is the results-toolbar "Re-run scan" (btn-refresh) — a single button, not two identical ones.
@@ -1339,12 +1342,110 @@
     } catch(e){ setStatus(''); showAuthError(e); }
   }
   function signOut(){
-    if(msalInstance && account) msalInstance.logoutPopup({ account: account }).catch(function(){});
+    if(extToken){ extToken = null; extClaims = null; el('cfg-token').value = ''; el('tokenInfo').innerHTML = ''; }   // token mode: nothing to log out of
+    else if(msalInstance && account) msalInstance.logoutPopup({ account: account }).catch(function(){});
     account = null; cache = { results: null }; writeToken = null;
     el('who').innerHTML = '<em>Not signed in</em>';
-    hide('btn-signout'); show('btn-signin'); show('configCard'); show('connectForm'); hide('results'); setStatus('Signed out.');
+    hide('btn-signout'); showConnect(); hide('results'); setStatus('Signed out.');
+  }
+  // Back to the connect card, with the action button that belongs to the selected sign-in tab.
+  function showConnect(){
+    var tok = authTab === 'token';
+    show('configCard'); show('connectForm');
+    el('btn-signin').classList.toggle('hidden', tok); el('btn-token').classList.toggle('hidden', !tok);
+  }
+  var authTab = 'delegated';
+  function setAuthTab(k){
+    authTab = k;
+    document.querySelectorAll('[data-auth]').forEach(function(b){ var on = b.getAttribute('data-auth') === k; b.classList.toggle('on', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); });
+    el('auth-delegated').classList.toggle('hidden', k !== 'delegated'); el('auth-token').classList.toggle('hidden', k !== 'token');
+    el('btn-signin').classList.toggle('hidden', k === 'token'); el('btn-token').classList.toggle('hidden', k !== 'token');
+  }
+
+  // -------------------- Access-token mode --------------------
+  // A browser cannot run client credentials, so an app-only (certificate / secret / managed identity) token is minted
+  // elsewhere and pasted. It is used for every Graph call in place of MSAL: required reads get it as-is, an optional
+  // read gets it only when its roles / scp carry that permission — otherwise null, which every optional path already
+  // treats as "not consented" — and nothing ever opens a popup.
+  var GRAPH_AUD_RX = /^(https:\/\/graph\.microsoft\.com\/?|00000003-0000-0000-c000-000000000000)$/i;
+  // Broader permissions that also satisfy an optional read, so a Directory.Read.All token is not reported as lacking
+  // the narrower one. (X.ReadWrite.Y satisfies X.Read.Y via tokenHas itself.)
+  var SCOPE_ALTS = {
+    'Application.Read.All': ['Directory.Read.All'],
+    'DelegatedPermissionGrant.Read.All': ['Directory.Read.All'],
+    'Organization.Read.All': ['Directory.Read.All'],
+    'RoleManagement.Read.Directory': ['RoleManagement.Read.All', 'Directory.Read.All']
+  };
+  function jwtClaims(tok){
+    try { var b = String(tok).split('.')[1].replace(/-/g, '+').replace(/_/g, '/'); while(b.length % 4) b += '='; return JSON.parse(decodeURIComponent(escape(atob(b)))); } catch(e){ return null; }
+  }
+  function tokenHas(perm){
+    if(!extClaims) return false;
+    var have = (extClaims.scp ? String(extClaims.scp).split(' ') : []).concat(Array.isArray(extClaims.roles) ? extClaims.roles : []);
+    perm = perm.replace('https://graph.microsoft.com/', '');
+    return [perm].concat(SCOPE_ALTS[perm] || []).some(function(p){ return have.indexOf(p) >= 0 || have.indexOf(p.replace('.Read.', '.ReadWrite.')) >= 0; });
+  }
+  // Set when a Graph call is refused because the pasted token ran out. Batches swallow their own errors, so runAudit
+  // checks this before showing a scan that would otherwise be silently incomplete.
+  var expiredHit = false;
+  function tokenExpired(){ return !!(extClaims && extClaims.exp && extClaims.exp * 1000 <= Date.now()); }
+  function expiredError(){ return new Error('The pasted access token expired at ' + new Date(extClaims.exp * 1000).toLocaleString() + ' — mint a fresh one, sign out, and paste it again.'); }
+  // The pasted token for one optional scope, or null when the token does not carry it. Throws once it has expired, so
+  // an expiry mid-run reads as an expiry rather than as a missing permission.
+  function pastedToken(scope){
+    if(tokenExpired()) throw expiredError();
+    return tokenHas(scope) ? extToken : null;
+  }
+  // Validate a pasted token and describe who it acts as. Throws a plain-language error for anything unusable.
+  function checkToken(raw){
+    var tok = String(raw || '').trim().replace(/^Bearer\s+/i, '');
+    var c = tok.split('.').length === 3 ? jwtClaims(tok) : null;
+    if(!c) throw new Error('That is not a readable access token. Paste the raw JWT (it starts with eyJ…).');
+    if(!GRAPH_AUD_RX.test(String(c.aud || ''))) throw new Error('The token\'s audience is ' + (c.aud || '(none)') + ' — mint one for https://graph.microsoft.com (e.g. az account get-access-token --resource-type ms-graph).');
+    if(c.exp && c.exp * 1000 <= Date.now()) throw new Error('The token expired at ' + new Date(c.exp * 1000).toLocaleString() + ' — mint a fresh one.');
+    var app = !c.scp;
+    return { token: tok, claims: c,
+      name: c.upn || c.preferred_username || c.unique_name || c.app_displayname || c.appid || 'app',
+      kind: app ? (c.xms_mirid ? 'managed identity' : 'app-only') : 'delegated token' };
+  }
+  // Live preview under the textarea: tenant, identity, permissions and expiry, before anything is called.
+  function tokenPreview(){
+    var raw = el('cfg-token').value.trim().replace(/^Bearer\s+/i, ''), c = raw ? jwtClaims(raw) : null;
+    if(!raw){ el('tokenInfo').innerHTML = ''; return; }
+    if(!c){ el('tokenInfo').innerHTML = '<div class="notice notice-warn">Not a readable JWT yet.</div>'; return; }
+    var exp = c.exp ? new Date(c.exp * 1000) : null, dead = exp && exp.getTime() <= Date.now();
+    var badAud = !GRAPH_AUD_RX.test(String(c.aud || ''));
+    el('tokenInfo').innerHTML = '<div class="notice ' + (dead || badAud ? 'notice-warn' : 'notice-info') + '">'
+      + 'tenant <code>' + escHtml(c.tid || '?') + '</code> · '
+      + (c.scp ? 'delegated as <b>' + escHtml(c.upn || c.preferred_username || '') + '</b> · scp: <code>' + escHtml(c.scp) + '</code>'
+               : (c.xms_mirid ? 'managed identity' : 'app-only') + ' <b>' + escHtml(c.app_displayname || c.appid || '') + '</b> · roles: <code>' + escHtml((c.roles || []).join(' ') || '(none)') + '</code>')
+      + (exp ? ' · ' + (dead ? '<b>expired</b> ' : 'expires ') + escHtml(exp.toLocaleString()) : '')
+      + (badAud ? ' · <b>audience ' + escHtml(c.aud || '(none)') + ' is not Microsoft Graph</b>' : '') + '</div>';
+  }
+  async function useToken(){
+    clearError();
+    try {
+      var t = checkToken(el('cfg-token').value);
+      extToken = t.token; extClaims = t.claims;
+      // The scan cannot start without these two (or Directory.Read.All) — say so now rather than as a Graph 403 later.
+      var miss = GRAPH_SCOPES.filter(function(s){ return !tokenHas(s); }).map(function(s){ return s.replace('https://graph.microsoft.com/', ''); });
+      if(miss.length){ extToken = null; extClaims = null; throw new Error('The token lacks ' + miss.join(' and ') + ' (or Directory.Read.All) — grant it as an ' + (t.claims.scp ? 'delegated' : 'Application') + ' permission with admin consent and mint a new token.'); }
+      account = null;   // a pasted token replaces any interactive session in this tab
+      el('cfg-graphver').value = el('cfg-tok-graphver').value || 'v1.0';
+      GBASE = 'https://graph.microsoft.com/' + (el('cfg-graphver').value || 'v1.0');
+      el('who').innerHTML = 'Token — <strong>' + escHtml(t.name) + '</strong> <span class="dmuted">(' + escHtml(t.kind) + ')</span>';
+      show('btn-signout'); hide('connectForm'); hide('btn-signin'); hide('btn-token');
+      setStatus('');
+      await runAudit();
+    } catch(e){ setStatus(''); showError(e); }
+  }
+  // The tenant the scan runs in: the interactive account's, or the pasted token's tid claim.
+  function myTenantId(){
+    if(extClaims) return extClaims.tid || null;
+    return (account && (account.tenantId || (account.idTokenClaims && account.idTokenClaims.tid))) || null;
   }
   async function getToken(){
+    if(extToken){ if(tokenExpired()) throw expiredError(); return extToken; }
     try { return (await msalInstance.acquireTokenSilent({ account: account, scopes: GRAPH_SCOPES })).accessToken; }
     catch(e){ return (await msalInstance.acquireTokenPopup({ scopes: GRAPH_SCOPES })).accessToken; }
   }
@@ -1356,12 +1457,12 @@
   // uses is a simple `eq` that works in DEFAULT consistency, so we stay out of advanced mode and the fields populate.
   async function graphGet(url, token){
     var res = await fetch(url, { headers: { 'Authorization':'Bearer '+token, 'Accept':'application/json' } });
-    if(!res.ok){ var t = await res.text(); throw new Error('Graph ' + res.status + ' — ' + url + '\n' + t); }
+    if(!res.ok){ if(res.status === 401 && tokenExpired()){ expiredHit = true; throw expiredError(); } var t = await res.text(); throw new Error('Graph ' + res.status + ' — ' + url + '\n' + t); }
     return res.json();
   }
   async function graphBatch(requests, token){
     var res = await fetch(GBASE + '/$batch', { method:'POST', headers:{ 'Authorization':'Bearer '+token, 'Content-Type':'application/json', 'Accept':'application/json' }, body: JSON.stringify({ requests: requests }) });
-    if(!res.ok){ var t = await res.text(); throw new Error('Batch ' + res.status + '\n' + t); }
+    if(!res.ok){ if(res.status === 401 && tokenExpired()){ expiredHit = true; throw expiredError(); } var t = await res.text(); throw new Error('Batch ' + res.status + '\n' + t); }
     return (await res.json()).responses || [];
   }
   async function graphGetAllPages(url, token, onProgress){
@@ -1900,7 +2001,7 @@
 
   // -------------------- Audit --------------------
   async function runAudit(){
-    clearError(); el('btn-refresh').disabled = true; setStatus('Acquiring token…', false, true);
+    clearError(); el('btn-refresh').disabled = true; setStatus('Acquiring token…', false, true); expiredHit = false;
     try {
       var token = await getToken();
 
@@ -2119,7 +2220,7 @@
       }
 
       // Tenancy + posture + risk
-      var myTid = (account && (account.tenantId || (account.idTokenClaims && account.idTokenClaims.tid))) || null;
+      var myTid = myTenantId();
       results.forEach(function(r){
         // Ground truth for "registered in another tenant": the app's OWNING tenant differs from ours.
         // A service principal in our tenant whose app is owned elsewhere is a consented external app and is
@@ -2139,6 +2240,7 @@
         r.riskWeight = computeRiskWeight(r, r.riskScore);
       });
 
+      if(expiredHit) throw expiredError();   // token mode only: part of the scan was refused, do not show it as complete
       cache.scannedAt = Date.now();
       cache.results = results;
       rollBaseline();
@@ -2146,7 +2248,7 @@
       // With results on screen the connect card has nothing left to say — its two live controls (status, sign out)
       // are in the header, and re-running the scan is a button on the results themselves.
       hide('configCard'); show('results'); render();
-    } catch(e){ setStatus(''); show('configCard'); show('connectForm'); show('btn-signin'); showError(e); }
+    } catch(e){ setStatus(''); showConnect(); showError(e); }
     finally { el('btn-refresh').disabled = false; }
   }
 
@@ -2417,7 +2519,7 @@
   // Called once per completed scan, before render: adopt the stored snapshot as the comparison
   // point, then leave the current one behind for next time.
   function rollBaseline(){
-    var tid = (account && (account.tenantId || (account.idTokenClaims && account.idTokenClaims.tid))) || '';
+    var tid = myTenantId() || '';
     var prev = loadBaseline();
     // A snapshot from a different tenant is not a baseline, it is a different estate.
     cache.baseline = (prev && prev.tenantId === tid && prev.apps) ? prev : null;
@@ -3262,7 +3364,7 @@
             || String(a.displayName).localeCompare(String(b.displayName)); });
     var when = new Date(cache.scannedAt || Date.now());
     var scanDate = when.toISOString().slice(0, 10), scanTime = when.toISOString();
-    var tid = (account && (account.tenantId || (account.idTokenClaims && account.idTokenClaims.tid))) || '';
+    var tid = myTenantId() || '';
     var msftF = el('f-msft').value;
     var pubFilter = viewOnly ? (msftF === 'no' ? 'non-microsoft' : msftF === 'yes' ? 'microsoft-first-party' : 'all') : 'all';
     var rowFilters = viewOnly ? activeFilterDesc() : '';
@@ -3306,7 +3408,7 @@
   function openManageModal(r){
     el('modal-title').textContent = r.displayName; el('modal-appid').textContent = r.appId;
     el('modal-body').innerHTML = '<div style="text-align:center;padding:30px 0;color:var(--muted)"><span class="spinner"></span> Loading…</div>';
-    el('modal-status').textContent = ''; el('modal-status').style.color = ''; el('modal-write-btn').style.display = ''; el('modal-write-btn').disabled = false; el('modal-save-btn').disabled = true;
+    el('modal-status').textContent = ''; el('modal-status').style.color = ''; el('modal-write-btn').style.display = extToken ? 'none' : ''; el('modal-write-btn').disabled = false; el('modal-save-btn').disabled = true;
     modalState = { appObjId: null, platforms: { spa: [], web: [], publicClient: [] }, writeMode: false };
     show('modal-overlay');
     getToken().then(function(token){ return graphGet(GBASE + '/applications?$filter=' + encodeURIComponent("appId eq '" + r.appId + "'") + '&$select=id,appId,displayName,spa,web,publicClient', token); }).then(function(data){
@@ -3322,7 +3424,9 @@
   var PLATFORM_LABELS = { spa: 'SPA (Single-page application)', web: 'Web', publicClient: 'Public client / native' };
   function renderModalBody(){
     var wm = modalState.writeMode, html = '';
-    if(!wm) html += '<div class="notice notice-info" style="margin-bottom:16px">Read-only. Click <b>Enable editing</b> to add/remove redirect URIs — prompts for admin consent to <code>Application.ReadWrite.All</code>.</div>';
+    // A pasted token is used read-only: no write consent can be requested for it, so editing is not offered.
+    if(!wm && extToken) html += '<div class="notice notice-info" style="margin-bottom:16px">Read-only. Editing redirect URIs needs interactive sign-in — a pasted access token is only ever used to read.</div>';
+    else if(!wm) html += '<div class="notice notice-info" style="margin-bottom:16px">Read-only. Click <b>Enable editing</b> to add/remove redirect URIs — prompts for admin consent to <code>Application.ReadWrite.All</code>.</div>';
     ['spa','web','publicClient'].forEach(function(key){
       var uris = modalState.platforms[key];
       html += '<div class="platform-section"><div class="platform-label">' + PLATFORM_LABELS[key] + '</div>';
@@ -3336,11 +3440,13 @@
   }
   function closeModal(){ hide('modal-overlay'); }
   async function enableWriteMode(){
+    if(extToken) return;   // token mode is read-only, and must never open a popup
     el('modal-write-btn').disabled = true; el('modal-status').textContent = 'Requesting consent…'; el('modal-status').style.color = 'var(--amber)';
     try { var scopes = GRAPH_SCOPES.concat([WRITE_SCOPE]), r; try { r = await msalInstance.acquireTokenSilent({ account: account, scopes: scopes }); } catch(e){ r = await msalInstance.acquireTokenPopup({ scopes: scopes }); } writeToken = r.accessToken; modalState.writeMode = true; renderModalBody(); }
     catch(e){ el('modal-status').textContent = 'Consent failed: ' + (e.message || String(e)); el('modal-status').style.color = 'var(--red)'; el('modal-write-btn').disabled = false; }
   }
   async function saveRedirectUris(){
+    if(extToken) return;
     el('modal-save-btn').disabled = true; el('modal-status').textContent = 'Saving…'; el('modal-status').style.color = 'var(--muted)';
     try {
       var scopes = GRAPH_SCOPES.concat([WRITE_SCOPE]);
@@ -3369,6 +3475,13 @@
   if(!el('cfg-tenant').value) el('cfg-tenant').value = 'organizations';
   el('btn-signin').addEventListener('click', signIn);
   el('btn-signout').addEventListener('click', signOut);
+  // Access-token sign-in: tab switcher, live claim preview, and one Graph-version setting shared by both tabs.
+  document.querySelectorAll('[data-auth]').forEach(function(b){ b.addEventListener('click', function(){ setAuthTab(b.getAttribute('data-auth')); }); });
+  el('btn-token').addEventListener('click', useToken);
+  el('cfg-token').addEventListener('input', tokenPreview);
+  el('cfg-tok-graphver').value = el('cfg-graphver').value || 'v1.0';
+  el('cfg-graphver').addEventListener('change', function(){ el('cfg-tok-graphver').value = el('cfg-graphver').value; });
+  el('cfg-tok-graphver').addEventListener('change', function(){ el('cfg-graphver').value = el('cfg-tok-graphver').value; });
   el('btn-refresh').addEventListener('click', runAudit);
   el('btn-csv').addEventListener('click', function(){ exportCsv('all'); });
   el('btn-csv-view').addEventListener('click', function(){ exportCsv('view'); });
