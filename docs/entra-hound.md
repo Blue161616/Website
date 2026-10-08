@@ -31,17 +31,14 @@ risk scores and findings are derived from it. Everything is exportable.
 
 ## Connecting
 
-Three ways in:
+Two ways in:
 
 1. **Interactive sign-in** — a single-page-application registration in the tenant
    (redirect URI `https://blue16.nl/entra-hound.html`). Delegated permissions;
    what you see is the intersection of the app's consent and your own role.
    Global Reader or Security Reader is enough. Global Administrator is never
    required.
-2. **External token** — paste an access token for `https://graph.microsoft.com`
-   minted outside the browser with a certificate, client secret or managed
-   identity. The token stays in the tab's memory.
-3. **Demo tenant** — a synthetic Contoso with deliberately planted exposure, to
+2. **Demo tenant** — a synthetic Contoso with deliberately planted exposure, to
    explore the tool without a tenant.
 
 ### Permissions
