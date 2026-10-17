@@ -1468,6 +1468,41 @@
     (creds||[]).forEach(function(c){ if(c.endDateTime){ var t = new Date(c.endDateTime).getTime(); if(t<now) expd++; else if(t-now < 90*86400000) expr++; } });
     return { expired: expd, expiring: expr };
   }
+  // ── Active threat advisories ─────────────────────────────────────────────────────────────────────────
+  // Multi-tenant vendor apps that Microsoft Threat Intelligence has reported as COMPROMISED at the publisher:
+  // a supply-chain attack where the attacker obtains tokens for the vendor's app and exercises the permissions
+  // customers already consented. Matched on appId, the one identifier an attacker can't rename. Presence of the
+  // service principal in a tenant = that tenant was in scope. Add new advisories here as they are published.
+  var THREAT_ADVISORIES = {
+    '506e08f9-6e9a-4da4-942b-a099a03644ae': {
+      title: 'ConnectWise Cloud Backup (formerly SkyKick Backup): active supply-chain compromise',
+      app: 'ConnectWise Cloud Backup', publisher: 'SkyKick', observed: '15 October 2026',
+      source: 'Microsoft Threat Intelligence',
+      summary: 'A threat actor compromised the trusted multi-tenant OAuth app of ConnectWise Cloud Backup to obtain access tokens across customer tenants, likely abusing permissions customers already granted (including Directory.ReadWrite.All). Follow-on activity: Microsoft Graph reconnaissance and attempts to add extra credentials to the service principal in target tenants as a backdoor.',
+      ips: ['144.172.64.128'],
+      userAgents: ['Python-urllib/3.12', 'python-requests/2.31', 'python-requests/2.34.2'],
+      alerts: ['Any alert related to “Suspicious sign-in”', 'Graph API activity from a Microsoft threat intelligence IP address', 'Verified Threat Actor IP'],
+      advisory: 'https://msft.it/6040aQBQp'
+    }
+  };
+  function threatFor(r){ return THREAT_ADVISORIES[String((r && r.appId) || '').toLowerCase()] || null; }
+  function defangIp(ip){ return String(ip).replace(/\.(?=\d+$)/, '[.]'); }
+  function threatKql(appId, t){
+    var ips = t.ips.map(function(x){ return '"' + x + '"'; }).join(', '), uas = t.userAgents.map(function(x){ return '"' + x + '"'; }).join(', ');
+    return '// ' + t.app + ' supply-chain advisory (' + t.source + ')\n'
+      + 'let appId = "' + appId + '";\nlet iocIps = dynamic([' + ips + ']);\nlet iocUAs = dynamic([' + uas + ']);\n'
+      + '// 1. Service principal sign-ins for the app, flagging the IOC IP\n'
+      + 'AADServicePrincipalSignInLogs\n| where TimeGenerated > ago(30d)\n| where AppId == appId or IPAddress in (iocIps)\n'
+      + '| extend IocIp = IPAddress in (iocIps)\n| summarize SignIns = count(), First = min(TimeGenerated), Last = max(TimeGenerated) by IPAddress, IocIp, ResultType, ServicePrincipalName, ResourceDisplayName\n| order by IocIp desc, Last desc\n\n'
+      + '// 2. Credential, consent and permission changes on the app\n'
+      + 'AuditLogs\n| where TimeGenerated > ago(30d)\n| where OperationName has_any ("credentials", "Certificates and secrets", "Consent to application", "app role assignment", "delegated permission grant", "Update service principal", "Update application")\n'
+      + '| where tostring(TargetResources) has appId or tostring(TargetResources) has_any ("ConnectWise", "SkyKick")\n'
+      + '| project TimeGenerated, OperationName, Result, Initiator = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), TargetResources\n\n'
+      + '// 3. Graph API activity from the IOC IP or user agents\n'
+      + 'MicrosoftGraphActivityLogs\n| where TimeGenerated > ago(30d)\n| where AppId == appId or IPAddress in (iocIps) or UserAgent has_any (iocUAs)\n'
+      + '| summarize Calls = count(), First = min(TimeGenerated), Last = max(TimeGenerated), Uris = make_set(RequestUri, 20) by AppId, IPAddress, UserAgent, RequestMethod';
+  }
+
   function computeFactors(r){
     var f = {};
     f.critical = r.permScore === 4;
@@ -1520,6 +1555,7 @@
     f.hasFIC = (r.fic||[]).length > 0;
     f.noOwner = r.localApp && !(r.owners && r.owners.length);
     f.msDisabled = !!r.disabledByMicrosoft;
+    f.activeThreat = !!threatFor(r);   // named in an active Microsoft Threat Intelligence advisory
     f.disabled = r.accountEnabled === false;
     f.assignmentNotRequired = r.appRoleAssignmentRequired === false;
     // Entra directory role assigned to the SERVICE PRINCIPAL itself (not a Graph permission). This is the real
@@ -1582,7 +1618,9 @@
       var extBase = 'Application permissions on an externally-registered app — its client credential lives in the publisher\'s tenant, so you can\'t see, rotate, or revoke the key (only pull the whole app\'s consent). A standing key into your tenant that is outside your control.';
       // The illicit-consent framing only earns its keep on an UNVERIFIED publisher; on a verified ISV it reads as
       // noise (the answer to "did you deliberately consent?" is obviously yes), so soften it there.
-      reasons.push(extBase + (r.isVerifiedPublisher
+      reasons.push(extBase + (f.activeThreat
+        ? ' This is exactly the path in the active advisory: the publisher-side credential is being abused, so a verified publisher is no reassurance here.'
+        : r.isVerifiedPublisher
         ? ' Publisher is MPN-verified — a known vendor; treat this as a supply-chain dependency to inventory and least-privilege, not a likely compromise.'
         : ' With an UNVERIFIED publisher this is the exact shape OAuth "illicit consent" / admin-consent phishing produces — confirm you deliberately consented this app, and if not, revoke it.')); }
     // Internal multi-tenant: your own registration. Broad audience, but you hold the keys — reframe, don't supply-chain it.
@@ -1666,6 +1704,16 @@
         + (f.caRiskBlock ? '; an enforced risk-based Conditional Access policy blocks it at the risk levels it names.'
           : (cache.caAvailable === true ? ', and NO enforced risk-based Conditional Access policy would block it — nothing stops the credential being used while the investigation waits.' : '.')));
     }
+    // Active threat advisory goes to the very top and is always Critical: this app's publisher-side credential is
+    // being abused right now. A disabled SP can't authenticate today, but you still need to hunt for what it did.
+    var adv = threatFor(r);
+    if(adv){
+      lvl = 4;
+      reasons.unshift('⚠ ACTIVE SUPPLY-CHAIN ATTACK — ' + escHtml(adv.source) + ' reports that <b>' + escHtml(adv.title) + '</b>. ' + escHtml(adv.summary)
+        + ' First broad abuse observed ' + escHtml(adv.observed) + ' from <code>' + escHtml(adv.ips.map(defangIp).join(', ')) + '</code>.'
+        + (f.disabled ? ' The service principal is disabled now, so it cannot sign in, but hunt for what it did before it was disabled.' : ' <b>Contain it now:</b> disable the service principal (or revoke its consent) until the vendor confirms remediation, then hunt sign-ins, credential changes and Graph activity for this appId.')
+        + ' <a href="' + escHtml(adv.advisory) + '" target="_blank" rel="noopener">ConnectWise advisory ↗</a>');
+    }
     r.riskReasons = reasons;
     return Math.max(1, lvl);
   }
@@ -1697,6 +1745,7 @@
     if(f.inertHighGrant && !f.appPerms) pts = Math.max(2, pts - 8);
     // Microsoft first-party right-sizing (mirrors the level cap at High): a high grant here is stale-consent hygiene.
     if(r.isFirstPartyMicrosoft && !f.msDisabled) pts = Math.round(pts * 0.6);
+    if(f.activeThreat) pts = Math.max(pts + 30, 25);              // named in an active advisory → top of Critical
     return RW_BASE[lvl] + Math.min(RW_SPAN[lvl], Math.max(0, pts));
   }
 
@@ -1716,12 +1765,12 @@
     function app(o){
       n++;
       var r = {
-        id: 'sp-' + n, appId: 'de300000-0000-4000-8000-' + String(100000000000 + n),
+        id: 'sp-' + n, appId: o.appId || ('de300000-0000-4000-8000-' + String(100000000000 + n)),
         displayName: o.name, publisherName: o.publisher || (o.ms ? 'Microsoft Services' : 'Contoso Partners Ltd'),
         isFirstPartyMicrosoft: !!o.ms, appOwnerOrganizationId: o.ext ? 'ffffffff-1111-2222-3333-444444444444' : 'demo-tenant',
         signInAudience: o.aud || 'AzureADMyOrg', localApp: !o.ext, appObjId: o.ext ? null : 'app-' + n,
         accountEnabled: o.off ? false : true, disabledByMicrosoft: !!o.msDisabled,
-        isVerifiedPublisher: !!o.verified, verifiedPublisherName: o.verified ? 'Contoso Partners Ltd' : null,
+        isVerifiedPublisher: !!o.verified, verifiedPublisherName: o.verified ? (o.verifiedName || 'Contoso Partners Ltd') : null,
         appRoleAssignmentRequired: o.assign === true, allowPublicClient: !!o.publicClient,
         implicitGrant: !!o.implicit, redirectUris: o.uris || [],
         createdDateTime: days(o.age || 400), owners: o.owners === false ? [] : [{ displayName: 'Priya Nair', upn: 'priya@demo.local' }],
@@ -1747,6 +1796,7 @@
     }
     // ---- the story apps: one per shape the tool is built to find ----
     app({ name:'Contoso Invoice Sync', ext:true, aud:'AzureADMultipleOrgs', app:['Mail.ReadWrite','Files.ReadWrite.All'], secret:true, owners:false, deleg:['User.Read'] });
+    app({ name:'ConnectWise Cloud Backup', appId:'506e08f9-6e9a-4da4-942b-a099a03644ae', publisher:'SkyKick', ext:true, aud:'AzureADMultipleOrgs', verified:true, verifiedName:'SkyKick', app:['Directory.ReadWrite.All','Mail.ReadWrite','Sites.FullControl.All'], age:1500 });
     app({ name:'Acme Analytics Connector', ext:true, aud:'AzureADMultipleOrgs', verified:true, app:['User.Read.All'], deleg:['User.Read'] });
     app({ name:'Mailbox Copilot Connector', app:['Mail.ReadWrite'], deleg:['Mail.Read, offline_access'], publicClient:true, secret:true, owners:false });
     app({ name:'Internal_AccessScope', ext:true, aud:'AzureADMultipleOrgs', msDisabled:true, off:true, owners:false, age:3600 });
@@ -2291,11 +2341,40 @@
       // appears in the table and the drawer says so on every row.
       + (cache.auditAvailable === true ? ''
           : '<div class="notice notice-warn"><b>Usage detection is OFF</b> — a consent scan shows what an app <i>can</i> do; grant <code>AuditLog.Read.All</code> (admin consent) to also read what it <i>has</i> done (whether it authenticated app-only, and with which credential). ' + (cache.auditError ? '<span class="mono">(' + escHtml(cache.auditError) + ')</span> — may also indicate the tenant lacks Entra ID P1/P2 for sign-in logs.' : 'Without it, the detail drawer falls back to a portal deep-link.') + '</div>');
-    el('notices').innerHTML += workloadNoticesHtml();
+    el('notices').innerHTML += threatNoticesHtml() + workloadNoticesHtml();
     renderKpis(); renderChange(); renderFacets(); renderRiskChips(); renderCombo(); renderTable();
   }
   // The two Workload ID reads follow the same rule as the bars above: only the state that costs you a result earns a
   // banner. With the licence absent there is one line, since both reads need it and two warnings would nag.
+  // Tenant-level banner for active threat advisories: present (red, with containment, hunting and IOCs) or a quiet
+  // all-clear line, so the result of the check is visible either way.
+  function threatNoticesHtml(){
+    var res = cache.results || [], out = '';
+    Object.keys(THREAT_ADVISORIES).forEach(function(appId){
+      var t = THREAT_ADVISORIES[appId], hit = res.filter(function(r){ return String(r.appId).toLowerCase() === appId; })[0];
+      if(!hit){
+        out += '<div class="notice"><b>Threat advisory check:</b> ' + escHtml(t.app) + ' (<code>' + appId + '</code>) is <b>not present</b> in this tenant — not exposed to the ' + escHtml(t.observed) + ' supply-chain compromise. <a href="' + escHtml(t.advisory) + '" target="_blank" rel="noopener">Advisory ↗</a></div>';
+        return;
+      }
+      var perms = (hit.allScopes || []).slice(0, 8).map(escHtml).join(', ');
+      out += '<div class="notice notice-warn threat-notice"><b>⚠ Active supply-chain attack: ' + escHtml(t.app) + ' is consented in this tenant</b>'
+        + (hit.accountEnabled === false ? ' <span class="dmuted">(service principal currently disabled)</span>' : ' <span style="color:var(--red);font-weight:700">(enabled, can still sign in)</span>')
+        + '<p style="margin:6px 0">' + escHtml(t.summary) + '</p>'
+        + (perms ? '<p style="margin:6px 0"><b>Permissions it holds here:</b> ' + perms + ((hit.allScopes || []).length > 8 ? ', …' : '') + '</p>' : '')
+        + '<p style="margin:6px 0"><b>Do now:</b> 1) disable the service principal or revoke its consent until ConnectWise confirms remediation; 2) review its service principal sign-ins from unrecognised IPs (open the app below → Sign-ins; rows from the IOC IP are flagged); 3) check for new credentials, consent or permission grants on it; 4) look for Defender alerts: ' + t.alerts.map(escHtml).join(' · ') + '.</p>'
+        + '<p style="margin:6px 0"><b>IOCs:</b> AppId <code>' + appId + '</code> · publisher ' + escHtml(t.publisher) + ' · IP <code>' + t.ips.map(defangIp).map(escHtml).join(', ') + '</code> · user agents <code>' + t.userAgents.map(escHtml).join('</code>, <code>') + '</code></p>'
+        + '<details style="margin-top:6px"><summary style="cursor:pointer;font-weight:600">Hunting queries (KQL · Sentinel / Log Analytics)</summary><pre class="threat-kql" style="white-space:pre-wrap;font-size:11.5px;margin:8px 0;padding:10px;border-radius:6px;background:var(--card);border:1px solid var(--border)">' + escHtml(threatKql(appId, t)) + '</pre>'
+        + '<button class="secondary" style="padding:4px 10px;font-size:11px" data-copy-kql="' + appId + '">Copy queries</button></details>'
+        + '<p style="margin:6px 0 0"><a href="' + escHtml(t.advisory) + '" target="_blank" rel="noopener">ConnectWise advisory ↗</a> · source: ' + escHtml(t.source) + '</p></div>';
+    });
+    return out;
+  }
+  document.addEventListener('click', function(e){
+    var b = e.target.closest && e.target.closest('[data-copy-kql]'); if(!b) return;
+    var id = b.getAttribute('data-copy-kql'), txt = threatKql(id, THREAT_ADVISORIES[id]);
+    var done = function(){ b.textContent = 'Copied'; setTimeout(function(){ b.textContent = 'Copy queries'; }, 1600); };
+    try { navigator.clipboard.writeText(txt).then(done, function(){ b.textContent = 'Select the text above'; }); } catch(err){ b.textContent = 'Select the text above'; }
+  });
   function workloadNoticesHtml(){
     var L = cache.workloadLicense;
     if(L && L.available === false) return '<div class="notice notice-info"><b>Risky workload identities and Conditional Access for workload identities were not assessed</b> — both need the Microsoft Entra Workload ID licence, which this tenant does not have.</div>';
@@ -2734,6 +2813,7 @@
   }
   function riskFlags(r){
     var f = '';
+    if(r.factors.activeThreat) f += '<span class="badge b-msdisabled" title="Named in an active Microsoft Threat Intelligence advisory: the vendor\'s multi-tenant app is being abused across customer tenants. Contain and hunt now.">Active threat</span>';
     if(r.factors.wiAtRisk) f += '<span class="badge b-msdisabled" title="Entra ID Protection: ' + escHtml((r.wiRisk||{}).state || '') + ' · ' + escHtml((r.wiRisk||{}).level || '') + '. Microsoft\'s own detections flagged this workload identity.">' + (r.factors.wiCompromised ? 'compromised' : 'at risk') + '</span>';
     if(r.factors.msImpersonation) f += '<span class="badge b-msdisabled" title="Claims to be Microsoft but is NOT registered in a Microsoft tenant and has no verified Microsoft publisher — the owner tenant is the fact an attacker can\'t fake. High-confidence impersonation of the most-abused brand; treat as malicious until the owner tenant is confirmed Microsoft.">⚠ Microsoft impersonation</span>';
     else if(r.factors.brandUnverified) f += '<span class="badge b-msdisabled" title="Display name claims “' + escHtml(r.factors.brand) + '” but the publisher is UNVERIFIED and the app is external — the name can\'t be trusted. Verify the real publisher / owner tenant before trusting (possible brand impersonation / consent-phishing lure).">⚠ Unverified “' + escHtml(r.factors.brand) + '” name</span>';
@@ -2948,14 +3028,17 @@
           : '<p class="dmuted" style="margin:7px 0 0">No service-principal sign-ins for this app in the retained window (~30 days) — it has not authenticated recently (or sign-in logs are not retained; needs Entra ID P1/P2).</p>';
         if(btn) btn.remove(); return;
       }
+      var iocHits = 0;
       var body = rows.map(function(s){
         var when = s.createdDateTime ? escHtml(new Date(s.createdDateTime).toISOString().slice(0,16).replace('T',' ')) : '—';
         var ok = s.status && s.status.errorCode === 0;
         var result = ok ? '<span style="color:var(--green)">success</span>' : '<span style="color:var(--red)">' + escHtml((s.status && (s.status.failureReason || ('error ' + s.status.errorCode))) || 'failed') + '</span>';
         var c = signInCred(s);
-        return '<tr><td class="mono">' + when + '</td><td class="mono">' + escHtml(s.ipAddress || '—') + '</td><td>' + escHtml(s.resourceDisplayName || '—') + '</td><td>' + result + '</td><td style="font-size:10px" title="' + escHtml(c.id || '') + '">' + credHtml(c) + '</td></tr>';
+        var adv = threatFor(r), ioc = adv && s.ipAddress && adv.ips.indexOf(s.ipAddress) >= 0; if(ioc) iocHits++;
+        return '<tr' + (ioc ? ' style="background:var(--red-bg)" title="Matches the IOC IP in the active threat advisory"' : '') + '><td class="mono">' + when + '</td><td class="mono">' + escHtml(s.ipAddress || '—') + (threatFor(r) && s.ipAddress && threatFor(r).ips.indexOf(s.ipAddress) >= 0 ? ' <b style="color:var(--red)">IOC</b>' : '') + '</td><td>' + escHtml(s.resourceDisplayName || '—') + '</td><td>' + result + '</td><td style="font-size:10px" title="' + escHtml(c.id || '') + '">' + credHtml(c) + '</td></tr>';
       }).join('');
-      slot.innerHTML = '<div style="margin-top:8px;overflow-x:auto"><table class="mini-table"><thead><tr><th>Time (UTC)</th><th>IP</th><th>Resource</th><th>Result</th><th>Credential</th></tr></thead><tbody>' + body + '</tbody></table></div>'
+      slot.innerHTML = (iocHits ? '<p style="margin:7px 0 0;color:var(--red);font-weight:700">⚠ ' + iocHits + ' of these sign-ins came from the advisory IOC IP. Treat the tenant as affected: contain the app and investigate.</p>' : '')
+        + '<div style="margin-top:8px;overflow-x:auto"><table class="mini-table"><thead><tr><th>Time (UTC)</th><th>IP</th><th>Resource</th><th>Result</th><th>Credential</th></tr></thead><tbody>' + body + '</tbody></table></div>'
         + '<p class="dmuted" style="margin:5px 0 0">Up to 25 most-recent app-only sign-ins. <b>Credential</b> = the credential type Entra ID was shown, then the KeyId / cert thumbprint / federated-credential id that authenticated — proves <i>which</i> key acted, even for an external app whose key you can\'t read. Hover a row for the full id.</p>';
       if(btn) btn.remove();
     } catch(e){ slot.innerHTML = '<p class="dmuted" style="margin:7px 0 0">Could not load sign-ins — ' + escHtml(e.message || String(e)) + '</p>'; if(btn){ btn.disabled = false; btn.textContent = 'Retry →'; } }
