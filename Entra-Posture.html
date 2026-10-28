@@ -8848,7 +8848,10 @@ function renderKpis() {
   const agents = (loaded && loaded.totalAgents) || 0;
   $("kpiHead").innerHTML = `<b>${bps.length}</b> ${word(bps.length, "blueprint", "blueprints")}`
     + `<span class="sep">·</span><b>${agents}</b> ${word(agents, "agent identity", "agent identities")}`
-    + (loaded && loaded.scannedAt ? `<span class="sep">·</span><span id="kpiWhen">scanned ${relTime(loaded.scannedAt)}</span>` : "");
+    + (loaded && loaded.scannedAt ? `<span class="sep">·</span><span id="kpiWhen">scanned ${relTime(loaded.scannedAt)}</span>` : "")
+    + (caAvailable === true ? `<span class="sep">·</span><span class="ep-xlink" data-view="ca" title="Open the Conditional Access posture view">⤳ Conditional Access</span>` : "");
+  // Cross-link: agent CA coverage is evaluated here; the tenant-wide policy posture lives in the CA view.
+  $("kpiHead").querySelectorAll('.ep-xlink[data-view]').forEach(x => x.addEventListener("click", e => { e.stopPropagation(); if (window.EP && EP.goto) EP.goto(x.getAttribute("data-view")); }));
 }
 
 // ============================ highest-risk combination ============================
@@ -11281,12 +11284,13 @@ const isEnabled    = p => p.state === 'enabled';
 const isReportOnly = p => p.state === 'enabledForReportingButNotEnforced';
 const isDisabled   = p => !isEnabled(p) && !isReportOnly(p);
 
-// A policy "requires strong auth" when it mandates MFA, an authentication
-// strength, or a device state Entra treats as a strong control.
+// A policy requires MFA when it mandates MFA or an authentication strength.
+// Device compliance is a SEPARATE grant control (tracked by requiresCompliantDevice),
+// not MFA — conflating them would overstate MFA coverage.
 function requiresMfa(p) {
   const g = grant(p);
   if (g.authenticationStrength) return true;
-  return builtIn(p).some(c => /^(mfa|compliantDevice|domainJoinedDevice)$/i.test(c));
+  return builtIn(p).indexOf('mfa') >= 0;
 }
 const requiresCompliantDevice = p => builtIn(p).some(c => /^(compliantDevice|domainJoinedDevice)$/i.test(c));
 const blocksAccess            = p => builtIn(p).indexOf('block') >= 0;
@@ -11586,7 +11590,7 @@ function heroHead(ctx) {
         '<div class="score-grade rs-' + sc.band + '">' + sc.grade + '</div>' +
         '<div><div class="riskscore rs-' + sc.band + '">' + sc.score + '</div>' +
         '<div class="risklbl muted">/ 100</div></div></div>' +
-        (window.EP ? '<button class="btn" id="ca-whomod" title="Show who can modify these policies in the Attack Paths view" style="padding:7px 14px;font-size:12px">⤳ Who can modify this</button>' : '') +
+        (window.EP ? '<button class="btn js-ca-whomod" title="Open the Attack Paths view, listing every identity that can modify Conditional Access" style="padding:7px 14px;font-size:12px">⤳ Who can modify CA</button>' : '') +
         '<button class="btn" id="ca-copy" style="padding:7px 14px;font-size:12px">Copy findings</button></div></div>';
 }
 
@@ -11607,7 +11611,7 @@ function overviewTiles(ctx) {
       reportOnly.length || disabled.length ? 'medium' : 'info', 'ca-policies') +
     tile(mfaAdmins && mfaAll ? '2/2' : (mfaAdmins || mfaAll ? '1/2' : '0/2'), 'MFA coverage',
       'admins ' + yn(mfaAdmins, '✓', '✗') + ' · all users ' + yn(mfaAll, '✓', '✗'),
-      mfaAdmins && mfaAll ? 'low' : mfaAdmins || mfaAll ? 'medium' : 'critical', 'ca-findings') +
+      mfaAdmins && mfaAll ? 'low' : mfaAdmins || mfaAll ? 'medium' : 'critical', 'ca-coverage') +
     tile(legacy ? 'blocked' : 'open', 'Legacy auth', legacy ? 'a policy blocks it' : 'no enforcing block',
       legacy ? 'low' : 'high', 'ca-findings') +
     tile(risk ? 'yes' : 'no', 'Risk-based CA', risk ? 'Identity Protection drives enforcement' : 'risk signals unused',
@@ -11662,7 +11666,8 @@ function policyTable(ctx) {
       '</tr>';
   }).join('');
   return '<div class="band" id="ca-policies"><span class="band-t">Policies</span>' +
-    '<span class="band-s">Every Conditional Access policy, enforcing first</span>' +
+    '<span class="band-s">Every Conditional Access policy, enforcing first' +
+      (window.EP ? ' <span class="sep" style="opacity:.5">·</span> <span class="js-ca-whomod" role="button" tabindex="0" title="Open the Attack Paths view" style="cursor:pointer;color:var(--accent-2);font-weight:600;white-space:nowrap">⤳ who can modify them</span>' : '') + '</span>' +
     '<span class="band-x" style="color:var(--muted)">' + pol.length + ' ' + plural(pol.length, 'policy', 'policies') + '</span></div>' +
     '<div class="card"><div class="card-b flush"><table class="data">' +
       '<thead><tr><th>Policy</th><th>State</th><th>Controls</th><th>Targets</th><th>Exclusions</th></tr></thead>' +
@@ -11677,6 +11682,60 @@ function caFindings(ctx) {
     findingsBlock(f, 'Nothing flagged. The enforcing policies cover MFA, legacy auth and the baseline.');
 }
 
+// Coverage: for each key control, is an ENFORCING policy present, what scope does it
+// target, and are all users in it. Read from policy scope — not the user directory.
+function coverageMatrix(ctx) {
+  const pol = ctx.policies || [];
+  const enabled = pol.filter(isEnabled);
+  const ro = pol.filter(isReportOnly);
+  const CONTROLS = [
+    { label: 'MFA — all users',           m: p => requiresMfa(p) && includesAllUsers(p) && coversAllApps(p) && !blocksAccess(p) },
+    { label: 'MFA — administrators',       m: p => requiresMfa(p) && targetsAdmins(p) && coversAllApps(p) && !blocksAccess(p) },
+    { label: 'Block legacy authentication',m: p => blocksAccess(p) && coversLegacyClients(p) && includesAllUsers(p) },
+    { label: 'Sign-in risk (risk-based)',  m: p => (conds(p).signInRiskLevels || []).length > 0 },
+    { label: 'User risk (risk-based)',     m: p => (conds(p).userRiskLevels || []).length > 0 },
+    { label: 'Compliant / managed device', m: p => requiresCompliantDevice(p) }
+  ];
+  const scopeOf = list => {
+    if (list.some(includesAllUsers)) return 'All users';
+    let roles = 0, groups = 0, users = 0;
+    list.forEach(p => { const u = usersCond(p);
+      roles += (u.includeRoles || []).length; groups += (u.includeGroups || []).length;
+      users += (u.includeUsers || []).filter(x => x !== 'All' && x !== 'None').length; });
+    const bits = [];
+    if (roles) bits.push(roles + ' ' + plural(roles, 'role'));
+    if (groups) bits.push(groups + ' ' + plural(groups, 'group'));
+    if (users) bits.push(users + ' ' + plural(users, 'user'));
+    return bits.join(', ') || 'scoped';
+  };
+  const rows = CONTROLS.map(c => {
+    const en = enabled.filter(c.m), r = ro.filter(c.m);
+    const basis = en.length ? en : r;
+    const pill = en.length ? '<span class="st-pill st-block">Enforced</span>'
+               : r.length  ? '<span class="st-pill st-allowq">Report-only</span>'
+               :             '<span class="st-pill st-na">Not configured</span>';
+    const scope = basis.length ? scopeOf(basis) : '—';
+    const exMax = basis.reduce((n, p) => Math.max(n, exclusionCount(p)), 0);
+    const allUsers = basis.some(includesAllUsers);
+    const inScope = en.length && allUsers ? '<span style="color:var(--low);font-weight:700">all users' + (exMax ? ' − ' + exMax : '') + '</span>'
+                  : en.length             ? '<span style="color:var(--med);font-weight:700">scoped only</span>'
+                  : r.length              ? '<span style="color:var(--med);font-weight:700">not enforced</span>'
+                  :                         '<span style="color:var(--crit);font-weight:700">no policy</span>';
+    return '<tr><td><div class="tname">' + esc(c.label) + '</div></td>' +
+      '<td>' + pill + '</td><td>' + esc(scope) + '</td>' +
+      '<td>' + (exMax ? '<span style="color:var(--med);font-weight:700">' + exMax + '</span>' : '<span style="color:var(--dim)">0</span>') + '</td>' +
+      '<td>' + inScope + '</td></tr>';
+  }).join('');
+  return '<div class="band" id="ca-coverage"><span class="band-t">Coverage</span>' +
+      '<span class="band-s">Is each control actually enforced, and who is in scope</span></div>' +
+    '<div class="note note-info">This reads policy <b>scope</b>, not your user directory — it answers “is there an ' +
+      'enforcing policy and does it target everyone”. Report-only counts as <b>not enforced</b>. For who is covered ' +
+      'account-by-account, the <b>User</b> view’s “Not MFA-covered” is the authoritative per-user side.</div>' +
+    '<div class="card"><div class="card-b flush"><table class="data">' +
+      '<thead><tr><th>Control</th><th>Status</th><th>Scope targeted</th><th>Exclusions</th><th>All users in scope?</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table></div></div>';
+}
+
 function render(ctx) {
   const demoBanner = ctx.demo
     ? '<div class="note note-warn"><b>Demo tenant.</b> A synthetic Conditional Access configuration, not a real one — '
@@ -11687,6 +11746,7 @@ function render(ctx) {
       demoBanner
     + heroHead(ctx)
     + overviewTiles(ctx)
+    + coverageMatrix(ctx)
     + policyTable(ctx)
     + caFindings(ctx);
 
@@ -11698,9 +11758,13 @@ function render(ctx) {
   });
   const copyBtn = $('ca-copy');
   if (copyBtn) copyBtn.onclick = () => copyFindings(ctx);
-  // Who can weaken this? Jump to Attack Paths, listing the CanModifyConditionalAccess edges.
-  const wm = $('ca-whomod');
-  if (wm) wm.onclick = () => { if (window.EP && EP.goto) EP.goto('entrahound', { query: 'edges CanModifyConditionalAccess' }); };
+  // Who can weaken this? Every .js-ca-whomod control jumps to Attack Paths, listing the
+  // CanModifyConditionalAccess edges (the hero button and the in-context Policies link).
+  const gotoWhoMod = () => { if (window.EP && EP.goto) EP.goto('entrahound', { query: 'edges CanModifyConditionalAccess' }); };
+  [].forEach.call($('content').querySelectorAll('.js-ca-whomod'), el => {
+    el.onclick = gotoWhoMod;
+    el.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); gotoWhoMod(); } };
+  });
   const fw = $('foot-when'); if (fw) fw.textContent = ctx.at ? 'Scanned ' + ctx.at.toLocaleString() : '';
 }
 
@@ -11786,7 +11850,8 @@ function demoContext() {
   const policies = [
     { id: 'p-mfa-all', displayName: 'Require MFA for all users', state: 'enabled',
       conditions: { users: { includeUsers: ['All'], excludeUsers: [], excludeGroups: ['grp-breakglass'], excludeRoles: [] },
-                    applications: { includeApplications: ['All'], excludeApplications: [] }, clientAppTypes: ['all'] },
+                    applications: { includeApplications: ['All'], excludeApplications: [] }, clientAppTypes: ['all'],
+                    locations: { includeLocations: ['All'], excludeLocations: ['nl-hq'] } },
       grantControls: { operator: 'OR', builtInControls: ['mfa'] } },
     { id: 'p-mfa-admins', displayName: 'Require MFA for admin roles', state: 'enabledForReportingButNotEnforced',
       conditions: { users: { includeRoles: [roleGA], includeUsers: [] },
