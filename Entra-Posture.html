@@ -169,6 +169,16 @@
     font-size: 13px; letter-spacing: .06em; padding: 10px 12px; cursor: pointer; transition: .14s; margin-bottom: 8px; box-shadow: none; }
   .ep-nav .ep-cfg svg { width: 17px; height: 17px; flex-shrink: 0; }
   .ep-nav .ep-cfg:hover { color: var(--text); background: var(--hover); border-color: var(--accent); transform: none; filter: none; }
+  /* Persistent AI connection status on the Configuration button — a dot + provider·model that
+     reflects a reachability ping (on load and after save), so you can see at a glance it's wired up. */
+  .ep-nav .ep-cfg .ep-cfg-txt { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.2; }
+  .ep-cfg-stat { font-family: var(--body); font-weight: 500; font-size: 10px; letter-spacing: 0; text-transform: none;
+    color: var(--muted); margin-top: 3px; display: flex; align-items: center; gap: 5px; max-width: 150px; }
+  .ep-cfg-stat::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+  .ep-cfg-stat.ok::before { background: var(--accent-dark); box-shadow: 0 0 7px var(--accent-dark); }
+  .ep-cfg-stat.fail::before { background: var(--red); box-shadow: 0 0 6px var(--red); }
+  .ep-cfg-stat.checking::before { background: var(--amber); animation: ep-blink 1s ease-in-out infinite; }
+  @keyframes ep-blink { 50% { opacity: .3; } }
   .ep-modal { position: fixed; inset: 0; z-index: 1000; background: rgba(3,8,20,.66); backdrop-filter: blur(3px);
     display: none; align-items: center; justify-content: center; padding: 20px; }
   .ep-modal.on { display: flex; }
@@ -1466,7 +1476,7 @@
   <div class="spacer"></div>
   <button class="ep-cfg" id="epConfigBtn" title="AI / LLM configuration">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.6v3M12 18.4v3M2.6 12h3M18.4 12h3M5.2 5.2l2.1 2.1M16.7 16.7l2.1 2.1M18.8 5.2l-2.1 2.1M7.3 16.7l-2.1 2.1" stroke-linecap="round"/></svg>
-    Configuration</button>
+    <span class="ep-cfg-txt">Configuration<span class="ep-cfg-stat" id="epCfgStat" aria-live="polite"></span></span></button>
   <div class="foot">Read-only · browser only · one tenant, one sign-in</div>
 </nav>
 
@@ -2076,8 +2086,36 @@ window.EP = (function () {
   async function cfgTest() {
     cfgSave();
     const s = $("epCfgStatus"); s.style.color = "var(--muted)"; s.innerHTML = '<span class="spinner"></span>Testing…';
-    try { const out = await llmComplete("You are a terse assistant.", "Reply with the single word: ready"); s.style.color = "var(--green)"; s.textContent = "Connected — " + llm.provider + " · " + llm.model + (out ? " · " + out.trim().slice(0, 30) : ""); }
-    catch (e) { s.style.color = "var(--red)"; s.textContent = "Failed — " + (e.message || e); }
+    try { const out = await llmComplete("You are a terse assistant.", "Reply with the single word: ready"); s.style.color = "var(--green)"; s.textContent = "Connected — " + llm.provider + " · " + llm.model + (out ? " · " + out.trim().slice(0, 30) : ""); llmState = "ok"; }
+    catch (e) { s.style.color = "var(--red)"; s.textContent = "Failed — " + (e.message || e); llmState = "fail"; }
+    cfgStat();
+  }
+
+  // ---- persistent AI connection indicator on the Configuration button ----
+  let llmState = "idle";   // idle (configured, unverified) | checking | ok | fail
+  const LLM_LABEL = { ollama: "Ollama", anthropic: "Claude", openai: "OpenAI" };
+  function cfgStat() {
+    const e = $("epCfgStat"); if (!e) return;
+    const label = LLM_LABEL[llm.provider] || llm.provider;
+    e.className = "ep-cfg-stat" + (["ok", "fail", "checking"].includes(llmState) ? " " + llmState : "");
+    e.title = e.textContent =
+      llmState === "checking" ? "Checking…"
+      : llmState === "ok"     ? label + " · " + llm.model
+      : llmState === "fail"   ? label + " · not reachable"
+      : llm.ready()           ? label + " · " + llm.model     // configured, not yet verified
+      :                         "AI not configured";
+  }
+  async function cfgPing() {    // lightweight reachability check (no model call) to light the dot
+    if (!llm.ready()) { llmState = "idle"; cfgStat(); return; }
+    llmState = "checking"; cfgStat();
+    try {
+      const p = llm.provider; let r;
+      if (p === "ollama") r = await fetch(llm.ollamaUrl + "/api/tags");
+      else if (p === "anthropic") r = await fetch("https://api.anthropic.com/v1/models", { headers: { "x-api-key": llm.key("anthropic"), "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" } });
+      else r = await fetch("https://api.openai.com/v1/models", { headers: { "Authorization": "Bearer " + llm.key("openai") } });
+      llmState = r && r.ok ? "ok" : "fail";
+    } catch (e) { llmState = "fail"; }
+    cfgStat();
   }
 
   function boot() {
@@ -2099,11 +2137,12 @@ window.EP = (function () {
     const closeCfg = () => $("epConfigModal").classList.remove("on");
     $("epConfigBtn").addEventListener("click", () => { cfgDraft = {}; $("epCfgStatus").textContent = ""; cfgRender(); $("epConfigModal").classList.add("on"); });
     $("epCfgClose").addEventListener("click", closeCfg);
-    $("epCfgSave").addEventListener("click", () => { cfgSave(); const s = $("epCfgStatus"); s.style.color = "var(--green)"; s.textContent = "Saved."; });
+    $("epCfgSave").addEventListener("click", () => { cfgSave(); const s = $("epCfgStatus"); s.style.color = "var(--green)"; s.textContent = "Saved."; cfgPing(); });
     $("epCfgTest").addEventListener("click", cfgTest);
     $("epConfigModal").addEventListener("click", e => { if (e.target === $("epConfigModal")) closeCfg(); });
     document.addEventListener("keydown", e => { if (e.key === "Escape") closeCfg(); });
     if (DEMO) { $("epDemoBar").classList.add("on"); $("epConnect").style.display = "none"; }
+    cfgStat(); cfgPing();   // reflect the saved AI config on the Configuration button at load
     show("user");
   }
 
