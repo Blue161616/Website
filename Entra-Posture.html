@@ -1308,7 +1308,9 @@
 /* ================= view: external ================= */
 #view-external * {box-sizing:border-box;margin:0;padding:0}
 #view-external {font-family:-apple-system,BlinkMacSystemFont,"Segoe UI Variable Text","Segoe UI",Roboto,sans-serif;
-    background:var(--bg);color:var(--text);min-height:100vh;font-size:14px;line-height:1.5}
+    background-color:var(--bg);color:var(--text);min-height:100vh;font-size:14px;line-height:1.5;
+    
+    background:radial-gradient(1200px 700px at 50% 0%, #10306A 0%, rgba(16,48,106,0) 60%), linear-gradient(180deg, #0A1C42 0%, var(--bg) 460px)}
 #view-external a {color:var(--accent-2)}
 #view-external code {font-family:var(--mono);font-size:.92em}
 #view-external #gate {position:fixed;inset:0;z-index:999;background:var(--bg);
@@ -10241,25 +10243,33 @@ async function loadGuests(partners, names, def, interactive) {
 
     let underDefault = 0, unresolved = 0;
     const trustedMap = {};
+    // One group per home domain, carrying the actual guest identities and the
+    // configuration that governs them — built in the same pass as the counts so
+    // the list below can never disagree with the tiles above it.
+    const groups = [];
+    const guestRow = u => ({ name: u.displayName || '', upn: u.userPrincipalName || '', state: u.externalUserState || '' });
     use.forEach(dom => {
       const info = domTenant[dom];
       const n = byDomain[dom].length;
-      if (!info) { unresolved += n; return; }
-      if (!partnerIds.has(info.tenantId)) { underDefault += n; return; }
+      const guests = byDomain[dom].map(guestRow);
+      if (!info) { unresolved += n; groups.push({ dom: dom, bucket: 'unresolved', tenant: '', guests: guests }); return; }
+      const tName = (names[info.tenantId] && names[info.tenantId].displayName) || info.displayName || '';
+      if (!partnerIds.has(info.tenantId)) { underDefault += n; groups.push({ dom: dom, bucket: 'default', tenant: tName, guests: guests }); return; }
       const p = partnerById[info.tenantId];
       const tru = effective(p.inboundTrust, def.inboundTrust);
       const on = trustFlags(tru.value).filter(f => f.on).map(f => f.label);
       if (on.length) {
-        const label = (names[info.tenantId] && names[info.tenantId].displayName) ||
-                      info.displayName || dom;
         const k = info.tenantId;
-        trustedMap[k] = trustedMap[k] || { label, flags: on, count: 0 };
+        trustedMap[k] = trustedMap[k] || { label: tName || dom, flags: on, count: 0 };
         trustedMap[k].count += n;
+        groups.push({ dom: dom, bucket: 'trusted', tenant: tName, flags: on, guests: guests });
+      } else {
+        groups.push({ dom: dom, bucket: 'partner', tenant: tName, guests: guests });
       }
     });
 
     return { state: 'ok', total: users.length, domains: domains.length, capped,
-             underDefault, unresolved, trusted: Object.values(trustedMap),
+             underDefault, unresolved, trusted: Object.values(trustedMap), groups: groups,
              byDomain, domTenant, use };
   } catch (e) {
     return { state: 'error', error: e.message || String(e) };
@@ -10507,7 +10517,7 @@ function heroHead(ctx) {
     .join('<span class="sep">·</span>');
   return '<div class="hero-head"><div class="hero-main"><h2>External Access</h2>' +
       '<div class="hero-sub"><span class="eyebrow">Security posture</span><span class="sep">·</span>' +
-        (chips || '<span style="color:var(--low);font-weight:700">Clear</span>') +
+        (chips ? '<span data-go="findings" role="button" tabindex="0" title="Jump to findings" style="cursor:pointer">' + chips + '</span>' : '<span style="color:var(--low);font-weight:700">Clear</span>') +
         '<span class="sep">·</span>scanned ' + esc(ctx.at.toLocaleString()) + '</div></div>' +
       '<div class="hero-actions"><button class="btn" id="epx-copy" style="padding:7px 14px;font-size:12px">Copy findings</button></div></div>';
 }
@@ -10543,7 +10553,7 @@ function overviewTiles(ctx) {
 }
 function externalFindings(ctx) {
   const f = ctx.findings || [];
-  return '<div class="band">' +
+  return '<div class="band" id="ext-findings">' +
       '<span class="band-t">Findings</span>' +
       '<span class="band-s">Every section, severity first</span>' +
       '<span class="band-x" style="color:var(--muted)">' + f.length + ' ' + plural(f.length, 'finding') + '</span></div>' +
@@ -10709,6 +10719,56 @@ function viewPartners(ctx, compact) {
   return h;
 }
 
+// The identities behind the guest counts: who each guest is, where they are
+// from, and which configuration governs them. Capped so a large guest
+// population stays a readable list rather than a wall of rows.
+function guestList(g) {
+  const groups = (g && g.groups) || [];
+  if (!groups.length) return '';
+  const MAX_ROWS = 200;
+  const GOV = {
+    trusted:     grp => ({ cls: 'st-allow',   txt: 'Trusted: ' + (grp.flags || []).join(', ') }),
+    'default':   ()  => ({ cls: 'st-allowq', txt: 'The default' }),
+    partner:     ()  => ({ cls: 'st-block',  txt: 'Partner entry' }),
+    unresolved:  ()  => ({ cls: 'st-na',     txt: 'Unresolved' })
+  };
+  const invite = s => {
+    const v = String(s || '').toLowerCase();
+    if (v === 'accepted')          return '<span class="st-pill st-block">Accepted</span>';
+    if (v === 'pendingacceptance') return '<span class="st-pill st-allowq">Pending</span>';
+    return '<span class="st-pill st-na">' + (s ? esc(s) : '—') + '</span>';
+  };
+  let total = 0; groups.forEach(grp => { total += grp.guests.length; });
+  let rows = '', shown = 0;
+  for (const grp of groups) {
+    const gov = (GOV[grp.bucket] || GOV.unresolved)(grp);
+    const home = esc(grp.dom) + (grp.tenant
+      ? '<div style="font-size:10.5px;color:var(--dim);margin-top:2px">' + esc(grp.tenant) + '</div>' : '');
+    for (const u of grp.guests) {
+      if (shown >= MAX_ROWS) break;
+      rows += '<tr>' +
+        '<td><div class="tname">' + (u.name ? esc(u.name) : '<span style="color:var(--dim)">(no display name)</span>') + '</div>' +
+          '<div class="tid">' + esc(u.upn) + '</div></td>' +
+        '<td>' + home + '</td>' +
+        '<td><span class="st-pill ' + gov.cls + '">' + esc(gov.txt) + '</span></td>' +
+        '<td>' + invite(u.state) + '</td>' +
+        '</tr>';
+      shown++;
+    }
+    if (shown >= MAX_ROWS) break;
+  }
+  const more = total > shown
+    ? '<div class="note note-info" style="margin:0;border-radius:0;border-left:none;border-top:1px solid var(--border)">' +
+        '<b>' + (total - shown) + ' more</b> guest ' + plural(total - shown, 'account') +
+        ' not listed here (first ' + MAX_ROWS + ' shown).</div>' : '';
+  return '<div class="card" id="ext-guest-list"><div class="card-h">' +
+      '<span class="t">Which guest accounts</span>' +
+      '<span class="s">The identities behind the counts above</span></div>' +
+      '<div class="card-b flush"><table class="data">' +
+        '<thead><tr><th>Guest</th><th>Home domain</th><th>Governed by</th><th>Invite</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table>' + more + '</div></div>';
+}
+
 // ── Guest correlation ──────────────────────────────────────────────────────
 function viewGuests(ctx, compact) {
   const g = ctx.guests || {};
@@ -10754,6 +10814,7 @@ function viewGuests(ctx, compact) {
         'and the first ' + MAX_GUEST_DOMAINS + ' by guest count were resolved. The rest are not included ' +
         'in the figures above.</div>';
     }
+    h += guestList(g);
   }
   if (!compact) h += '<div class="band" style="' + bandColour(worstOf(own) || 'info') + '">' +
       '<span class="band-t">What these guests cost you</span>' +
