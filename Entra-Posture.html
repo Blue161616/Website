@@ -182,9 +182,11 @@
   .ep-prov .pd { font-size: 10.5px; color: var(--muted); margin-top: 3px; line-height: 1.4; }
   .ep-cfg-field { margin-bottom: 12px; }
   .ep-cfg-field label { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 5px; font-weight: 700; }
-  .ep-cfg-field input { width: 100%; background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text);
+  .ep-cfg-field input, .ep-cfg-field select { width: 100%; background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text);
     padding: 8px 10px; border-radius: 6px; font-size: 13px; font-family: "Cascadia Code", Consolas, monospace; }
-  .ep-cfg-field input:focus { outline: none; border-color: var(--accent); }
+  .ep-cfg-field input:focus, .ep-cfg-field select:focus { outline: none; border-color: var(--accent); }
+  .ep-cfg-field label .ep-cfg-refresh { float: right; font-size: 10px; text-transform: none; letter-spacing: 0; font-weight: 600;
+    color: var(--accent-dark); cursor: pointer; }
   .ep-cfg-hint { font-size: 10.5px; color: var(--muted); margin-top: 5px; line-height: 1.5; }
   #epCfgStatus { font-size: 12px; }
 
@@ -1959,6 +1961,13 @@ window.EP = (function () {
   //      sovereign (the tenant graph never leaves the machine); Anthropic / OpenAI keys are stored in
   //      THIS browser only (localStorage) and sent directly to the provider, same options as WebProbe. ----
   const LLM_DEFAULTS = { ollama: "qwen2.5", anthropic: "claude-sonnet-5-5", openai: "gpt-4o-mini" };
+  // Curated fallbacks so the dropdown is useful before (or without) a live model fetch.
+  const LLM_MODELS = {
+    ollama: ["qwen2.5", "qwen2.5:14b", "llama3.1", "llama3.2", "mistral"],
+    anthropic: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
+    openai: ["gpt-4o", "gpt-4o-mini", "o3-mini", "gpt-4.1", "gpt-4.1-mini"]
+  };
+  const cfgModels = {};   // provider -> live model ids (via Ollama /api/tags or the cloud /v1/models)
   const llm = {
     get provider() { return localStorage.getItem("ep_llm_provider") || "ollama"; },
     get model() { return localStorage.getItem("ep_llm_model") || LLM_DEFAULTS[this.provider] || ""; },
@@ -2003,11 +2012,35 @@ window.EP = (function () {
       + '<div class="ep-provs">' + card("ollama", "Ollama · local", "Runs on your box — data stays local. Recommended.")
       + card("anthropic", "Claude · Anthropic", "Cloud API — most capable; sends data off-box.")
       + card("openai", "ChatGPT · OpenAI", "Cloud API — sends data off-box.") + '</div>'
-      + '<div class="ep-cfg-field"><label>Model</label><input id="epCfgModel" value="' + esc(model) + '" placeholder="' + esc(LLM_DEFAULTS[p] || "model id") + '"></div>';
+      + (function () {
+          const opts = [...new Set([].concat(cfgModels[p] || [], LLM_MODELS[p] || [], model || []).filter(Boolean))];
+          return '<div class="ep-cfg-field"><label>Model <a id="epCfgRefresh" class="ep-cfg-refresh">↻ refresh list</a></label>'
+            + '<select id="epCfgModel">' + opts.map(m => '<option value="' + esc(m) + '"' + (m === model ? " selected" : "") + '>' + esc(m) + '</option>').join("") + '</select>'
+            + (p === "ollama" && !(cfgModels.ollama && cfgModels.ollama.length) ? '<div class="ep-cfg-hint">Showing common models — refresh to list what Ollama actually has installed.</div>' : "")
+            + '</div>';
+        })();
     if (p === "ollama") h += '<div class="ep-cfg-field"><label>Ollama server URL</label><input id="epCfgUrl" value="' + esc(cfgDraft.ollamaUrl != null ? cfgDraft.ollamaUrl : llm.ollamaUrl) + '" placeholder="http://localhost:11434"><div class="ep-cfg-hint">If Ollama runs on another host, start it with <b>OLLAMA_ORIGINS=*</b> so this page may call it.</div></div>';
     if (cloud) h += '<div class="ep-cfg-field"><label>' + (p === "anthropic" ? "Anthropic" : "OpenAI") + ' API key</label><input id="epCfgKey" type="password" autocomplete="off" value="' + esc(cfgDraft.key != null ? cfgDraft.key : llm.key(p)) + '" placeholder="sk-…"><div class="ep-cfg-hint" style="color:var(--amber)">Stored in this browser and sent directly to ' + (p === "anthropic" ? "Anthropic" : "OpenAI") + ' — for sensitive tenants use Ollama (local).</div></div>';
     $("epCfgBody").innerHTML = h;
     $("epCfgBody").querySelectorAll(".ep-prov").forEach(b => b.addEventListener("click", () => { cfgDraft = { provider: b.dataset.prov }; cfgRender(); }));
+    const ms = $("epCfgModel"); if (ms) ms.addEventListener("change", () => { cfgDraft.model = ms.value; });
+    const rf = $("epCfgRefresh"); if (rf) rf.addEventListener("click", () => cfgFetchModels(p, true));
+    if (cfgModels[p] === undefined && (p === "ollama" || llm.key(p))) cfgFetchModels(p, false);  // auto-fetch once
+  }
+  async function cfgFetchModels(p, manual) {
+    if (cfgModels[p + "__loading"]) return;
+    cfgModels[p + "__loading"] = true;
+    const s = $("epCfgStatus");
+    if (manual && s) { s.style.color = "var(--muted)"; s.innerHTML = '<span class="spinner"></span>Fetching models…'; }
+    try {
+      let ids = [];
+      if (p === "ollama") { const r = await fetch(llm.ollamaUrl + "/api/tags"); if (r.ok) ids = ((await r.json()).models || []).map(m => m.name); }
+      else if (p === "anthropic" && llm.key("anthropic")) { const r = await fetch("https://api.anthropic.com/v1/models", { headers: { "x-api-key": llm.key("anthropic"), "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" } }); if (r.ok) ids = ((await r.json()).data || []).map(m => m.id); }
+      else if (p === "openai" && llm.key("openai")) { const r = await fetch("https://api.openai.com/v1/models", { headers: { "Authorization": "Bearer " + llm.key("openai") } }); if (r.ok) ids = ((await r.json()).data || []).map(m => m.id).filter(id => /^(gpt|o[0-9]|chatgpt)/.test(id)).sort(); }
+      cfgModels[p] = ids;
+      if (manual && s) { s.style.color = ids.length ? "var(--green)" : "var(--amber)"; s.textContent = ids.length ? ("Found " + ids.length + " models.") : "No models returned (check the provider / key)."; }
+    } catch (e) { cfgModels[p] = cfgModels[p] || []; if (manual && s) { s.style.color = "var(--red)"; s.textContent = "Model list failed — " + (e.message || e); } }
+    finally { cfgModels[p + "__loading"] = false; cfgRender(); }
   }
   function cfgSave() {
     const p = cfgDraft.provider || llm.provider;
