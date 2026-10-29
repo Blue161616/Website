@@ -1783,7 +1783,7 @@
 #view-entrahound {
     margin: 0; min-height: 100vh;
     background: radial-gradient(1200px 700px at 50% 0%, #10306A 0%, rgba(16,48,106,0) 60%), linear-gradient(180deg, var(--bg-2) 0%, var(--bg) 420px);
-    background-color: var(--bg); color: var(--ink); font: 400 14.5px/1.55 var(--body); padding-inline: var(--gutter); overflow-x: hidden;
+    background-color: var(--bg); color: var(--ink); font: 400 14.5px/1.55 var(--body); padding-inline: var(--gutter); overflow-x: clip;
   }
 #view-entrahound::before {
     content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
@@ -1798,7 +1798,9 @@
 #view-entrahound .hidden { display: none !important; }
 #view-entrahound :focus-visible { outline: 2px solid var(--accent-2); outline-offset: 3px; border-radius: 6px; }
 #view-entrahound ::selection { background: rgba(63,169,255,.35); }
-#view-entrahound nav.top { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-block: 18px; flex-wrap: wrap; }
+#view-entrahound nav.top { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-block: 14px; flex-wrap: wrap;
+    position: sticky; top: 49px; z-index: 20; background: color-mix(in srgb, var(--bg) 90%, transparent);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
 #view-entrahound .brand { display: flex; align-items: center; gap: 12px; color: var(--ink); text-decoration: none; }
 #view-entrahound .brand svg { width: 36px; height: auto; }
 #view-entrahound .brand span { font: 400 14px/1 var(--display); letter-spacing: .16em; }
@@ -2660,6 +2662,7 @@
       <li><button data-view="paths">Attack paths<span class="n" id="n-paths">0</span></button></li>
       <li><button data-view="graph">Graph</button></li>
       <li><button data-view="findings">Findings<span class="n" id="n-findings">0</span></button></li>
+      <li><button data-view="fixplan">Fix plan<span class="n" id="n-fixplan">0</span></button></li>
       <li><button data-view="inventory">Inventory</button></li>
       <li><button data-view="query">Query</button></li>
       <li><button data-view="collect">Collection</button></li>
@@ -2766,8 +2769,26 @@
             <span class="count" id="fCount"></span>
           </div>
         </div>
-        <div id="fixPlan"></div>
         <div id="findingsList"></div>
+      </div>
+    </section>
+
+    <!-- Fix plan (remediation by blast radius) -->
+    <section class="view hidden" id="view-fixplan">
+      <div class="panel">
+        <div class="toolbar">
+          <div><p class="kicker">Remediation</p><h2>Fix plan — by blast radius</h2></div>
+          <div class="actions">
+            <select id="fpTarget" style="width:auto" title="Scope the plan to the paths that reach one crown-jewel target"></select>
+            <button type="button" class="btn btn-ghost btn-sm" id="fpGraph" title="Open the graph with the choke-point edges highlighted">Show choke points in graph</button>
+            <button type="button" class="btn btn-ghost btn-sm hidden" id="fpNarrate">✦ Narrate plan</button>
+          </div>
+        </div>
+        <div id="fpBody"></div>
+      </div>
+      <div class="panel" id="fpStandaloneWrap" style="display:none">
+        <div class="toolbar"><div><p class="kicker">Findings-aware</p><h2>Also fix — not on any attack path</h2></div></div>
+        <div id="fpStandalone"></div>
       </div>
     </section>
 
@@ -3337,7 +3358,8 @@ window.EP = (function () {
     if (ai) h += '<div class="ai"><p>' + esc(ai).replace(/\n{2,}/g, "</p><p>").replace(/\n/g, "<br>") + '</p></div>';
     else h += '<div class="ai">' + (llm.ready() ? "" : '<p class="muted">Configure a local AI model in Configuration for an AI-written summary.</p>') + '<p>' + esc(deterministicSummary(data, overall)) + '</p></div>';
     h += renderUserSection(data.user) + renderWorkloadSection(data.workload) + renderAgentSection(data.agent)
-      + renderExternalSection(data.external) + renderConditionalAccessSection(data.ca) + renderPathsSection(data.entrahound) + renderRemediation(data);
+      + renderExternalSection(data.external) + renderConditionalAccessSection(data.ca) + renderPathsSection(data.entrahound)
+      + renderCrossDomain(data) + renderRemediation(data);
     h += '<h2>Collection</h2><p class="muted">Read-only Microsoft Graph collection' + (who ? " as " + esc(who) : "") + " · " + esc(new Date().toLocaleString()) + ". Nothing is written to the tenant." + (DEMO ? " Demo data — no Graph calls were made." : "") + '</p>';
     return h + '</body></html>';
   }
@@ -3392,6 +3414,65 @@ window.EP = (function () {
     h += '<h3>Top attack paths</h3>';
     h += (s.topPaths || []).slice(0, 12).map(p => '<p><span class="sev ' + sevCls(p.severity) + '">' + esc(p.severity) + ' ' + p.score + '</span> <span class="chain">' + esc(p.chain) + '</span>' + (p.why ? '<br><span class="muted">' + esc(p.why) + '</span>' : "") + '</p>').join("") || '<p class="muted">No attack paths.</p>';
     if (s.criticalAssets && s.criticalAssets.length) h += '<h3>Critical assets</h3>' + repTable([["Type", r => esc(r.type)], ["Asset", r => esc(r.label)], ["Identities with a path", r => r.reachers]], s.criticalAssets);
+    return h;
+  }
+  // Cross-domain correlation — where a gap in one domain makes an exposure in another materially
+  // worse. Every line is DERIVED from the per-domain summary numbers already shown above; nothing
+  // here is new data, and a correlation only fires when both sides are actually present.
+  function renderCrossDomain(data) {
+    const eh = data.entrahound, ca = data.ca, ext = data.external, user = data.user;
+    const x = (eh && eh.exposure) || {};
+    const critHigh = (x.crit || 0) + (x.high || 0);
+    const rows = [];
+
+    // Attack paths that a role can disable Conditional Access — the control the whole report leans on.
+    if (eh && eh.criticalAssets) {
+      const caAdmin = eh.criticalAssets.filter(a => /conditional access/i.test(a.label))[0];
+      if (caAdmin && caAdmin.reachers > 0)
+        rows.push({ sev: 'critical',
+          title: caAdmin.reachers + ' identit' + (caAdmin.reachers > 1 ? 'ies' : 'y') + ' can reach Conditional Access Administrator',
+          detail: 'Conditional Access is the enforcement layer the rest of this report depends on, yet ' + caAdmin.reachers + ' identit' + (caAdmin.reachers > 1 ? 'ies have' : 'y has') + ' an attack path to a role that can modify or switch it off. Securing these paths protects every CA-based control above.' });
+    }
+
+    // High-risk attack paths + Conditional Access not enforcing MFA = the paths are not gated.
+    if (eh && critHigh > 0 && ca && ca.totals) {
+      const t = ca.totals, ro = t.reportOnly ? ' (' + t.reportOnly + ' CA ' + (t.reportOnly === 1 ? 'policy is' : 'policies are') + ' in report-only, enforcing nothing)' : '';
+      if (!t.mfaAdmins)
+        rows.push({ sev: 'critical',
+          title: critHigh + ' high-risk attack path' + (critHigh > 1 ? 's' : '') + ' and no enforced MFA for administrators',
+          detail: (x.crit || 0) + ' critical and ' + (x.high || 0) + ' high-risk path' + (critHigh > 1 ? 's' : '') + ' reach a critical asset, while Conditional Access does not enforce MFA for privileged roles' + ro + '. An identity on any of these paths can authenticate with a password alone — the path and the missing control compound.' });
+      else if (!t.mfaAllUsers)
+        rows.push({ sev: 'high',
+          title: critHigh + ' high-risk path' + (critHigh > 1 ? 's' : '') + ', MFA not enforced for all users',
+          detail: 'MFA is enforced for admins but not the general population' + ro + ', so the non-admin identities that begin many of these paths are password-only.' });
+      if (!t.legacyBlocked)
+        rows.push({ sev: 'high', title: 'Legacy authentication is not blocked while attack paths exist',
+          detail: 'Legacy auth cannot present an MFA challenge, so it is a password-spray route onto the identities that start these ' + critHigh + ' path' + (critHigh > 1 ? 's' : '') + '. Blocking it is a single Conditional Access change.' });
+    }
+
+    // Guests with a path + an open External Access inbound surface.
+    const gp = x.guestPaths || 0;
+    if (eh && gp > 0 && ext && ext.tiles) {
+      const dc = String(ext.tiles.directConnect || ''), trust = String(ext.tiles.delegatedTrust || '');
+      const trustOpen = trust && !/none/i.test(trust), dcOpen = /open|named/i.test(dc);
+      rows.push({ sev: 'high',
+        title: gp + ' guest' + (gp > 1 ? 's' : '') + ' with an attack path, across ' + (ext.tiles.partners || 0) + ' partner configuration' + ((ext.tiles.partners || 0) === 1 ? '' : 's'),
+        detail: gp + ' external identit' + (gp > 1 ? 'ies' : 'y') + ' can already reach a critical asset. External Access ' + (trustOpen ? 'also delegates trust (' + esc(trust) + ')' : 'governs who may be invited in') + (dcOpen ? ' and direct connect is ' + esc(dc) : '') + ' — the inbound surface and the reachability compound.' });
+    }
+
+    // Weak/no-MFA accounts on a tenant that already has live paths.
+    if (user && user.totals && user.totals.weakNoMfa && critHigh > 0)
+      rows.push({ sev: 'high',
+        title: user.totals.weakNoMfa + ' account' + (user.totals.weakNoMfa > 1 ? 's' : '') + ' with weak or no MFA on a tenant with live attack paths',
+        detail: 'These are the cheapest entry points; with ' + critHigh + ' path' + (critHigh > 1 ? 's' : '') + ' to a critical asset, one phished password can become tenant takeover.' });
+
+    if (!rows.length) return '';
+    const ord = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+    rows.sort((a, b) => ord[a.sev] - ord[b.sev]);
+    let h = '<h2>Cross-domain correlation</h2>';
+    h += '<p class="muted">Where a gap in one domain makes an exposure in another materially worse. Each line is derived from the domain numbers above — nothing here is new data. This is the view no single-domain tool can give.</p>';
+    h += repTable([["", r => '<span class="sev ' + sevCls(r.sev) + '">' + r.sev.charAt(0).toUpperCase() + r.sev.slice(1) + '</span>'],
+                   ["Correlation", r => '<b>' + esc(r.title) + '</b><br><span class="muted">' + esc(r.detail) + '</span>']], rows.slice(0, 6));
     return h;
   }
   function renderRemediation(data) {
@@ -11169,56 +11250,90 @@ function viewPartners(ctx, compact) {
   return h;
 }
 
-// The identities behind the guest counts: who each guest is, where they are
-// from, and which configuration governs them. Capped so a large guest
-// population stays a readable list rather than a wall of rows.
+// Guests rolled up by home domain — one row per home tenant, so a population of
+// hundreds or thousands stays a short, readable table. Every domain is represented
+// (the per-identity list is the drill-down, opened from a row), which the old flat
+// 200-row cap could not show. Counts and governed-by come from the same groups the
+// tiles were built from, so the rollup can never disagree with the figures above it.
+const GUEST_GOV_PILL = grp =>
+    grp.bucket === 'trusted' ? '<span class="st-pill st-allow">Trusted: ' + esc((grp.flags || []).join(', ')) + '</span>'
+  : grp.bucket === 'default' ? '<span class="st-pill st-allowq">The default</span>'
+  : grp.bucket === 'partner' ? '<span class="st-pill st-block">Partner entry</span>'
+  :                            '<span class="st-pill st-na">Unresolved</span>';
+
 function guestList(g) {
   const groups = (g && g.groups) || [];
   if (!groups.length) return '';
-  const MAX_ROWS = 200;
-  const GOV = {
-    trusted:     grp => ({ cls: 'st-allow',   txt: 'Trusted: ' + (grp.flags || []).join(', ') }),
-    'default':   ()  => ({ cls: 'st-allowq', txt: 'The default' }),
-    partner:     ()  => ({ cls: 'st-block',  txt: 'Partner entry' }),
-    unresolved:  ()  => ({ cls: 'st-na',     txt: 'Unresolved' })
-  };
-  const invite = s => {
+  const collapsed = groups.length > 12;
+  const rows = groups.map(grp => {
+    const n = grp.guests.length;
+    let acc = 0, pend = 0;
+    grp.guests.forEach(u => { const s = String(u.state || '').toLowerCase(); if (s === 'accepted') acc++; else if (s === 'pendingacceptance') pend++; });
+    const inv = ((acc ? '<span style="color:var(--low);font-weight:600">' + acc + ' accepted</span>' : '') +
+                 (acc && pend ? ' · ' : '') +
+                 (pend ? '<span style="color:var(--med);font-weight:600">' + pend + ' pending</span>' : '')) ||
+                '<span style="color:var(--dim)">—</span>';
+    return '<tr class="prow" data-guestdom="' + esc(grp.dom) + '" role="button" tabindex="0" title="See the guests from this domain">' +
+      '<td><div class="tname">' + esc(grp.dom) + '</div>' +
+        (grp.tenant ? '<div class="tid">' + esc(grp.tenant) + '</div>' : '') + '</td>' +
+      '<td><span style="font-weight:700;font-variant-numeric:tabular-nums">' + n + '</span></td>' +
+      '<td>' + GUEST_GOV_PILL(grp) + '</td>' +
+      '<td>' + inv + '</td></tr>';
+  }).join('');
+  return '<div class="card' + (collapsed ? ' collapsed' : '') + '" id="ext-guests-card"><div class="card-h">' +
+      '<span class="t">Guests by home domain</span>' +
+      '<span class="s">One row per home tenant — click to see the identities</span>' +
+      (collapsed ? '<span class="band-toggle" data-collapse="ext-guests-card">show</span>' : '') + '</div>' +
+      '<div class="card-b flush"><table class="data">' +
+        '<thead><tr><th>Home domain</th><th>Guests</th><th>Governed by</th><th>Invite status</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table></div></div>';
+}
+
+// Drill-down: the identities from one home domain, opened in the shared drawer.
+function guestDomainDetailBody(grp) {
+  const MAX = 200;
+  const n = grp.guests.length;
+  const shown = grp.guests.slice(0, MAX);
+  const inviteP = s => {
     const v = String(s || '').toLowerCase();
     if (v === 'accepted')          return '<span class="st-pill st-block">Accepted</span>';
     if (v === 'pendingacceptance') return '<span class="st-pill st-allowq">Pending</span>';
     return '<span class="st-pill st-na">' + (s ? esc(s) : '—') + '</span>';
   };
-  let total = 0; groups.forEach(grp => { total += grp.guests.length; });
-  let rows = '', shown = 0;
-  for (const grp of groups) {
-    const gov = (GOV[grp.bucket] || GOV.unresolved)(grp);
-    const home = esc(grp.dom) + (grp.tenant
-      ? '<div style="font-size:10.5px;color:var(--dim);margin-top:2px">' + esc(grp.tenant) + '</div>' : '');
-    for (const u of grp.guests) {
-      if (shown >= MAX_ROWS) break;
-      rows += '<tr>' +
-        '<td><div class="tname">' + (u.name ? esc(u.name) : '<span style="color:var(--dim)">(no display name)</span>') + '</div>' +
-          '<div class="tid">' + esc(u.upn) + '</div></td>' +
-        '<td>' + home + '</td>' +
-        '<td><span class="st-pill ' + gov.cls + '">' + esc(gov.txt) + '</span></td>' +
-        '<td>' + invite(u.state) + '</td>' +
-        '</tr>';
-      shown++;
-    }
-    if (shown >= MAX_ROWS) break;
-  }
-  const more = total > shown
-    ? '<div class="note note-info" style="margin:0;border-radius:0;border-left:none;border-top:1px solid var(--border)">' +
-        '<b>' + (total - shown) + ' more</b> guest ' + plural(total - shown, 'account') +
-        ' not listed here (first ' + MAX_ROWS + ' shown).</div>' : '';
-  const collapsed = total > 12;
-  return '<div class="card' + (collapsed ? ' collapsed' : '') + '" id="ext-guests-card"><div class="card-h">' +
-      '<span class="t">Which guest accounts</span>' +
-      '<span class="s">The identities behind the counts above</span>' +
-      (collapsed ? '<span class="band-toggle" data-collapse="ext-guests-card">show</span>' : '') + '</div>' +
-      '<div class="card-b flush"><table class="data">' +
-        '<thead><tr><th>Guest</th><th>Home domain</th><th>Governed by</th><th>Invite</th></tr></thead>' +
-        '<tbody>' + rows + '</tbody></table>' + more + '</div></div>';
+  const govExplain = grp.bucket === 'trusted'
+      ? 'You accept this tenant’s ' + (grp.flags || []).join(', ') + '. Real accounts here arrived from a tenant whose authentication or device posture you trust.'
+    : grp.bucket === 'default'
+      ? 'This home tenant has no partner entry, so these guests are governed entirely by the inherited default configuration.'
+    : grp.bucket === 'partner'
+      ? 'A partner entry governs this tenant; no inbound trust is delegated to it.'
+      : 'This home domain could not be resolved to a tenant — it may no longer exist.';
+  const rows = shown.map(u =>
+    '<tr><td><div class="tname">' + (u.name ? esc(u.name) : '<span style="color:var(--dim)">(no display name)</span>') + '</div>' +
+      '<div class="tid">' + esc(u.upn) + '</div></td><td>' + inviteP(u.state) + '</td></tr>').join('');
+  const more = n > shown.length
+    ? '<div class="note note-info" style="margin:10px 0 0"><b>' + (n - shown.length) + ' more</b> not shown (first ' + MAX + ').</div>' : '';
+  return '<div class="pdh">' +
+      '<div class="pdh-main"><div class="pdh-title">' + esc(grp.dom) + '</div>' +
+        '<div class="pdh-sub">' + (grp.tenant ? _chip(grp.tenant) : '') + GUEST_GOV_PILL(grp) +
+          '<span class="chip">' + n + ' ' + plural(n, 'guest') + '</span></div></div>' +
+      '<button class="pd-close" id="epx-pd-close" title="Close" aria-label="Close">&times;</button>' +
+    '</div>' +
+    '<div class="pd-body">' +
+      '<div class="pd-h">Governed by</div><div class="pd-lead">' + esc(govExplain) + '</div>' +
+      '<div class="pd-h">Identities (' + n + ')</div>' +
+      '<table class="data"><thead><tr><th>Guest</th><th>Invite</th></tr></thead><tbody>' + rows + '</tbody></table>' + more +
+    '</div>';
+}
+function openGuestDomain(dom, ctx) {
+  const grp = ((ctx.guests && ctx.guests.groups) || []).find(x => String(x.dom) === String(dom)); if (!grp) return;
+  const dr = $('epx-pdrawer'), sc = $('epx-scrim'); if (!dr) return;
+  dr.innerHTML = guestDomainDetailBody(grp);
+  dr.classList.add('open'); dr.setAttribute('aria-hidden', 'false');
+  if (sc) sc.classList.add('open');
+  const cl = $('epx-pd-close'); if (cl) cl.onclick = closePartner;
+  if (sc) sc.onclick = closePartner;
+  if (!window.__epxDrawerEsc) { window.__epxDrawerEsc = true; window.addEventListener('keydown', e => { if (e.key === 'Escape') closePartner(); }); }
+  try { if (cl) cl.focus(); } catch (e) {}
 }
 
 // ── Guest correlation ──────────────────────────────────────────────────────
@@ -11332,6 +11447,12 @@ function render(ctx) {
   // Partner rows open that partner's detail drawer (where & why the risk, plus its findings).
   [].forEach.call($('content').querySelectorAll('[data-partner]'), el => {
     const open = e => { if (e) e.stopPropagation(); openPartner(el.getAttribute('data-partner'), ctx); };
+    el.onclick = open;
+    el.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(e); } };
+  });
+  // Guest-domain rows drill down to the identities from that home domain (shared drawer).
+  [].forEach.call($('content').querySelectorAll('[data-guestdom]'), el => {
+    const open = e => { if (e) e.stopPropagation(); openGuestDomain(el.getAttribute('data-guestdom'), ctx); };
     el.onclick = open;
     el.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(e); } };
   });
@@ -13602,6 +13723,7 @@ EH.ui = (function(){
   function renderAll(){
     show('app'); show('views'); hide('hero'); hide('connectCard');
     el('n-paths').textContent = S.paths.length; el('n-findings').textContent = S.findings.length;
+    if(el('n-fixplan')) el('n-fixplan').textContent = blastRadiusPlan(14).steps.length;
     renderDashboard(); renderAnalyses(); renderFindings(); renderInventoryTabs(); renderQueryExamples(); renderCollection(); renderCritical();
     if(!S.cy) initGraph(); else { S.cy.elements().remove(); el('gempty').classList.remove('hidden'); }
     setView('dashboard');
@@ -13614,7 +13736,7 @@ EH.ui = (function(){
     if(v === 'graph' && S.cy) setTimeout(function(){ S.cy.resize(); fitCapped(); }, 50);
     if(v === 'inventory') renderInventory();
     if(v === 'query') updateQueryAiNote();
-    if(v === 'findings') renderFixPlan();
+    if(v === 'fixplan') renderFixPlanView();
   }
   // Reflects whether the AI translator is available (shell EP.llm) on the Query view.
   function updateQueryAiNote(){
@@ -13750,8 +13872,9 @@ EH.ui = (function(){
   //     paths — each step is the single edge whose removal severs the most still-open paths — with
   //     cumulative coverage. All numbers are a deterministic graph delta; the AI (local-only) narrates
   //     the order, it does not compute it. ---
-  function blastRadiusPlan(maxFixes){
+  function blastRadiusPlan(maxFixes, pred){
     var paths = (S.paths || []);
+    if(pred) paths = paths.filter(pred);
     if(!paths.length) return { total: 0, covered: 0, steps: [] };
     var byEdge = {};
     paths.forEach(function(p, i){ p.edges.forEach(function(e){ (byEdge[e.id] = byEdge[e.id] || { e: e, idx: [] }).idx.push(i); }); });
@@ -13762,7 +13885,7 @@ EH.ui = (function(){
       if(!best || !bestCut) break;
       byEdge[best].idx.forEach(function(i){ if(!covered[i]){ covered[i] = 1; nCov++; } });
       var e = byEdge[best].e;
-      steps.push({ k: e.k, m: e.m, from: N(e.s).label, to: N(e.t).label, cut: bestCut, cumulative: nCov, fix: EDGE_FIX[e.k] || 'Review and remove or constrain this relationship.' });
+      steps.push({ k: e.k, m: e.m, from: N(e.s).label, to: N(e.t).label, cut: bestCut, cumulative: nCov, fix: EDGE_FIX[e.k] || 'Review and remove or constrain this relationship.', e: e });
       if(nCov >= total) break;
     }
     return { total: total, covered: nCov, steps: steps };
@@ -13789,14 +13912,71 @@ EH.ui = (function(){
       topPaths: topPaths, remediation: remediation, criticalAssets: criticalAssets, coverage: S.cov || null
     };
   }
-  function renderFixPlan(){
-    var slot = el('fixPlan'); if(!slot || !slot.innerHTML && !slot.classList) return;
-    var plan = blastRadiusPlan(8);
-    if(!plan.total){ slot.innerHTML = ''; return; }
+  // Crown-jewel targets actually reached by a path, for the scope picker — most-reached first.
+  function fpTargets(){
+    var byT = {};
+    (S.paths || []).forEach(function(p){ var o = byT[p.target] || (byT[p.target] = { id: p.target, n: N(p.target), srcs: {}, paths: 0 }); o.srcs[p.source] = 1; o.paths++; });
+    return Object.keys(byT).map(function(id){ var o = byT[id]; return { id: id, label: o.n ? o.n.label : id, type: o.n ? o.n.type : '', reachers: Object.keys(o.srcs).length, paths: o.paths }; })
+      .sort(function(a, b){ return b.paths - a.paths || b.reachers - a.reachers; });
+  }
+  // Path predicate for the current scope: all paths, or only those reaching the chosen target.
+  function fpPred(){ var t = S.fpTarget; return t ? function(p){ return p.target === t; } : null; }
+
+  // The Fix plan view: a scoped greedy min-cut over attack paths + a findings-aware tail.
+  function renderFixPlanView(){
+    var sel = el('fpTarget'); if(!sel) return;
+    if(S.fpTarget == null) S.fpTarget = '';
+    var targets = fpTargets(), cur = S.fpTarget;
+    sel.innerHTML = '<option value="">All critical assets · ' + (S.paths || []).length + ' path' + ((S.paths || []).length === 1 ? '' : 's') + '</option>' +
+      targets.map(function(t){ return '<option value="' + esc(t.id) + '">' + esc((M.TYPE_LABEL[t.type] || t.type) + ' · ' + t.label) + ' — ' + t.paths + ' path' + (t.paths > 1 ? 's' : '') + '</option>'; }).join('');
+    if(cur && targets.some(function(t){ return t.id === cur; })) sel.value = cur; else { sel.value = ''; S.fpTarget = ''; }
+
+    var plan = blastRadiusPlan(14, fpPred()); S._fpPlan = plan;
+    var body = el('fpBody'), nb = el('fpNarrate'), gb = el('fpGraph');
+    if(!plan.total){
+      body.innerHTML = '<p class="intro">No attack paths ' + (S.fpTarget ? 'reach this target.' : 'in scope — nothing to sequence.') + '</p>';
+      if(nb) nb.classList.add('hidden'); if(gb) gb.disabled = true; renderFpStandalone(); return;
+    }
+    if(gb) gb.disabled = false;
+    if(nb) nb.classList.toggle('hidden', !narrationAvailable());
     var pct = Math.round(100 * plan.covered / plan.total);
+    var tn = targets.filter(function(t){ return t.id === S.fpTarget; })[0];
+    var scope = S.fpTarget ? ('the paths to <b>' + esc(tn ? tn.label : 'this target') + '</b>') : 'all attack paths';
     var rows = plan.steps.map(function(s, i){ return '<li><div class="fp-row"><span class="fp-n">' + (i + 1) + '</span><div class="fp-main"><div class="fp-edge"><b>' + esc(s.k) + '</b> <span class="muted">' + esc(s.from) + ' → ' + esc(s.to) + '</span></div><div class="fp-fix">' + esc(s.fix) + '</div></div><div class="fp-cut"><b>' + s.cut + '</b> paths<div class="muted">cum. ' + s.cumulative + '/' + plan.total + '</div></div></div></li>'; }).join('');
-    slot.innerHTML = '<div class="panel fp"><div class="toolbar"><div><p class="kicker">Remediation sequencing</p><h2>Fix plan — by blast radius</h2></div><div class="actions">' + (narrationAvailable() ? '<button type="button" class="btn btn-ghost btn-sm" id="fpNarrate">✦ Narrate plan</button>' : '') + '</div></div><p class="intro" style="font-size:12.5px">Greedy order — each step is the single change that severs the most still-open attack paths. These ' + plan.steps.length + ' fixes cut <b>' + plan.covered + ' of ' + plan.total + '</b> paths (' + pct + '%). Counts are a live graph delta; the AI only narrates the order.</p><ol class="fplist">' + rows + '</ol><div class="pathnarr" id="fpNarr"></div></div>';
-    var b = el('fpNarrate'); if(b && b.addEventListener) b.addEventListener('click', narrateFixPlan);
+    body.innerHTML = '<p class="intro" style="font-size:12.5px">Greedy min-cut over ' + scope + ' — each step is the single change that severs the most still-open paths. These <b>' + plan.steps.length + '</b> fixes cut <b>' + plan.covered + ' of ' + plan.total + '</b> paths (' + pct + '%). Counts are a live graph delta; the AI only narrates the order.</p><ol class="fplist">' + rows + '</ol><div class="pathnarr" id="fpNarr"></div>';
+    renderFpStandalone();
+  }
+
+  // Findings-aware tail: high/critical findings that sit on NO attack path — standalone
+  // misconfigurations the path min-cut structurally cannot rank, surfaced so nothing is missed.
+  function renderFpStandalone(){
+    var wrap = el('fpStandaloneWrap'), slot = el('fpStandalone'); if(!slot) return;
+    var onPath = {}; (S.paths || []).forEach(function(p){ p.nodes.forEach(function(id){ onPath[id] = 1; }); });
+    var list = (S.findings || []).filter(function(f){ return (f.sev === 'Critical' || f.sev === 'High') && (!f.node || !onPath[f.node]); });
+    if(!list.length){ if(wrap) wrap.style.display = 'none'; slot.innerHTML = ''; return; }
+    if(wrap) wrap.style.display = '';
+    var rows = list.slice(0, 40).map(function(f){ var n = f.node ? N(f.node) : null; return '<li><div class="fp-row"><span class="fp-n" style="background:' + (f.sev === 'Critical' ? 'var(--crit)' : 'var(--bad)') + '">!</span><div class="fp-main"><div class="fp-edge"><b>' + esc(f.title) + '</b>' + (n ? ' <span class="muted">· ' + esc(n.label) + '</span>' : '') + '</div><div class="fp-fix">' + esc((f.remediation && f.remediation[0]) || '') + '</div></div><div class="fp-cut"><span class="sev sev-' + f.sev + '">' + esc(f.sev) + '</span></div></div></li>'; }).join('');
+    slot.innerHTML = '<p class="intro" style="font-size:12.5px">' + list.length + ' high/critical ' + (list.length === 1 ? 'finding is' : 'findings are') + ' not on any attack path — standalone misconfigurations the min-cut can\'t rank. Fix these alongside the plan.</p><ol class="fplist">' + (list.length > 40 ? '' : '') + rows + '</ol>' + (list.length > 40 ? '<p class="muted" style="font-size:11.5px;margin-top:6px">+' + (list.length - 40) + ' more in the Findings view.</p>' : '');
+  }
+
+  // Open the graph with just the choke-point edges and their endpoints highlighted.
+  function showChokeEdges(edges){
+    edges = (edges || []).filter(Boolean);
+    if(!edges.length){ U.toast('No choke-point edges to show'); return; }
+    setView('graph'); var cy = S.cy; if(!cy) return;
+    if(!el('cy').offsetWidth){ setTimeout(function(){ showChokeEdges(edges); }, 80); return; }
+    cy.elements().remove();
+    var nodeIds = {}; edges.forEach(function(e){ nodeIds[e.s] = 1; nodeIds[e.t] = 1; });
+    addNodes(Object.keys(nodeIds), false);
+    edges.forEach(function(e){ if(!cy.getElementById(e.id).length) cy.add(cyEdge(e)); cy.getElementById(e.id).addClass('path'); });
+    cy.nodes().addClass('hl');
+    el('glayout').value = 'breadthfirst';
+    var cov = S._fpPlan ? (S._fpPlan.covered + ' of ' + S._fpPlan.total) : edges.length;
+    var b = el('pathBanner');
+    if(b){ b.className = 'Critical'; b.classList.remove('hidden');
+      b.innerHTML = '<div class="ic"><svg viewBox="0 0 24 24" width="38" height="38"><path d="M12 2.5 22.5 21h-21z" fill="#FF4D6A"/><path d="M12 9v5M12 16.5v1.5" stroke="#050D22" stroke-width="2.4" stroke-linecap="round"/></svg></div><div><div class="k">Choke points</div><div class="t">Cut these ' + edges.length + ' edge' + (edges.length > 1 ? 's' : '') + '</div><div class="s">Severs ' + cov + ' attack paths in scope</div></div><div class="n"><b>' + edges.length + '</b>to cut</div>';
+    }
+    layout();
   }
   function fixPlanPrompt(){
     return [
@@ -13813,7 +13993,7 @@ EH.ui = (function(){
   async function narrateFixPlan(){
     var slot = el('fpNarr'); if(!slot) return;
     if(!narrationAvailable()){ slot.innerHTML = '<div class="narr-note">Plan narration runs only on a <b>local Ollama</b> model (it sends the plan\'s object names to the model). Set Ollama in <b>Configuration</b>.</div>'; return; }
-    var plan = blastRadiusPlan(8);
+    var plan = S._fpPlan || blastRadiusPlan(14, fpPred());
     slot.innerHTML = '<div class="narr-note"><span class="spinner"></span> ' + esc(window.EP.llm.model) + ' is sequencing the plan…</div>';
     var input = 'TOTAL attack paths in scope: ' + plan.total + '\nGREEDY FIX STEPS (each severs the most still-open paths):\n'
       + plan.steps.map(function(s, i){ return (i + 1) + '. ' + s.k + ' (' + s.from + ' -> ' + s.to + ') — severs ' + s.cut + ' paths; cumulative ' + s.cumulative + '/' + plan.total; }).join('\n');
@@ -14376,6 +14556,10 @@ EH.ui = (function(){
     el('btn-recollect').addEventListener('click', function(){ if(S.raw.demo){ el('btn-demo').click(); return; } connectAndRun(function(){ return EH.auth.who(); }); });
     el('btn-report').addEventListener('click', report);
     document.querySelectorAll('#views button').forEach(function(b){ b.addEventListener('click', function(){ setView(b.getAttribute('data-view')); }); });
+    // Fix-plan view: scope picker, choke-point graph, AI narration.
+    el('fpTarget').addEventListener('change', function(){ S.fpTarget = this.value; renderFixPlanView(); });
+    el('fpGraph').addEventListener('click', function(){ var plan = S._fpPlan || blastRadiusPlan(14, fpPred()); showChokeEdges(plan.steps.map(function(s){ return s.e; })); });
+    el('fpNarrate').addEventListener('click', narrateFixPlan);
     // delegated clicks — bound to #app AND #drawer (not document.body) so in the merged Entra-Posture
     // app this delegate never catches clicks in the other views (several of which also use data-id /
     // data-* rows). The drawer is a SIBLING of #app, not a descendant, so it needs its own binding —
