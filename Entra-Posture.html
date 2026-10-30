@@ -486,6 +486,7 @@
 #view-user .facet.on { border-color: var(--accent); }
 #view-user .facet-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
 #view-user .facet-title { min-width: 0; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+#view-user .facet-note { font-size: 10px; line-height: 1.3; color: var(--muted); opacity: .8; margin: 1px 0 5px; }
 #view-user .facet-modes { display: inline-flex; flex-shrink: 0; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
 #view-user .facet-modes button { font: inherit; font-size: 10px; line-height: 1.5; padding: 0 6px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
 #view-user .facet-modes button + button { border-left: 1px solid var(--border); }
@@ -788,6 +789,7 @@
 #view-workload .hero-sub .notice { flex-basis: 100%; margin: 4px 0 0; }
 #view-workload .hero-sub .eyebrow { font-size: 13px; font-weight: 600; color: var(--text); opacity: .78; }
 #view-workload .hero-sub .sep { opacity: .5; }
+#view-workload .hero-sub .of { opacity: .55; font-weight: 400; }
 #view-workload .hero-sub b { color: var(--text); }
 #view-workload .hero-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 #view-workload .hero-scan { text-align: right; font-size: 11.5px; color: var(--muted); line-height: 1.3; margin-right: 6px; }
@@ -3187,12 +3189,21 @@ window.EP = (function () {
       return () => EP_NULL;
     }, set() { return true; }, apply() { return EP_NULL; }
   });
+  // click/change bubble, and User, Workload and Agent each register their own document-level
+  // delegated handler for them. Bound to the real document they all fire for every view's events,
+  // so a handler looking up another view's data-fg / data-mg in its own facet map hits undefined
+  // and throws (Cannot read 'on' / set 'mode' of undefined). Bind just these to the view root, so a
+  // view only hears events from inside its own container. Everything else — notably keydown for the
+  // Escape-to-close handlers — stays on the real document so it still fires with focus anywhere.
+  const SCOPED_EVT = { click: 1, change: 1 };
   function scopedDoc(root) {
     const real = window.document;
     return new Proxy(real, { get(t, k) {
       if (k === "getElementById") return id => root.querySelector("#" + (window.CSS && CSS.escape ? CSS.escape(id) : id)) || EP_NULL;
       if (k === "querySelector") return sel => { try { return root.querySelector(sel); } catch (e) { return null; } };
       if (k === "querySelectorAll") return sel => { try { return root.querySelectorAll(sel); } catch (e) { return []; } };
+      if (k === "addEventListener") return (type, fn, opts) => (SCOPED_EVT[type] && root ? root : real).addEventListener(type, fn, opts);
+      if (k === "removeEventListener") return (type, fn, opts) => (SCOPED_EVT[type] && root ? root : real).removeEventListener(type, fn, opts);
       const v = t[k];
       return typeof v === "function" ? v.bind(t) : v;
     }});
@@ -3606,6 +3617,10 @@ window.EP = (function () {
   //    the Attack Paths view's loaded graph (EH.ui.S) and the global cytoscape. Falls back to the flow
   //    rows when the graph/library isn't available. ──
   const OV_GCOLOR = { user: "#4FB8FF", guest: "#FFC15E", group: "#8FE3FF", role: "#FF7A8A", app: "#B48CFF", sp: "#7C9CFF", mi: "#5AC8FF", device: "#93ACD3", agent: "#FF9FEF", blueprint: "#E08CFF", tenant: "#FFFFFF", resource: "#3FA9FF", permission: "#FF5C7A", issuer: "#FFD36E", partner: "#C7D3EA", au: "#6FB1FF", policy: "#9BB0D6" };
+  // A short type word for a node, so an endpoint reads "Global Administrator (role)" rather than a
+  // bare name that collides with the account that happens to be called "Global Administrator".
+  const OV_TYPEWORD = { user: "user", guest: "guest", group: "group", role: "role", app: "app", sp: "app", mi: "managed id", device: "device", agent: "agent", blueprint: "blueprint", tenant: "tenant", resource: "resource", permission: "permission", issuer: "issuer", partner: "partner", au: "admin unit", policy: "policy" };
+  function ovTypeWord(n) { return (n && (OV_TYPEWORD[n.type] || n.type)) || ""; }
   let _ovMiniCy = null, _ovPathList = [], _ovPathG = null, _ovPathSel = 0;
   function ovDestroyMini() { if (_ovMiniCy) { try { _ovMiniCy.destroy(); } catch (_) {} _ovMiniCy = null; } }
   // All attack paths to Global Administrator (else to any critical / tier-0 asset), deduped, most hops first.
@@ -3619,7 +3634,10 @@ window.EP = (function () {
       if (!pool.length) pool = S.paths.slice();
       const seen = new Set(), out = [];
       pool.forEach(p => { const k = p.nodes.join(">"); if (!seen.has(k) && N(p.source) && N(p.target)) { seen.add(k); out.push(p); } });
-      out.sort((a, b) => b.nodes.length - a.nodes.length);
+      // Prefer a real escalation — a source that isn't already Tier-0/critical reaching Global Admin —
+      // over a trivial near-self hop like "the GA account → the GA role", then prefer more hops.
+      const trivial = p => { const s = N(p.source); return (p.edges.length <= 1 && s && (s.critical || s.tier === 0)) ? 1 : 0; };
+      out.sort((a, b) => (trivial(a) - trivial(b)) || (b.nodes.length - a.nodes.length));
       _ovPathList = out.slice(0, 50); _ovPathG = g;
       if (_ovPathSel >= _ovPathList.length) _ovPathSel = 0;
     } catch (_) {}
@@ -3685,7 +3703,8 @@ window.EP = (function () {
     let body;
     if (_ovPathList.length && typeof cytoscape !== "undefined") {
       const g = _ovPathG, N = id => g.nodes.get(id);
-      const opts = _ovPathList.map((p, i) => '<option value="' + i + '"' + (i === _ovPathSel ? " selected" : "") + '>' + esc(N(p.source).label + " → " + N(p.target).label + " · " + p.edges.length + " hop" + (p.edges.length === 1 ? "" : "s")) + '</option>').join("");
+      const pl = n => n.label + " (" + ovTypeWord(n) + ")";
+      const opts = _ovPathList.map((p, i) => '<option value="' + i + '"' + (i === _ovPathSel ? " selected" : "") + '>' + esc(pl(N(p.source)) + " → " + pl(N(p.target)) + " · " + p.edges.length + " hop" + (p.edges.length === 1 ? "" : "s")) + '</option>').join("");
       const cur = _ovPathList[_ovPathSel], q = "paths from id:" + cur.source + " to id:" + cur.target;
       body = '<div class="ov-mini-head"><select class="ov-mini-select" id="ovMiniSel" title="Choose an attack path to show">' + opts + '</select>'
         + '<button class="ov-mini-open" id="ovMiniOpen" data-ovgo="entrahound" data-ovfocus="' + esc(JSON.stringify({ query: q })) + '" title="Open this path in the full Attack Paths graph">Open full graph &rarr;</button></div>'
@@ -3949,7 +3968,8 @@ window.EP = (function () {
     const p = [];
     if (overall) p.push("The tenant scores " + overall.score + "/100 (grade " + overall.grade + ") for identity exposure, weighted across attack paths, Tier-0 hygiene, dangerous permissions, findings and guest reach.");
     if (overall && (overall.crit || overall.high)) p.push(overall.crit + " critical and " + overall.high + " high-risk attack paths reach a critical asset.");
-    if (data.user && data.user.totals) p.push(data.user.totals.privileged + " privileged accounts (" + data.user.totals.globalAdmins + " Global Admins), " + (data.user.totals.weakNoMfa || 0) + " with weak or no MFA.");
+    if (data.user && data.user.totals) { const ut = data.user.totals;
+      p.push(ut.privileged + " privileged accounts (" + ut.globalAdmins + " Global Admins). " + (ut.weakNoMfa || 0) + " of " + ut.accounts + " accounts have weak or no MFA."); }
     p.push("See the domain sections and prioritised remediation below.");
     return p.join(" ");
   }
@@ -5020,13 +5040,13 @@ const FACETS = [
       tip: "An ordinary member account. Still worth MFA — it is where an attacker lands first — but it holds no directory privilege of its own.",
       test: u => !u.isAdmin },
     { k: "any", label: "Privileged", sev: "med",
-      tip: "Holds at least one privileged directory role, read-only ones included. Listing-level fact; the rows below split it by write and tier.",
+      tip: "Holds at least one privileged directory role, read-only ones included. Listing-level fact; the rows below split it by write and tier. A <b>member-account</b> count on the definition above; the Attack Paths graph scores privileged identities on a different basis (role tier, read-only roles excluded, guests included), so its total can differ.",
       test: u => u.isAdmin },
     { k: "write", label: "Write role", sev: "high",
       tip: "Holds a role that can <b>change</b> things, not just read them. Read-only roles are broad visibility; a write role is control.",
       test: u => u.hasWriteRole },
     { k: "tier0", label: "Tier-0 · GA-class", sev: "high",
-      tip: "Holds a <b>GA-class write role</b> — the top of the directory. Compromise here is compromise of everything under it, so this account\'s credential is the tenant\'s credential.",
+      tip: "Holds a <b>GA-class write role</b> — the top of the directory. Compromise here is compromise of everything under it, so this account\'s credential is the tenant\'s credential. Counted here for <b>member user accounts</b> with a Tier-0 <i>write</i> role; the Attack Paths graph scores Tier-0 on a different basis (role tier, read-only included, guests), so its Tier-0 total can differ.",
       test: u => u.isTier0 } ]},
   { id: "act", label: "Activation", opts: [
     { k: "standing", label: "Standing (permanent)", sev: "high",
@@ -5056,7 +5076,7 @@ const FACETS = [
     { k: "unknown", label: "Not read",
       tip: "Registration could not be read for this account — absence of data, not absence of MFA.",
       test: u => !u.mfa || u.mfa.level === "unknown" } ]},
-  { id: "enf", label: "MFA enforced (CA)", opts: [
+  { id: "enf", label: "MFA enforced (CA)", note: "Privileged accounts only — per-user CA coverage is evaluated for role-holders.", opts: [
     { k: "covered", label: "Covered",
       tip: "An enforcing Conditional Access policy actually applies to this account. <b>This is the authoritative check</b> — registration only says what they could use.",
       test: u => u.caCovered === true },
@@ -5136,6 +5156,7 @@ function renderFacets() {
     const st = facet[g.id];
     return '<div class="facet' + (facetActive(g) ? " on" : "") + '">'
       + '<div class="facet-head"><span class="facet-title">' + escapeHtml(g.label) + "</span>" + modesHtml(g.id) + "</div>"
+      + (g.note ? '<div class="facet-note">' + escapeHtml(g.note) + "</div>" : "")
       + g.opts.map(o =>
           '<label class="facet-opt"><input type="checkbox" data-fg="' + g.id + '" data-fk="' + escapeHtml(o.k) + '"' + (st.on[o.k] ? " checked" : "") + ">"
           + '<span class="fo-l">' + escapeHtml(o.label) + (o.sev ? '<i class="fo-r fo-r-' + o.sev + '"></i>' : "") + "</span>"
@@ -7604,8 +7625,12 @@ EP.registerView("workload", (function () {
     // The publisher filter decides what "analysed" covers, so the line names the subset — otherwise the total
     // does not reconcile with the count in the status line.
     var msftF = el('f-msft').value;
+    var total = (cache.results || []).length;
     var scope = msftF === 'no' ? ' (non-Microsoft)' : msftF === 'yes' ? ' (Microsoft first-party)' : '';
-    el('kpiHead').innerHTML = '<b>' + b.length + '</b> enterprise application' + (b.length === 1 ? '' : 's') + ' analysed' + scope
+    // When the publisher filter hides a subset, show "N of TOTAL" so the count reconciles with the
+    // Overview card and the Report, which both scope Workloads to every service principal in the tenant.
+    var ofTotal = (b.length !== total) ? ' <span class="of">of ' + total + '</span>' : '';
+    el('kpiHead').innerHTML = '<b>' + b.length + '</b>' + ofTotal + ' enterprise application' + (b.length === 1 ? '' : 's') + ' analysed' + scope
       + (cache.scannedAt ? '<span class="sep">\u00b7</span><span id="kpiWhen">scanned ' + relTime(cache.scannedAt) + '</span>' : '');
   }
 
