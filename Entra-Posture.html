@@ -2247,6 +2247,11 @@
   .ov-trend-ph { padding: 16px; color: var(--muted); font-size: 11.5px; line-height: 1.55; display: flex; flex-direction: column; gap: 8px; }
   .ov-trend-now { font-size: 30px; font-weight: 800; color: var(--text); line-height: 1; }
   .ov-trend-now span { font-size: 11px; font-weight: 600; color: var(--muted); margin-left: 6px; }
+  .ov-trend-delta { font-family: "IBM Plex Mono","Cascadia Code",Consolas,monospace; font-size: 12.5px; font-weight: 700; }
+  .ov-trend-delta.up { color: var(--sev-crit); } .ov-trend-delta.down { color: var(--sev-low); }
+  .ov-trend-flat { font-size: 12px; color: var(--muted); }
+  .ov-spark { width: 100%; height: 44px; display: block; }
+  .ov-trend-cap { font-size: 9.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .09em; }
   .ov-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 8px; }
   @media (max-width: 1150px) { .ov-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   @media (max-width: 720px) { .ov-grid { grid-template-columns: 1fr; } }
@@ -2276,6 +2281,14 @@
   .ov-item:hover .ov-go { opacity: 1; }
   .ov-clean { color: var(--muted); font-size: 12px; padding: 10px 11px; }
   .ov-na { color: var(--muted); font-size: 12px; }
+  /* Attack Paths mini-graph (live Cytoscape of the top critical path) */
+  .ov-mini-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px 4px; }
+  .ov-mini-title { font-size: 12px; font-weight: 700; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .ov-mini-arrow { color: var(--sev-crit); font-weight: 800; }
+  .ov-mini-open { margin-left: auto; flex-shrink: 0; background: var(--bg2); border: 1px solid var(--border); color: var(--accent-dark); border-radius: 7px; padding: 4px 9px; font-size: 10.5px; font-weight: 700; cursor: pointer; font-family: inherit; white-space: nowrap; }
+  .ov-mini-open:hover { border-color: var(--accent); color: var(--text); }
+  .ov-minigraph { height: 208px; margin: 0 10px; border-radius: 10px; border: 1px solid var(--border); overflow: hidden; background: radial-gradient(circle at 50% 42%, rgba(12,30,69,.55), rgba(5,13,34,.35)); }
+  .ov-mini-foot { font-size: 9px; color: var(--muted); padding: 5px 12px 9px; text-transform: uppercase; letter-spacing: .08em; }
   .ov-paths { padding: 8px 10px 10px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
   .ov-path { position: relative; overflow: hidden; display: flex; align-items: center; gap: 4px; padding: 9px 10px; border-radius: 8px; background: #122546; border-left: 3px solid var(--sev-info); cursor: pointer; }
   .ov-path:hover { background: rgba(63,169,255,.1); }
@@ -3575,6 +3588,67 @@ window.EP = (function () {
   }
   // Attack Paths card: the top critical paths drawn as node→edge→node flows (source
   // in blue, the critical asset in red), parsed from each path's chain string.
+  // ── Attack Paths mini-graph — a real, draggable Cytoscape instance of the top critical path, reusing
+  //    the Attack Paths view's loaded graph (EH.ui.S) and the global cytoscape. Falls back to the flow
+  //    rows when the graph/library isn't available. ──
+  const OV_GCOLOR = { user: "#4FB8FF", guest: "#FFC15E", group: "#8FE3FF", role: "#FF7A8A", app: "#B48CFF", sp: "#7C9CFF", mi: "#5AC8FF", device: "#93ACD3", agent: "#FF9FEF", blueprint: "#E08CFF", tenant: "#FFFFFF", resource: "#3FA9FF", permission: "#FF5C7A", issuer: "#FFD36E", partner: "#C7D3EA", au: "#6FB1FF", policy: "#9BB0D6" };
+  let _ovMiniCy = null;
+  function ovDestroyMini() { if (_ovMiniCy) { try { _ovMiniCy.destroy(); } catch (_) {} _ovMiniCy = null; } }
+  // Prefer a path to Global Administrator, then the one with the most hops (makes the nicest graph).
+  function ovShowcasePath() {
+    try {
+      const S = window.EH && EH.ui && EH.ui.S; if (!S || !S.g || !S.paths || !S.paths.length) return null;
+      const g = S.g, N = id => g.nodes.get(id);
+      const crit = S.paths.filter(p => { const t = N(p.target); return t && (t.critical || t.tier === 0); });
+      const pool = crit.length ? crit : S.paths;
+      const ga = pool.filter(p => { const t = N(p.target); return t && /global administrator/i.test(t.label || ""); });
+      const pick = (ga.length ? ga : pool).slice().sort((a, b) => b.nodes.length - a.nodes.length)[0];
+      return pick ? { path: pick, g } : null;
+    } catch (_) { return null; }
+  }
+  function ovMiniEls(path, g) {
+    const N = id => g.nodes.get(id), els = [];
+    path.nodes.forEach((id, i) => { const n = N(id); if (!n) return;
+      els.push({ data: { id: n.id, label: n.label, type: n.type, crit: (n.critical || n.tier === 0) ? 1 : 0 }, position: { x: 60 + i * 132, y: 96 } }); });
+    path.edges.forEach(e => { els.push({ data: { id: e.id || (e.s + ">" + e.t), source: e.s, target: e.t, label: e.k + (e.m && e.m !== "DIRECT" ? " · " + e.m : "") } }); });
+    return els;
+  }
+  function ovInitMiniGraph() {
+    ovDestroyMini();
+    const host = document.getElementById("ovMiniCy"); if (!host || typeof cytoscape === "undefined") return;
+    const sc = ovShowcasePath(); if (!sc) return;
+    _ovMiniCy = cytoscape({
+      container: host, elements: ovMiniEls(sc.path, sc.g), layout: { name: "preset" },
+      minZoom: 0.3, maxZoom: 2.5, wheelSensitivity: 0.25,
+      style: [
+        { selector: "node", style: { "background-color": ele => OV_GCOLOR[ele.data("type")] || "#7C9CFF", "label": "data(label)", "color": "#EAF2FF", "font-size": 9, "font-family": "IBM Plex Sans, sans-serif", "text-wrap": "wrap", "text-max-width": 108, "width": 22, "height": 22, "shape": "round-diamond", "text-valign": "bottom", "text-halign": "center", "text-margin-y": 5, "border-width": 2, "border-color": "#0A1C42" } },
+        { selector: "node[crit = 1]", style: { "background-color": "#FF4D6D", "border-color": "rgba(255,77,109,.5)", "border-width": 4, "width": 26, "height": 26, "color": "#FFC2CC", "font-weight": "bold" } },
+        { selector: "edge", style: { "width": 1.6, "line-color": "rgba(143,227,255,.45)", "line-style": "dashed", "target-arrow-color": "rgba(143,227,255,.7)", "target-arrow-shape": "triangle", "arrow-scale": 0.9, "curve-style": "bezier", "label": "data(label)", "font-size": 7.5, "color": "#8FE3FF", "text-rotation": "autorotate", "text-background-color": "#0A1C42", "text-background-opacity": 0.85, "text-background-padding": 2 } }
+      ]
+    });
+    setTimeout(() => { if (_ovMiniCy) { try { _ovMiniCy.resize(); _ovMiniCy.fit(undefined, 30); } catch (_) {} } }, 70);
+  }
+  // The Attack Paths card: a live mini-graph of the top critical path, or the flow rows if the graph isn't loaded.
+  function ovEntrahoundCard(v, s) {
+    const grade = (s && (s.grade || (s.exposure && s.exposure.grade))) || null;
+    const counts = ovCounts(s);
+    const sc = (typeof cytoscape !== "undefined") ? ovShowcasePath() : null;
+    let body;
+    if (sc) {
+      const N = id => sc.g.nodes.get(id), src = N(sc.path.source), tgt = N(sc.path.target);
+      const q = "paths from id:" + sc.path.source + " to id:" + sc.path.target;
+      body = '<div class="ov-mini-head"><span class="ov-mini-title" title="' + esc(src.label + " → " + tgt.label) + '">' + esc(src.label) + ' <span class="ov-mini-arrow">&rarr;</span> ' + esc(tgt.label) + '</span>'
+        + '<button class="ov-mini-open" data-ovgo="entrahound" data-ovfocus="' + esc(JSON.stringify({ query: q })) + '" title="Open this path in the full Attack Paths graph">Open full graph &rarr;</button></div>'
+        + '<div class="ov-minigraph" id="ovMiniCy"></div>'
+        + '<div class="ov-mini-foot">Drag nodes to explore · ' + sc.path.nodes.length + '-node path · scroll to zoom</div>';
+    } else {
+      body = ovPathGraph(s);
+    }
+    return '<div class="ov-card ' + ovCardCls(counts) + '">'
+      + '<div class="ov-card-h" data-ovgo="entrahound" title="Open Attack Paths"><span class="ov-card-ic">' + (OV_DOM_ICON.entrahound || "") + '</span><span class="ov-dom">' + esc(v.label) + '</span>'
+      + (counts ? '<span class="ov-counts">' + repCounts(counts) + '</span>' : "")
+      + (grade ? '<span class="ov-grade-badge ' + ovGradeCls(grade) + '">' + esc(grade) + '</span>' : "") + '</div>' + body + '</div>';
+  }
   function ovPathGraph(s) {
     const paths = (s.topPaths || []).slice(0, OV_MAX);
     if (!paths.length) return '<div class="ov-items"><div class="ov-clean">No attack paths found.</div></div>';
@@ -3622,6 +3696,7 @@ window.EP = (function () {
   }
   function ovSection(v, s) {
     if (v.name === "external") return ovExternalCard(v, s);
+    if (v.name === "entrahound" && s) return ovEntrahoundCard(v, s);
     if (!s) return '<div class="ov-card"><div class="ov-card-h" data-ovgo="' + v.name + '"><span class="ov-card-ic">' + (OV_DOM_ICON[v.name] || "") + '</span><span class="ov-dom">' + esc(v.label) + '</span><span class="ov-na">not collected</span></div></div>';
     const grade = s.grade || (s.exposure && s.exposure.grade) || null;
     const counts = ovCounts(s);
@@ -3656,15 +3731,66 @@ window.EP = (function () {
       + (grade ? '<span class="ov-grade-badge ' + ovGradeCls(grade) + '">' + esc(grade) + '</span>' : "")
       + '</div>' + body + '</div>';
   }
+  // ── Risk Trend — real history in this browser's localStorage. Only ever shows genuine scores this
+  //    browser computed; a trend/delta appear once there are ≥2 points. (Demo seeds a sample series,
+  //    which is honest because demo mode is explicitly a synthetic tenant.) ──
+  const OV_TREND_KEY = "ep_score_history";
+  function ovTrendKey() { try { return OV_TREND_KEY + ":" + (DEMO ? "demo" : (account && account.tenantId ? account.tenantId : "default")); } catch (_) { return OV_TREND_KEY; } }
+  function ovTrendLoad() { try { const a = JSON.parse(localStorage.getItem(ovTrendKey()) || "[]"); return Array.isArray(a) ? a.filter(p => p && typeof p.s === "number") : []; } catch (_) { return []; } }
+  function ovTrendSave(a) { try { localStorage.setItem(ovTrendKey(), JSON.stringify(a.slice(-60))); } catch (_) {} }
+  function ovTrendRecord(score) {
+    if (score == null) return ovTrendLoad();
+    let a = ovTrendLoad(); const now = Date.now();
+    if (a.length && (now - a[a.length - 1].t) < 36e5) a[a.length - 1] = { t: now, s: score };   // collapse refreshes within the hour into one point
+    else a.push({ t: now, s: score });
+    ovTrendSave(a); return a;
+  }
+  function ovTrendDemoSeed(score) {
+    let a = ovTrendLoad(); if (a.length >= 2) return a;
+    const base = score != null ? score : 50, now = Date.now(), out = [];
+    [-9, -6, -7, -4, -5, -2, -3, -1, -2, 1, 3, 0].forEach((d, i, arr) => out.push({ t: now - (arr.length - 1 - i) * 864e5, s: Math.max(0, Math.min(100, Math.round(base + d))) }));
+    ovTrendSave(out); return out;
+  }
+  function ovSparkline(pts) {
+    const w = 236, h = 44, pad = 3, n = pts.length, ss = pts.map(p => p.s);
+    const min = Math.min(...ss), max = Math.max(...ss), range = (max - min) || 1;
+    const x = i => pad + (i / (n - 1)) * (w - 2 * pad), y = s => pad + (1 - (s - min) / range) * (h - 2 * pad);
+    const line = pts.map((p, i) => (i ? "L" : "M") + x(i).toFixed(1) + " " + y(p.s).toFixed(1)).join(" ");
+    const area = line + " L" + x(n - 1).toFixed(1) + " " + h + " L" + x(0).toFixed(1) + " " + h + " Z";
+    return '<svg class="ov-spark" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">'
+      + '<defs><linearGradient id="ovSparkFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity=".3"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>'
+      + '<path d="' + area + '" fill="url(#ovSparkFill)"/><path d="' + line + '" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>'
+      + '<circle cx="' + x(n - 1).toFixed(1) + '" cy="' + y(pts[n - 1].s).toFixed(1) + '" r="3" fill="var(--accent)"/></svg>';
+  }
+  function ovTrendPanel(o) {
+    const score = o && o.score != null ? o.score : null;
+    const pts = DEMO ? ovTrendDemoSeed(score) : ovTrendRecord(score);
+    const now = score != null ? score : (pts.length ? pts[pts.length - 1].s : null);
+    let body;
+    if (pts.length >= 2) {
+      const delta = Math.round(now - pts[pts.length - 2].s);
+      // higher score = worse, so a rise is bad (red), a fall is good (blue)
+      const deltaHtml = delta === 0
+        ? '<span class="ov-trend-flat">no change since last scan</span>'
+        : '<span class="ov-trend-delta ' + (delta > 0 ? "up" : "down") + '">' + (delta > 0 ? "▲ +" + delta : "▼ " + Math.abs(delta)) + ' since last scan</span>';
+      body = '<div class="ov-trend-now">' + (now == null ? "—" : now) + '<span>current</span></div>' + deltaHtml
+        + ovSparkline(pts) + '<div class="ov-trend-cap">' + pts.length + ' scans recorded · higher = worse</div>';
+    } else {
+      body = '<div class="ov-trend-now">' + (now == null ? "—" : now) + '<span>current</span></div>'
+        + '<p>This browser now records each scan’s score — the trend line fills in from your next scan. For shared, durable history, wire it to the SightLine store or a Log Analytics export.</p>';
+    }
+    return '<div class="ov-panel ov-trend"><div class="ov-panel-h">Risk Trend</div><div class="ov-trend-ph">' + body + '</div></div>';
+  }
   function paintOverview(st) {
     const host = $("ov-body"); if (!host) return;
     const o = st.overall, data = st.data;
     let h = '<div class="ov-cmd">';
     h += '<div class="ov-panel ov-posture"><div class="ov-panel-h">Security Posture</div><div class="ov-posture-body">' + ovGauge(o) + ovKpis(o, data) + '</div></div>';
     h += '<div class="ov-panel ov-exposure"><div class="ov-panel-h">Exposure Overview<span class="ov-legend"><span><i class="crit"></i>Critical</span><span><i class="high"></i>High</span><span><i class="med"></i>Medium</span><span><i class="low"></i>Healthy</span></span></div><div class="ov-bars">' + OV_EXP.map(v => ovBar(v.name, v.label, data[v.name])).join("") + '</div></div>';
-    h += '<div class="ov-panel ov-trend"><div class="ov-panel-h">Risk Trend</div><div class="ov-trend-ph"><div class="ov-trend-now">' + (o && o.score != null ? o.score : "—") + '<span>current</span></div><p>A 30-day trend needs stored score history. Wire it to the Sentinel / Log Analytics export to start charting.</p></div></div>';
+    h += ovTrendPanel(o);
     h += '</div>';
     h += '<div class="ov-grid">' + REPORT_VIEWS.map(v => ovSection(v, data[v.name])).join("") + '</div>';
+    ovDestroyMini();   // tear down any previous Cytoscape instance before replacing the DOM
     host.innerHTML = h;
     // Live header strip — honest: it shows when this Overview was actually gathered, not a fake "last scan".
     const lv = $("ovLive");
@@ -3673,6 +3799,7 @@ window.EP = (function () {
       lv.innerHTML = '<span class="ov-live-dot"></span>Live · refreshed ' + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + (n ? ' · ' + n + ' domains' : "");
     }
     ovAnimate();
+    ovInitMiniGraph();   // mount the live Attack Paths mini-graph once its container is in the DOM
   }
   async function renderOverview(force) {
     const host = $("ov-body"); if (!host) return;
