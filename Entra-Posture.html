@@ -96,6 +96,14 @@
   .ep-top::after { content:''; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
     background: linear-gradient(90deg, transparent, var(--accent) 12%, var(--accent-dark) 50%, var(--accent) 88%, transparent); opacity: .8; }
   .ep-top .vtitle { font-family: var(--display); font-size: 15px; letter-spacing: .06em; text-transform: uppercase; }
+  /* collapsible left menu */
+  .ep-navtoggle { background: var(--bg2); border: 1px solid var(--border); color: var(--muted); border-radius: 8px;
+    width: 34px; height: 30px; padding: 0; display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer; box-shadow: none; flex-shrink: 0; transition: .14s; }
+  .ep-navtoggle:hover { color: var(--text); border-color: var(--accent); background: var(--hover); transform: none; filter: none; box-shadow: none; }
+  .ep-navtoggle svg { width: 17px; height: 17px; }
+  body.nav-collapsed .ep-nav { display: none; }
+  body.nav-collapsed .ep-main { margin-left: 0; }
   .ep-top .spacer { flex: 1; }
   .ep-top #epStatus { font-size: 12px; color: var(--muted); max-width: 440px; text-align: right; }
   .ep-top #epStatus.err { color: var(--red); }
@@ -185,7 +193,7 @@
   .ep-view.on { display: block; }
   /* Horizontal gutters for the posture views so their content aligns with the top bar (26px) and matches
      External / Attack Paths. Their own <main> wrapper (which carried this padding) is stripped by the build. */
-  #view-user, #view-workload, #view-agent { padding: 18px 26px 60px; }
+  #view-user, #view-workload, #view-agent, #view-external, #view-ca { padding: 18px 26px 60px; }
   .ep-view-empty { padding: 60px 28px; text-align: center; color: var(--muted); }
 
   /* ---- config button + AI/LLM modal ---- */
@@ -2156,6 +2164,8 @@
   #view-entrahound nav.top { justify-content: flex-start; }
   #view-entrahound::before { display: none; }
   /* ── Overview — security command center ─────────────────────────────── */
+  #view-overview { padding: 16px 26px 26px; }
+  @media (max-width: 720px) { #view-overview { padding: 12px 15px 18px; } }
   .ov-top { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; }
   .ov-lede { color: var(--muted); font-size: 13px; flex: 1; }
   .ov-refresh { background: var(--bg2); border: 1px solid var(--border); color: var(--accent-dark);
@@ -2362,6 +2372,7 @@
 
 <div class="ep-main">
   <div class="ep-top">
+    <button id="epNavToggle" class="ep-navtoggle" title="Hide menu" aria-label="Toggle menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16" stroke-linecap="round"/></svg></button>
     <span class="vtitle" id="epViewTitle">Entra Posture</span>
     <span class="spacer"></span>
     <span id="epStatus" aria-live="polite"></span>
@@ -3929,6 +3940,14 @@ window.EP = (function () {
     $("epSignIn").addEventListener("click", signIn);
     $("epSignOut").addEventListener("click", signOut);
     document.querySelectorAll(".ep-nav button.nav").forEach(b => b.addEventListener("click", () => show(b.dataset.view)));
+    // Collapsible left menu — persisted per browser
+    (function () {
+      const KEY = "ep_nav_collapsed", btn = $("epNavToggle");
+      const apply = c => { document.body.classList.toggle("nav-collapsed", c); if (btn) btn.title = c ? "Show menu" : "Hide menu"; };
+      let collapsed = false; try { collapsed = localStorage.getItem(KEY) === "1"; } catch (_) {}
+      apply(collapsed);
+      if (btn) btn.addEventListener("click", () => { collapsed = !collapsed; apply(collapsed); try { localStorage.setItem(KEY, collapsed ? "1" : "0"); } catch (_) {} });
+    })();
     // AI configuration modal
     const closeCfg = () => $("epConfigModal").classList.remove("on");
     $("epConfigBtn").addEventListener("click", () => { cfgDraft = {}; $("epCfgStatus").textContent = ""; cfgRender(); $("epConfigModal").classList.add("on"); });
@@ -6649,7 +6668,8 @@ EP.registerView("workload", (function () {
           setStatus('Fetching directory role assignments…', false, true);
           // roleAssignments accepts only ONE $expand, so expand `principal` (to keep SP holders) and resolve role NAMES
           // from a separate roleDefinitions fetch (roleDefinitionId == template GUID for built-in roles).
-          var roleDefs = await graphGetAllPages(GBASE + '/roleManagement/directory/roleDefinitions?$select=id,displayName,templateId&$top=999', roleToken).catch(function(){ return []; });
+          // NB: roleDefinitions rejects $top=999 (400 — its page cap is lower); omit it and let nextLink paging fetch all.
+          var roleDefs = await graphGetAllPages(GBASE + '/roleManagement/directory/roleDefinitions?$select=id,displayName,templateId', roleToken).catch(function(){ return []; });
           var defById = {}; roleDefs.forEach(function(rd){ defById[String(rd.id).toLowerCase()] = rd; });
           var roleAssigns = await graphGetAllPages(GBASE + '/roleManagement/directory/roleAssignments?$expand=principal&$top=999', roleToken, function(n){ setStatus('Fetching directory role assignments… ' + n, false, true); });
           roleAssigns.forEach(function(a){
@@ -13748,6 +13768,14 @@ EH.model = (function(){
     critOverride = critOverride || { add: [], remove: [] };
     nodes.forEach(function(n){ n.critical = (n.autoCritical && critOverride.remove.indexOf(n.id) < 0) || critOverride.add.indexOf(n.id) >= 0; });
 
+    /* ---- role occupancy: a Tier-0 role no one holds is a latent crown-jewel, not a live risk.
+            Holders = inbound AssignedRole / EligibleRole / ScopedRole edges from principals. ---- */
+    nodes.forEach(function(n){
+      if(n.type !== 'role') return;
+      n.flags.holders = (inn.get(n.id) || []).filter(function(e){ return e.k === 'AssignedRole' || e.k === 'EligibleRole' || e.k === 'ScopedRole'; }).length;
+      n.flags.unoccupied = n.flags.holders === 0;
+    });
+
     /* ---- derived capability edges (two passes so capabilities reach what matters) ---- */
     function targetsFor(spec){
       var kind = spec.split(':')[0], q = spec.split(':')[1], res = [];
@@ -14117,7 +14145,7 @@ EH.ui = (function(){
   function N(id){ return S.g.nodes.get(id); }
   function ntype(n){ return '<span class="ntype" style="--c:' + COLOR[n.type] + '"><i></i>' + esc(M.TYPE_LABEL[n.type] || n.type) + '</span>'; }
   function nlink(n, cls){ return '<a href="#" class="nl ' + (cls || '') + '" data-id="' + esc(n.id) + '" style="color:' + COLOR[n.type] + ';text-decoration:none">' + esc(n.label) + '</a>'; }
-  function flagsOf(n){ var f = n.flags, t = []; if(n.critical) t.push(tag('critical', 'crit')); if(f.tier0) t.push(tag('tier-0', 'bad')); else if(f.privileged) t.push(tag('privileged', 'warn')); if(f.guest) t.push(tag('guest', 'warn')); if(f.disabled) t.push(tag('disabled')); if(f.synced) t.push(tag('synced', 'acc')); if(f.mfa === false) t.push(tag('no mfa', 'bad')); if(f.caExcluded) t.push(tag('CA excluded', 'bad')); else if(f.caProtected === false && (n.type === 'user' || n.type === 'guest')) t.push(tag('no CA', 'warn')); if(f.dormant) t.push(tag('dormant')); if(f.secret) t.push(tag('secret', 'warn')); if(f.cert) t.push(tag('cert')); if(f.fic) t.push(tag('federated', 'warn')); if(f.roleAssignable) t.push(tag('role-assignable', 'bad')); if(f.dynamic) t.push(tag('dynamic', 'acc')); if(f.eligibleOnly) t.push(tag('PIM eligible', 'acc')); if(f.permTier === 0) t.push(tag('tier-0 perms', 'bad')); else if(f.permTier === 1) t.push(tag('high perms', 'warn')); if(f.msFirstParty) t.push(tag('Microsoft')); if(f.external) t.push(tag('other tenant', 'warn')); if(f.multiTenant) t.push(tag('multi-tenant')); if(f.broad) t.push(tag('wildcard', 'bad')); return t.join(''); }
+  function flagsOf(n){ var f = n.flags, t = []; if(n.critical){ if(n.type === 'role' && f.unoccupied) t.push(tag('tier-0 · unoccupied')); else t.push(tag('critical', 'crit')); } if(f.tier0) t.push(tag('tier-0', 'bad')); else if(f.privileged) t.push(tag('privileged', 'warn')); if(f.guest) t.push(tag('guest', 'warn')); if(f.disabled) t.push(tag('disabled')); if(f.synced) t.push(tag('synced', 'acc')); if(f.mfa === false) t.push(tag('no mfa', 'bad')); if(f.caExcluded) t.push(tag('CA excluded', 'bad')); else if(f.caProtected === false && (n.type === 'user' || n.type === 'guest')) t.push(tag('no CA', 'warn')); if(f.dormant) t.push(tag('dormant')); if(f.secret) t.push(tag('secret', 'warn')); if(f.cert) t.push(tag('cert')); if(f.fic) t.push(tag('federated', 'warn')); if(f.roleAssignable) t.push(tag('role-assignable', 'bad')); if(f.dynamic) t.push(tag('dynamic', 'acc')); if(f.eligibleOnly) t.push(tag('PIM eligible', 'acc')); if(f.permTier === 0) t.push(tag('tier-0 perms', 'bad')); else if(f.permTier === 1) t.push(tag('high perms', 'warn')); if(f.msFirstParty) t.push(tag('Microsoft')); if(f.external) t.push(tag('other tenant', 'warn')); if(f.multiTenant) t.push(tag('multi-tenant')); if(f.broad) t.push(tag('wildcard', 'bad')); return t.join(''); }
 
   /* ---------- pipeline ---------- */
   function stage(name){ document.querySelectorAll('#stages div').forEach(function(d){ var k = d.getAttribute('data-stage'); if(k === name) d.className = 'on'; else if(d.classList.contains('on') || d.classList.contains('done')) d.className = 'done'; }); }
@@ -14640,7 +14668,7 @@ EH.ui = (function(){
     else if(n.type === 'group'){ kv = [['Kind', n.sub], ['Role-assignable', n.flags.roleAssignable], ['Dynamic rule', n.props.membershipRule || '—'], ['Mail', n.props.mail || '—'], ['Visibility', n.props.visibility || '—'], ['Created', U.fmtDate(n.props.createdDateTime)], ['Members (direct)', inE.filter(function(e){ return e.k === 'MemberOf'; }).length], ['Owners', inE.filter(function(e){ return e.k === 'OwnerOf'; }).length]]; }
     else if(n.type === 'app' || n.type === 'blueprint'){ var a = n.props; kv = [['App ID', a.appId], ['Object ID', a.id], ['Audience', a.signInAudience], ['Publisher domain', a.publisherDomain || '—'], ['Created', U.fmtDate(a.createdDateTime)], ['Secrets', creds(a.passwordCredentials)], ['Certificates', creds(a.keyCredentials)], ['Federated credentials', (a.fics || a.federatedIdentityCredentials || []).map(function(f){ return (f.name || '') + ' · ' + f.issuer + ' · ' + f.subject; }).join('<br>') || 'none'], ['Declared permissions', (a.requiredResourceAccess || []).reduce(function(x, r){ return x + (r.resourceAccess || []).length; }, 0) + ' (requiredResourceAccess)'], ['Redirect URIs', ((a.web && a.web.redirectUris) || []).concat((a.spa && a.spa.redirectUris) || []).join('<br>') || '—']]; }
     else if(n.type === 'sp' || n.type === 'mi' || n.type === 'agent'){ var s = n.props; kv = [['App ID', s.appId], ['Object ID', s.id], ['Type', s.servicePrincipalType || n.type], ['Enabled', s.accountEnabled], ['Owner tenant', n.flags.msFirstParty ? 'Microsoft' : n.flags.homeTenant ? 'this tenant' : s.appOwnerOrganizationId || '—'], ['Publisher', s.publisherName || '—'], ['Assignment required', s.appRoleAssignmentRequired], ['Secrets on SP', creds(s.passwordCredentials)], ['Certificates on SP', creds(s.keyCredentials)], ['Admin consent (app perms)', outE.filter(function(e){ return e.k === 'HasApplicationPermission'; }).map(function(e){ return N(e.t).label; }).join(', ') || 'none'], ['Delegated grants', (s.oauthGrants || []).map(function(gr){ return (gr.consentType === 'AllPrincipals' ? 'all users' : 'user ' + (N(gr.principalId) ? N(gr.principalId).label : gr.principalId)) + ': ' + gr.scope; }).join('<br>') || 'none'], ['Blueprint', n.props.agentIdentityBlueprintId || '—']]; }
-    else if(n.type === 'role'){ kv = [['Template', n.props.templateId], ['Tier', n.tier], ['isPrivileged (Graph)', n.props.isPrivileged], ['Scope', n.props.scopeAU ? 'AU ' + (N(n.props.scopeAU) ? N(n.props.scopeAU).label : n.props.scopeAU) : 'tenant'], ['Capabilities', (n.props.caps || []).map(function(c){ return c[0] + ' → ' + c[1]; }).join('<br>') || '—'], ['Description', n.props.description || '']]; }
+    else if(n.type === 'role'){ kv = [['Template', n.props.templateId], ['Tier', n.tier], ['Holders', (n.flags.holders || 0) + (n.flags.unoccupied ? ' — unoccupied' : '')], ['isPrivileged (Graph)', n.props.isPrivileged], ['Scope', n.props.scopeAU ? 'AU ' + (N(n.props.scopeAU) ? N(n.props.scopeAU).label : n.props.scopeAU) : 'tenant'], ['Capabilities', (n.props.caps || []).map(function(c){ return c[0] + ' → ' + c[1]; }).join('<br>') || '—'], ['Description', n.props.description || '']]; }
     else if(n.type === 'permission'){ kv = [['Resource', n.sub], ['Tier', n.tier], ['Kind', n.flags.delegated ? 'delegated' : 'application'], ['Capabilities', (n.props.caps || []).map(function(c){ return c[0] + ' → ' + c[1]; }).join('<br>') || 'data access only'], ['Held by', inE.length + ' principals']]; }
     else if(n.type === 'device'){ var d = n.props; kv = [['OS', d.operatingSystem + ' ' + (d.operatingSystemVersion || '')], ['Join', d.trustType], ['Compliant', d.isCompliant], ['Managed', d.isManaged], ['Last activity', U.fmtDate(d.approximateLastSignInDateTime)], ['Registered', U.fmtDate(d.registrationDateTime)]]; }
     else if(n.type === 'policy'){ var c = n.props.conditions || {}, gr = n.props.grantControls || {}; kv = [['State', n.props.state], ['Users', JSON.stringify(c.users || {})], ['Apps', JSON.stringify(c.applications || {})], ['Client apps', (c.clientAppTypes || []).join(', ')], ['Grant', (gr.builtInControls || []).join(' ' + (gr.operator || '') + ' ') + (gr.authenticationStrength ? ' · ' + gr.authenticationStrength.displayName : '')], ['Session', Object.keys(n.props.sessionControls || {}).filter(function(k){ return n.props.sessionControls[k]; }).join(', ') || '—']]; }
@@ -14648,6 +14676,8 @@ EH.ui = (function(){
     else if(n.type === 'issuer'){ kv = [['Issuer', n.props.issuer || '—'], ['Subject', n.props.subject || '—'], ['Audiences', (n.props.audiences || []).join(', ')]]; }
     else if(n.type === 'tenant'){ var o = n.props; kv = [['Tenant ID', o.id], ['Created', U.fmtDate(o.createdDateTime)], ['Sync', o.onPremisesSyncEnabled ? 'on-prem sync on' : 'cloud only'], ['Security defaults', S.raw.secdef ? S.raw.secdef.isEnabled : 'unknown'], ['CA policies', g.caPolicies.length + ' (' + g.mfaPolicies.length + ' all-apps MFA)'], ['Legacy auth blocked', g.caBlocksLegacy]]; }
     sec('Overview', '<dl class="kv">' + kv.map(function(x){ return '<dt>' + esc(x[0]) + '</dt><dd>' + (typeof x[1] === 'boolean' ? U.yesno(x[1]) : (x[1] == null ? '—' : x[1])) + '</dd>'; }).join('') + '</dl>');
+    // A Tier-0 role no one holds is latent, not a live risk — say so plainly so the crit marking doesn't read as an alarm.
+    if(n.type === 'role' && n.critical && n.flags.unoccupied) h += '<div class="notice ok">Tier-0 role, but <b>no one holds it</b> — there is no live attack path today. It stays flagged as a crown-jewel to <i>watch</i>: if any principal is ever assigned or made eligible for it, it becomes tenant-control-class.</div>';
     // privilege
     if(n.props.roles && Object.keys(n.props.roles).length) sec('Roles', '<div class="rel">' + Object.keys(n.props.roles).map(function(rid){ var r = N(rid), a = n.props.roles[rid]; return '<div data-id="' + rid + '"><span class="ek">' + esc(a.mode) + '</span><span>' + ntype(r) + ' ' + esc(r.label) + ' <span style="color:var(--muted);font-size:11.5px">· ' + esc(a.via) + (a.edge.via ? ' · ' + esc(a.edge.via) : '') + '</span></span></div>'; }).join('') + '</div>');
     var groups = outE.filter(function(e){ return e.k === 'MemberOf'; }); if(groups.length) sec('Group memberships (direct)', rels(groups, 'out'));
@@ -14815,12 +14845,17 @@ EH.ui = (function(){
     return line.replace(/^(query|a)\s*[:.]\s*/i, "").replace(/[.;]\s*$/, "").trim();
   }
   async function aiTranslate(q){ return cleanGrammar(await window.EP.llmComplete(querySystemPrompt(), q, { temperature: 0, max_tokens: 120 })); }
+  // A bare term ("Raymond Roethof", "admin") is a name search, not a question — it needs no AI.
+  // Only interrogative/command phrasings need translation. This keeps the box useful with AI off.
+  function looksLikeQuestion(q){ return /\?\s*$/.test(q) || /^(who|which|what|whom|how|where|when|why|show|list|display|find|does|do|are|is|can|could|count|paths?|nodes?|edges?)\b/i.test(q); }
+  function nameSearch(q, note){ var cmd = 'nodes name:"' + q.replace(/"/g, "") + '"'; el('qInput').value = cmd; execQuery(cmd, '<div class="notice info">' + note + ' <code>' + esc(cmd) + '</code> · edit the box and Run, or use the advanced grammar below.</div>'); }
   async function runQuery(text){
     var q = (text || "").trim(); if(!q) return;
     if(grammarParses(q)){ execQuery(q, ""); return; }                              // already valid grammar
     var t = nlMatch(q);
     if(t){ execQuery(t, '<div class="notice info">Translated to <code>' + esc(t) + '</code></div>'); return; }  // deterministic
     var EP = window.EP;
+    if(!looksLikeQuestion(q)){ nameSearch(q, "Searched by name for &ldquo;" + esc(q) + "&rdquo;:"); return; }  // bare term → name search, no AI needed
     if(EP && EP.llm && EP.llm.ready()){                                            // AI translate, gated by grammarParses
       el('qOut').innerHTML = '<div class="notice info"><span class="spinner"></span> Asking ' + esc(EP.llm.provider) + ' · ' + esc(EP.llm.model) + ' to translate your question…</div>';
       try {
@@ -14831,10 +14866,11 @@ EH.ui = (function(){
         } else {
           el('qOut').innerHTML = '<div class="notice bad">The AI didn\'t return a runnable query' + (cmd ? ' (<code>' + esc(cmd) + '</code>)' : '') + '. Rephrase, or use the advanced grammar below.</div>';
         }
-      } catch(e){ el('qOut').innerHTML = '<div class="notice bad">AI translation failed — ' + esc(e.message || e) + '. Check <b>Configuration</b>, or use the advanced grammar below.</div>'; }
+      } catch(e){ el('qOut').innerHTML = '<div class="notice bad">AI translation unavailable — ' + esc(e.message || e) + '. Type a <b>name</b> to search it, click a sample query above, or use the advanced grammar below.</div>'; }
       return;
     }
-    execQuery(q, "");   // no AI configured and nothing matched → the parser shows its own error
+    // A free-form question, but no local AI model configured → explain rather than fail cryptically.
+    el('qOut').innerHTML = '<div class="notice info">No local AI model is configured, so free-form questions can\'t be translated. Type a <b>name</b> to search for it, click a <b>sample query</b> above, or set a model in <b>Configuration</b>.</div>';
   }
   function execQuery(cmd, head){
     var out = el('qOut'), h = head || '';
@@ -14864,7 +14900,7 @@ EH.ui = (function(){
     el('logTable').querySelector('tbody').innerHTML = EH.graph.log.slice(-300).reverse().map(function(l){ return '<tr><td class="mono">' + new Date(l.t).toLocaleTimeString() + '</td><td>' + l.status + '</td><td>' + l.ms + '</td><td class="mono" style="font-size:11px">' + esc(l.url) + '</td></tr>'; }).join('') || '<tr><td colspan="4" class="empty">' + (S.raw.demo ? 'Demo data — no Graph calls were made.' : 'No calls logged.') + '</td></tr>';
     el('exportBtns').innerHTML = [['json', 'Everything (JSON)'], ['findings', 'Findings (CSV)'], ['paths', 'Attack paths (CSV)'], ['identities', 'Identities (CSV)'], ['apps', 'Applications (CSV)'], ['edges', 'Relationships (CSV)'], ['critical', 'Critical assets (CSV)'], ['remediation', 'Remediation (CSV)'], ['log', 'Collection log (CSV)']].map(function(b){ return '<button type="button" class="btn btn-ghost btn-sm" data-export="' + b[0] + '">' + b[1] + '</button>'; }).join('');
   }
-  function renderCritical(){ var cs = []; S.g.nodes.forEach(function(n){ if(n.critical) cs.push(n); }); el('criticalList').innerHTML = cs.slice(0, 120).map(function(n){ return '<span class="chip" style="cursor:pointer;font-size:11px;padding:6px 9px" data-id="' + esc(n.id) + '"><span class="ntype" style="--c:' + COLOR[n.type] + '"><i></i></span> ' + esc(n.label) + (S.crit.add.indexOf(n.id) >= 0 ? ' <span style="color:var(--accent-2)">custom</span>' : '') + '</span>'; }).join('') + (cs.length > 120 ? '<span class="chip dim">+' + (cs.length - 120) + '</span>' : ''); }
+  function renderCritical(){ var cs = []; S.g.nodes.forEach(function(n){ if(n.critical) cs.push(n); }); el('criticalList').innerHTML = cs.slice(0, 120).map(function(n){ return '<span class="chip" style="cursor:pointer;font-size:11px;padding:6px 9px" data-id="' + esc(n.id) + '"><span class="ntype" style="--c:' + COLOR[n.type] + '"><i></i></span> ' + esc(n.label) + (n.flags && n.flags.unoccupied ? ' <span style="color:var(--muted)">unoccupied</span>' : '') + (S.crit.add.indexOf(n.id) >= 0 ? ' <span style="color:var(--accent-2)">custom</span>' : '') + '</span>'; }).join('') + (cs.length > 120 ? '<span class="chip dim">+' + (cs.length - 120) + '</span>' : ''); }
 
   /* ---------- export ---------- */
   function doExport(kind){
