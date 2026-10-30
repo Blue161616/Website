@@ -2239,6 +2239,14 @@
   .ov-item:hover .ov-go { opacity: 1; }
   .ov-clean { color: var(--muted); font-size: 12px; padding: 10px 11px; }
   .ov-na { color: var(--muted); font-size: 12px; }
+  .ov-paths { padding: 8px 10px 10px; display: flex; flex-direction: column; gap: 8px; }
+  .ov-path { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; padding: 9px 10px; border-radius: 8px; background: #122546; border-left: 3px solid var(--sev-info); cursor: pointer; }
+  .ov-path:hover { background: rgba(63,169,255,.1); }
+  .ov-path.critical { border-left-color: var(--sev-crit); } .ov-path.high { border-left-color: var(--sev-high); }
+  .ov-node { font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 6px; background: var(--bg2); border: 1px solid var(--border); max-width: 165px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ov-node.src { border-color: var(--accent); color: var(--accent-dark); }
+  .ov-node.crit { border-color: var(--sev-crit); color: var(--sev-crit); background: rgba(255,77,109,.08); }
+  .ov-edge { font-size: 9px; color: var(--muted); font-weight: 600; white-space: nowrap; }
   .ov-recs { margin-bottom: 8px; }
   .ov-recs-list { margin: 0; padding: 8px 12px 12px; list-style: none; display: grid; grid-template-columns: 1fr 1fr; gap: 4px 18px; }
   @media (max-width: 820px) { .ov-recs-list { grid-template-columns: 1fr; } }
@@ -3417,6 +3425,7 @@ window.EP = (function () {
   };
   const OV_DOM_ICON = { user: OV_ICON.user, workload: OV_ICON.workload, agent: OV_ICON.agent, external: OV_ICON.globe, ca: OV_ICON.shield, entrahound: OV_ICON.path };
   const OV_EXP = [{ name: "user", label: "Users" }, { name: "workload", label: "Workloads" }, { name: "agent", label: "Agents" }, { name: "external", label: "External Access" }, { name: "ca", label: "Conditional Access" }];
+  const OV_LIMIT = { user: 3, workload: 3, agent: 3 };   // top-N items per card (others default below)
   function ovCounts(s) { return s && (s.counts || (s.exposure ? { critical: s.exposure.crit, high: s.exposure.high } : null)); }
   function ovSevBadge(k) { const c = sevCls(k || "").toLowerCase(); const lab = { critical: "CRIT", high: "HIGH", medium: "MED", low: "LOW" }[c]; return lab ? '<span class="ov-badge ' + c + '">' + lab + '</span>' : '<span class="ov-badge low" style="opacity:.45">·</span>'; }
   // Exposure score: higher = worse, so the gauge fills and reddens with the score; colour by grade.
@@ -3475,30 +3484,57 @@ window.EP = (function () {
       setTimeout(() => { arc.style.strokeDashoffset = final; }, 1300);
     }
   }
+  // Attack Paths card: the top critical paths drawn as node→edge→node flows (source
+  // in blue, the critical asset in red), parsed from each path's chain string.
+  function ovPathGraph(s) {
+    const paths = (s.topPaths || []).slice(0, 3);
+    if (!paths.length) return '<div class="ov-items"><div class="ov-clean">No attack paths found.</div></div>';
+    return '<div class="ov-paths">' + paths.map(p => {
+      const chain = String(p.chain || "");
+      const nodes = chain.split(/\s-\[.*?\]->\s/);
+      const edges = (chain.match(/-\[(.*?)\]->/g) || []).map(e => e.replace(/^-\[|\]->$/g, ""));
+      const sev = sevCls(p.severity || "").toLowerCase();
+      let flow = "";
+      nodes.forEach((n, i) => {
+        const last = i === nodes.length - 1;
+        flow += '<span class="ov-node' + (last ? " crit" : (i === 0 ? " src" : "")) + '" title="' + esc(n) + '">' + esc(n) + '</span>';
+        if (!last) flow += '<span class="ov-edge" title="' + esc(edges[i] || "") + '">' + esc(edges[i] || "") + ' &rsaquo;</span>';
+      });
+      return '<div class="ov-path ' + sev + '" data-ovgo="entrahound" data-ovlabel="' + esc(nodes[0] || "") + '" title="Open in Attack Paths">' + flow + '</div>';
+    }).join("") + '</div>';
+  }
   function ovSection(v, s) {
     if (!s) return '<div class="ov-card"><div class="ov-card-h" data-ovgo="' + v.name + '"><span class="ov-card-ic">' + (OV_DOM_ICON[v.name] || "") + '</span><span class="ov-dom">' + esc(v.label) + '</span><span class="ov-na">not collected</span></div></div>';
     const grade = s.grade || (s.exposure && s.exposure.grade) || null;
     const counts = ovCounts(s);
-    const items = s.top || s.topPaths || [];
-    const risky = items.filter(t => !t.sev || /crit|high|act|sprint/i.test(String(t.sev))).slice(0, 5);
-    const rows = risky.length
-      ? risky.map(t => {
-          const lab = t.name || t.title || t.chain || "(item)";
-          const why = ovReason(t);
-          return '<button class="ov-item" data-ovgo="' + v.name + '" data-ovlabel="' + esc(lab) + '">'
-            + ovSevBadge(t.sev || t.severity || t.band || t.level || t.tier)
-            + '<span class="ov-item-txt"><span class="ov-item-t">' + esc(lab) + '</span>'
-            + (why ? '<span class="ov-item-why">' + esc(why) + '</span>' : "") + '</span>'
-            + '<span class="ov-go">→</span></button>';
-        }).join("")
-      : '<div class="ov-clean">Nothing high-risk flagged.</div>';
+    let body;
+    if (v.name === "entrahound") {
+      body = ovPathGraph(s);
+    } else {
+      // External findings are often medium — show them anyway rather than "nothing"; the
+      // scored domains (user/workload/agent) are already worst-first, so top-N is enough.
+      const items = s.top || [];
+      const risky = (v.name === "external" ? items : items.filter(t => !t.sev || /crit|high|act|sprint/i.test(String(t.sev)))).slice(0, OV_LIMIT[v.name] || 5);
+      const rows = risky.length
+        ? risky.map(t => {
+            const lab = t.name || t.title || t.chain || "(item)";
+            const why = ovReason(t);
+            return '<button class="ov-item" data-ovgo="' + v.name + '" data-ovlabel="' + esc(lab) + '">'
+              + ovSevBadge(t.sev || t.severity || t.band || t.level || t.tier)
+              + '<span class="ov-item-txt"><span class="ov-item-t">' + esc(lab) + '</span>'
+              + (why ? '<span class="ov-item-why">' + esc(why) + '</span>' : "") + '</span>'
+              + '<span class="ov-go">→</span></button>';
+          }).join("")
+        : '<div class="ov-clean">Nothing high-risk flagged.</div>';
+      body = '<div class="ov-items">' + rows + '</div>';
+    }
     return '<div class="ov-card ' + ovCardCls(counts) + '">'
       + '<div class="ov-card-h" data-ovgo="' + v.name + '" title="Open ' + esc(v.label) + '">'
       + '<span class="ov-card-ic">' + (OV_DOM_ICON[v.name] || "") + '</span>'
       + '<span class="ov-dom">' + esc(v.label) + '</span>'
       + (counts ? '<span class="ov-counts">' + repCounts(counts) + '</span>' : "")
       + (grade ? '<span class="ov-grade-badge ' + ovGradeCls(grade) + '">' + esc(grade) + '</span>' : "")
-      + '</div><div class="ov-items">' + rows + '</div></div>';
+      + '</div>' + body + '</div>';
   }
   function paintOverview(st) {
     const host = $("ov-body"); if (!host) return;
