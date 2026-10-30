@@ -2279,6 +2279,8 @@
   /* Attack Paths mini-graph (live Cytoscape of the top critical path) */
   .ov-mini-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px 4px; }
   .ov-mini-title { font-size: 12px; font-weight: 700; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .ov-mini-select { flex: 1; min-width: 0; background: var(--bg2); border: 1px solid var(--border); color: var(--text); border-radius: 7px; padding: 4px 8px; font-size: 11.5px; font-weight: 600; font-family: inherit; cursor: pointer; }
+  .ov-mini-select:hover, .ov-mini-select:focus-visible { border-color: var(--accent); outline: none; }
   .ov-mini-arrow { color: var(--sev-crit); font-weight: 800; }
   .ov-mini-open { margin-left: auto; flex-shrink: 0; background: var(--bg2); border: 1px solid var(--border); color: var(--accent-dark); border-radius: 7px; padding: 4px 9px; font-size: 10.5px; font-weight: 700; cursor: pointer; font-family: inherit; white-space: nowrap; }
   .ov-mini-open:hover { border-color: var(--accent); color: var(--text); }
@@ -3602,19 +3604,29 @@ window.EP = (function () {
   //    the Attack Paths view's loaded graph (EH.ui.S) and the global cytoscape. Falls back to the flow
   //    rows when the graph/library isn't available. ──
   const OV_GCOLOR = { user: "#4FB8FF", guest: "#FFC15E", group: "#8FE3FF", role: "#FF7A8A", app: "#B48CFF", sp: "#7C9CFF", mi: "#5AC8FF", device: "#93ACD3", agent: "#FF9FEF", blueprint: "#E08CFF", tenant: "#FFFFFF", resource: "#3FA9FF", permission: "#FF5C7A", issuer: "#FFD36E", partner: "#C7D3EA", au: "#6FB1FF", policy: "#9BB0D6" };
-  let _ovMiniCy = null;
+  let _ovMiniCy = null, _ovPathList = [], _ovPathG = null, _ovPathSel = 0;
   function ovDestroyMini() { if (_ovMiniCy) { try { _ovMiniCy.destroy(); } catch (_) {} _ovMiniCy = null; } }
-  // Prefer a path to Global Administrator, then the one with the most hops (makes the nicest graph).
-  function ovShowcasePath() {
+  // All attack paths to Global Administrator (else to any critical / tier-0 asset), deduped, most hops first.
+  function ovRefreshPaths() {
+    _ovPathList = []; _ovPathG = null;
     try {
-      const S = window.EH && EH.ui && EH.ui.S; if (!S || !S.g || !S.paths || !S.paths.length) return null;
+      const S = window.EH && EH.ui && EH.ui.S; if (!S || !S.g || !S.paths || !S.paths.length) return;
       const g = S.g, N = id => g.nodes.get(id);
-      const crit = S.paths.filter(p => { const t = N(p.target); return t && (t.critical || t.tier === 0); });
-      const pool = crit.length ? crit : S.paths;
-      const ga = pool.filter(p => { const t = N(p.target); return t && /global administrator/i.test(t.label || ""); });
-      const pick = (ga.length ? ga : pool).slice().sort((a, b) => b.nodes.length - a.nodes.length)[0];
-      return pick ? { path: pick, g } : null;
-    } catch (_) { return null; }
+      let pool = S.paths.filter(p => { const t = N(p.target); return t && /global administrator/i.test(t.label || ""); });
+      if (!pool.length) pool = S.paths.filter(p => { const t = N(p.target); return t && (t.critical || t.tier === 0); });
+      if (!pool.length) pool = S.paths.slice();
+      const seen = new Set(), out = [];
+      pool.forEach(p => { const k = p.nodes.join(">"); if (!seen.has(k) && N(p.source) && N(p.target)) { seen.add(k); out.push(p); } });
+      out.sort((a, b) => b.nodes.length - a.nodes.length);
+      _ovPathList = out.slice(0, 50); _ovPathG = g;
+      if (_ovPathSel >= _ovPathList.length) _ovPathSel = 0;
+    } catch (_) {}
+  }
+  function ovShowcasePath() {
+    if (!_ovPathList.length) ovRefreshPaths();
+    if (!_ovPathList.length || !_ovPathG) return null;
+    if (_ovPathSel >= _ovPathList.length) _ovPathSel = 0;
+    return { path: _ovPathList[_ovPathSel], g: _ovPathG };
   }
   function ovMiniEls(path, g) {
     const N = id => g.nodes.get(id), els = [];
@@ -3647,20 +3659,34 @@ window.EP = (function () {
       ]
     });
     setTimeout(() => { if (_ovMiniCy) { try { _ovMiniCy.resize(); _ovMiniCy.fit(undefined, 52); if (_ovMiniCy.zoom() > 0.82) { _ovMiniCy.zoom(0.82); _ovMiniCy.center(); } } catch (_) {} } }, 70);
+    // Dropdown: pick another path and redraw the graph with it.
+    const sel = document.getElementById("ovMiniSel");
+    if (sel && !sel._ovWired) {
+      sel._ovWired = true;
+      sel.addEventListener("change", () => {
+        _ovPathSel = +sel.value || 0; const cur = _ovPathList[_ovPathSel];
+        ovInitMiniGraph();
+        const open = document.getElementById("ovMiniOpen");
+        if (open && cur) open.setAttribute("data-ovfocus", JSON.stringify({ query: "paths from id:" + cur.source + " to id:" + cur.target }));
+        const foot = document.getElementById("ovMiniFoot");
+        if (foot && cur) foot.textContent = "Drag nodes to explore · " + cur.nodes.length + "-node path · " + _ovPathList.length + " paths · scroll to zoom";
+      });
+    }
   }
   // The Attack Paths card: a live mini-graph of the top critical path, or the flow rows if the graph isn't loaded.
   function ovEntrahoundCard(v, s) {
     const grade = (s && (s.grade || (s.exposure && s.exposure.grade))) || null;
     const counts = ovCounts(s);
-    const sc = (typeof cytoscape !== "undefined") ? ovShowcasePath() : null;
+    if (typeof cytoscape !== "undefined") ovRefreshPaths();
     let body;
-    if (sc) {
-      const N = id => sc.g.nodes.get(id), src = N(sc.path.source), tgt = N(sc.path.target);
-      const q = "paths from id:" + sc.path.source + " to id:" + sc.path.target;
-      body = '<div class="ov-mini-head"><span class="ov-mini-title" title="' + esc(src.label + " → " + tgt.label) + '">' + esc(src.label) + ' <span class="ov-mini-arrow">&rarr;</span> ' + esc(tgt.label) + '</span>'
-        + '<button class="ov-mini-open" data-ovgo="entrahound" data-ovfocus="' + esc(JSON.stringify({ query: q })) + '" title="Open this path in the full Attack Paths graph">Open full graph &rarr;</button></div>'
+    if (_ovPathList.length && typeof cytoscape !== "undefined") {
+      const g = _ovPathG, N = id => g.nodes.get(id);
+      const opts = _ovPathList.map((p, i) => '<option value="' + i + '"' + (i === _ovPathSel ? " selected" : "") + '>' + esc(N(p.source).label + " → " + N(p.target).label + " · " + p.edges.length + " hop" + (p.edges.length === 1 ? "" : "s")) + '</option>').join("");
+      const cur = _ovPathList[_ovPathSel], q = "paths from id:" + cur.source + " to id:" + cur.target;
+      body = '<div class="ov-mini-head"><select class="ov-mini-select" id="ovMiniSel" title="Choose an attack path to show">' + opts + '</select>'
+        + '<button class="ov-mini-open" id="ovMiniOpen" data-ovgo="entrahound" data-ovfocus="' + esc(JSON.stringify({ query: q })) + '" title="Open this path in the full Attack Paths graph">Open full graph &rarr;</button></div>'
         + '<div class="ov-minigraph" id="ovMiniCy"></div>'
-        + '<div class="ov-mini-foot">Drag nodes to explore · ' + sc.path.nodes.length + '-node path · scroll to zoom</div>';
+        + '<div class="ov-mini-foot" id="ovMiniFoot">Drag nodes to explore · ' + cur.nodes.length + '-node path · ' + _ovPathList.length + ' paths · scroll to zoom</div>';
     } else {
       body = ovPathGraph(s);
     }
