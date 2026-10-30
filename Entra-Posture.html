@@ -11513,6 +11513,10 @@ const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0
 const DEMO = /[?&]demo(=1)?(&|$)/.test(location.search);
 
 let MSAL = EP.msalShim(), ACCOUNT = EP.ACCOUNT, LAST = null;
+// GUID → display name for the users/groups a policy targets. Filled best-effort in
+// run() when Directory.Read.All is available; empty otherwise, so names fall back
+// to GUIDs and the core view keeps working on Policy.Read.All alone.
+let DIR_NAMES = {};
 
 const $  = id => document.getElementById(id);
 const esc = s => String(s == null ? '' : s)
@@ -11666,6 +11670,34 @@ async function graphAll(path, tok, opts, cap) {
     pages++;
   }
   return out;
+}
+
+// Every user/group GUID a policy includes or excludes — the set we resolve to names.
+function _principalIds(policies) {
+  const set = new Set();
+  const add = arr => (arr || []).forEach(x => { if (GUID_RE.test(x)) set.add(x); });
+  (policies || []).forEach(p => {
+    const u = (p.conditions && p.conditions.users) || {};
+    add(u.includeUsers); add(u.excludeUsers); add(u.includeGroups); add(u.excludeGroups);
+  });
+  return [...set];
+}
+// Resolve directory object GUIDs → display names via getByIds (one call per 1000).
+// Needs a token carrying Directory.Read.All; throws if the scope isn't consented.
+async function resolveDirNames(ids, tok) {
+  const names = {};
+  for (let i = 0; i < ids.length; i += 1000) {
+    const chunk = ids.slice(i, i + 1000);
+    const r = await fetch(GRAPH + '/v1.0/directoryObjects/getByIds', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ ids: chunk, types: ['user', 'group'] }),
+    });
+    if (!r.ok) throw new Error('getByIds ' + r.status);
+    const d = await r.json();
+    (d.value || []).forEach(o => { if (o && o.id) names[o.id] = o.displayName || o.userPrincipalName || o.id; });
+  }
+  return names;
 }
 
 // ═════════════════════════ Policy semantics ═════════════════════════
@@ -12061,9 +12093,10 @@ function targetLabel(p) {
 
 // ═════════════════════════ Per-policy detail + score ═════════════════════════
 // Built-in role template IDs → display names, so a policy that targets roles shows
-// names instead of GUIDs (we only hold Policy.Read.All — no directory lookup). The
-// shared built-in set also used by the Workload-Posture / EntraHound views; a role
-// outside it (e.g. a custom role) still falls back to its GUID.
+// names instead of GUIDs. Roles are template IDs, which the directory getByIds lookup
+// (used for users/groups) does not resolve, so they stay mapped here — the shared
+// built-in set also used by the Workload-Posture / EntraHound views; a role outside
+// it (e.g. a custom role) still falls back to its GUID.
 const ROLE_NAMES = {
   '62e90394-69f5-4237-9190-012177145e10':'Global Administrator',
   '194ae4cb-b126-40b2-bd5b-6091b380977d':'Security Administrator',
@@ -12171,9 +12204,9 @@ function _principals(u, pre) {
   const usersRaw = u[pre + 'Users'] || [], roles = u[pre + 'Roles'] || [], groups = u[pre + 'Groups'] || [];
   const out = [];
   if (pre === 'include' && usersRaw.indexOf('All') >= 0) out.push(_chip('All users'));
-  usersRaw.filter(x => x !== 'All' && x !== 'None' && x !== 'GuestsOrExternalUsers').forEach(id => out.push(_chip('user ' + _short(id), id)));
+  usersRaw.filter(x => x !== 'All' && x !== 'None' && x !== 'GuestsOrExternalUsers').forEach(id => out.push(_chip(DIR_NAMES[id] || ('user ' + _short(id)), id)));
   roles.forEach(id => out.push(_chip(ROLE_NAMES[id] || ('role ' + _short(id)), id)));
-  groups.forEach(id => out.push(_chip('group ' + _short(id), id)));
+  groups.forEach(id => out.push(_chip(DIR_NAMES[id] || ('group ' + _short(id)), id)));
   if (usersRaw.indexOf('GuestsOrExternalUsers') >= 0 || u[pre + 'GuestsOrExternalUsers']) out.push(_chip('Guests / external'));
   return out.length ? out.join(' ') : '<span style="color:var(--dim)">none</span>';
 }
@@ -12605,6 +12638,16 @@ async function run() {
     const tok = await token(CORE_SCOPES, true);
 
     const policies = await graphAll('/v1.0/identity/conditionalAccess/policies', tok);
+
+    // Best-effort: resolve the user/group GUIDs a policy targets to display names,
+    // so an excluded user reads as a name, not a bare id. Needs Directory.Read.All
+    // (read-only); if it isn't consented the silent token throws and we quietly keep
+    // the GUIDs — the view still works on Policy.Read.All alone.
+    DIR_NAMES = {};
+    try {
+      const ids = _principalIds(policies);
+      if (ids.length) DIR_NAMES = await resolveDirNames(ids, await token([GRAPH + '/Directory.Read.All'], false));
+    } catch (e) { /* no directory scope — GUIDs stay */ }
 
     // Named locations resolve the GUIDs a policy excludes; its absence is not fatal.
     let namedLocations = [], nlErr = null;
