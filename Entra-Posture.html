@@ -3658,7 +3658,9 @@ window.EP = (function () {
         { selector: "edge", style: { "width": 1.4, "line-color": "rgba(143,227,255,.45)", "line-style": "dashed", "target-arrow-color": "rgba(143,227,255,.7)", "target-arrow-shape": "triangle", "arrow-scale": 0.85, "curve-style": "bezier", "label": "data(label)", "font-size": 5.5, "font-weight": 600, "color": "#8FE3FF", "text-rotation": "autorotate", "text-background-color": "#0A1C42", "text-background-opacity": 0.85, "text-background-padding": 2 } }
       ]
     });
-    setTimeout(() => { if (_ovMiniCy) { try { _ovMiniCy.resize(); _ovMiniCy.fit(undefined, 52); if (_ovMiniCy.zoom() > 0.82) { _ovMiniCy.zoom(0.82); _ovMiniCy.center(); } } catch (_) {} } }, 70);
+    // Fit, then clamp into a sensible zoom band so a short (2-node) path lands at a good size instead of
+    // the fit over-padding it down to tiny, and a long path never zooms in past the cap.
+    setTimeout(() => { if (_ovMiniCy) { try { _ovMiniCy.resize(); _ovMiniCy.fit(undefined, 24); _ovMiniCy.zoom(Math.max(0.58, Math.min(0.82, _ovMiniCy.zoom()))); _ovMiniCy.center(); } catch (_) {} } }, 70);
     // Dropdown: pick another path and redraw the graph with it.
     const sel = document.getElementById("ovMiniSel");
     if (sel && !sel._ovWired) {
@@ -4773,6 +4775,9 @@ function computeUserFlags(u) {
   u.writeRoles = u.roles.filter((r) => !r.ro);
   u.readRoles  = u.roles.filter((r) => r.ro);
   u.isAdmin = u.roles.length > 0;                    // holds ANY privileged directory role (incl. read-only) — for listing
+  // Break-glass / emergency access accounts, detected by naming convention — they're handled differently from
+  // regular admins: keep them EXCLUDED from Conditional Access, but P2 still lets Identity Protection monitor them.
+  u.breakGlass = /break[\s_-]*glass|emergency[\s_]*(access|admin)/i.test((u.name || "") + " " + (u.upn || ""));
   u.hasWriteRole = u.writeRoles.length > 0;          // holds a role that can CHANGE things — drives the heavy weighting
   u.readOnlyAdmin = !u.hasWriteRole && u.readRoles.length > 0;   // only read-only role(s)
   u.isTier0 = u.writeRoles.some((r) => r.tier === 0);           // Tier-0 = GA-class WRITE role (readers are never tier 0)
@@ -4919,7 +4924,7 @@ function demoUsers() {
   u({ name: "Marta Kovacs", roles: [role("Global Administrator", 0, "active")], mfa: MFA.none, ca: false });      // the full chain
   u({ name: "Dev Admin", upn: "svc.devadmin", roles: [role("Global Administrator", 0, "active")], mfa: MFA.sms, ca: "excluded", idle: 95, noP2: true });
   u({ name: "Ana Silva", roles: [role("Global Administrator", 0, "eligible", false, true)] });                    // the good shape
-  u({ name: "Break Glass 01", upn: "breakglass01", roles: [role("Global Administrator", 0, "active")], ca: "excluded", never: true });
+  u({ name: "Break Glass 01", upn: "breakglass01", roles: [role("Global Administrator", 0, "active")], ca: "excluded", never: true, noP2: true });
   u({ name: "Break Glass 02", upn: "breakglass02", roles: [role("Global Administrator", 0, "active")], ca: "excluded", never: true });
   u({ name: "Tom Bauer", roles: [role("Application Administrator", 0, "active")], mfa: MFA.app, ca: "reportonly" });
   u({ name: "Sofia Rossi", roles: [role("Exchange Administrator", 1, "active")], mfa: MFA.sms, onPrem: true });
@@ -4987,7 +4992,9 @@ function renderNotices() {
   if (noP2) n.push('<div class="notice notice-warn"><b>Entra ID P2 is not licensed in this tenant</b> — no Identity Protection risk, no risk-based Conditional Access, no PIM. It comes with standalone P2, Microsoft 365 E5 or E7, or EMS E5 (service plan <code>AAD_PREMIUM_P2</code>).</div>');
   else if (MODEL.p2 && MODEL.p2.available && MODEL.users) {
     const gap = MODEL.users.filter(u => u.isAdmin && u.enabled && !u.p2Seat);
-    if (gap.length) n.push('<div class="notice notice-warn"><b>' + gap.length + ' privileged account' + (gap.length === 1 ? " holds" : "s hold") + ' no Entra ID P2 seat</b> — Identity Protection risk and risk-based Conditional Access do not apply to ' + (gap.length === 1 ? "it" : "them") + ', licence or not. Assign P2 (or the E5 / E7 bundle) to every admin: ' + escapeHtml(gap.slice(0, 6).map(u => u.name).join(", ")) + (gap.length > 6 ? " and " + (gap.length - 6) + " more" : "") + '.</div>');
+    const reg = gap.filter(u => !u.breakGlass), bg = gap.filter(u => u.breakGlass);
+    if (reg.length) n.push('<div class="notice notice-warn"><b>' + reg.length + ' privileged account' + (reg.length === 1 ? " holds" : "s hold") + ' no Entra ID P2 seat</b> — Identity Protection risk and risk-based Conditional Access do not apply to ' + (reg.length === 1 ? "it" : "them") + ', licence or not. Assign P2 (or the E5 / E7 bundle): ' + escapeHtml(reg.slice(0, 6).map(u => u.name).join(", ")) + (reg.length > 6 ? " and " + (reg.length - 6) + " more" : "") + '.</div>');
+    if (bg.length) n.push('<div class="notice notice-info"><b>' + bg.length + ' break-glass / emergency account' + (bg.length === 1 ? "" : "s") + ' without a P2 seat</b> — ' + escapeHtml(bg.map(u => u.name).join(", ")) + '. These should stay <b>excluded from Conditional Access</b> so they always work in an outage — so risk-based CA isn’t the goal here — but assign P2 anyway so <b>Identity Protection can monitor and alert</b> if one is ever compromised. (Detected by name; confirm these really are your emergency accounts.)</div>');
   }
   if (!MODEL.riskAvailable && !noP2) n.push('<div class="notice notice-warn">Identity Protection risk not read — grant <code>IdentityRiskyUser.Read.All</code> (Entra ID P2) to fold each user’s risk state into the score.' + (MODEL.riskError ? ' <span class="mono">(' + escapeHtml(MODEL.riskError) + ')</span>' : "") + '</div>');
   if (MODEL.caAvailable && MODEL.legacyOpen) n.push('<div class="notice notice-warn">Legacy authentication is <b>not blocked</b> tenant-wide — password-only sign-in bypasses MFA for every account below. Block it via Conditional Access. <span class="ep-xlink" data-view="ca" title="Open the Conditional Access posture view">⤳ Conditional Access</span></div>');
