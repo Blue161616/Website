@@ -601,6 +601,22 @@
 #view-user .dimbar { flex: 1; height: 9px; background: var(--border); border-radius: 5px; overflow: hidden; }
 #view-user .dimfill { height: 100%; border-radius: 5px; }
 #view-user .dimval { width: 26px; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+#view-user .ask-head { font-size: 12px; color: var(--muted); margin-bottom: 8px; line-height: 1.5; }
+#view-user .askbox { display: flex; gap: 8px; margin: 2px 0 8px; }
+#view-user .askbox input { flex: 1; }
+#view-user .ask-note { font-size: 11.5px; color: var(--muted); margin: 2px 0 8px; line-height: 1.5; }
+#view-user .ask-note .on { color: var(--accent); font-weight: 600; }
+#view-user .ask-note code, #view-user .ask-head code { font-size: 11px; background: rgba(127,127,127,.14); padding: 1px 5px; border-radius: 4px; }
+#view-user .ask-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+#view-user .ask-chip { cursor: pointer; font: inherit; font-size: 11.5px; padding: 5px 10px; border: 1.5px solid var(--border); border-radius: 999px; color: var(--muted); background: transparent; }
+#view-user .ask-chip:hover { border-color: var(--accent); color: var(--accent); }
+#view-user .ask-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 4px; border-top: 1px solid var(--border); cursor: pointer; }
+#view-user .ask-row:hover { background: rgba(127,127,127,.06); }
+#view-user .ask-row .chev { color: var(--muted); font-size: 11px; line-height: 1.7; }
+#view-user .ask-row .nm { font-weight: 600; }
+#view-user .ask-row .up { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
+#view-user .ask-detail { padding: 2px 6px 14px 24px; border-top: 1px dashed var(--border); }
+#view-user .ask-detail.hidden { display: none; }
 /* ================= view: workload ================= */
 #view-workload * { box-sizing: border-box; }
 #view-workload { margin: 0; font-family: var(--body); background-color: var(--bg); color: var(--text); font-size: 14px;
@@ -2496,6 +2512,18 @@
     <div class="card" id="tenantPanel" style="display:none"></div>
 
     <div class="kpis" id="kpis"></div>
+
+    <div class="card" id="askCard">
+      <h2 style="font-size:14px;margin-bottom:6px">Ask about your accounts <span style="font-weight:500;font-size:12px;color:var(--muted)">— plain-English questions, answered from the accounts on this page</span></h2>
+      <div class="ask-head">e.g. &ldquo;Which users have phishing-resistant MFA?&rdquo; or &ldquo;Which admins are out of scope of the MFA CA policy?&rdquo; The question becomes a filter over the real accounts &mdash; the filter is shown and stays editable, so every answer is the live data, never a guess.</div>
+      <div class="askbox">
+        <input id="askInput" placeholder="Which users have phishing-resistant MFA?" autocomplete="off" spellcheck="false" />
+        <button id="askRun" type="button">Ask</button>
+      </div>
+      <div class="ask-note" id="askNote"></div>
+      <div class="ask-chips" id="askChips"></div>
+      <div id="askOut"></div>
+    </div>
 
     <div class="card" id="comboCard">
       <h2 style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;font-size:14px">
@@ -4989,7 +5017,7 @@ function startDemo() {
 function render() { renderTenant(); renderNotices(); renderAll(); }
 // Everything that reads the filter state, in one call — so a control never has to remember
 // which of four renderers it invalidates.
-function renderAll() { renderKpis(); renderFacets(); renderRiskChips(); renderCombo(); renderTable(); }
+function renderAll() { renderKpis(); renderFacets(); renderRiskChips(); renderCombo(); renderTable(); renderAsk(); }
 
 function tfinding(status, title, html) {
   const cls = status === "good" ? "b-low" : status === "warn" ? "b-med" : "b-crit";
@@ -5530,6 +5558,231 @@ function renderTable() {
   }));
 }
 
+// ============================ Ask (identity Q&A) ============================
+// Plain-English questions about the member accounts, answered by filtering the real
+// MODEL.users. The question is translated into a small, validated query grammar
+// ([count] users <selector>) — never free-form code — the translation is shown and
+// stays editable, and the rows returned are the live accounts. Mirrors EntraHound's
+// "Ask the graph": the LLM proposes the query, code disposes. Local Ollama preferred;
+// works with AI off via the built-in phrasings and the sample chips. No tenant data is
+// ever sent to a model — only the question and the static grammar prompt.
+const _ASK_CA_TOKENS = { covered: 1, notcovered: 1, excluded: 1, reportonly: 1, notenforced: 1, uncovered: 1, outofscope: 1 };
+const _ASK_PREDS = {
+  admin:       { t: u => !!u.isAdmin },
+  privileged:  { t: u => !!u.isAdmin },
+  member:      { t: u => !u.isAdmin },
+  write:       { t: u => !!u.hasWriteRole },
+  tier0:       { t: u => !!u.isTier0 },
+  standing:    { t: u => !!u.standingWrite },
+  eligible:    { t: u => !!u.hasWriteRole && !u.standingWrite },
+  pim:         { t: u => !!u.hasWriteRole && !u.standingWrite },
+  readonly:    { t: u => !!u.readOnlyAdmin },
+  phishres:          { t: u => u.mfa && u.mfa.level === "phishres" },
+  phishresistant:    { t: u => u.mfa && u.mfa.level === "phishres" },
+  phishingresistant: { t: u => u.mfa && u.mfa.level === "phishres" },
+  weakmfa:     { t: u => u.mfa && u.mfa.level === "weak" },
+  nomfa:       { t: u => u.mfa && u.mfa.level === "nomfa" },
+  covered:     { t: u => u.caCovered === true },
+  notcovered:  { t: u => u.caCovered === false },
+  excluded:    { t: u => u.caCovered === "excluded" },
+  reportonly:  { t: u => u.caCovered === "reportonly" },
+  notenforced: { t: u => u.caCovered === false || u.caCovered === "excluded" || u.caCovered === "reportonly" },
+  uncovered:   { t: u => u.caCovered === false || u.caCovered === "excluded" || u.caCovered === "reportonly" },
+  outofscope:  { t: u => u.caCovered === false || u.caCovered === "excluded" || u.caCovered === "reportonly" },
+  enabled:     { t: u => !!u.enabled },
+  disabled:    { t: u => !u.enabled },
+  stale:       { t: u => !!u.stale },
+  dormant:     { t: u => !!u.stale },
+  onprem:      { t: u => !!u.onPrem },
+  synced:      { t: u => !!u.onPrem },
+  atrisk:      { t: u => !!u.risk },
+  risky:       { t: u => !!u.risk },
+  critical:    { t: u => u.postureTier === "critical" },
+  high:        { t: u => u.postureTier === "high" },
+  medium:      { t: u => u.postureTier === "medium" },
+  low:         { t: u => u.postureTier === "low" }
+};
+// Parse "[count] users <selector>" into predicates. Unknown tokens → null (rejected,
+// never run) — this is what keeps it grounded: only the vocabulary above can execute.
+function askParse(cmd) {
+  const m = /^(count\s+)?users?\b\s*(.*)$/i.exec(String(cmd || "").trim());
+  if (!m) return null;
+  const count = !!m[1], selStr = (m[2] || "").trim();
+  if (!selStr) return null;
+  const toks = selStr.match(/(\w+:"[^"]*")|(\w+:\S+)|("[^"]*")|(\S+)/g) || [];
+  const tests = [], labels = []; let caCaveat = false;
+  for (const raw of toks) {
+    const tok = raw.trim(); if (!tok) continue;
+    const fm = /^(name|role):(.*)$/i.exec(tok);
+    if (fm) {
+      const field = fm[1].toLowerCase(), val = fm[2].replace(/^"|"$/g, "").toLowerCase();
+      if (!val) return null;
+      if (field === "name") { tests.push(u => ((u.name || "") + " " + (u.upn || "")).toLowerCase().includes(val)); labels.push('name “' + val + '”'); }
+      else { tests.push(u => (u.roles || []).some(r => (r.name || "").toLowerCase().includes(val))); labels.push('role “' + val + '”'); }
+      continue;
+    }
+    const key = tok.toLowerCase().replace(/["\s_\-]/g, "");
+    const p = _ASK_PREDS[key];
+    if (!p) return null;                 // unknown token → whole query is invalid
+    tests.push(p.t); labels.push(key);
+    if (_ASK_CA_TOKENS[key]) caCaveat = true;
+  }
+  return { count, tests, labels, caCaveat };
+}
+// Deterministic phrasings — so the box is useful with no AI model. Specific first.
+const _ASK_NL = [
+  [/(admin|privileg).*(no|without).*mfa|(no|without).*mfa.*(admin|privileg)/i, "users admin nomfa"],
+  [/(admin|privileg).*(out of scope|not covered|not enforced|excluded|uncovered)|(out of scope|not covered|not enforced|excluded|uncovered).*(admin|privileg)/i, "users admin notenforced"],
+  [/phish|fido|passkey|hardware key|security key|windows hello/i, "users phishres"],
+  [/\bno\b[^.]*\bmfa\b|without mfa|password only|no second factor|no mfa/i, "users nomfa"],
+  [/weak mfa|\bsms\b|text message|phone call|voice call|\bpush\b/i, "users weakmfa"],
+  [/(out of scope|not in scope|not covered|uncovered|not enforced|no(t)? enforcing)[^.]*(mfa|conditional access|\bca\b)|(mfa|conditional access|\bca\b)[^.]*(not enforced|not covered|excluded|out of scope|report.?only)/i, "users notenforced"],
+  [/excluded/i, "users excluded"],
+  [/report.?only/i, "users reportonly"],
+  [/stale|dormant|inactive|never signed|not signed in/i, "users stale"],
+  [/\bdisabled\b/i, "users disabled"],
+  [/at.?risk|risky|identity protection/i, "users atrisk"],
+  [/standing|permanent/i, "users standing"],
+  [/tier.?0|global admin|ga-class/i, "users tier0"],
+  [/privileged|\badmins?\b/i, "users admin"]
+];
+function askNlMatch(q) { for (const [re, cmd] of _ASK_NL) { if (re.test(q)) return cmd; } return null; }
+function askLooksLikeQuestion(q) { return /\?\s*$/.test(q) || /^(who|which|what|whom|how|list|show|find|display|count|are|is|do|does|give|with|without)\b/i.test(q); }
+function askSystemPrompt() {
+  return [
+    "You translate an administrator's plain-English question about Microsoft Entra ID (Azure AD)",
+    "MEMBER user accounts into ONE query in the grammar below. Output ONLY the query line — no prose,",
+    "no code fences, no explanation.",
+    "",
+    "GRAMMAR:  [count] users <selector>",
+    "SELECTOR = one or more space-separated terms; ALL must hold (AND). Terms:",
+    "  TOKENS (bare words):",
+    "    admin privileged member write tier0 standing eligible readonly",
+    "    phishres weakmfa nomfa",
+    "    covered notcovered excluded reportonly notenforced",
+    "    enabled disabled stale onprem atrisk critical high medium low",
+    "  FIELD MATCHERS:  name:\"text\"   role:\"Role Name\"",
+    "",
+    "MEANINGS:",
+    "  phishres = phishing-resistant MFA registered (FIDO2 / Windows Hello / passkey / certificate).",
+    "  weakmfa = only weak MFA (SMS / voice / push).  nomfa = no MFA registered (password only).",
+    "  covered = an enforcing MFA Conditional Access policy applies.",
+    "  notcovered = reached by no enforcing MFA policy.  excluded = excluded from the policy.",
+    "  reportonly = only a report-only policy applies.",
+    "  notenforced = any of notcovered/excluded/reportonly — i.e. OUT OF SCOPE of enforced MFA.",
+    "  admin/privileged = holds any directory role.  write = a role that can change things.",
+    "  tier0 = GA-class write role.  standing = held permanently (not PIM).  eligible = PIM-eligible.",
+    "  stale = no recent sign-in.  onprem = synced from on-prem AD.  atrisk = Identity Protection flagged.",
+    "",
+    "RULES:",
+    "- Output exactly one line. Use 'count users …' only when the question asks how many.",
+    "- Use only the tokens and matchers above; combine them for compound questions.",
+    "",
+    "EXAMPLES:",
+    "Q: Which users have phishing-resistant MFA?",
+    "A: users phishres",
+    "Q: Which admins are out of scope of the MFA Conditional Access policy?",
+    "A: users admin notenforced",
+    "Q: Who has no MFA registered?",
+    "A: users nomfa",
+    "Q: List privileged accounts excluded from the MFA policy.",
+    "A: users admin excluded",
+    "Q: How many Tier-0 accounts hold their role permanently?",
+    "A: count users tier0 standing",
+    "Q: Which enabled users are stale?",
+    "A: users enabled stale",
+    "Q: Who holds the Global Administrator role with weak MFA?",
+    "A: users role:\"Global Administrator\" weakmfa"
+  ].join("\n");
+}
+function askClean(s) {
+  s = String(s || "").replace(/```[a-z]*/gi, "").replace(/`/g, "").trim();
+  const line = (s.split("\n").map(x => x.trim()).filter(Boolean)[0]) || "";
+  return line.replace(/^(query|a)\s*[:.]\s*/i, "").replace(/[.;]\s*$/, "").trim();
+}
+async function askTranslate(q) { return askClean(await window.EP.llmComplete(askSystemPrompt(), q, { temperature: 0, max_tokens: 60 })); }
+let _askRows = [];
+function askRun(text) {
+  const q = (text || "").trim(); if (!q) return;
+  const inp = $("askInput"); if (inp && inp.value !== q) inp.value = q;
+  if (askParse(q)) { askExec(q, ""); return; }                                  // already valid grammar
+  const nl = askNlMatch(q);
+  if (nl) { if (inp) inp.value = nl; askExec(nl, '<div class="ask-note">Read as <code>' + escapeHtml(nl) + '</code> · edit and Ask to refine.</div>'); return; }
+  if (!askLooksLikeQuestion(q)) {                                               // bare term → name search, no AI
+    const cmd = 'users name:"' + q.replace(/"/g, "") + '"'; if (inp) inp.value = cmd;
+    askExec(cmd, '<div class="ask-note">Searched by name for “' + escapeHtml(q) + '”.</div>'); return;
+  }
+  const EP = window.EP;
+  if (EP && EP.llm && EP.llm.ready() && EP.llmComplete) {                        // AI translate, gated by askParse
+    $("askOut").innerHTML = '<div class="ask-note"><span class="spinner"></span> Asking ' + escapeHtml(EP.llm.provider) + ' · ' + escapeHtml(EP.llm.model) + ' to translate your question…</div>';
+    askTranslate(q).then(cmd => {
+      if (askParse(cmd)) { if (inp) inp.value = cmd; askExec(cmd, '<div class="ask-note">AI read <b>“' + escapeHtml(q) + '”</b> → <code>' + escapeHtml(cmd) + '</code> · edit and Ask to refine.</div>'); }
+      else { $("askOut").innerHTML = '<div class="ask-note">That didn’t translate to a runnable query' + (cmd ? ' (<code>' + escapeHtml(cmd) + '</code>)' : '') + '. Click a sample below, or try a grammar like <code>users admin notenforced</code>.</div>'; }
+    }).catch(e => { $("askOut").innerHTML = '<div class="ask-note">AI translation unavailable — ' + escapeHtml(e.message || String(e)) + '. Click a sample below, or type a <b>name</b>.</div>'; });
+    return;
+  }
+  $("askOut").innerHTML = '<div class="ask-note">No local AI model is configured, so free-form questions can’t be translated. Click a sample below, type a <b>name</b> to find it, or use a grammar like <code>users admin nomfa</code>. Set a model in <b>Configuration</b> to ask freely.</div>';
+}
+function askExec(cmd, head) {
+  const p = askParse(cmd), out = $("askOut"); if (!out) return;
+  if (!p) { out.innerHTML = '<div class="ask-note">Could not parse <code>' + escapeHtml(cmd) + '</code>.</div>'; return; }
+  const all = MODEL.users || [], rows = all.filter(u => p.tests.every(t => t(u)));
+  _askRows = rows;
+  let h = (head || "") + '<div class="ask-head" style="margin:6px 0 2px"><b>' + rows.length + '</b> of ' + all.length + ' member account' + (all.length === 1 ? '' : 's') + (p.count ? ' match' : '') + '</div>';
+  if (p.caCaveat) h += '<div class="ask-note">Conditional Access coverage is evaluated for <b>privileged role-holders</b>; ordinary members without a directory role show as n/a and are not counted here.</div>';
+  if (p.count) { out.innerHTML = h; return; }
+  if (!rows.length) { out.innerHTML = h + '<div class="ask-note">No matching accounts.</div>'; return; }
+  const cap = 300;
+  h += rows.slice(0, cap).map((u, i) => askRowHtml(u, i)).join("");
+  if (rows.length > cap) h += '<div class="ask-note">first ' + cap + ' of ' + rows.length + ' — add another term to narrow.</div>';
+  out.innerHTML = h;
+  out.querySelectorAll(".ask-row").forEach(r => r.addEventListener("click", () => {
+    const i = r.getAttribute("data-i"), d = out.querySelector('.ask-detail[data-d="' + i + '"]'); if (!d) return;
+    if (d.getAttribute("data-filled") !== "1") { d.innerHTML = userDetailHtml(_askRows[+i]); d.setAttribute("data-filled", "1"); }
+    d.classList.toggle("hidden");
+    r.querySelector(".chev").textContent = d.classList.contains("hidden") ? "▸" : "▾";
+  }));
+  out.querySelectorAll(".ep-xlink").forEach(x => x.addEventListener("click", e => { e.stopPropagation(); if (window.EP && EP.goto) EP.goto("entrahound", { query: x.getAttribute("data-q") }); }));
+}
+function askRowHtml(u, i) {
+  const c = (typeof ehPathCount === "function") ? ehPathCount(u.id) : null;
+  const xl = '<span class="ep-xlink' + (c ? ' hot' : '') + '" data-q="paths from id:' + u.id + ' to critical" title="Show this account’s attack paths in the Attack Paths view">' + (c != null ? '⤳ ' + c + ' path' + (c === 1 ? '' : 's') : '⤳ attack paths') + '</span>';
+  return '<div class="ask-row" data-i="' + i + '"><span class="chev">▸</span>'
+    + '<div style="flex:1;min-width:0"><span class="nm">' + escapeHtml(u.name) + '</span> ' + mfaBadge(u.mfa)
+    + (u.upn ? '<div class="up mono">' + escapeHtml(u.upn) + '</div>' : '')
+    + '<div class="rolechips" style="margin-top:3px">' + (flagBadges(u) || '') + '</div></div>'
+    + '<div style="text-align:right;white-space:nowrap">' + xl + '</div></div>'
+    + '<div class="ask-detail hidden" data-d="' + i + '"></div>';
+}
+const _ASK_SAMPLES = [
+  "Which users have phishing-resistant MFA?",
+  "Which admins are out of scope of the MFA CA policy?",
+  "Who has no MFA registered?",
+  "Privileged accounts with weak MFA only",
+  "Tier-0 accounts held permanently",
+  "Stale enabled accounts"
+];
+function renderAskChips() {
+  const el = $("askChips"); if (!el) return;
+  el.innerHTML = _ASK_SAMPLES.map(s => '<button type="button" class="ask-chip" data-q="' + escapeHtml(s) + '">' + escapeHtml(s) + '</button>').join("");
+}
+function updateAskNote() {
+  const el = $("askNote"); if (!el) return;
+  const EP = window.EP, ready = EP && EP.llm && EP.llm.ready();
+  el.innerHTML = ready
+    ? '<span class="on">✦ AI translation on</span> · ' + escapeHtml(EP.llm.provider) + ' · ' + escapeHtml(EP.llm.model) + ' · ask any question; the query it builds is shown and stays editable. Nothing but the question leaves the machine.'
+    : 'AI translation off — using built-in phrasings. Set a local model in <b>Configuration</b> for free-form questions. The grammar also works directly, e.g. <code>users admin notenforced</code>.';
+}
+let _askInit = false;
+function renderAsk() {
+  renderAskChips(); updateAskNote();
+  if (_askInit) return; _askInit = true;
+  const btn = $("askRun"), inp = $("askInput"), chips = $("askChips");
+  if (btn) btn.addEventListener("click", () => askRun($("askInput").value));
+  if (inp) inp.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); askRun(inp.value); } });
+  if (chips) chips.addEventListener("click", e => { const b = e.target.closest(".ask-chip"); if (b) { const q = b.getAttribute("data-q"); if (inp) inp.value = q; askRun(q); } });
+}
+
 function userDetailHtml(u) {
   const risk = (u.reasons || []).map((r) => '<li><span class="badge ' + (POSTURE_CLS[r.sev] || "b-med") + '" style="margin-right:6px">' + r.sev.toUpperCase() + '</span>' + escapeHtml(r.t) + '</li>').join("");
   const dimBars = DIM_META.map((dm) => {
@@ -5650,7 +5903,7 @@ $("table").querySelectorAll("th.sortable").forEach((th) => th.addEventListener("
 
 if (DEMO) startDemo();
 
-function __epUserFocus(f){ if(!f||!f.search) return; try { var s=$("fltSearch"); if(s){ s.value=f.search; s.dispatchEvent(new Event("input")); } setTimeout(function(){ var tb=$("table").querySelector("tbody"), r=tb&&tb.querySelector("tr.rowx"); if(r){ r.scrollIntoView({behavior:"smooth",block:"center"}); r.click(); r.classList.add("ep-flash"); setTimeout(function(){ r.classList.remove("ep-flash"); },1800); } },140); } catch(e){ console.error("[user focus]",e); } }
+function __epUserFocus(f){ if(!f) return; try { if(f.ask){ var a=$("askInput"); if(a) a.value=f.ask; if(typeof askRun==="function") askRun(f.ask); var ac=$("askCard"); if(ac) setTimeout(function(){ ac.scrollIntoView({behavior:"smooth",block:"start"}); },120); return; } if(!f.search) return; var s=$("fltSearch"); if(s){ s.value=f.search; s.dispatchEvent(new Event("input")); } setTimeout(function(){ var tb=$("table").querySelector("tbody"), r=tb&&tb.querySelector("tr.rowx"); if(r){ r.scrollIntoView({behavior:"smooth",block:"center"}); r.click(); r.classList.add("ep-flash"); setTimeout(function(){ r.classList.remove("ep-flash"); },1800); } },140); } catch(e){ console.error("[user focus]",e); } }
 function ehPathCount(objId){ try { if(window.EP && window.EP.DEMO) return null; var S=window.EH&&window.EH.ui&&window.EH.ui.S; if(!S||!S.paths||!S.paths.length) return null; var n=0; for(var i=0;i<S.paths.length;i++) if(S.paths[i].source===objId) n++; return n; } catch(e){ return null; } }
 try { window.addEventListener("ep:graphready", function(){ try { renderTable(); } catch(e){} }); } catch(e){}
 
@@ -13134,7 +13387,10 @@ function coverageMatrix(ctx) {
       '<span class="band-s">Is each control actually enforced, and who is in scope</span></div>' +
     '<div class="note note-info">This reads policy <b>scope</b>, not your user directory — it answers “is there an ' +
       'enforcing policy and does it target everyone”. Report-only counts as <b>not enforced</b>. For who is covered ' +
-      'account-by-account, the <b>User</b> view’s “Not MFA-covered” is the authoritative per-user side.</div>' +
+      'account-by-account, the <b>User</b> view’s “Not MFA-covered” is the authoritative per-user side. ' +
+      '<span class="ep-xlink" role="button" tabindex="0" title="Open the User view and list the accounts out of scope of enforced MFA" ' +
+      'onclick="if(window.EP&&EP.goto)EP.goto(\'user\',{ask:\'users admin notenforced\'})" ' +
+      'onkeydown="if((event.key===\'Enter\'||event.key===\' \')&&window.EP&&EP.goto){event.preventDefault();EP.goto(\'user\',{ask:\'users admin notenforced\'})}">→ list the accounts out of scope</span></div>' +
     '<div class="card"><div class="card-b flush"><table class="data">' +
       '<thead><tr><th>Control</th><th>Status</th><th>Scope targeted</th><th>Exclusions</th><th>All users in scope?</th></tr></thead>' +
       '<tbody>' + rows + '</tbody></table></div></div>';
