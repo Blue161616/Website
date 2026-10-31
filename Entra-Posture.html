@@ -13306,7 +13306,7 @@ function policyTable(ctx) {
     const a = policyAssessment(p, ctx);
     return '<tr class="prow" data-pol="' + esc(p.id) + '" role="button" tabindex="0" title="Open policy details &amp; score">' +
       '<td><div class="tname">' + esc(p.displayName || p.id) + '</div></td>' +
-      '<td>' + caStatePill(p) + '</td>' +
+      '<td>' + caStatePill(p) + caVerdictChip(p) + '</td>' +
       '<td><span class="pscore rs-' + a.band + '" title="' + a.score + ' / 100 — ' + a.issues.length + ' ' + plural(a.issues.length, 'issue') + '">' + a.grade + '</span></td>' +
       '<td>' + esc(controlsLabel(p)) + '</td>' +
       '<td>' + esc(targetLabel(p)) + '</td>' +
@@ -13318,6 +13318,7 @@ function policyTable(ctx) {
       (window.EP ? ' <span class="sep" style="opacity:.5">·</span> <span class="js-ca-whomod" role="button" tabindex="0" title="Open the Attack Paths view" style="cursor:pointer;color:var(--accent-2);font-weight:600;white-space:nowrap">⤳ who can modify them</span>' : '') + '</span>' +
     '<span class="band-x" style="color:var(--muted)">' + pol.length + ' ' + plural(pol.length, 'policy', 'policies') +
       (pol.length > 12 ? '<span class="band-toggle" data-collapse="ca-policies-card">show</span>' : '') + '</span></div>' +
+    caAssessBar(ctx) +
     '<div class="card' + (pol.length > 12 ? ' collapsed' : '') + '" id="ca-policies-card"><div class="card-b flush"><table class="data">' +
       '<thead><tr><th>Policy</th><th>State</th><th>Risk</th><th>Controls</th><th>Targets</th><th>Exclusions</th></tr></thead>' +
       '<tbody>' + body + '</tbody></table></div></div>';
@@ -13328,7 +13329,8 @@ function caFindings(ctx) {
   return '<div class="band" id="ca-findings"><span class="band-t">Findings</span>' +
       '<span class="band-s">Coverage and hygiene, severity first</span>' +
       '<span class="band-x" style="color:var(--muted)">' + f.length + ' ' + plural(f.length, 'finding') + '</span></div>' +
-    findingsBlock(f, 'Nothing flagged. The enforcing policies cover MFA, legacy auth and the baseline.');
+    findingsBlock(f, 'Nothing flagged. The enforcing policies cover MFA, legacy auth and the baseline.') +
+    caTriageBlock(ctx);
 }
 
 // Coverage: for each key control, is an ENFORCING policy present, what scope does it
@@ -13441,6 +13443,17 @@ function caAiDigest(ctx) {
 
 const DISP = { PROMOTE: { cls: 'st-block', label: 'Promote' }, REVIEW: { cls: 'st-allowq', label: 'Review' }, RETIRE: { cls: 'st-na', label: 'Retire' } };
 
+// The last AI triage result, keyed by policy name so the Policies rows (verdict chips) and the
+// Findings section (advisory results block) can both read it. Advisory only — the deterministic
+// findings stay the source of truth. Null until the user runs "Assess report-only backlog".
+let CA_TRIAGE = null;
+function caVerdictChip(p) {
+  if (!CA_TRIAGE || !isReportOnly(p)) return '';
+  const v = CA_TRIAGE.byName[(p.displayName || p.id || '').toLowerCase()];
+  const d = v && DISP[v.disp]; if (!d) return '';
+  return ' <span class="st-pill ' + d.cls + '" title="✦ AI triage (advisory): ' + esc(v.reason || '') + '">✦ ' + d.label + '</span>';
+}
+
 // Match the model's lines back to the real report-only names; drop anything that doesn't.
 function parseTriage(text, names) {
   const lower = names.map(n => n.toLowerCase());
@@ -13480,40 +13493,54 @@ function renderTriage(res, raw) {
     '<div class="note" style="color:var(--dim)">AI-suggested from your policy configuration — verify before changing anything. These are advice, not a control; the deterministic findings above are the source of truth.</div>';
 }
 
-function aiSection(ctx) {
+// The assess control lives in the Policies section (it acts on the report-only subset listed
+// there). Offered only when there are report-only policies and a model is configured.
+function caAssessBar(ctx) {
   const ro = (ctx.policies || []).filter(isReportOnly);
   if (!ro.length || !(window.EP && EP.llm && EP.llm.ready())) return '';
   const model = esc((EP.llm.provider || '') + ' · ' + (EP.llm.model || ''));
-  return '<div class="band" id="ca-ai"><span class="band-t">✦ AI triage</span>' +
-      '<span class="band-s">Rank the ' + ro.length + ' report-only ' + plural(ro.length, 'policy', 'policies') + ' — promote, review or retire</span></div>' +
-    '<div class="card"><div class="card-b">' +
-      '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">' +
+  return '<div class="ca-assess" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 10px">' +
       '<button class="btn btn-primary" id="ca-ai-run" style="padding:8px 16px">✦ Assess report-only backlog</button>' +
-      '<span style="font-size:11.5px;color:var(--dim)">Runs on ' + model + ' — grounded in your policies, nothing leaves the machine</span></div>' +
-      '<div id="ca-ai-out" style="margin-top:12px"></div></div></div>';
+      '<span style="font-size:11.5px;color:var(--dim)">Ranks the ' + ro.length + ' report-only ' + plural(ro.length, 'policy', 'policies') +
+        ' — promote, review or retire. Runs on ' + model + ', grounded in your policies; nothing leaves the machine. ' +
+        'Verdicts show on the rows below and in Findings — advisory, not a control.</span>' +
+      '<span id="ca-ai-status" style="font-size:11.5px"></span></div>';
+}
+
+// The triage results, shown inside Findings under a clear advisory header (kept separate from the
+// grounded findings above it). Empty until an assessment has run.
+function caTriageBlock(ctx) {
+  if (!CA_TRIAGE || !CA_TRIAGE.rows) return '';
+  const model = esc((window.EP && EP.llm && EP.llm.model) || 'the model');
+  const when = CA_TRIAGE.at ? ' · assessed ' + CA_TRIAGE.at.toLocaleTimeString() : '';
+  return '<div class="band" id="ca-triage" style="margin-top:24px"><span class="band-t" style="color:var(--accent-2)">✦ AI triage</span>' +
+      '<span class="band-s">Report-only backlog — advisory, ranked by ' + model + when + '</span></div>' +
+    renderTriage({ rows: CA_TRIAGE.rows, summary: CA_TRIAGE.summary }, CA_TRIAGE.raw || '');
 }
 
 async function runAiTriage(ctx) {
-  const out = $('ca-ai-out'), btn = $('ca-ai-run');
-  if (!out || !(window.EP && EP.llmComplete)) return;
+  const btn = $('ca-ai-run'), st = $('ca-ai-status');
+  if (!(window.EP && EP.llmComplete)) return;
   const model = esc((EP.llm.provider || '') + ' · ' + (EP.llm.model || ''));
-  out.innerHTML = '<div class="note note-info"><span class="spinner"></span> Asking ' + model + ' to triage the report-only policies…</div>';
+  if (st) st.innerHTML = '<span class="spinner"></span> Asking ' + model + ' to triage the report-only policies…';
   if (btn) btn.disabled = true;
   try {
     const names = (ctx.policies || []).filter(isReportOnly).map(p => p.displayName || p.id);
     const raw = await EP.llmComplete(CA_AI_SYSTEM, caAiDigest(ctx), { temperature: 0.2, max_tokens: 900 });
-    out.innerHTML = renderTriage(parseTriage(raw, names), raw);
+    const parsed = parseTriage(raw, names), byName = {};
+    parsed.rows.forEach(r => { byName[(r.name || '').toLowerCase()] = { disp: r.disp, reason: r.reason }; });
+    CA_TRIAGE = { rows: parsed.rows, summary: parsed.summary, raw: raw, byName: byName, at: new Date() };
+    render(ctx);                                           // repaint: verdict chips on the rows + results in Findings
+    const fnd = $('ca-findings'); if (fnd) fnd.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
-    out.innerHTML = '<div class="note note-warn"><b>AI triage unavailable.</b> ' + esc(e.message || String(e)) +
-      '<br>Check the model in <b>Configuration</b> (a local Ollama is preferred).</div>';
-  } finally { if (btn) btn.disabled = false; }
+    if (st) st.innerHTML = '<span style="color:var(--crit)">AI triage unavailable — ' + esc(e.message || String(e)) + '. Check the model in Configuration.</span>';
+    if (btn) btn.disabled = false;
+  }
 }
 
 // Sticky section nav — one chip per band, in render order; scrolls and highlights.
 function jumpNav(ctx) {
-  const items = [['ca-coverage', 'Coverage']];
-  if ((ctx.policies || []).filter(isReportOnly).length && window.EP && EP.llm && EP.llm.ready()) items.push(['ca-ai', 'AI triage']);
-  items.push(['ca-policies', 'Policies'], ['ca-findings', 'Findings']);
+  const items = [['ca-coverage', 'Coverage'], ['ca-policies', 'Policies'], ['ca-findings', 'Findings']];
   return '<div class="jumpnav">' + items.map(x =>
     '<span class="jn" role="button" tabindex="0" data-sec="' + x[0] + '">' + esc(x[1]) + '</span>').join('') + '</div>';
 }
@@ -13563,7 +13590,6 @@ function render(ctx) {
     + overviewTiles(ctx)
     + jumpNav(ctx)
     + coverageMatrix(ctx)
-    + aiSection(ctx)
     + policyTable(ctx)
     + caFindings(ctx)
     + policyDrawer(ctx);
