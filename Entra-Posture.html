@@ -9130,7 +9130,8 @@ EP.registerView("workload", (function () {
         .map(function(p){ return { value: p.roleValue || p.roleName || '(permission)', score: scoreScope(p.roleValue || '') }; })
         .sort(function(a, b){ return b.score - a.score; });
       return { name: r.displayName || r.appId, appId: r.appId || '',
-        ownerTenantId: r.appOwnerOrganizationId || '', publisher: r.publisherName || '',
+        ownerTenantId: r.appOwnerOrganizationId || '',
+        publisher: r.verifiedPublisherName || r.publisherName || '',   // prefer the MPN-verified publisher name
         verified: !!r.isVerifiedPublisher, enabled: r.accountEnabled !== false,
         permScore: r.permScore || 1, riskScore: r.riskScore || 1, perms: perms };
     });
@@ -12124,8 +12125,8 @@ function buildFindings(ctx) {
       const sev = PERM_SEV[gp.worst] || 'low';
       const topPerms = [];
       gp.apps.forEach(a => a.perms.forEach(p => { if (topPerms.indexOf(p.value) < 0) topPerms.push(p.value); }));
-      add(sev, 'XCON-' + String(gp.tenantId || gp.label).replace(/\W+/g, '').slice(0, 12),
-        'External publisher “' + gp.label + '” holds app-only access to your tenant',
+      add(sev, 'XCON-' + String(gp.tenantId || gp.publisher || '').replace(/\W+/g, '').slice(0, 12),
+        'External publisher “' + _consentLabel(gp) + '” holds app-only access to your tenant',
         gp.apps.length + ' consented multi-tenant ' + plural(gp.apps.length, 'app') + ' registered in this external tenant '
         + 'hold application permissions in your directory'
         + (topPerms.length ? ' — including ' + topPerms.slice(0, 5).join(', ') : '') + '. '
@@ -12246,6 +12247,7 @@ async function run() {
 
     LAST = { def, partners, sync, syncErr, names, namesAttempted, namesErr, guests, gdap, home, at: new Date() };
     LAST.consentApps = loadConsentedApps();
+    await resolveConsentOwners(LAST.consentApps, names, tok);
     LAST.findings = buildFindings(LAST);
     render(LAST);
     setStatus('');
@@ -12423,14 +12425,32 @@ function loadConsentedApps() {
   const groups = {};
   (data.apps || []).forEach(a => {
     const k = a.ownerTenantId || a.publisher || a.appId;
-    if (!groups[k]) groups[k] = { tenantId: a.ownerTenantId || '', label: a.publisher || a.ownerTenantId || '(unknown publisher)', apps: [], worst: 0, anyUnverified: false };
+    if (!groups[k]) groups[k] = { tenantId: a.ownerTenantId || '', publisher: a.publisher || '', orgName: '', apps: [], worst: 0, anyUnverified: false };
     const g = groups[k];
+    if (!g.publisher && a.publisher) g.publisher = a.publisher;   // best verified/publisher name in the group
     g.apps.push(a);
     g.worst = Math.max(g.worst, a.permScore || 0);
     if (!a.verified) g.anyUnverified = true;
   });
   const list = Object.keys(groups).map(k => groups[k]).sort((x, y) => (y.worst - x.worst) || (y.apps.length - x.apps.length));
   return { state: 'ok', total: data.total || (data.apps || []).length, publishers: list.length, groups: list };
+}
+// Group label: verified/publisher name → resolved owner-org name → owner tenant GUID. So an unverified
+// publisher still reads as the owning organisation's name (from Entra) rather than a bare GUID.
+const _consentLabel = g => g.publisher || g.orgName || g.tenantId || '(unknown publisher)';
+// Resolve owner tenant GUIDs to org names (only where no vendor name is known), reusing the partner-name
+// cache first, then the same cross-tenant lookup the Partners section uses. No new scope.
+async function resolveConsentOwners(ca, names, tok) {
+  if (!ca || ca.state !== 'ok' || !tok) return;
+  await Promise.all((ca.groups || []).map(async g => {
+    if (g.publisher || g.orgName || !g.tenantId) return;
+    if (names && names[g.tenantId] && names[g.tenantId].displayName) { g.orgName = names[g.tenantId].displayName; return; }
+    try {
+      const t = await graph("/v1.0/tenantRelationships/findTenantInformationByTenantId(tenantId='" +
+        encodeURIComponent(g.tenantId) + "')", tok);
+      if (t && t.displayName) g.orgName = t.displayName;
+    } catch (e) { /* unresolved — the label falls back to the GUID */ }
+  }));
 }
 
 // ═════════════════════════ Render ═════════════════════════
@@ -12441,6 +12461,7 @@ async function loadConsentAppsNow() {
   if (btn) { btn.disabled = true; btn.textContent = 'Scanning workloads…'; }
   try { if (window.EP && EP.ensureLoaded) await EP.ensureLoaded('workload'); } catch (e) { /* surfaced as not-loaded below */ }
   LAST.consentApps = loadConsentedApps();
+  try { const tok = await token(CORE_SCOPES, false); await resolveConsentOwners(LAST.consentApps, LAST.names, tok); } catch (e) { /* names stay as GUIDs */ }
   LAST.findings = buildFindings(LAST);
   render(LAST);
 }
@@ -13302,7 +13323,7 @@ function viewConsent(ctx, compact) {
 function consentList(c) {
   const rows = c.groups.map(g => {
     const col = SEV_COL[PERM_SEV[g.worst] || 'low'];
-    const head = '<div class="gtop"><span class="gname">' + esc(g.label) +
+    const head = '<div class="gtop"><span class="gname">' + esc(_consentLabel(g)) +
       (g.anyUnverified ? ' <span class="gunv" title="Publisher is not MPN-verified">unverified</span>' : '') + '</span>' +
       '<span class="gmeta">' + g.apps.length + ' ' + plural(g.apps.length, 'app') +
       (g.tenantId ? ' · <span class="mono">' + esc(g.tenantId) + '</span>' : '') + '</span></div>';
