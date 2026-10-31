@@ -1727,6 +1727,12 @@
 #view-external .gchips {display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}
 #view-external .gchip {font-size:11px;color:var(--rc,var(--muted));border:1px solid var(--rc,var(--border));
     border-radius:6px;padding:1.5px 8px;white-space:nowrap;background:color-mix(in srgb,var(--rc,transparent) 10%,transparent)}
+#view-external .gunv {font-size:10px;font-weight:700;color:var(--high);border:1px solid rgba(227,144,31,.5);border-radius:5px;padding:0 5px;margin-left:4px}
+#view-external .mono {font-family:var(--mono,ui-monospace,monospace);font-size:10.5px;color:var(--dim)}
+#view-external .gmore {font-size:10.5px;color:var(--muted);align-self:center}
+#view-external .capps {margin-top:8px;display:flex;flex-direction:column;gap:8px}
+#view-external .capp {padding-left:10px;border-left:2px solid rgba(127,127,127,.2)}
+#view-external .caname {font-size:12px;font-weight:600;color:var(--text)}
 /* ================= view: ca ================= */
 #view-ca * {box-sizing:border-box;margin:0;padding:0}
 #view-ca {font-family:var(--body);   
@@ -9112,6 +9118,24 @@ EP.registerView("workload", (function () {
       licence: lic, threats: threats, top: top
     };
   }
+  // Exposed to the External Access view (EP.viewApi("workload").externalApps): the apps that create a
+  // cross-tenant consent exposure — multi-tenant apps registered in an EXTERNAL tenant that hold
+  // application (app-only) permissions you have consented. Grouped there by publisher tenant. Read-only,
+  // reuses this scan's data (no extra Graph calls).
+  function __epWorkloadExternalApps(){
+    var rs = cache.results; if(!rs || !rs.length) return null;
+    var apps = rs.filter(function(r){ return r.factors && r.factors.externalAppKey; }).map(function(r){
+      var perms = (r.appPermissions || [])
+        .filter(function(p){ return !p.retired && p.roleName !== 'Default access'; })
+        .map(function(p){ return { value: p.roleValue || p.roleName || '(permission)', score: scoreScope(p.roleValue || '') }; })
+        .sort(function(a, b){ return b.score - a.score; });
+      return { name: r.displayName || r.appId, appId: r.appId || '',
+        ownerTenantId: r.appOwnerOrganizationId || '', publisher: r.publisherName || '',
+        verified: !!r.isVerifiedPublisher, enabled: r.accountEnabled !== false,
+        permScore: r.permScore || 1, riskScore: r.riskScore || 1, perms: perms };
+    });
+    return { apps: apps, total: apps.length };
+  }
   // -------------------- Redirect-URI inspector modal (read-only) --------------------
   // Shows the redirect URIs registered for an app, grouped by platform. This tool never writes:
   // there is no edit/add/remove and no Application.ReadWrite.All consent.
@@ -9229,7 +9253,7 @@ function __epWorkloadFocus(f){ if(!f||!f.search) return; try { var s=el("q"); if
 function ehPathCount(objId){ try { if(window.EP && window.EP.DEMO) return null; var S=window.EH&&window.EH.ui&&window.EH.ui.S; if(!S||!S.paths||!S.paths.length) return null; var n=0; for(var i=0;i<S.paths.length;i++) if(S.paths[i].source===objId) n++; return n; } catch(e){ return null; } }
 try { window.addEventListener("ep:graphready", function(){ try { renderTable(); } catch(e){} }); } catch(e){}
 
-;return { load: (typeof runAudit === "function") ? runAudit : null, focus: (typeof __epWorkloadFocus === 'function' ? __epWorkloadFocus : null), summary: (typeof __epWorkloadSummary === 'function' ? __epWorkloadSummary : null), ask: (typeof __epWorkloadAsk === 'function' ? __epWorkloadAsk : null) };
+;return { load: (typeof runAudit === "function") ? runAudit : null, focus: (typeof __epWorkloadFocus === 'function' ? __epWorkloadFocus : null), summary: (typeof __epWorkloadSummary === 'function' ? __epWorkloadSummary : null), ask: (typeof __epWorkloadAsk === 'function' ? __epWorkloadAsk : null), externalApps: (typeof __epWorkloadExternalApps === 'function' ? __epWorkloadExternalApps : null) };
 })());
 </script>
 <script>
@@ -12093,6 +12117,26 @@ function buildFindings(ctx) {
     });
   }
 
+  // ── Consented external apps (OAuth supply chain) ────────────────────────
+  const ca = ctx.consentApps;
+  if (ca && ca.state === 'ok') {
+    ca.groups.forEach(gp => {
+      const sev = PERM_SEV[gp.worst] || 'low';
+      const topPerms = [];
+      gp.apps.forEach(a => a.perms.forEach(p => { if (topPerms.indexOf(p.value) < 0) topPerms.push(p.value); }));
+      add(sev, 'XCON-' + String(gp.tenantId || gp.label).replace(/\W+/g, '').slice(0, 12),
+        'External publisher “' + gp.label + '” holds app-only access to your tenant',
+        gp.apps.length + ' consented multi-tenant ' + plural(gp.apps.length, 'app') + ' registered in this external tenant '
+        + 'hold application permissions in your directory'
+        + (topPerms.length ? ' — including ' + topPerms.slice(0, 5).join(', ') : '') + '. '
+        + (gp.worst >= 4 ? 'This is tenant-takeover-class access; a compromise of the publisher reaches straight into your tenant (the OAuth-app path abused in the wild). '
+           : gp.worst >= 3 ? 'These are high-impact read/write permissions. ' : '')
+        + (gp.anyUnverified ? 'The publisher is not MPN-verified — no vendor identity assurance behind an app that holds access in your tenant. ' : ''),
+        'Confirm the app is still needed and that its application permissions are the minimum required; revoke the admin consent (or the specific app roles) under Enterprise applications → Permissions if not. Prefer verified publishers.',
+        'service principal · owner tenant ' + (gp.tenantId || '—'), REF.spChain);
+    });
+  }
+
   F.sort((a, b) => SEV_RANK[b.sev] - SEV_RANK[a.sev]);
   return F;
 }
@@ -12201,6 +12245,7 @@ async function run() {
     const gdap = await loadGdap(false);
 
     LAST = { def, partners, sync, syncErr, names, namesAttempted, namesErr, guests, gdap, home, at: new Date() };
+    LAST.consentApps = loadConsentedApps();
     LAST.findings = buildFindings(LAST);
     render(LAST);
     setStatus('');
@@ -12363,7 +12408,42 @@ async function loadGdap(interactive) {
   }
 }
 
+// ═════════════════════════ Consented external apps ═════════════════════════
+// The OAuth-app side of "how partners connect": multi-tenant apps registered in an EXTERNAL tenant that
+// hold application (app-only) permissions you have consented — a compromise of that publisher reaches into
+// your tenant (Midnight Blizzard's lever). The data is the Workload scan's; we read it through the view's
+// exposed provider and GROUP it by publisher tenant. Unlike GDAP, the owner tenant GUID IS available here.
+// No new scope — purely a correlation of an already-run scan.
+function loadConsentedApps() {
+  const api = window.EP && EP.viewApi && EP.viewApi('workload');
+  if (!api || typeof api.externalApps !== 'function') return { state: 'no-provider' };
+  let data;
+  try { data = api.externalApps(); } catch (e) { return { state: 'error', error: (e && e.message) || String(e) }; }
+  if (!data) return { state: 'not-loaded' };        // the Workload view has not been scanned this session
+  const groups = {};
+  (data.apps || []).forEach(a => {
+    const k = a.ownerTenantId || a.publisher || a.appId;
+    if (!groups[k]) groups[k] = { tenantId: a.ownerTenantId || '', label: a.publisher || a.ownerTenantId || '(unknown publisher)', apps: [], worst: 0, anyUnverified: false };
+    const g = groups[k];
+    g.apps.push(a);
+    g.worst = Math.max(g.worst, a.permScore || 0);
+    if (!a.verified) g.anyUnverified = true;
+  });
+  const list = Object.keys(groups).map(k => groups[k]).sort((x, y) => (y.worst - x.worst) || (y.apps.length - x.apps.length));
+  return { state: 'ok', total: data.total || (data.apps || []).length, publishers: list.length, groups: list };
+}
+
 // ═════════════════════════ Render ═════════════════════════
+/** Scan workloads (if not already) and re-correlate the consented-apps section. */
+async function loadConsentAppsNow() {
+  if (!LAST) return;
+  const btn = document.getElementById('btn-load-consent');
+  if (btn) { btn.disabled = true; btn.textContent = 'Scanning workloads…'; }
+  try { if (window.EP && EP.ensureLoaded) await EP.ensureLoaded('workload'); } catch (e) { /* surfaced as not-loaded below */ }
+  LAST.consentApps = loadConsentedApps();
+  LAST.findings = buildFindings(LAST);
+  render(LAST);
+}
 /** Re-run only the GDAP half, after an interactive consent top-up. */
 async function loadGdapNow() {
   if (!LAST) return;
@@ -12521,7 +12601,8 @@ let VIEW = 'overview';
 
 // Findings are numbered by where they were found, so the section that owns a
 // check is the section that shows it.
-const scopeOf = id => id.indexOf('GDAP') === 0 ? 'gdap' : id.charAt(0) === 'D' ? 'baseline' : id.charAt(0) === 'P' ? 'partners' : 'guests';
+const scopeOf = id => id.indexOf('GDAP') === 0 ? 'gdap' : id.indexOf('XCON') === 0 ? 'consent' : id.charAt(0) === 'D' ? 'baseline' : id.charAt(0) === 'P' ? 'partners' : 'guests';
+const PERM_SEV = { 4: 'critical', 3: 'high', 2: 'medium', 1: 'low', 0: 'low' };
 
 function bandColour(sev) {
   const map = { critical:['rgba(248,81,73,.5)','#ff8b84'], high:['rgba(227,144,31,.5)','#eda343'],
@@ -13184,12 +13265,63 @@ function gdapList(g) {
   return '<div class="card"><div class="card-b flush">' + rows + '</div></div>';
 }
 
+// Consented-external-apps section — the OAuth-app channel, correlated from the Workload scan and grouped by
+// publisher tenant. If the Workload view has not been scanned, offer to scan + correlate (no new scope).
+function viewConsent(ctx, compact) {
+  const c = ctx.consentApps || {};
+  const own = ctx.findings.filter(x => scopeOf(x.id) === 'consent');
+  let h = '<div class="band" id="ext-consent">' +
+      '<span class="band-t">Consented external apps</span>' +
+      '<span class="band-s">External publishers that hold app-only access into your tenant, and what they can do</span></div>';
+  if (c.state === 'no-provider') {
+    h += '<div class="note note-warn"><b>Unavailable.</b> The Workload scan this correlates is not present in this build.</div>';
+  } else if (c.state === 'error') {
+    h += '<div class="note note-warn"><b>Not evaluated.</b> ' + esc(c.error || '') + '</div>';
+  } else if (c.state === 'not-loaded') {
+    h += '<div class="note note-info"><b>Not correlated yet.</b> This reuses the <b>Workload</b> scan to find external-owned, ' +
+      'multi-tenant apps that hold application (app-only) permissions you have consented — grouped by publisher. The ' +
+      'Workload view has not been scanned this session.' +
+      '<div style="margin-top:10px"><button class="btn btn-primary" id="btn-load-consent" style="padding:7px 14px;font-size:12.5px">Scan workloads &amp; correlate</button></div></div>';
+  } else if (c.state === 'ok' && !c.total) {
+    h += '<div class="note note-info"><b>None.</b> No external-owned multi-tenant app holds application (app-only) permissions in your tenant.</div>';
+  } else if (c.state === 'ok') {
+    const crit = c.groups.filter(g => g.worst >= 4).length;
+    const unv = c.groups.filter(g => g.anyUnverified).length;
+    h += '<div class="grid">' +
+      tile(c.publishers, 'External publishers', c.total + ' consented ' + plural(c.total, 'app'), c.publishers ? 'info' : 'low') +
+      tile(crit, 'With takeover access', 'tenant-takeover-class perms', crit ? 'critical' : 'low') +
+      tile(unv, 'Unverified publisher', 'no MPN verified publisher', unv ? 'high' : 'low') +
+      '</div>' + consentList(c);
+  }
+  if (!compact) h += '<div class="band" style="' + bandColour(worstOf(own) || 'info') + '">' +
+      '<span class="band-t">What this exposure costs you</span>' +
+      '<span class="band-s">' + own.length + ' ' + plural(own.length, 'finding') + '</span></div>' +
+    findingsBlock(own, c.state === 'ok' ? 'Nothing flagged on consented external apps.' : 'No findings, because the Workload scan has not been correlated.');
+  return h;
+}
+function consentList(c) {
+  const rows = c.groups.map(g => {
+    const col = SEV_COL[PERM_SEV[g.worst] || 'low'];
+    const head = '<div class="gtop"><span class="gname">' + esc(g.label) +
+      (g.anyUnverified ? ' <span class="gunv" title="Publisher is not MPN-verified">unverified</span>' : '') + '</span>' +
+      '<span class="gmeta">' + g.apps.length + ' ' + plural(g.apps.length, 'app') +
+      (g.tenantId ? ' · <span class="mono">' + esc(g.tenantId) + '</span>' : '') + '</span></div>';
+    const apps = g.apps.map(a => {
+      const chips = a.perms.slice(0, 6).map(p => '<span class="gchip" style="--rc:' + SEV_COL[PERM_SEV[p.score] || 'low'] + '">' + esc(p.value) + '</span>').join('');
+      return '<div class="capp"><span class="caname">' + esc(a.name) + (a.enabled ? '' : ' <span class="gunv">disabled</span>') + '</span>' +
+        '<div class="gchips">' + (chips || '<span class="gchip">app permissions</span>') + (a.perms.length > 6 ? '<span class="gmore">+' + (a.perms.length - 6) + '</span>' : '') + '</div></div>';
+    }).join('');
+    return '<div class="grow" style="--fc:' + col + '">' + head + '<div class="capps">' + apps + '</div></div>';
+  }).join('');
+  return '<div class="card"><div class="card-b flush">' + rows + '</div></div>';
+}
+
 // ── Router ─────────────────────────────────────────────────────────────────
 // Single page: header + exposure tiles + the (sub-nav-free) baseline, partner and guest sections,
 // with one findings block at the end. Matches the layout of the other posture views.
 // Sticky section nav — one chip per band, in render order; scrolls and highlights.
 function jumpNav(ctx) {
-  const items = [['ext-baseline', 'Baseline'], ['ext-partners', 'Partners'], ['ext-guests', 'Guests'], ['ext-gdap', 'Delegated admin'], ['ext-findings', 'Findings']];
+  const items = [['ext-baseline', 'Baseline'], ['ext-partners', 'Partners'], ['ext-guests', 'Guests'], ['ext-gdap', 'Delegated admin'], ['ext-consent', 'Consented apps'], ['ext-findings', 'Findings']];
   return '<div class="jumpnav">' + items.map(x =>
     '<span class="jn" role="button" tabindex="0" data-sec="' + x[0] + '">' + esc(x[1]) + '</span>').join('') + '</div>';
 }
@@ -13230,6 +13362,7 @@ function render(ctx) {
     + viewPartners(ctx, true)
     + viewGuests(ctx, true)
     + viewGdap(ctx, true)
+    + viewConsent(ctx, true)
     + externalFindings(ctx)
     + partnerDrawer(ctx);
   // Exposure tiles scroll to the section that explains them (single page, no sub-nav).
@@ -13254,6 +13387,8 @@ function render(ctx) {
   if (gb) gb.onclick = loadGuestsNow;
   const gdb = document.getElementById('btn-load-gdap');
   if (gdb) gdb.onclick = loadGdapNow;
+  const cnb = document.getElementById('btn-load-consent');
+  if (cnb) cnb.onclick = loadConsentAppsNow;
   const cp = document.getElementById('epx-copy');
   if (cp) cp.onclick = copyFindings;
   const exrf = document.getElementById('epx-refresh');
