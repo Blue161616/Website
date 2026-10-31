@@ -13315,10 +13315,10 @@ function policyTable(ctx) {
   }).join('');
   return '<div class="band" id="ca-policies"><span class="band-t">Policies</span>' +
     '<span class="band-s">Every Conditional Access policy, enforcing first — click any row for details &amp; score' +
-      (window.EP ? ' <span class="sep" style="opacity:.5">·</span> <span class="js-ca-whomod" role="button" tabindex="0" title="Open the Attack Paths view" style="cursor:pointer;color:var(--accent-2);font-weight:600;white-space:nowrap">⤳ who can modify them</span>' : '') + '</span>' +
+      (window.EP ? ' <span class="sep" style="opacity:.5">·</span> <span class="js-ca-whomod" role="button" tabindex="0" title="Open the Attack Paths view" style="cursor:pointer;color:var(--accent-2);font-weight:600;white-space:nowrap">⤳ who can modify them</span>' : '') +
+      caAssessLink(ctx) + '</span>' +
     '<span class="band-x" style="color:var(--muted)">' + pol.length + ' ' + plural(pol.length, 'policy', 'policies') +
       (pol.length > 12 ? '<span class="band-toggle" data-collapse="ca-policies-card">show</span>' : '') + '</span></div>' +
-    caAssessBar(ctx) +
     '<div class="card' + (pol.length > 12 ? ' collapsed' : '') + '" id="ca-policies-card"><div class="card-b flush"><table class="data">' +
       '<thead><tr><th>Policy</th><th>State</th><th>Risk</th><th>Controls</th><th>Targets</th><th>Exclusions</th></tr></thead>' +
       '<tbody>' + body + '</tbody></table></div></div>';
@@ -13446,7 +13446,7 @@ const DISP = { PROMOTE: { cls: 'st-block', label: 'Promote' }, REVIEW: { cls: 's
 // The last AI triage result, keyed by policy name so the Policies rows (verdict chips) and the
 // Findings section (advisory results block) can both read it. Advisory only — the deterministic
 // findings stay the source of truth. Null until the user runs "Assess report-only backlog".
-let CA_TRIAGE = null;
+let CA_TRIAGE = null, caTriaging = false;
 function caVerdictChip(p) {
   if (!CA_TRIAGE || !isReportOnly(p)) return '';
   const v = CA_TRIAGE.byName[(p.displayName || p.id || '').toLowerCase()];
@@ -13495,16 +13495,21 @@ function renderTriage(res, raw) {
 
 // The assess control lives in the Policies section (it acts on the report-only subset listed
 // there). Offered only when there are report-only policies and a model is configured.
-function caAssessBar(ctx) {
+// The trigger to run the advisory triage — a quiet inline link in the Policies header, next to
+// "who can modify them", NOT a primary button: ranking the report-only backlog is an optional
+// aside, and its verdicts land on the rows below and in Findings. The full explanation rides in
+// the tooltip. Hidden when there's no report-only backlog or no local model.
+function caAssessLink(ctx) {
   const ro = (ctx.policies || []).filter(isReportOnly);
   if (!ro.length || !(window.EP && EP.llm && EP.llm.ready())) return '';
   const model = esc((EP.llm.provider || '') + ' · ' + (EP.llm.model || ''));
-  return '<div class="ca-assess" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 10px">' +
-      '<button class="btn btn-primary" id="ca-ai-run" style="padding:8px 16px">✦ Assess report-only backlog</button>' +
-      '<span style="font-size:11.5px;color:var(--dim)">Ranks the ' + ro.length + ' report-only ' + plural(ro.length, 'policy', 'policies') +
-        ' — promote, review or retire. Runs on ' + model + ', grounded in your policies; nothing leaves the machine. ' +
-        'Verdicts show on the rows below and in Findings — advisory, not a control.</span>' +
-      '<span id="ca-ai-status" style="font-size:11.5px"></span></div>';
+  const tip = 'Ranks the ' + ro.length + ' report-only ' + plural(ro.length, 'policy', 'policies') +
+    ' — promote, review or retire. Runs on ' + model + ', grounded in your policies; nothing leaves ' +
+    'the machine. Verdicts show on the rows below and in Findings — advisory, not a control.';
+  return ' <span class="sep" style="opacity:.5">·</span> ' +
+    '<span class="js-ca-assess" id="ca-ai-run" role="button" tabindex="0" title="' + tip + '" ' +
+      'style="cursor:pointer;color:var(--accent-2);font-weight:600;white-space:nowrap">✦ assess the report-only backlog</span>' +
+    '<span id="ca-ai-status" style="font-size:11.5px;margin-left:8px"></span>';
 }
 
 // The triage results, shown inside Findings under a clear advisory header (kept separate from the
@@ -13520,10 +13525,11 @@ function caTriageBlock(ctx) {
 
 async function runAiTriage(ctx) {
   const btn = $('ca-ai-run'), st = $('ca-ai-status');
-  if (!(window.EP && EP.llmComplete)) return;
+  if (!(window.EP && EP.llmComplete) || caTriaging) return;   // the trigger is a span, so guard re-entry here
+  caTriaging = true;
   const model = esc((EP.llm.provider || '') + ' · ' + (EP.llm.model || ''));
   if (st) st.innerHTML = '<span class="spinner"></span> Asking ' + model + ' to triage the report-only policies…';
-  if (btn) btn.disabled = true;
+  if (btn) btn.setAttribute('aria-busy', 'true');
   try {
     const names = (ctx.policies || []).filter(isReportOnly).map(p => p.displayName || p.id);
     const raw = await EP.llmComplete(CA_AI_SYSTEM, caAiDigest(ctx), { temperature: 0.2, max_tokens: 900 });
@@ -13534,7 +13540,9 @@ async function runAiTriage(ctx) {
     const fnd = $('ca-findings'); if (fnd) fnd.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
     if (st) st.innerHTML = '<span style="color:var(--crit)">AI triage unavailable — ' + esc(e.message || String(e)) + '. Check the model in Configuration.</span>';
-    if (btn) btn.disabled = false;
+    if (btn) btn.removeAttribute('aria-busy');
+  } finally {
+    caTriaging = false;
   }
 }
 
@@ -13618,7 +13626,8 @@ function render(ctx) {
     el.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); gotoWhoMod(); } };
   });
   const aiBtn = $('ca-ai-run');
-  if (aiBtn) aiBtn.onclick = () => runAiTriage(ctx);
+  if (aiBtn) { aiBtn.onclick = () => runAiTriage(ctx);
+    aiBtn.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); runAiTriage(ctx); } }; }
   const fw = $('foot-when'); if (fw) fw.textContent = ctx.at ? 'Scanned ' + ctx.at.toLocaleString() : '';
 }
 
