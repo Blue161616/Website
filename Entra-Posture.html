@@ -1718,6 +1718,15 @@
 #view-external .pstrength {font-size:12.5px;color:var(--low);padding:3px 0;display:flex;gap:7px;align-items:flex-start}
 #view-external footer.foot {margin-top:34px;padding-top:16px;border-top:1px solid var(--border);
     font-size:11px;color:var(--dim);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+#view-external .grow {padding:11px 15px;border-bottom:1px solid rgba(48,54,61,.55);border-left:3px solid var(--fc,var(--dim))}
+#view-external .grow:last-child {border-bottom:none}
+#view-external .gtop {display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap}
+#view-external .gname {font-size:13px;font-weight:700;color:var(--text)}
+#view-external .gmeta {font-size:11px;color:var(--muted);display:flex;gap:8px;flex-wrap:wrap}
+#view-external .gstat {font-weight:700;text-transform:capitalize}
+#view-external .gchips {display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}
+#view-external .gchip {font-size:11px;color:var(--rc,var(--muted));border:1px solid var(--rc,var(--border));
+    border-radius:6px;padding:1.5px 8px;white-space:nowrap;background:color-mix(in srgb,var(--rc,transparent) 10%,transparent)}
 /* ================= view: ca ================= */
 #view-ca * {box-sizing:border-box;margin:0;padding:0}
 #view-ca {font-family:var(--body);   
@@ -3417,7 +3426,8 @@ window.EP = (function () {
     ["RoleManagement.Read.Directory", "Directory roles held by service principals", "workload"],
     ["RoleManagementPolicy.Read.Directory", "PIM activation / approval policy", "user"],
     ["IdentityRiskyUser.Read.All", "Identity Protection risky users", "user"],
-    ["IdentityRiskyServicePrincipal.Read.All", "Risky service principals / agents", "workload · agent"]
+    ["IdentityRiskyServicePrincipal.Read.All", "Risky service principals / agents", "workload · agent"],
+    ["DelegatedAdminRelationship.Read.All", "Delegated admin (GDAP) relationships", "external"]
   ];
   const SIGNIN_SCOPES = REQUIRED_SCOPES.map(s => s[0]);
 
@@ -11614,6 +11624,7 @@ EP.registerView("external", (function () {
 const GRAPH  = 'https://graph.microsoft.com';
 const CORE_SCOPES = [GRAPH + '/Policy.Read.All', GRAPH + '/CrossTenantInformation.ReadBasic.All'];
 const GUEST_SCOPE = [GRAPH + '/User.Read.All'];
+const GDAP_SCOPE = [GRAPH + '/DelegatedAdminRelationship.Read.All'];
 const CID_KEY = 'blue16_xtap_client_id';
 const TID_KEY = 'blue16_xtap_tenant_id';
 const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
@@ -12064,6 +12075,24 @@ function buildFindings(ctx) {
     });
   }
 
+  // ── Delegated admin (GDAP) ──────────────────────────────────────────────
+  const gd = ctx.gdap;
+  if (gd && gd.state === 'ok') {
+    gd.relationships.filter(r => r.active).forEach(r => {
+      const sev = GDAP_TIER_SEV[r.topTier] || 'medium';
+      const roleList = r.roleInfos.map(x => x.n).join(', ') || '(roles not specified)';
+      add(sev, 'GDAP-' + (r.id || '').slice(0, 8), 'Partner “' + r.name + '” holds delegated admin (GDAP) in your tenant',
+        'A delegated-admin relationship lets a partner (MSP/CSP) activate ' + r.roleIds.length + ' directory '
+        + plural(r.roleIds.length, 'role') + ' in your tenant: ' + roleList + '. '
+        + (r.topTier >= 4 ? 'These include tenant-takeover-class roles — a compromise of that partner is a compromise of your tenant; this is the service-provider trust-chain path abused in the wild. '
+           : r.topTier >= 3 ? 'These include identity/credential-control roles that can be escalated toward full control. ' : '')
+        + (r.autoExtend ? 'It auto-extends (' + r.autoExtend + '), so it does not naturally expire. '
+           : r.endDateTime ? 'It is set to expire ' + new Date(r.endDateTime).toLocaleDateString() + '. ' : ''),
+        'Confirm the partner is current and the roles are the minimum needed. In Partner Center / the Entra admin center, remove the relationship if it is stale, or scope the access assignments down to least privilege; require the partner to activate GDAP roles just-in-time with MFA.',
+        'delegatedAdminRelationships[' + (r.id || '') + ']', REF.spChain);
+    });
+  }
+
   F.sort((a, b) => SEV_RANK[b.sev] - SEV_RANK[a.sev]);
   return F;
 }
@@ -12169,8 +12198,9 @@ async function run() {
     }
 
     const guests = await loadGuests(partners, names, def);
+    const gdap = await loadGdap(false);
 
-    LAST = { def, partners, sync, syncErr, names, namesAttempted, namesErr, guests, home, at: new Date() };
+    LAST = { def, partners, sync, syncErr, names, namesAttempted, namesErr, guests, gdap, home, at: new Date() };
     LAST.findings = buildFindings(LAST);
     render(LAST);
     setStatus('');
@@ -12270,7 +12300,79 @@ async function loadGuests(partners, names, def, interactive) {
   }
 }
 
+// ═════════════════════════ Delegated admin (GDAP) ═════════════════════════
+// A partner (MSP/CSP) that holds a delegated-admin relationship can ACTIVATE directory roles in your tenant —
+// the "service-provider trust chain" APT29 abused. The customer side of the Graph resource does NOT expose the
+// partner's tenant GUID, so partners are identified by the relationship's display name. We grade by the highest-
+// privilege role the relationship grants (tier 4 = tenant-takeover, 3 = identity/credential control, 2 = service
+// admin, 1 = read-only). Directory role TEMPLATE ids are well-known constants.
+const GDAP_ROLES = {
+  '62e90394-69f5-4237-9190-012177145e10': { n: 'Global Administrator', t: 4 },
+  'e8611ab8-c189-46e8-94e1-60213ab1f814': { n: 'Privileged Role Administrator', t: 4 },
+  '7be44c8a-adaf-4e2a-84d6-ab2649e08a13': { n: 'Privileged Authentication Administrator', t: 4 },
+  '9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3': { n: 'Application Administrator', t: 3 },
+  '158c047a-c907-4556-b7ef-446551a6b5f7': { n: 'Cloud Application Administrator', t: 3 },
+  'fe930be7-5e62-47db-91af-98c3a49a38b1': { n: 'User Administrator', t: 3 },
+  'c4e39bd9-1100-46d3-8c65-fb160da0071f': { n: 'Authentication Administrator', t: 3 },
+  '966707d0-3269-4727-9be2-8c3a10f19b9d': { n: 'Password Administrator', t: 3 },
+  '729827e3-9c14-49f7-bb1b-9608f156bbb8': { n: 'Helpdesk Administrator', t: 3 },
+  '194ae4cb-b126-40b2-bd5b-6091b380977d': { n: 'Security Administrator', t: 3 },
+  'b1be1c3e-b65d-4f19-8427-f6fa0d97feb9': { n: 'Conditional Access Administrator', t: 3 },
+  '3a2c62db-5318-420d-8d74-23affee5d9d5': { n: 'Intune Administrator', t: 3 },
+  '8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2': { n: 'Hybrid Identity Administrator', t: 3 },
+  '29232cdf-9323-42fd-ade2-1d097af3e4de': { n: 'Exchange Administrator', t: 2 },
+  'f28a1f50-f6e7-4571-818b-6a12f2af6b6c': { n: 'SharePoint Administrator', t: 2 },
+  '69091246-20e8-4a56-aa4d-066075b2a7a8': { n: 'Teams Administrator', t: 2 },
+  'f2ef992c-3afb-46b9-b7cf-a126ee74c451': { n: 'Global Reader', t: 1 },
+  '88d8e3e3-8f55-4a1e-953a-9b9898b8876b': { n: 'Directory Readers', t: 1 }
+};
+const GDAP_TIER_SEV = { 4: 'critical', 3: 'high', 2: 'medium', 1: 'low', 0: 'medium' };
+function _gdapRole(id) { return GDAP_ROLES[id] || { n: 'role ' + String(id || '').slice(0, 8) + '…', t: 2 }; }
+
+/** Optional (same silent-first / top-up pattern as guests). Reads delegated-admin (GDAP) relationships. */
+async function loadGdap(interactive) {
+  let tok;
+  try { tok = await token(GDAP_SCOPE, !!interactive); }
+  catch (e) {
+    const code = (e && e.errorCode) || '';
+    if (!interactive) return { state: 'not-loaded' };
+    if (['consent_required', 'access_denied', 'invalid_grant'].some(c => code.indexOf(c) > -1))
+      return { state: 'denied', error: (e && e.message) || code };
+    if (['user_cancelled', 'popup_window_error'].some(c => code.indexOf(c) > -1))
+      return { state: 'not-loaded' };
+    return { state: 'error', error: (e && e.message) || code || String(e) };
+  }
+  try {
+    const rels = await graphAll('/v1.0/tenantRelationships/delegatedAdminRelationships?$top=100', tok, null, 10);
+    const relationships = rels.map(r => {
+      const roleIds = ((((r.accessDetails) || {}).unifiedRoles) || []).map(u => u.roleDefinitionId).filter(Boolean);
+      const roleInfos = roleIds.map(_gdapRole);
+      const topTier = roleInfos.reduce((m, x) => Math.max(m, x.t), 0);
+      const st = String(r.status || '').toLowerCase();
+      const active = st === 'active' || st === 'activating';
+      const ext = String(r.autoExtendDuration || '');
+      return { id: r.id || '', name: r.displayName || '(unnamed relationship)', status: r.status || '', active,
+        roleIds, roleInfos, topTier, endDateTime: r.endDateTime || null,
+        autoExtend: (ext && ext !== 'PT0S' && ext !== 'P0D') ? ext : null };
+    });
+    return { state: 'ok', relationships, total: relationships.length, active: relationships.filter(r => r.active).length };
+  } catch (e) {
+    const msg = (e && e.message) || String(e);
+    if (e && e.status === 403) return { state: 'denied', error: msg };
+    return { state: 'error', error: msg };
+  }
+}
+
 // ═════════════════════════ Render ═════════════════════════
+/** Re-run only the GDAP half, after an interactive consent top-up. */
+async function loadGdapNow() {
+  if (!LAST) return;
+  const btn = document.getElementById('btn-load-gdap');
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
+  LAST.gdap = await loadGdap(true);
+  LAST.findings = buildFindings(LAST);
+  render(LAST);
+}
 /** Re-run only the guest half, after an interactive consent top-up. */
 async function loadGuestsNow() {
   if (!LAST) return;
@@ -12419,7 +12521,7 @@ let VIEW = 'overview';
 
 // Findings are numbered by where they were found, so the section that owns a
 // check is the section that shows it.
-const scopeOf = id => id.charAt(0) === 'D' ? 'baseline' : id.charAt(0) === 'P' ? 'partners' : 'guests';
+const scopeOf = id => id.indexOf('GDAP') === 0 ? 'gdap' : id.charAt(0) === 'D' ? 'baseline' : id.charAt(0) === 'P' ? 'partners' : 'guests';
 
 function bandColour(sev) {
   const map = { critical:['rgba(248,81,73,.5)','#ff8b84'], high:['rgba(227,144,31,.5)','#eda343'],
@@ -13031,12 +13133,63 @@ function viewGuests(ctx, compact) {
   return h;
 }
 
+// Delegated-admin (GDAP) section — partners that can activate roles in your tenant. Same optional-scope
+// state handling (not-loaded / denied / error / ok) as the guest section.
+function viewGdap(ctx, compact) {
+  const g = ctx.gdap || {};
+  const own = ctx.findings.filter(x => scopeOf(x.id) === 'gdap');
+  let h = '<div class="band" id="ext-gdap">' +
+      '<span class="band-t">Delegated admin (GDAP)</span>' +
+      '<span class="band-s">Which partners (MSP/CSP) can activate admin roles in your tenant</span></div>';
+  if (g.state === 'not-loaded') {
+    h += '<div class="note note-info"><b>Not loaded yet.</b> This reads delegated-admin (GDAP) relationships with ' +
+      'delegated <code>DelegatedAdminRelationship.Read.All</code>, and the current token does not carry that scope — ' +
+      'normal when the sign-in predates the consent (it needs admin consent). One more sign-in adds it.' +
+      '<div style="margin-top:10px"><button class="btn btn-primary" id="btn-load-gdap" style="padding:7px 14px;font-size:12.5px">Load GDAP</button></div></div>';
+  } else if (g.state === 'denied') {
+    h += '<div class="note note-warn"><b>Refused.</b> Delegated <code>DelegatedAdminRelationship.Read.All</code> was ' +
+      'not granted to this sign-in (it requires admin consent). ' + esc(g.error || '') + '</div>';
+  } else if (g.state === 'error') {
+    h += '<div class="note note-warn"><b>Not evaluated.</b> ' + esc(g.error || '') + '</div>';
+  } else if (g.state === 'ok' && !g.total) {
+    h += '<div class="note note-info"><b>No delegated-admin relationships.</b> No partner (MSP/CSP) holds GDAP access in this tenant.</div>';
+  } else if (g.state === 'ok') {
+    const active = g.relationships.filter(r => r.active);
+    const crit = active.filter(r => r.topTier >= 4).length;
+    const autoX = active.filter(r => r.autoExtend).length;
+    h += '<div class="grid">' +
+      tile(g.total, 'GDAP relationships', g.active + ' active', g.active ? 'info' : 'low') +
+      tile(crit, 'With takeover roles', 'Global Admin / privileged', crit ? 'critical' : 'low') +
+      tile(autoX, 'Auto-extending', 'never naturally expire', autoX ? 'medium' : 'low') +
+      '</div>' + gdapList(g);
+  }
+  if (!compact) h += '<div class="band" style="' + bandColour(worstOf(own) || 'info') + '">' +
+      '<span class="band-t">What these relationships cost you</span>' +
+      '<span class="band-s">' + own.length + ' ' + plural(own.length, 'finding') + '</span></div>' +
+    findingsBlock(own, g.state === 'ok' ? 'Nothing flagged on delegated admin.' : 'No GDAP findings, because GDAP has not been read.');
+  return h;
+}
+function gdapList(g) {
+  const rows = g.relationships.slice().sort((a, b) => (b.active - a.active) || (b.topTier - a.topTier)).map(r => {
+    const sev = r.active ? (GDAP_TIER_SEV[r.topTier] || 'medium') : null;
+    const col = sev ? SEV_COL[sev] : 'var(--dim)';
+    const chips = r.roleInfos.map(x => '<span class="gchip" style="--rc:' + (SEV_COL[GDAP_TIER_SEV[x.t]] || 'var(--muted)') + '">' + esc(x.n) + '</span>').join('');
+    const meta = ['<span class="gstat" style="color:' + col + '">' + esc(r.status || '—') + '</span>'];
+    if (r.autoExtend) meta.push('auto-extends ' + esc(r.autoExtend));
+    else if (r.endDateTime) { const d = new Date(r.endDateTime); if (!isNaN(d.getTime())) meta.push('expires ' + d.toLocaleDateString()); }
+    return '<div class="grow" style="--fc:' + col + '"><div class="gtop"><span class="gname">' + esc(r.name) + '</span>' +
+      '<span class="gmeta">' + meta.join(' · ') + '</span></div>' +
+      '<div class="gchips">' + (chips || '<span class="gchip">no roles listed</span>') + '</div></div>';
+  }).join('');
+  return '<div class="card"><div class="card-b flush">' + rows + '</div></div>';
+}
+
 // ── Router ─────────────────────────────────────────────────────────────────
 // Single page: header + exposure tiles + the (sub-nav-free) baseline, partner and guest sections,
 // with one findings block at the end. Matches the layout of the other posture views.
 // Sticky section nav — one chip per band, in render order; scrolls and highlights.
 function jumpNav(ctx) {
-  const items = [['ext-baseline', 'Baseline'], ['ext-partners', 'Partners'], ['ext-guests', 'Guests'], ['ext-findings', 'Findings']];
+  const items = [['ext-baseline', 'Baseline'], ['ext-partners', 'Partners'], ['ext-guests', 'Guests'], ['ext-gdap', 'Delegated admin'], ['ext-findings', 'Findings']];
   return '<div class="jumpnav">' + items.map(x =>
     '<span class="jn" role="button" tabindex="0" data-sec="' + x[0] + '">' + esc(x[1]) + '</span>').join('') + '</div>';
 }
@@ -13076,6 +13229,7 @@ function render(ctx) {
     + viewBaseline(ctx, true)
     + viewPartners(ctx, true)
     + viewGuests(ctx, true)
+    + viewGdap(ctx, true)
     + externalFindings(ctx)
     + partnerDrawer(ctx);
   // Exposure tiles scroll to the section that explains them (single page, no sub-nav).
@@ -13098,6 +13252,8 @@ function render(ctx) {
   });
   const gb = document.getElementById('btn-load-guests');
   if (gb) gb.onclick = loadGuestsNow;
+  const gdb = document.getElementById('btn-load-gdap');
+  if (gdb) gdb.onclick = loadGdapNow;
   const cp = document.getElementById('epx-copy');
   if (cp) cp.onclick = copyFindings;
   const exrf = document.getElementById('epx-refresh');
@@ -14634,7 +14790,6 @@ function render(ctx) {
   $('content').innerHTML =
       demoBanner
     + heroHead(ctx)
-    + overviewTiles(ctx)
     + jumpNav(ctx)
     + coverageMatrix(ctx)
     + policyTable(ctx)
