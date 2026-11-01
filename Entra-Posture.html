@@ -2496,7 +2496,9 @@
   .cis-ring-n { fill: var(--text); font: 700 26px var(--font, "IBM Plex Sans", sans-serif); }
   .cis-ring-s { fill: var(--muted); font: 600 11px var(--font, "IBM Plex Sans", sans-serif); }
   .cis-kpis { display: flex; gap: 10px; }
-  .cis-kpi { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 10px 16px; min-width: 92px; }
+  .cis-kpi { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 10px 16px; min-width: 92px; transition: border-color .12s, box-shadow .12s; }
+  .cis-kpi[data-cmplrf]:hover { border-color: var(--accent); }
+  .cis-kpi.sel { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
   .cis-kpi-l { font-size: 12px; color: var(--muted); margin-bottom: 3px; }
   .cis-kpi-n { font-size: 24px; font-weight: 700; }
   .cis-kpi-n.pass, .cis-ring-s.pass { color: var(--green); }
@@ -4315,13 +4317,86 @@ window.EP = (function () {
       const crit = (d.external.counts && d.external.counts.critical) || 0;
       return crit ? _cisFail(crit + " critical external-access finding(s) — guests / GDAP / consent", "external") : _cisPass("No critical external-access findings"); } }
   ];
+  // Catalog of EIDSCA (Maester's Entra ID Security Config Analyzer) checks — each reads
+  // a specific Microsoft Graph setting (the authentication-methods policy or the tenant
+  // authorization policy) and compares it to the recommended secure value. Within the
+  // existing read scopes (Policy.Read.All). IDs align to Maester EIDSCA and are indicative.
+  const _amCfg = (d, id) => { const a = d && d.eidsca && d.eidsca.authMethods && d.eidsca.authMethods.authenticationMethodConfigurations; return Array.isArray(a) ? a.find(c => String(c.id || "").toLowerCase() === id.toLowerCase()) : undefined; };
+  const _amOn  = (d, id) => { const c = _amCfg(d, id); return c ? c.state === "enabled" : null; };   // null = config not collected
+  const _authz = (d) => d && d.eidsca && d.eidsca.authzPolicy;
+  const EIDSCA_CONTROLS = [
+    { id: "EIDSCA.AF01", title: "FIDO2 security key method is enabled", level: "High", assess(d) {
+      const on = _amOn(d, "Fido2"); if (on == null) return _cisNa("Authentication methods policy not collected");
+      return on ? _cisPass("FIDO2 security keys are enabled") : _cisFail("FIDO2 security keys are disabled — enable phishing-resistant keys", "ca"); } },
+    { id: "EIDSCA.AF05", title: "FIDO2 attestation enforcement is on", level: "Medium", assess(d) {
+      const c = _amCfg(d, "Fido2"); if (!c) return _cisNa("Authentication methods policy not collected");
+      if (c.state !== "enabled") return _cisNa("FIDO2 not enabled — attestation not applicable");
+      return c.isAttestationEnforced ? _cisPass("FIDO2 attestation is enforced") : _cisFail("FIDO2 attestation is not enforced — only allow attested keys", "ca"); } },
+    { id: "EIDSCA.AF03", title: "FIDO2 key restrictions are enforced", level: "Medium", assess(d) {
+      const c = _amCfg(d, "Fido2"); if (!c) return _cisNa("Authentication methods policy not collected");
+      if (c.state !== "enabled") return _cisNa("FIDO2 not enabled — key restrictions not applicable");
+      const kr = c.keyRestrictions; return (kr && kr.isEnforced) ? _cisPass("FIDO2 key restrictions are enforced") : _cisFail("FIDO2 key restrictions are not enforced", "ca"); } },
+    { id: "EIDSCA.AM10", title: "Authenticator number matching is required", level: "High", assess(d) {
+      const c = _amCfg(d, "MicrosoftAuthenticator"); if (!c) return _cisNa("Authentication methods policy not collected");
+      const s = c.featureSettings && c.featureSettings.numberMatchingRequiredState && c.featureSettings.numberMatchingRequiredState.state;
+      if (s == null) return _cisNa("Number-matching setting not present (enforced by Microsoft since 2023)");
+      return s === "enabled" ? _cisPass("Authenticator number matching is required") : _cisFail("Authenticator number matching is not required", "ca"); } },
+    { id: "EIDSCA.AM02", title: "Authenticator shows application name in push", level: "Medium", assess(d) {
+      const c = _amCfg(d, "MicrosoftAuthenticator"); if (!c) return _cisNa("Authentication methods policy not collected");
+      const s = c.featureSettings && c.featureSettings.displayAppInformationRequiredState && c.featureSettings.displayAppInformationRequiredState.state;
+      if (s == null) return _cisNa("Setting not present");
+      return s === "enabled" ? _cisPass("Application name shown in Authenticator prompts") : _cisFail("Application name not shown in Authenticator prompts", "ca"); } },
+    { id: "EIDSCA.AM03", title: "Authenticator shows geographic location in push", level: "Medium", assess(d) {
+      const c = _amCfg(d, "MicrosoftAuthenticator"); if (!c) return _cisNa("Authentication methods policy not collected");
+      const s = c.featureSettings && c.featureSettings.displayLocationInformationRequiredState && c.featureSettings.displayLocationInformationRequiredState.state;
+      if (s == null) return _cisNa("Setting not present");
+      return s === "enabled" ? _cisPass("Geographic location shown in Authenticator prompts") : _cisFail("Geographic location not shown in Authenticator prompts", "ca"); } },
+    { id: "EIDSCA.AS04", title: "SMS is disabled as an authentication method", level: "Medium", assess(d) {
+      const on = _amOn(d, "Sms"); if (on == null) return _cisNa("Authentication methods policy not collected");
+      return on ? _cisFail("SMS is enabled — disable this phishable method", "ca") : _cisPass("SMS authentication method is disabled"); } },
+    { id: "EIDSCA.AV01", title: "Voice call is disabled as an authentication method", level: "Medium", assess(d) {
+      const on = _amOn(d, "Voice"); if (on == null) return _cisNa("Authentication methods policy not collected");
+      return on ? _cisFail("Voice call is enabled — disable this phishable method", "ca") : _cisPass("Voice call authentication method is disabled"); } },
+    { id: "EIDSCA.AT02", title: "Temporary Access Pass is single-use", level: "Medium", assess(d) {
+      const c = _amCfg(d, "TemporaryAccessPass"); if (!c) return _cisNa("Authentication methods policy not collected");
+      if (c.state !== "enabled") return _cisNa("TAP not enabled — not applicable");
+      return c.isUsableOnce ? _cisPass("Temporary Access Pass is single-use") : _cisFail("Temporary Access Pass allows reuse — set to one-time use", "ca"); } },
+    { id: "EIDSCA.AP10", title: "Only administrators can register applications", level: "High", assess(d) {
+      const p = _authz(d); if (!p) return _cisNa("Authorization policy not collected");
+      const v = p.defaultUserRolePermissions && p.defaultUserRolePermissions.allowedToCreateApps;
+      if (v == null) return _cisNa("Setting not present");
+      return v === false ? _cisPass("Users cannot register applications") : _cisFail("Any user can register applications — restrict to admins", "workload"); } },
+    { id: "EIDSCA.AP05", title: "Email-based subscription sign-up is blocked", level: "Medium", assess(d) {
+      const p = _authz(d); if (!p) return _cisNa("Authorization policy not collected");
+      const v = p.allowedToSignUpEmailBasedSubscriptions;
+      if (v == null) return _cisNa("Setting not present");
+      return v === false ? _cisPass("Email-based subscription sign-up is blocked") : _cisFail("Email-based subscription sign-up is allowed — block self-service sign-up"); } },
+    { id: "EIDSCA.AP06", title: "Email-verified users cannot self-join the tenant", level: "Medium", assess(d) {
+      const p = _authz(d); if (!p) return _cisNa("Authorization policy not collected");
+      const v = p.allowEmailVerifiedUsersToJoinOrganization;
+      if (v == null) return _cisNa("Setting not present");
+      return v === false ? _cisPass("Email-verified users cannot self-join") : _cisFail("Email-verified users can self-join the tenant — disable"); } },
+    { id: "EIDSCA.AP04", title: "Guest invitations are restricted", level: "High", assess(d) {
+      const p = _authz(d); if (!p) return _cisNa("Authorization policy not collected");
+      const v = p.allowInvitesFrom;
+      if (v == null) return _cisNa("Setting not present");
+      return v !== "everyone" ? _cisPass("Guest invitations restricted (" + v + ")") : _cisFail("Anyone can invite guests (allowInvitesFrom = everyone) — restrict to admins / guest inviters", "external"); } },
+    { id: "EIDSCA.AP09", title: "User consent to applications is restricted", level: "High", assess(d) {
+      const p = _authz(d); if (!p) return _cisNa("Authorization policy not collected");
+      const g = p.defaultUserRolePermissions && p.defaultUserRolePermissions.permissionGrantPoliciesAssigned;
+      if (!Array.isArray(g)) return _cisNa("Setting not present");
+      const legacy = g.some(x => /default-legacy/i.test(String(x)));
+      return legacy ? _cisFail("Users can consent to apps broadly (legacy user-consent policy) — restrict to verified publishers / low-risk permissions", "workload")
+                    : _cisPass("User consent is restricted (no legacy allow-all policy)"); } }
+  ];
   // Framework registry — the engine is catalog-driven, so a framework is just its
   // controls plus how the page labels itself. Add one here; nothing else changes.
   const CMPL_FRAMEWORKS = {
-    cis:   { label: "CIS · Microsoft 365", noun: "CIS controls",  benchmark: "the CIS Microsoft 365 Benchmark",                 controls: CIS_CONTROLS },
-    scuba: { label: "SCuBA · M365",        noun: "SCuBA policies", benchmark: "CISA's SCuBA Microsoft 365 (Entra ID) baseline", controls: SCUBA_CONTROLS }
+    cis:    { label: "CIS · Microsoft 365", noun: "CIS controls",       benchmark: "the CIS Microsoft 365 Benchmark",                                 controls: CIS_CONTROLS },
+    scuba:  { label: "CISA · M365",         noun: "CISA SCuBA policies", benchmark: "CISA's SCuBA Microsoft 365 (Entra ID) baseline",                   controls: SCUBA_CONTROLS },
+    eidsca: { label: "EIDSCA · Entra",      noun: "EIDSCA checks",       benchmark: "the Maester EIDSCA baseline (Entra ID Security Config Analyzer)",  controls: EIDSCA_CONTROLS }
   };
-  let _cmplFw = (function () { try { return localStorage.getItem("ep_cmpl_fw") === "scuba" ? "scuba" : "cis"; } catch (e) { return "cis"; } })();
+  let _cmplFw = (function () { try { const f = localStorage.getItem("ep_cmpl_fw"); return (f === "scuba" || f === "eidsca") ? f : "cis"; } catch (e) { return "cis"; } })();
   function cisAssess(data, controls) {
     const rows = (controls || CIS_CONTROLS).map(c => {
       let r; try { r = c.assess(data); } catch (e) { r = _cisNa("could not assess"); }
@@ -4358,27 +4433,61 @@ window.EP = (function () {
       + '<div class="cis-main"><div class="cis-title">' + esc(r.title) + '</div><div class="cis-ev">' + esc(r.evidence) + '</div></div>'
       + '<div class="cis-rt">' + pill + fix + '</div></div>';
   }
-  let _cisState = null, _cisBusy = false, _cisWired = false, _cisRetried = 0;
+  let _cisState = null, _cisBusy = false, _cisWired = false, _cisRetried = 0, _cmplRowFilter = null;
   function paintCompliance(st) {
     const host = document.getElementById("view-compliance"); if (!host) return;
     const fw = CMPL_FRAMEWORKS[_cmplFw] || CMPL_FRAMEWORKS.cis;
     const a = cisAssess(st.data, fw.controls), order = { fail: 0, pass: 1, na: 2 };
-    const rows = a.rows.slice().sort((x, y) => order[x.status] - order[y.status]);
+    const allRows = a.rows.slice().sort((x, y) => order[x.status] - order[y.status]);
+    const rows = _cmplRowFilter ? allRows.filter(r => r.status === _cmplRowFilter) : allRows;
+    // A clickable KPI tile — filter the control list to that status; click again to clear.
+    const kpi = (key, label, n, cls) => '<div class="cis-kpi' + (_cmplRowFilter === key ? ' sel' : '') + '" data-cmplrf="' + key + '" style="cursor:pointer" title="Show only the ' + label.toLowerCase() + ' controls (click again to clear)">'
+      + '<div class="cis-kpi-l">' + label + '</div><div class="cis-kpi-n ' + cls + '">' + n + '</div></div>';
     const chip = key => '<span class="' + (_cmplFw === key ? 'cis-fw-on' : 'cis-fw-off') + '" data-cmplfw="' + key + '" style="cursor:pointer" title="Assess against ' + esc(CMPL_FRAMEWORKS[key].benchmark) + '">' + esc(CMPL_FRAMEWORKS[key].label) + '</span>';
     let h = '<div class="cis-head"><div class="cis-h-l"><h2>Compliance</h2>'
-      + '<div class="cis-fw">' + chip("cis") + chip("scuba") + '</div></div>'
+      + '<div class="cis-fw">' + chip("cis") + chip("scuba") + chip("eidsca") + '</div></div>'
       + '<button class="cis-refresh" id="cisRefresh" title="Re-assess from the latest scan">&#x21bb; Re-assess</button></div>';
     h += '<div class="cis-top">' + cisRing(a.score)
       + '<div class="cis-kpis">'
-      + '<div class="cis-kpi"><div class="cis-kpi-l">Passed</div><div class="cis-kpi-n pass">' + a.passed + '</div></div>'
-      + '<div class="cis-kpi"><div class="cis-kpi-l">Failed</div><div class="cis-kpi-n fail">' + a.failed + '</div></div>'
-      + '<div class="cis-kpi"><div class="cis-kpi-l">Not assessed</div><div class="cis-kpi-n na">' + a.na + '</div></div>'
+      + kpi("pass", "Passed", a.passed, "pass")
+      + kpi("fail", "Failed", a.failed, "fail")
+      + kpi("na", "Not assessed", a.na, "na")
       + '</div><div class="cis-blurb">' + esc(cisDeterministic(a, fw.noun)) + '</div></div>';
-    h += '<div class="cis-sub">Controls · ' + a.assessed + ' assessed · aligned to ' + esc(fw.benchmark) + '</div>';
-    h += '<div class="cis-list">' + rows.map(cisRowHtml).join("") + '</div>';
+    const _rfLabel = { pass: "passed", fail: "failed", na: "not-assessed" };
+    h += '<div class="cis-sub">Controls · ' + a.assessed + ' assessed · aligned to ' + esc(fw.benchmark)
+      + (_cmplRowFilter ? ' · <span data-cmplrf="' + _cmplRowFilter + '" style="color:var(--accent-dark);cursor:pointer">showing ' + rows.length + ' ' + _rfLabel[_cmplRowFilter] + ' · clear ✕</span>' : '') + '</div>';
+    h += '<div class="cis-list">' + (rows.length ? rows.map(cisRowHtml).join("")
+      : '<div style="padding:16px;color:var(--muted);font-size:13px">No ' + _rfLabel[_cmplRowFilter] + ' controls.</div>') + '</div>';
     h += '<div class="cis-foot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3" stroke-linecap="round"/></svg>'
       + 'Read-only — every status is computed from this scan; nothing is enforced. Controls needing scopes we don’t collect are marked N / A, never passed.</div>';
     host.innerHTML = h;
+  }
+  // Fetch the EIDSCA-relevant Graph config once for the compliance assessment. Read-only
+  // (Policy.Read.All, which we already request); returns null silently if not granted, so
+  // the EIDSCA checks degrade to N/A rather than failing or raising a consent dialog.
+  async function _eidGraph(path) {
+    try { const tok = await tokenOptional(["Policy.Read.All"]); if (!tok) return null;
+      const r = await fetch(graphBase() + path, { headers: { Authorization: "Bearer " + tok } });
+      return r.ok ? await r.json() : null;
+    } catch (e) { return null; }
+  }
+  async function _eidscaConfig() {
+    if (DEMO) return _eidscaDemo();
+    if (!msalInstance || !account) return null;
+    return { authMethods: await _eidGraph("/policies/authenticationMethodsPolicy"), authzPolicy: await _eidGraph("/policies/authorizationPolicy") };
+  }
+  function _eidscaDemo() {
+    return {
+      authMethods: { authenticationMethodConfigurations: [
+        { id: "Fido2", state: "enabled", isAttestationEnforced: false, keyRestrictions: { isEnforced: false } },
+        { id: "MicrosoftAuthenticator", state: "enabled", featureSettings: { numberMatchingRequiredState: { state: "enabled" }, displayAppInformationRequiredState: { state: "disabled" }, displayLocationInformationRequiredState: { state: "disabled" } } },
+        { id: "Sms", state: "enabled" },
+        { id: "Voice", state: "disabled" },
+        { id: "TemporaryAccessPass", state: "enabled", isUsableOnce: false }
+      ] },
+      authzPolicy: { allowInvitesFrom: "everyone", allowedToSignUpEmailBasedSubscriptions: true, allowEmailVerifiedUsersToJoinOrganization: false,
+        defaultUserRolePermissions: { allowedToCreateApps: true, allowedToReadOtherUsers: true, permissionGrantPoliciesAssigned: ["ManagePermissionGrantsForSelf.microsoft-user-default-legacy"] } }
+    };
   }
   async function renderCompliance(force) {
     const host = document.getElementById("view-compliance"); if (!host) return;
@@ -4389,6 +4498,8 @@ window.EP = (function () {
         if (fwEl) { const k = fwEl.getAttribute("data-cmplfw");
           if (CMPL_FRAMEWORKS[k] && k !== _cmplFw) { _cmplFw = k; try { localStorage.setItem("ep_cmpl_fw", k); } catch (_) {} if (_cisState) paintCompliance(_cisState); }
           return; }
+        const rfEl = e.target.closest("[data-cmplrf]");
+        if (rfEl) { const k = rfEl.getAttribute("data-cmplrf"); _cmplRowFilter = (_cmplRowFilter === k) ? null : k; if (_cisState) paintCompliance(_cisState); return; }
         const el = e.target.closest("[data-cisgo]"); if (!el) return;
         const fj = el.getAttribute("data-cisfocus"); let f = null; if (fj) { try { f = JSON.parse(fj); } catch (_) {} }
         goto(el.getAttribute("data-cisgo"), f);
@@ -4402,6 +4513,7 @@ window.EP = (function () {
     try {
       const data = await gatherReport();
       if (DEMO && !(data.user && data.ca) && _cisRetried < 4) { _cisRetried++; _cisBusy = false; setTimeout(() => renderCompliance(true), 500); return; }
+      try { data.eidsca = await _eidscaConfig(); } catch (e) { data.eidsca = null; }
       _cisState = { data, assess: cisAssess(data) };
       paintCompliance(_cisState);
     } catch (e) { host.innerHTML = '<div class="ov-err">Could not assess compliance — ' + esc(e.message || e) + '</div>'; }
