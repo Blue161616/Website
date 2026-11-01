@@ -3859,7 +3859,10 @@ window.EP = (function () {
         headers: { "Content-Type": "application/json", "x-api-key": llm.key("anthropic"), "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
         body: JSON.stringify({ model, max_tokens: o.max_tokens || 1024, system, messages: [{ role: "user", content: user }] }) });   // no temperature: current Claude models (Haiku 5.5 etc.) 400 on it; they decide depth themselves
       if (!r.ok) throw new Error("Anthropic " + r.status + ": " + (await r.text()).slice(0, 180));
-      const j = await r.json(); return (j.content && j.content[0] && j.content[0].text) || "";
+      const j = await r.json();
+      // Current Claude models think first: content[0] is a (usually empty) thinking
+      // block and the answer is in a later text block — collect every text block.
+      return ((j.content || []).filter(b => b && b.type === "text").map(b => b.text || "").join("")) || "";
     }
     if (p === "openai") {
       if (!llm.key("openai")) throw new Error("No OpenAI API key set.");
@@ -3919,6 +3922,7 @@ window.EP = (function () {
     const u = $("epCfgUrl"); if (u && p === "ollama") localStorage.setItem("ep_llm_ollama_url", u.value.trim());
     const k = $("epCfgKey"); if (k && (p === "anthropic" || p === "openai")) localStorage.setItem("ep_llm_key_" + p, k.value);
     cfgDraft = {};
+    try { window.dispatchEvent(new CustomEvent('ep:cfg')); } catch (e) {}   // let open views refresh their AI-status lines
   }
   async function cfgTest() {
     cfgSave();
@@ -4133,8 +4137,70 @@ window.EP = (function () {
     { id: "6.1.2", title: "Sign-in and audit log retention", level: "L1", assess() {
       return _cisNa("Requires AuditLog.Read.All and sign-in logs — not collected"); } }
   ];
-  function cisAssess(data) {
-    const rows = CIS_CONTROLS.map(c => {
+  // Catalog aligned to CISA's SCuBA Microsoft 365 Secure Configuration Baseline for
+  // Microsoft Entra ID (the MS.AAD policies, group version as published). Same engine
+  // as CIS — each policy reads the gathered summaries → a deterministic PASS / FAIL /
+  // N-A. Policies that need tenant settings or logs we don't read (consent config,
+  // password expiry, SIEM forwarding, PIM alerts) are N/A, never passed. SHALL is
+  // mandatory, SHOULD advised.
+  const SCUBA_CONTROLS = [
+    { id: "MS.AAD.1.1v1", title: "Legacy authentication SHALL be blocked", level: "SHALL", assess(d) {
+      const t = d.ca && d.ca.totals; if (!t) return _cisNa("Conditional Access not collected");
+      return t.legacyBlocked ? _cisPass("An enabled CA policy blocks legacy authentication") : _cisFail("Legacy authentication is not blocked", "ca"); } },
+    { id: "MS.AAD.2.1v1", title: "Users detected as high risk SHALL be blocked", level: "SHALL", assess(d) {
+      const t = d.ca && d.ca.totals; if (!t) return _cisNa("Conditional Access not collected");
+      return t.riskBased ? _cisPass("A risk-based CA policy is enforced") : _cisFail("No risk-based CA policy blocks high-risk users — requires Entra ID P2", "ca"); } },
+    { id: "MS.AAD.2.3v1", title: "Sign-ins detected as high risk SHALL be blocked", level: "SHALL", assess(d) {
+      const t = d.ca && d.ca.totals; if (!t) return _cisNa("Conditional Access not collected");
+      return t.riskBased ? _cisPass("A risk-based CA policy is enforced") : _cisFail("No risk-based CA policy blocks high-risk sign-ins — requires Entra ID P2", "ca"); } },
+    { id: "MS.AAD.3.2v2", title: "MFA SHALL be enforced for all users", level: "SHALL", assess(d) {
+      const t = d.ca && d.ca.totals; if (!t) return _cisNa("Conditional Access not collected");
+      return t.mfaAllUsers ? _cisPass("An enforced CA policy requires MFA for all users") : _cisFail("No enforced CA policy requires MFA for all users", "ca"); } },
+    { id: "MS.AAD.3.1v1", title: "Phishing-resistant MFA SHALL be enforced for all users", level: "SHALL", assess(d) {
+      const t = d.ca && d.ca.totals, w = _cisNum(d.user && d.user.totals, "weakNoMfa");
+      if (!t && w == null) return _cisNa("Conditional Access and Users not collected");
+      if (t && !t.mfaAllUsers) return _cisFail("MFA is not enforced for all users — it cannot be phishing-resistant", "ca");
+      if (w != null && w > 0) return _cisFail(w + " account" + (w === 1 ? "" : "s") + " use weak or no MFA — not phishing-resistant", "user");
+      return _cisNa("MFA enforced for all; the phishing-resistance of the methods in use isn't collected"); } },
+    { id: "MS.AAD.3.5v2", title: "Weak MFA methods (SMS, voice, email OTP) SHALL be disabled", level: "SHALL", assess(d) {
+      const w = _cisNum(d.user && d.user.totals, "weakNoMfa"); if (w == null) return _cisNa("Users not collected");
+      const a = _cisNum(d.user && d.user.totals, "accounts");
+      return w === 0 ? _cisPass("No accounts rely on weak MFA methods") : _cisFail(w + (a ? " of " + a : "") + " accounts rely on weak or no MFA", "user"); } },
+    { id: "MS.AAD.3.6v1", title: "Phishing-resistant MFA SHALL be required for highly privileged roles", level: "SHALL", assess(d) {
+      const t = d.ca && d.ca.totals; if (!t) return _cisNa("Conditional Access not collected");
+      if (!t.mfaAdmins) return _cisFail("No enforced CA policy requires MFA for admin roles", "ca");
+      const nc = _cisNum(d.user && d.user.totals, "notCovered");
+      if (nc && nc > 0) return _cisFail(nc + " privileged accounts fall outside enforced MFA", "user", { ask: "users admin notenforced" });
+      return _cisNa("Privileged MFA enforced; the phishing-resistance of the methods isn't collected"); } },
+    { id: "MS.AAD.5.2v1", title: "User consent to applications SHALL be restricted", level: "SHALL", assess(d) {
+      const c = _cisNum(d.workload && d.workload.counts, "critical");
+      if (c == null) return _cisNa("App consent settings not collected");
+      return c > 0 ? _cisFail(c + " application(s) hold tenant-takeover-class permissions — consent is too permissive", "workload")
+                   : _cisNa("No tenant-takeover-class app permissions seen; the consent setting itself isn't collected"); } },
+    { id: "MS.AAD.6.1v1", title: "User passwords SHALL NOT expire", level: "SHALL", assess() {
+      return _cisNa("Requires the tenant password-expiry policy — not collected"); } },
+    { id: "MS.AAD.7.1v1", title: "Two to eight users SHALL hold the Global Administrator role", level: "SHALL", assess(d) {
+      const g = _cisNum(d.user && d.user.totals, "globalAdmins"); if (g == null) return _cisNa("Users not collected");
+      return (g >= 2 && g <= 8) ? _cisPass(g + " Global Administrators (SCuBA target 2–8)") : _cisFail(g + " Global Administrators (SCuBA target 2–8)", "user"); } },
+    { id: "MS.AAD.7.4v1", title: "Permanent active assignments SHALL NOT be allowed for privileged roles", level: "SHALL", assess(d) {
+      const s = _cisNum(d.user && d.user.totals, "standingTier0"); if (s == null) return _cisNa("Users not collected");
+      return s === 0 ? _cisPass("No permanent standing Tier-0 admins — eligible (PIM) in use") : _cisFail(s + " standing Tier-0 admins — move to eligible (PIM)", "user"); } },
+    { id: "MS.AAD.4.1v1", title: "Security logs SHALL be sent to the SOC for monitoring", level: "SHALL", assess() {
+      return _cisNa("Requires sign-in / audit log forwarding config — not collected"); } },
+    { id: "MS.AAD.8.1v1", title: "Guest users SHOULD have restricted directory access", level: "SHOULD", assess(d) {
+      if (!d.external) return _cisNa("External Access is live-only — sign in to assess");
+      const crit = (d.external.counts && d.external.counts.critical) || 0;
+      return crit ? _cisFail(crit + " critical external-access finding(s) — guests / GDAP / consent", "external") : _cisPass("No critical external-access findings"); } }
+  ];
+  // Framework registry — the engine is catalog-driven, so a framework is just its
+  // controls plus how the page labels itself. Add one here; nothing else changes.
+  const CMPL_FRAMEWORKS = {
+    cis:   { label: "CIS · Microsoft 365", noun: "CIS controls",  benchmark: "the CIS Microsoft 365 Benchmark",                 controls: CIS_CONTROLS },
+    scuba: { label: "SCuBA · M365",        noun: "SCuBA policies", benchmark: "CISA's SCuBA Microsoft 365 (Entra ID) baseline", controls: SCUBA_CONTROLS }
+  };
+  let _cmplFw = (function () { try { return localStorage.getItem("ep_cmpl_fw") === "scuba" ? "scuba" : "cis"; } catch (e) { return "cis"; } })();
+  function cisAssess(data, controls) {
+    const rows = (controls || CIS_CONTROLS).map(c => {
       let r; try { r = c.assess(data); } catch (e) { r = _cisNa("could not assess"); }
       return Object.assign({ id: c.id, title: c.title, level: c.level }, r);
     });
@@ -4144,9 +4210,9 @@ window.EP = (function () {
     const assessed = passed + failed;
     return { rows, passed, failed, na, assessed, score: assessed ? Math.round(passed / assessed * 100) : null };
   }
-  function cisDeterministic(a) {
+  function cisDeterministic(a, noun) {
     if (a.score == null) return "No controls could be assessed — collect at least one domain first.";
-    return "You meet " + a.passed + " of " + a.assessed + " assessed CIS controls (" + a.score + "%). " +
+    return "You meet " + a.passed + " of " + a.assessed + " assessed " + (noun || "CIS controls") + " (" + a.score + "%). " +
       a.failed + " need attention" + (a.na ? "; " + a.na + " not assessable with current read scopes" : "") + ".";
   }
   function cisRing(pct) {
@@ -4172,18 +4238,20 @@ window.EP = (function () {
   let _cisState = null, _cisBusy = false, _cisWired = false, _cisRetried = 0;
   function paintCompliance(st) {
     const host = document.getElementById("view-compliance"); if (!host) return;
-    const a = st.assess, order = { fail: 0, pass: 1, na: 2 };
+    const fw = CMPL_FRAMEWORKS[_cmplFw] || CMPL_FRAMEWORKS.cis;
+    const a = cisAssess(st.data, fw.controls), order = { fail: 0, pass: 1, na: 2 };
     const rows = a.rows.slice().sort((x, y) => order[x.status] - order[y.status]);
+    const chip = key => '<span class="' + (_cmplFw === key ? 'cis-fw-on' : 'cis-fw-off') + '" data-cmplfw="' + key + '" style="cursor:pointer" title="Assess against ' + esc(CMPL_FRAMEWORKS[key].benchmark) + '">' + esc(CMPL_FRAMEWORKS[key].label) + '</span>';
     let h = '<div class="cis-head"><div class="cis-h-l"><h2>Compliance</h2>'
-      + '<div class="cis-fw"><span class="cis-fw-on">CIS · Microsoft 365</span><span class="cis-fw-off" title="SCuBA catalog coming — same engine, different controls">SCuBA</span></div></div>'
+      + '<div class="cis-fw">' + chip("cis") + chip("scuba") + '</div></div>'
       + '<button class="cis-refresh" id="cisRefresh" title="Re-assess from the latest scan">&#x21bb; Re-assess</button></div>';
     h += '<div class="cis-top">' + cisRing(a.score)
       + '<div class="cis-kpis">'
       + '<div class="cis-kpi"><div class="cis-kpi-l">Passed</div><div class="cis-kpi-n pass">' + a.passed + '</div></div>'
       + '<div class="cis-kpi"><div class="cis-kpi-l">Failed</div><div class="cis-kpi-n fail">' + a.failed + '</div></div>'
       + '<div class="cis-kpi"><div class="cis-kpi-l">Not assessed</div><div class="cis-kpi-n na">' + a.na + '</div></div>'
-      + '</div><div class="cis-blurb">' + esc(cisDeterministic(a)) + '</div></div>';
-    h += '<div class="cis-sub">Controls · ' + a.assessed + ' assessed · aligned to the CIS Microsoft 365 Benchmark</div>';
+      + '</div><div class="cis-blurb">' + esc(cisDeterministic(a, fw.noun)) + '</div></div>';
+    h += '<div class="cis-sub">Controls · ' + a.assessed + ' assessed · aligned to ' + esc(fw.benchmark) + '</div>';
     h += '<div class="cis-list">' + rows.map(cisRowHtml).join("") + '</div>';
     h += '<div class="cis-foot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3" stroke-linecap="round"/></svg>'
       + 'Read-only — every status is computed from this scan; nothing is enforced. Controls needing scopes we don’t collect are marked N / A, never passed.</div>';
@@ -4194,6 +4262,10 @@ window.EP = (function () {
     if (!_cisWired) {
       host.addEventListener("click", e => {
         if (e.target.closest("#cisRefresh")) { renderCompliance(true); return; }
+        const fwEl = e.target.closest("[data-cmplfw]");
+        if (fwEl) { const k = fwEl.getAttribute("data-cmplfw");
+          if (CMPL_FRAMEWORKS[k] && k !== _cmplFw) { _cmplFw = k; try { localStorage.setItem("ep_cmpl_fw", k); } catch (_) {} if (_cisState) paintCompliance(_cisState); }
+          return; }
         const el = e.target.closest("[data-cisgo]"); if (!el) return;
         const fj = el.getAttribute("data-cisfocus"); let f = null; if (fj) { try { f = JSON.parse(fj); } catch (_) {} }
         goto(el.getAttribute("data-cisgo"), f);
@@ -5576,6 +5648,7 @@ EP.registerView("ask", (function () {
       hero.classList.remove("scanning"); void hero.offsetWidth; hero.classList.add("scanning");
       hero.addEventListener("animationend", function onEnd(e) { if (e.animationName === "ask-scan") { hero.classList.remove("scanning"); hero.removeEventListener("animationend", onEnd); } });
     });
+    window.addEventListener("ep:cfg", updateAiState);      // keep the AI-translation line in step with Configuration
   }
   function renderAskPage() {
     const r = $("results"); if (r) r.classList.remove("hidden");
