@@ -6380,6 +6380,16 @@ async function analyze() {
 }
 
 const STALE_DAYS = 90;
+// ── Break-The-Glass marks — a LOCAL, read-only designation (nothing is written to the
+// tenant). An operator verifies an emergency-access account here; scoring then treats its
+// Conditional Access exclusion and dormancy as expected rather than as findings. Stored in
+// the browser, per tenant.
+function _bgKey() { var t = ""; try { t = (window.EP && EP.ACCOUNT && EP.ACCOUNT.tenantId) || ""; } catch (e) {} return "ep_bg_" + (t || "default"); }
+function _bgSet() { try { return new Set(JSON.parse(localStorage.getItem(_bgKey()) || "[]")); } catch (e) { return new Set(); } }
+function _bgMarked(u) { try { return _bgSet().has(String((u && (u.id || u.upn)) || "")); } catch (e) { return false; } }
+function _bgToggle(key) { var s = _bgSet(); key = String(key); if (s.has(key)) s.delete(key); else s.add(key); try { localStorage.setItem(_bgKey(), JSON.stringify(Array.from(s))); } catch (e) {} }
+function _rescore() { (MODEL.users || []).forEach(function (u) { computeUserFlags(u); u.posture = userRisk(u); u.postureTier = postureTier(u.posture); }); try { computeStats(); } catch (e) {} try { render(); } catch (e) {} }
+function _bgMark(key) { _bgToggle(key); _rescore(); }
 function computeUserFlags(u) {
   // Split WRITE admin roles from READ-ONLY roles (Global Reader, Directory Readers, …). A standing read-only role is
   // broad VISIBILITY, not control — far less risky than a standing write admin — so the "standing"/"admin" risk
@@ -6392,9 +6402,10 @@ function computeUserFlags(u) {
   // in if CA/MFA breaks), so they must not be counted as an MFA coverage gap. Detect by name OR — since break-glass
   // is often an unnamed account — by the canonical config: a PERMANENT (standing) cloud-only Global Administrator
   // explicitly excluded from the enforcing MFA policy. P2 can still monitor them via Identity Protection.
-  const _bgName = /break[\s_-]*glass|emergenc|firecall|b-?g-?admin/i.test((u.name || "") + " " + (u.upn || ""));
+  const _bgName = /\bbtg\b|break[\s_-]*(the[\s_-]*)?glass|emergenc|firecall|b-?g-?admin/i.test((u.name || "") + " " + (u.upn || ""));
   const _permGA = u.writeRoles.some((r) => r.name === "Global Administrator" && r.kind === "active");
-  u.breakGlass = _bgName || (_permGA && !u.onPrem && u.caCovered === "excluded");
+  u.breakGlassManual = _bgMarked(u);
+  u.breakGlass = u.breakGlassManual || _bgName || (_permGA && !u.onPrem && u.caCovered === "excluded");
   u.hasWriteRole = u.writeRoles.length > 0;          // holds a role that can CHANGE things — drives the heavy weighting
   u.readOnlyAdmin = !u.hasWriteRole && u.readRoles.length > 0;   // only read-only role(s)
   u.isTier0 = u.writeRoles.some((r) => r.tier === 0);           // Tier-0 = GA-class WRITE role (readers are never tier 0)
@@ -6429,12 +6440,18 @@ function userRisk(u) {
     else if (u.mfa.level === "weak") { d.mfa += u.hasWriteRole ? 16 : 8; reasons.push({ sev: u.hasWriteRole ? "high" : "medium", t: (u.hasWriteRole ? "Admin with " : "") + "weak MFA only — phishable" }); }
   }
   // (1b) MFA & auth posture — CA enforcement (privileged)
-  if (u.caCovered === "excluded") { d.mfa += 22; reasons.push({ sev: "critical", t: "Excluded from the enforcing MFA Conditional Access policy" }); }
+  if (u.caCovered === "excluded") {
+    if (u.breakGlass) reasons.push({ sev: "low", t: "Break-glass — excluded from the MFA Conditional Access policy (expected" + (u.breakGlassManual ? ", marked verified" : ", auto-detected") + "). Keep phishing-resistant MFA and sign-in alerting." });
+    else { d.mfa += 22; reasons.push({ sev: "critical", t: "Excluded from the enforcing MFA Conditional Access policy" }); }
+  }
   else if (u.caCovered === false) { d.mfa += 20; reasons.push({ sev: "critical", t: "Not covered by any enforcing MFA Conditional Access policy" }); }
   else if (u.caCovered === "reportonly") { d.mfa += 12; reasons.push({ sev: "high", t: "Only a report-only MFA policy applies — nothing enforced" }); }
   // (2) Privileged access. An eligible role whose activation requires APPROVAL is less trivially abusable than one that
   // self-activates (an attacker with the account still needs an approver to say yes), so it scores below plain eligible.
-  if (u.isTier0) {
+  if (u.isTier0 && u.breakGlass) {
+    d.priv += 6;   // a break-glass Global Admin is standing BY DESIGN — residual target risk only, not a misconfiguration
+    reasons.push({ sev: "low", t: "Tier-0 Global Admin — standing by design for a break-glass account; keep credentials offline and alert on every sign-in." });
+  } else if (u.isTier0) {
     const pts = u.standingWrite ? 30 : (u.approvalGated ? 12 : 18);
     d.priv += pts;
     reasons.push({ sev: u.standingWrite ? "critical" : (u.approvalGated ? "high" : "critical"),
@@ -6454,7 +6471,10 @@ function userRisk(u) {
   // (3) Identity Protection risk
   if (u.risk) { const rl = u.risk.level; d.risk += rl === "high" ? 25 : rl === "medium" ? 14 : rl === "low" ? 6 : 8; reasons.push({ sev: rl === "high" ? "critical" : rl === "medium" ? "high" : "medium", t: "Identity Protection risk: " + rl + " (" + u.risk.state + ")" }); }
   // (4) Account hygiene
-  if (u.stale) { d.hygiene += u.hasWriteRole ? 12 : 6; reasons.push({ sev: u.hasWriteRole ? "high" : "medium", t: u.lastSignIn ? "Stale — no sign-in in " + u.staleDays + " days" : "Enabled but never signed in" }); }
+  if (u.stale) {
+    if (u.breakGlass) reasons.push({ sev: "low", t: "Dormant — expected for a break-glass account (used only in emergencies); ensure sign-in alerting is in place." });
+    else { d.hygiene += u.hasWriteRole ? 12 : 6; reasons.push({ sev: u.hasWriteRole ? "high" : "medium", t: u.lastSignIn ? "Stale — no sign-in in " + u.staleDays + " days" : "Enabled but never signed in" }); }
+  }
   if (u.pwdNeverExpires) { d.hygiene += 4; reasons.push({ sev: "medium", t: "Password set to never expire" }); }
   if (u.onPrem && u.hasWriteRole) { d.hygiene += 4; reasons.push({ sev: "medium", t: "Privileged account is synced from on-premises (hybrid attack surface)" }); }
   let total = d.mfa + d.priv + d.hygiene + d.risk;
@@ -7247,7 +7267,8 @@ function userDetailHtml(u) {
   else if (u.standingWrite) rem.push("Move the permanent privileged assignment to PIM-eligible (just-in-time) where the role permits.");
   else if (u.standingRead) rem.push("Standing read-only role (e.g. Global Reader) — lower priority, but move to PIM-eligible if the broad read access isn't needed permanently.");
   if (u.risk) rem.push("Investigate and remediate the Identity Protection risk (" + escapeHtml(u.risk.level) + " · " + escapeHtml(u.risk.state) + ") — confirm compromise or dismiss as safe.");
-  if (u.stale && u.enabled) rem.push(u.lastSignIn ? "Review whether this stale account (no sign-in in " + u.staleDays + " days) should be disabled or deleted." : "Review this enabled-but-never-signed-in account — disable or delete if unused.");
+  if (u.breakGlass) rem.push("Break-glass account — keep it excluded from Conditional Access with phishing-resistant MFA, store its credentials offline, and alert on every sign-in. Verify it's a legitimate emergency-access account, not an attacker backdoor named to blend in.");
+  else if (u.stale && u.enabled) rem.push(u.lastSignIn ? "Review whether this stale account (no sign-in in " + u.staleDays + " days) should be disabled or deleted." : "Review this enabled-but-never-signed-in account — disable or delete if unused.");
   if (u.pwdNeverExpires) rem.push("Remove the DisablePasswordExpiration policy unless there is a documented reason.");
   if (!rem.length) rem.push("No standout remediation — maintain phishing-resistant MFA and least-privilege.");
   const rolesFull = u.roles.length
@@ -7260,10 +7281,13 @@ function userDetailHtml(u) {
   facts.push("Last sign-in: " + (u.lastSignIn ? new Date(u.lastSignIn).toISOString().slice(0, 19).replace("T", " ") : (u.enabled ? "never" : "—")));
   facts.push("Source: " + (u.onPrem ? "on-premises synced" : "cloud-only"));
   if (u.risk) facts.push("Identity Protection: " + escapeHtml(u.risk.level) + " (" + escapeHtml(u.risk.state) + (u.risk.detail ? ", " + escapeHtml(u.risk.detail) : "") + ")");
+  facts.push("Break-glass: " + (u.breakGlass ? (u.breakGlassManual ? "<b>marked (verified)</b>" : "auto-detected") : "no"));
   return '<div class="dpanel">'
     + '<div class="dsec dsec-wide"><div class="dhead">Posture score ' + u.posture + ' (' + u.postureTier.toUpperCase() + ') — by dimension</div><div class="dimbars">' + dimBars + '</div><ul class="dlist">' + risk + '</ul></div>'
     + '<div class="dsec"><div class="dhead">Privileged roles</div>' + rolesFull + '</div>'
-    + '<div class="dsec"><div class="dhead">Account facts</div><ul class="dlist">' + facts.map((f) => "<li>" + f + "</li>").join("") + '</ul></div>'
+    + '<div class="dsec"><div class="dhead">Account facts</div><ul class="dlist">' + facts.map((f) => "<li>" + f + "</li>").join("") + '</ul>'
+    +   '<button type="button" data-bgmark="' + escapeHtml(String(u.id || u.upn)) + '" style="margin-top:9px;font-size:11px;cursor:pointer;background:' + (u.breakGlassManual ? "var(--accent,#2E86DE)" : "transparent") + ';color:' + (u.breakGlassManual ? "#fff" : "var(--accent,#2E86DE)") + ';border:1px solid var(--accent,#2E86DE);border-radius:6px;padding:4px 11px">' + (u.breakGlassManual ? "✓ Marked Break-The-Glass — unmark" : "🧯 Mark as Break-The-Glass") + '</button>'
+    +   '<div style="font-size:10px;color:var(--dim)">Local only — nothing is written to the tenant.</div></div>'
     + '<div class="dsec dsec-wide"><div class="dhead">Remediation</div><ul class="dlist">' + rem.map((x) => "<li>" + escapeHtml(x) + "</li>").join("") + '</ul></div>'
     + '</div>';
 }
@@ -7301,6 +7325,8 @@ $("fltSearch").addEventListener("input", () => { activeKpi = null; activeCard = 
 // is a dead control.
 document.addEventListener("click", (e) => {
   if (e.target.closest && e.target.closest("[data-grant]")) { grantOptional(); return; }
+  const _bgEl = e.target.closest && e.target.closest("[data-bgmark]");
+  if (_bgEl) { e.stopPropagation(); _bgMark(_bgEl.getAttribute("data-bgmark")); return; }
   if (!MODEL.users) return;
   const m = e.target.closest && e.target.closest(".facet-modes button");
   if (m) { facet[m.parentNode.getAttribute("data-mg")].mode = m.getAttribute("data-m"); activeKpi = null; activeCard = null; renderAll(); return; }
