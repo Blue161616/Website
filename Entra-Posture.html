@@ -4324,6 +4324,10 @@ window.EP = (function () {
   const _amCfg = (d, id) => { const a = d && d.eidsca && d.eidsca.authMethods && d.eidsca.authMethods.authenticationMethodConfigurations; return Array.isArray(a) ? a.find(c => String(c.id || "").toLowerCase() === id.toLowerCase()) : undefined; };
   const _amOn  = (d, id) => { const c = _amCfg(d, id); return c ? c.state === "enabled" : null; };   // null = config not collected
   const _authz = (d) => d && d.eidsca && d.eidsca.authzPolicy;
+  const _dirSet = (d, tpl) => { const a = d && d.eidsca && d.eidsca.settings && d.eidsca.settings.value; return Array.isArray(a) ? a.find(s => s.templateId === tpl) : undefined; };
+  const _dirVal = (d, tpl, name) => { const s = _dirSet(d, tpl); if (!s || !Array.isArray(s.values)) return null; const v = s.values.find(x => x.name === name); return v ? v.value : null; };
+  const _acr    = (d) => d && d.eidsca && d.eidsca.adminConsentReq;
+  const _PW_TPL = "5cf42378-d67d-4f36-ba46-e8b86229381d", _GRP_TPL = "62375ab9-6b52-47ed-826b-58e47e0e304b";
   const EIDSCA_CONTROLS = [
     { id: "EIDSCA.AF01", title: "FIDO2 security key method is enabled", level: "High", assess(d) {
       const on = _amOn(d, "Fido2"); if (on == null) return _cisNa("Authentication methods policy not collected");
@@ -4387,7 +4391,51 @@ window.EP = (function () {
       if (!Array.isArray(g)) return _cisNa("Setting not present");
       const legacy = g.some(x => /default-legacy/i.test(String(x)));
       return legacy ? _cisFail("Users can consent to apps broadly (legacy user-consent policy) — restrict to verified publishers / low-risk permissions", "workload")
-                    : _cisPass("User consent is restricted (no legacy allow-all policy)"); } }
+                    : _cisPass("User consent is restricted (no legacy allow-all policy)"); } },
+    // ── Phase 2 — auth-methods general, admin-consent workflow, password protection, groups ──
+    { id: "EIDSCA.AG01", title: "System-preferred MFA is enabled", level: "Medium", assess(d) {
+      const s = d && d.eidsca && d.eidsca.authMethods && d.eidsca.authMethods.systemCredentialPreferences && d.eidsca.authMethods.systemCredentialPreferences.state;
+      if (s == null) return _cisNa("Authentication methods policy not collected");
+      return s === "enabled" ? _cisPass("System-preferred MFA is enabled") : _cisFail("System-preferred MFA is not enabled — let Entra prompt the strongest method", "ca"); } },
+    { id: "EIDSCA.AG03", title: "Report suspicious activity is enabled", level: "Medium", assess(d) {
+      const s = d && d.eidsca && d.eidsca.authMethods && d.eidsca.authMethods.reportSuspiciousActivitySettings && d.eidsca.authMethods.reportSuspiciousActivitySettings.state;
+      if (s == null) return _cisNa("Authentication methods policy not collected");
+      return s === "enabled" ? _cisPass("Report suspicious activity is enabled") : _cisFail("Report suspicious activity is not enabled — let users flag fraud on MFA prompts", "ca"); } },
+    { id: "EIDSCA.AP07", title: "Guest users have restricted directory access", level: "Medium", assess(d) {
+      const p = _authz(d); if (!p) return _cisNa("Authorization policy not collected");
+      const g = p.guestUserRoleId; if (g == null) return _cisNa("Setting not present");
+      return g === "2af84b1e-32c8-42b7-82bc-daa82404023b" ? _cisPass("Guests have the most restrictive directory access")
+        : _cisFail("Guest access is broader than 'restricted' — set guest permissions to the most restrictive", "external"); } },
+    { id: "EIDSCA.CR01", title: "Admin consent request workflow is enabled", level: "Medium", assess(d) {
+      const a = _acr(d); if (!a) return _cisNa("Admin consent request policy not collected");
+      return a.isEnabled === true ? _cisPass("Admin consent request workflow is enabled") : _cisFail("Admin consent workflow is off — users can't request admin approval for apps", "workload"); } },
+    { id: "EIDSCA.CR02", title: "Admin consent request reviewers are notified", level: "Medium", assess(d) {
+      const a = _acr(d); if (!a) return _cisNa("Admin consent request policy not collected");
+      if (a.isEnabled !== true) return _cisNa("Admin consent workflow disabled — not applicable");
+      return a.notifyReviewers === true ? _cisPass("Reviewers are notified of consent requests") : _cisFail("Reviewers are not notified of consent requests", "workload"); } },
+    { id: "EIDSCA.CR04", title: "Admin consent requests expire within 30 days", level: "Medium", assess(d) {
+      const a = _acr(d); if (!a) return _cisNa("Admin consent request policy not collected");
+      if (a.isEnabled !== true) return _cisNa("Admin consent workflow disabled — not applicable");
+      const n = a.requestDurationInDays; if (n == null) return _cisNa("Setting not present");
+      return n <= 30 ? _cisPass("Consent requests expire in " + n + " days") : _cisFail("Consent requests stay open " + n + " days — reduce to 30 or fewer", "workload"); } },
+    { id: "EIDSCA.PR02", title: "On-premises password protection is enabled", level: "Medium", assess(d) {
+      const v = _dirVal(d, _PW_TPL, "EnableBannedPasswordCheckOnPremises"); if (v == null) return _cisNa("Password Rule Settings not configured");
+      return String(v) === "True" ? _cisPass("On-premises password protection is enabled") : _cisFail("On-premises password protection is disabled", "user"); } },
+    { id: "EIDSCA.PR01", title: "On-premises banned-password check is enforced", level: "Medium", assess(d) {
+      const v = _dirVal(d, _PW_TPL, "BannedPasswordCheckOnPremisesMode"); if (v == null) return _cisNa("Password Rule Settings not configured");
+      return String(v) === "Enforced" ? _cisPass("On-premises banned-password check is enforced") : _cisFail("On-premises banned-password check is in Audit, not Enforced", "user"); } },
+    { id: "EIDSCA.PR06", title: "Smart lockout threshold is 10 or fewer", level: "Medium", assess(d) {
+      const v = _dirVal(d, _PW_TPL, "LockoutThreshold"); if (v == null) return _cisNa("Password Rule Settings not configured");
+      const n = parseInt(v, 10); return (n >= 0 && n <= 10) ? _cisPass("Smart lockout threshold is " + n) : _cisFail("Smart lockout threshold is " + n + " — set to 10 or fewer", "user"); } },
+    { id: "EIDSCA.PR05", title: "Smart lockout duration is at least 60 seconds", level: "Medium", assess(d) {
+      const v = _dirVal(d, _PW_TPL, "LockoutDurationInSeconds"); if (v == null) return _cisNa("Password Rule Settings not configured");
+      const n = parseInt(v, 10); return n >= 60 ? _cisPass("Smart lockout duration is " + n + "s") : _cisFail("Smart lockout duration is " + n + "s — set to 60 or more", "user"); } },
+    { id: "EIDSCA.ST08", title: "Guests cannot be Microsoft 365 group owners", level: "Medium", assess(d) {
+      const v = _dirVal(d, _GRP_TPL, "AllowGuestsToBeGroupOwner"); if (v == null) return _cisNa("Group.Unified settings not configured");
+      return String(v) === "False" ? _cisPass("Guests cannot be group owners") : _cisFail("Guests can be Microsoft 365 group owners — disable", "external"); } },
+    { id: "EIDSCA.ST09", title: "Guests cannot access Microsoft 365 group content", level: "Medium", assess(d) {
+      const v = _dirVal(d, _GRP_TPL, "AllowGuestsToAccessGroups"); if (v == null) return _cisNa("Group.Unified settings not configured");
+      return String(v) === "False" ? _cisPass("Guests cannot access group content") : _cisFail("Guests can access Microsoft 365 group content — review", "external"); } }
   ];
   // Framework registry — the engine is catalog-driven, so a framework is just its
   // controls plus how the page labels itself. Add one here; nothing else changes.
@@ -4465,8 +4513,8 @@ window.EP = (function () {
   // Fetch the EIDSCA-relevant Graph config once for the compliance assessment. Read-only
   // (Policy.Read.All, which we already request); returns null silently if not granted, so
   // the EIDSCA checks degrade to N/A rather than failing or raising a consent dialog.
-  async function _eidGraph(path) {
-    try { const tok = await tokenOptional(["Policy.Read.All"]); if (!tok) return null;
+  async function _eidGraph(path, scopes) {
+    try { const tok = await tokenOptional(scopes || ["Policy.Read.All"]); if (!tok) return null;
       const r = await fetch(graphBase() + path, { headers: { Authorization: "Bearer " + tok } });
       return r.ok ? await r.json() : null;
     } catch (e) { return null; }
@@ -4474,11 +4522,17 @@ window.EP = (function () {
   async function _eidscaConfig() {
     if (DEMO) return _eidscaDemo();
     if (!msalInstance || !account) return null;
-    return { authMethods: await _eidGraph("/policies/authenticationMethodsPolicy"), authzPolicy: await _eidGraph("/policies/authorizationPolicy") };
+    return {
+      authMethods:     await _eidGraph("/policies/authenticationMethodsPolicy", ["Policy.Read.All"]),
+      authzPolicy:     await _eidGraph("/policies/authorizationPolicy", ["Policy.Read.All"]),
+      adminConsentReq: await _eidGraph("/policies/adminConsentRequestPolicy", ["Policy.Read.All"]),
+      settings:        await _eidGraph("/settings", ["Directory.Read.All"])
+    };
   }
   function _eidscaDemo() {
     return {
-      authMethods: { authenticationMethodConfigurations: [
+      authMethods: { systemCredentialPreferences: { state: "disabled" }, reportSuspiciousActivitySettings: { state: "disabled" },
+        authenticationMethodConfigurations: [
         { id: "Fido2", state: "enabled", isAttestationEnforced: false, keyRestrictions: { isEnforced: false } },
         { id: "MicrosoftAuthenticator", state: "enabled", featureSettings: { numberMatchingRequiredState: { state: "enabled" }, displayAppInformationRequiredState: { state: "disabled" }, displayLocationInformationRequiredState: { state: "disabled" } } },
         { id: "Sms", state: "enabled" },
@@ -4486,7 +4540,16 @@ window.EP = (function () {
         { id: "TemporaryAccessPass", state: "enabled", isUsableOnce: false }
       ] },
       authzPolicy: { allowInvitesFrom: "everyone", allowedToSignUpEmailBasedSubscriptions: true, allowEmailVerifiedUsersToJoinOrganization: false,
-        defaultUserRolePermissions: { allowedToCreateApps: true, allowedToReadOtherUsers: true, permissionGrantPoliciesAssigned: ["ManagePermissionGrantsForSelf.microsoft-user-default-legacy"] } }
+        guestUserRoleId: "10dae51f-b6af-4016-8d66-8c2a99b929b3",
+        defaultUserRolePermissions: { allowedToCreateApps: true, allowedToReadOtherUsers: true, permissionGrantPoliciesAssigned: ["ManagePermissionGrantsForSelf.microsoft-user-default-legacy"] } },
+      adminConsentReq: { isEnabled: false, notifyReviewers: false, requestDurationInDays: 30, reviewers: [] },
+      settings: { value: [
+        { templateId: "5cf42378-d67d-4f36-ba46-e8b86229381d", displayName: "Password Rule Settings", values: [
+          { name: "LockoutThreshold", value: "10" }, { name: "LockoutDurationInSeconds", value: "60" },
+          { name: "BannedPasswordCheckOnPremisesMode", value: "Audit" }, { name: "EnableBannedPasswordCheckOnPremises", value: "False" } ] },
+        { templateId: "62375ab9-6b52-47ed-826b-58e47e0e304b", displayName: "Group.Unified", values: [
+          { name: "AllowGuestsToBeGroupOwner", value: "False" }, { name: "AllowGuestsToAccessGroups", value: "True" } ] }
+      ] }
     };
   }
   async function renderCompliance(force) {
