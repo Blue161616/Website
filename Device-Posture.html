@@ -1668,6 +1668,17 @@ window.EP = (function () {
     const v = views[name];
     if (!v) return;
     const applyFocus = () => { if (v.focus) { const f = consumeFocus(name); if (f != null) { try { v.focus(f); } catch (e) { console.error("[" + name + "] focus failed", e); } } } };
+    if (IMPORTED) {   // imported-CSV mode: render ready views from the import store; show a notice for the rest
+      if (IMPORT_READY.has(name)) {
+        const root = window.document.getElementById("view-" + name), r = root && root.querySelector("#results"); if (r) r.classList.remove("hidden");
+        if (!v.loaded && v.load) { v.loaded = true; try { await v.load(); } catch (e) { console.error("[" + name + "] import render failed", e); } }
+        applyFocus();
+      } else {
+        const root = window.document.getElementById("view-" + name), r = root && (root.querySelector("#results") || root);
+        if (r) { if (r.classList) r.classList.remove("hidden"); r.innerHTML = '<div class="ep-view-empty" style="padding:28px">This view isn’t wired to imported data yet — <b>Devices</b> is. Coverage, Compliance, Hardening, Vulnerabilities and the Overview come next.</div>'; }
+      }
+      return;
+    }
     if (v.loaded || DEMO || !account || !v.load) { applyFocus(); return; }   // already loaded / demo self-render → focus now
     v.loaded = true;
     // Each app un-hides its own #results inside the onSignedIn routine the shell replaces, so do it here.
@@ -1686,10 +1697,13 @@ window.EP = (function () {
     active = name;
     document.querySelectorAll(".ep-nav button.nav").forEach(b => b.classList.toggle("on", b.dataset.view === name));
     $("epViewTitle").textContent = VIEW_TITLES[name] || "Device Posture";
-    if (!DEMO && !account) { $("epConnect").style.display = ""; document.querySelectorAll(".ep-view").forEach(v => v.classList.remove("on")); return; }
+    if (!DEMO && !account && !IMPORTED) { $("epConnect").style.display = ""; document.querySelectorAll(".ep-view").forEach(v => v.classList.remove("on")); return; }
     $("epConnect").style.display = "none";
     document.querySelectorAll(".ep-view").forEach(v => v.classList.toggle("on", v.id === "view-" + name));
-    if (name === "overview") { renderOverview(); return; }
+    if (name === "overview") {
+      if (IMPORTED && !IMPORT_READY.has("overview")) { const b = $("ov-body"); if (b) b.innerHTML = '<div class="ep-view-empty" style="padding:28px">The Overview reads imported data in a later step — open <b>Devices</b> to see the imported inventory now.</div>'; return; }
+      renderOverview(); return;
+    }
     loadView(name);
   }
 
@@ -3633,13 +3647,214 @@ window.EP = (function () {
     $("epRepGo").addEventListener("click", genReport);
     document.addEventListener("keydown", e => { if (e.key === "Escape") { closeCfg(); closeRep(); } });
     if (DEMO) { $("epDemoBar").classList.add("on"); $("epConnect").style.display = "none"; $("epReportBtn").style.display = ""; }
+    if (IMPORT_FLAG) importInit();   // reveal the hidden CSV-import panel on the connect card
     cfgStat(); cfgPing();   // reflect the saved AI config on the Configuration button at load
     show("overview");
+  }
+
+  // ============================ Hidden CSV import (scale-testing) ============================
+  // A non-advertised path (?import) to drive the app from exported CSVs instead of live Graph — for
+  // testing / demoing at a real customer's scale when only Security Administrator is available (no
+  // Global Reader / admin consent). READ-ONLY and honest: it only LOADS data, writes nothing, needs
+  // no new scope, and the UI labels the dataset "Imported", never "Live". Raw Microsoft portal export
+  // CSVs (Intune devices / Entra devices / Defender device inventory; recommendations + weaknesses
+  // feed Hardening + Vulnerabilities later) are detected by their headers and mapped tolerantly; a
+  // per-file diagnostic shows exactly what matched so column drift is visible, not silent.
+  const IMPORT_FLAG = /[?&]import(=1)?(&|$)/.test(location.search);
+  const IMPORT_READY = new Set(["devices"]);   // views wired to imported data (grows as they are built)
+  let IMPORTED = false, IMPORT = null;
+
+  function csvParse(text) {
+    text = String(text || "").replace(/^﻿/, "");
+    const rows = []; let row = [], cur = "", q = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (q) { if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; }
+      else if (c === '"') q = true;
+      else if (c === ",") { row.push(cur); cur = ""; }
+      else if (c === "\n") { row.push(cur); rows.push(row); row = []; cur = ""; }
+      else if (c === "\r") { /* skip */ }
+      else cur += c;
+    }
+    if (cur.length || row.length) { row.push(cur); rows.push(row); }
+    if (!rows.length) return { headers: [], rows: [] };
+    const headers = rows.shift().map(h => String(h).trim());
+    return { headers, rows: rows.filter(r => r.some(c => String(c).trim() !== "")).map(r => { const o = {}; headers.forEach((h, i) => o[h] = r[i] != null ? r[i] : ""); return o; }) };
+  }
+  const _nh = h => String(h || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  function _nmap(headers) { const m = {}; headers.forEach(h => { const k = _nh(h); if (!(k in m)) m[k] = h; }); return m; }
+  function _get(o, nm, aliases) { for (const a of aliases) { const h = nm[_nh(a)]; if (h != null) { const v = o[h]; if (v != null && String(v).trim() !== "") return String(v).trim(); } } return ""; }
+  function _hasAny(nm, aliases) { return aliases.some(a => nm[_nh(a)] != null); }
+  // Logical field -> portal-export column aliases (blades/versions vary; list the ones we've seen).
+  const CSV_FIELDS = {
+    name: ["Device name", "DeviceName", "displayName", "Name", "Computer name", "Host name", "Device"],
+    aad: ["Azure AD Device ID", "AAD Device ID", "aadDeviceId", "Entra Device ID", "deviceId", "Azure AD device ID"],
+    os: ["OS", "operatingSystem", "OS platform", "OSPlatform", "Operating system"],
+    osVer: ["OS version", "operatingSystemVersion", "OSVersion", "Version", "Build"],
+    trust: ["trustType", "Join type", "Join Type", "Registration type", "Trust type"],
+    isCompliant: ["isCompliant", "Compliant"],
+    lastSignIn: ["approximateLastSignInDateTime", "Activity timestamp", "Last sign-in", "Registered"],
+    enabled: ["accountEnabled", "Enabled"],
+    compliance: ["complianceState", "Compliance", "Compliance state"],
+    encrypted: ["isEncrypted", "Encrypted", "Encryption"],
+    jailbroken: ["jailBroken", "Jailbroken", "Rooted"],
+    lastSync: ["lastSyncDateTime", "Last check-in", "Last check in", "Last contact", "Last sync"],
+    owner: ["managedDeviceOwnerType", "Ownership", "Owner", "Owner type"],
+    upn: ["userPrincipalName", "Primary user UPN", "Primary user", "User principal name", "User", "Email address"],
+    agent: ["managementAgent", "Managed by", "Management agent"],
+    intuneId: ["Intune Device ID", "managedDeviceId", "Device ID (Intune)"],
+    machineId: ["Machine ID", "MDE Machine ID", "Sensor ID"],
+    sensor: ["Health state", "Sensor health state", "sensorHealthState", "Health status"],
+    onboarding: ["Onboarding status", "onboardingStatus"],
+    exposure: ["Exposure level", "exposureLevel"],
+    threat: ["Risk level", "riskScore"],
+    criticality: ["Device value", "Criticality level", "criticalityLevel", "deviceValue", "Business criticality"],
+    internet: ["Internet facing", "isInternetFacing", "Internet-facing"],
+    lastSeen: ["Last seen", "Last device update", "lastSeen"]
+  };
+  const CSV_TYPE_FIELDS = {
+    entra: ["name", "aad", "os", "osVer", "trust", "isCompliant", "lastSignIn", "enabled"],
+    intune: ["name", "aad", "os", "osVer", "compliance", "encrypted", "jailbroken", "lastSync", "owner", "upn", "agent", "intuneId"],
+    defender: ["name", "aad", "machineId", "os", "osVer", "sensor", "onboarding", "exposure", "criticality", "internet", "lastSeen"]
+  };
+  function classifyCsv(headers) {
+    const nm = _nmap(headers);
+    if (_hasAny(nm, CSV_FIELDS.onboarding) || _hasAny(nm, CSV_FIELDS.sensor) || _hasAny(nm, CSV_FIELDS.exposure)) return "defender";
+    if (_hasAny(nm, ["CVE ID", "CVEID", "CVE"])) return "weaknesses";
+    if (_hasAny(nm, ["Recommendation", "Security recommendation"]) && _hasAny(nm, ["Exposed devices", "Exposed devices count"])) return "recommendations";
+    if (_hasAny(nm, ["Software name", "Software"]) && _hasAny(nm, ["Vendor", "Publisher"])) return "software";
+    if (_hasAny(nm, CSV_FIELDS.compliance) && (_hasAny(nm, CSV_FIELDS.agent) || _hasAny(nm, CSV_FIELDS.intuneId) || _hasAny(nm, ["Primary user UPN"]))) return "intune";
+    if (_hasAny(nm, CSV_FIELDS.trust) || (_hasAny(nm, CSV_FIELDS.aad) && _hasAny(nm, CSV_FIELDS.os))) return "entra";
+    return "unknown";
+  }
+  const _mapRow = (keys) => (o, nm) => { const r = {}; keys.forEach(k => r[k] = _get(o, nm, CSV_FIELDS[k])); if (r.aad) r.aad = r.aad.toLowerCase(); return r; };
+  const mapEntra = _mapRow(CSV_TYPE_FIELDS.entra), mapIntune = _mapRow(CSV_TYPE_FIELDS.intune), mapDefender = _mapRow(CSV_TYPE_FIELDS.defender);
+  // normalisers (shell-local; mirror the Devices view's own)
+  function _days(s) { if (!s) return null; const t = Date.parse(s); if (isNaN(t)) return null; const d = Math.floor((Date.now() - t) / 864e5); return d < 0 ? 0 : d; }
+  function _os(s) { s = String(s || "").toLowerCase(); if (s.includes("server")) return "Windows Server"; if (s.includes("win")) return "Windows"; if (s.includes("ipad")) return "iPadOS"; if (s.includes("iphone") || s === "ios") return "iOS"; if (s.includes("mac")) return "macOS"; if (s.includes("android")) return "Android"; if (s.includes("linux")) return "Linux"; return s ? s.charAt(0).toUpperCase() + s.slice(1) : "Other"; }
+  function _join(t) { t = String(t || "").toLowerCase(); if (t === "azuread" || t.includes("entra joined")) return "Entra joined"; if (t === "workplace" || t.includes("register")) return "Entra registered"; if (t === "serverad" || t.includes("hybrid")) return "Hybrid joined"; return t ? (t.charAt(0).toUpperCase() + t.slice(1)) : "—"; }
+  function _normName(s) { s = String(s || "").trim().toLowerCase(); const d = s.indexOf("."); if (d > 0) s = s.slice(0, d); return s; }
+  function _ownerMap(o) { o = String(o || "").toLowerCase(); return (o === "company" || o === "corporate") ? "Corporate" : o === "personal" ? "Personal" : o ? "Unknown" : "—"; }
+  function _expLevel(s) { s = String(s || "").toLowerCase(); if (s.includes("high")) return "High"; if (s.includes("medium") || s.includes("moderate")) return "Medium"; if (s.includes("low")) return "Low"; if (s.includes("none") || s.includes("informational")) return "None"; return s ? s.charAt(0).toUpperCase() + s.slice(1) : "—"; }
+  function _boolish(s) { s = String(s || "").toLowerCase(); if (["yes", "true", "1", "internet facing", "internet-facing"].indexOf(s) >= 0) return true; if (["no", "false", "0", ""].indexOf(s) >= 0) return s === "" ? null : false; return null; }
+  function _comp(cs) { cs = String(cs || "").toLowerCase().replace(/\s/g, ""); if (!cs) return "—"; if (cs === "compliant") return "compliant"; if (cs === "noncompliant" || cs === "error" || cs === "conflict" || cs === "notcompliant") return "noncompliant"; if (cs === "ingraceperiod" || cs.includes("grace")) return "grace"; if (cs === "unknown" || cs === "notapplicable" || cs.includes("noteval")) return "unevaluated"; return cs; }
+  // Merge Entra + Intune + Defender CSV rows into the Devices view's record shape (one row per device,
+  // keyed by Entra device id, falling back to normalised name). Risk is the same composite the live
+  // Devices view computes. Per-device CVEs / config fails are not in portal DEVICE exports, so they stay
+  // null (noTvm) — the Vulnerabilities / Hardening workspaces read those from their own exports.
+  function buildDeviceRecords(p) {
+    const keys = new Map();
+    const keyOf = (aad, name) => (aad && aad.length) ? "aad:" + aad : "name:" + _normName(name);
+    const upsert = (k, slot, v) => { const o = keys.get(k) || {}; o[slot] = v; keys.set(k, o); };
+    p.entra.forEach(e => upsert(keyOf(e.aad, e.name), "e", e));
+    p.intune.forEach(i => { let k = keyOf(i.aad, i.name); if (!keys.has(k) && i.aad) { const nk = "name:" + _normName(i.name); if (keys.has(nk)) k = nk; } upsert(k, "i", i); });
+    p.defender.forEach(m => { let k = keyOf(m.aad, m.name); if (!keys.has(k)) { const nk = "name:" + _normName(m.name); if (keys.has(nk)) k = nk; } upsert(k, "m", m); });
+    const hasMde = p.defender.length > 0, out = []; let ix = 0;
+    keys.forEach(rec => {
+      const e = rec.e, i = rec.i, m = rec.m;
+      if (e && String(e.enabled).toLowerCase() === "false") return;   // mirror the live "accountEnabled !== false" filter
+      const aad = (e && e.aad) || (i && i.aad) || (m && m.aad) || "—";
+      const agent = String((i && i.agent) || "").toLowerCase();
+      const compliance = i ? _comp(i.compliance) : (e && String(e.isCompliant).toLowerCase() === "true" ? "compliant" : "—");
+      const exposure = m ? _expLevel(m.exposure) : "—";
+      const lastSync = i ? _days(i.lastSync) : null, lastMde = m ? _days(m.lastSeen) : null, lastSign = e ? _days(e.lastSignIn) : null;
+      const seenArr = [lastMde, lastSync, lastSign].filter(x => x != null);
+      const seen = seenArr.length ? Math.min.apply(null, seenArr) : null, activeDev = !(seen != null && seen > 30);
+      let base, baseWhy;
+      if (compliance === "noncompliant") { base = activeDev ? "High" : "Medium"; baseWhy = activeDev ? "non-compliant · active" : "non-compliant · stale"; }
+      else if (compliance === "unevaluated") { base = "Medium"; baseWhy = "no compliance result"; }
+      else if (!i) { base = activeDev ? "Medium" : "Low"; baseWhy = activeDev ? "unmanaged" : "unmanaged · stale"; }
+      else { base = "Low"; baseWhy = "compliant"; }
+      const BRANK = { High: 3, Medium: 2, Low: 1 }, expBand = exposure === "High" ? "High" : exposure === "Medium" ? "Medium" : null;
+      let risk = base, riskSub = baseWhy;
+      if (expBand && BRANK[expBand] > (BRANK[base] || 0)) { risk = expBand; riskSub = "Defender exposure · " + expBand.toLowerCase(); }
+      const riskWhy = [];
+      if (compliance === "noncompliant") riskWhy.push(activeDev ? "Non-compliant (active)" : "Non-compliant (stale)");
+      else if (compliance === "unevaluated") riskWhy.push("No compliance result");
+      else if (compliance === "compliant") riskWhy.push("Compliant");
+      if (!i) riskWhy.push("Not managed by Intune");
+      if (exposure === "High" || exposure === "Medium") riskWhy.push("Defender exposure: " + exposure);
+      if (seen != null && seen > 30) riskWhy.push("No sync in " + seen + "d");
+      if (!riskWhy.length) riskWhy.push("No elevated signals");
+      out.push({
+        id: aad !== "—" ? aad.toLowerCase() : ("imp" + ix), name: (e && e.name) || (i && i.name) || (m && m.name) || "(device)",
+        os: _os((e && e.os) || (i && i.os) || (m && m.os)), osVer: (i && i.osVer) || (m && m.osVer) || (e && e.osVer) || "—",
+        joinType: _join(e && e.trust), owner: i ? _ownerMap(i.owner) : "—", user: (i && i.upn) || "—",
+        managedBy: i ? ((agent.includes("configurationmanager") || agent.includes("co-manag")) ? "Co-managed" : "Intune") : (m ? "MDE" : "—"),
+        entra: e ? 1 : 0, intune: i ? 1 : 0, defender: hasMde ? (m ? 1 : 0) : null,
+        compliance, risk, riskSub, riskWhy, exposure, threat: null, cve: null, cveCount: null, cveCrit: null, cveHigh: null, cveMed: null, configFail: null, noTvm: true,
+        internet: m ? _boolish(m.internet) : null, internetReason: null,
+        lastSeenDays: seen, lastSyncDays: lastSync, lastMdeDays: lastMde, stale: seen != null && seen > 30,
+        onboarding: m ? (m.onboarding || "Onboarded") : (hasMde ? "Not onboarded" : "—"), aadId: aad, intuneId: i ? (i.intuneId || null) : null,
+        sensor: m ? (m.sensor || "—") : null, criticality: (m && m.criticality) || "—", src: "import"
+      });
+      ix++;
+    });
+    return out;
+  }
+  function importLoad(parsed) {
+    const devices = buildDeviceRecords(parsed);
+    IMPORT = { raw: parsed, devices, hasMde: parsed.defender.length > 0, meta: { files: parsed.files, counts: { entra: parsed.entra.length, intune: parsed.intune.length, defender: parsed.defender.length, devices: devices.length } } };
+    IMPORTED = true;
+    const bar = $("epDemoBar");
+    if (bar) { bar.innerHTML = '<span class="tag">Imported</span><span class="n">' + devices.length + ' devices built from the CSVs you provided — not a live scan. Nothing was fetched from Graph; read-only. <a href="?">Leave import mode</a></span>'; bar.classList.add("on"); }
+    const conn = $("epConnect"); if (conn) conn.style.display = "none";
+    const rb = $("epReportBtn"); if (rb) rb.style.display = "";
+    Object.keys(views).forEach(n => { views[n].loaded = false; });   // force re-render from the import store
+    show("devices");
+  }
+  function importInit() {
+    const card = document.querySelector("#epConnect .card"); if (!card || $("epImport")) return;
+    const panel = document.createElement("div"); panel.id = "epImport";
+    panel.style.cssText = "margin-top:16px;padding:15px 16px;border:1px dashed var(--border);border-radius:12px;background:rgba(127,160,210,.05)";
+    panel.innerHTML = '<div style="font-weight:800;font-size:13px;color:var(--text);margin-bottom:4px">Import exported CSVs <span style="font-weight:600;font-size:11px;color:var(--muted)">· scale-test · read-only · labelled “Imported”, never “Live”</span></div>'
+      + '<div style="font-size:11.5px;color:var(--muted);line-height:1.5;margin-bottom:10px">Drop raw portal exports — <b>Intune devices</b>, <b>Entra devices</b>, <b>Defender device inventory</b> (recommendations &amp; weaknesses light up Hardening &amp; Vulnerabilities later). Files are detected by their columns; nothing is uploaded.</div>'
+      + '<div id="epImpDrop" style="padding:18px;border:1.5px dashed var(--border);border-radius:10px;text-align:center;color:var(--muted);font-size:12px;cursor:pointer">Drop CSV files here, or <u>browse</u><input id="epImpFile" type="file" accept=".csv,text/csv" multiple style="display:none"></div>'
+      + '<div id="epImpDiag" style="margin-top:10px"></div>'
+      + '<div style="margin-top:12px"><button id="epImpGo" disabled style="opacity:.5">Load dataset →</button></div>';
+    card.appendChild(panel);
+    const drop = panel.querySelector("#epImpDrop"), fileIn = panel.querySelector("#epImpFile"), go = panel.querySelector("#epImpGo"), diag = panel.querySelector("#epImpDiag");
+    const parsed = { entra: [], intune: [], defender: [], weaknesses: [], recommendations: [], software: [], files: [] };
+    const TLABEL = { entra: "Entra devices", intune: "Intune devices", defender: "Defender devices", weaknesses: "Defender weaknesses (CVEs)", recommendations: "Security recommendations", software: "Software inventory", unknown: "Unrecognised — skipped" };
+    async function addFiles(list) {
+      for (const f of list) {
+        let text = ""; try { text = await f.text(); } catch (e) { continue; }
+        const { headers, rows } = csvParse(text), type = classifyCsv(headers), nm = _nmap(headers);
+        if (type === "entra") rows.forEach(r => parsed.entra.push(mapEntra(r, nm)));
+        else if (type === "intune") rows.forEach(r => parsed.intune.push(mapIntune(r, nm)));
+        else if (type === "defender") rows.forEach(r => parsed.defender.push(mapDefender(r, nm)));
+        else if (type === "weaknesses") parsed.weaknesses = parsed.weaknesses.concat(rows);
+        else if (type === "recommendations") parsed.recommendations = parsed.recommendations.concat(rows);
+        else if (type === "software") parsed.software = parsed.software.concat(rows);
+        const fields = CSV_TYPE_FIELDS[type] || [], matched = fields.filter(fn => _hasAny(nm, CSV_FIELDS[fn]));
+        const used = new Set(); matched.forEach(fn => CSV_FIELDS[fn].forEach(a => { if (nm[_nh(a)]) used.add(nm[_nh(a)]); }));
+        parsed.files.push({ name: f.name, type, rows: rows.length, matched: matched.length, fields: fields.length, unmapped: headers.filter(h => !used.has(h)) });
+      }
+      renderDiag();
+    }
+    function renderDiag() {
+      if (!parsed.files.length) { diag.innerHTML = ""; go.disabled = true; go.style.opacity = ".5"; return; }
+      diag.innerHTML = parsed.files.map(f => {
+        const ok = f.type !== "unknown", col = ok ? "var(--sev-low)" : "var(--sev-high)";
+        return '<div style="display:flex;gap:9px;align-items:baseline;font-size:11.5px;padding:3px 0;line-height:1.4"><span style="color:' + col + ';font-weight:800;flex-shrink:0">' + (ok ? "✓" : "?") + '</span>'
+          + '<span style="color:var(--text);font-weight:600;min-width:140px;flex-shrink:0">' + esc(f.name) + '</span>'
+          + '<span style="color:var(--muted)">' + TLABEL[f.type] + ' · ' + f.rows + ' rows' + (ok ? ' · mapped ' + f.matched + '/' + f.fields + ' fields' + (f.unmapped.length ? ' · unmapped: ' + f.unmapped.slice(0, 6).map(esc).join(", ") + (f.unmapped.length > 6 ? "…" : "") : "") : "") + '</span></div>';
+      }).join("");
+      const haveDev = parsed.entra.length || parsed.intune.length || parsed.defender.length;
+      go.disabled = !haveDev; go.style.opacity = haveDev ? "1" : ".5";
+    }
+    drop.addEventListener("click", () => fileIn.click());
+    fileIn.addEventListener("change", () => addFiles(fileIn.files));
+    ["dragover", "dragenter"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.style.borderColor = "var(--accent)"; }));
+    ["dragleave"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.style.borderColor = "var(--border)"; }));
+    drop.addEventListener("drop", e => { e.preventDefault(); drop.style.borderColor = "var(--border)"; if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files); });
+    go.addEventListener("click", () => importLoad(parsed));
   }
 
   return { registerView, viewApi, ensureLoaded, makeAsk, token, tokenSilent, tokenOptional, graphBase, setStatus, esc, DEMO,
     scopedDoc, msalShim, ACCOUNT, llm, llmComplete, goto, mitre: mitreFor,
     get account() { return account; }, get signedIn() { return !!account; },
+    get IMPORT() { return IMPORT; }, get IMPORTED() { return IMPORTED; },
     _boot: boot };
 })();
 document.addEventListener("DOMContentLoaded", () => window.EP._boot());
@@ -3736,6 +3951,7 @@ async function ensureComplianceDetail(d){
   if (!d || COMPLIANCE_DETAIL[d.id] || _cdInflight[d.id]) return;
   if (!["noncompliant","grace","unevaluated"].includes(d.compliance)) return;
   if (window.EP && EP.DEMO){ COMPLIANCE_DETAIL[d.id] = _demoWhy(d); paint(); return; }
+  if (window.EP && EP.IMPORT){ COMPLIANCE_DETAIL[d.id] = { imported: true }; paint(); return; }   // no per-setting detail in a device export
   if (!d.intuneId) return;   // not Intune-managed — nothing to read
   _cdInflight[d.id] = true;
   try {
@@ -4013,7 +4229,8 @@ function detailRow(d, cols){
   if (["noncompliant","grace","unevaluated"].includes(d.compliance)){
     const cd = COMPLIANCE_DETAIL[d.id];
     const link = '<a href="' + intuneDeviceLink(d) + '" target="_blank" rel="noopener" class="di-why-link">Open in Intune →</a>';
-    if (cd && cd.error) why = '<div class="di-why">Couldn’t read compliance detail — ' + esc(cd.error) + ' ' + link + '</div>';
+    if (cd && cd.imported) why = '<div class="di-why di-why-load"><b>Imported dataset.</b> Per-setting failure detail isn’t in a device export — the Compliance workspace groups these devices by reason.</div>';
+    else if (cd && cd.error) why = '<div class="di-why">Couldn’t read compliance detail — ' + esc(cd.error) + ' ' + link + '</div>';
     else if (cd && cd.policies && cd.policies.length) why = '<div class="di-why"><div class="di-why-h">Why not compliant</div>'
       + cd.policies.map(p => '<div class="di-why-p"><b>' + esc(p.policy) + '</b>' + (p.settings.length ? '<ul>' + p.settings.map(s => '<li>' + esc(s) + '</li>').join("") + '</ul>' : ' <span class="di-sub">(policy-level — no per-setting detail)</span>') + '</div>').join("") + link + '</div>';
     else if (cd) why = '<div class="di-why">' + (d.compliance === "unevaluated" ? '<b>No compliance result.</b> No compliance policy is evaluating this device, so it passes by default — assign one. ' : 'No failing compliance setting found (state may be policy-level or transient). ') + link + '</div>';
@@ -4024,6 +4241,7 @@ function detailRow(d, cols){
   // ── Hardening (secure-config baseline fails) ──
   let hardBody;
   if (d.defender !== 1) hardBody = '<div class="drow"><span class="dk">Baseline</span><span class="p-mute">no Defender sensor</span></div>';
+  else if (d.noTvm) hardBody = '<div class="drow"><span class="dk">Baseline</span><span class="p-mute">not in this export — see Hardening</span></div>';
   else if (d.configFail == null) hardBody = '<div class="drow"><span class="dk">Baseline</span><span class="p-mute">—</span></div>';
   else if (d.configFail === 0) hardBody = '<div class="drow"><span class="dk">Baseline</span><span class="di-pill p-ok">no failing controls</span></div>';
   else hardBody = '<div class="di-big"><span class="big" style="color:var(--sev-med)">' + d.configFail + '</span><span class="dk">failing baseline control' + (d.configFail>1?'s':'') + '</span></div><div class="dsub">CIS / Microsoft secure-config assessments not passing</div>';
@@ -4031,6 +4249,7 @@ function detailRow(d, cols){
   // ── Vulnerabilities (Defender TVM CVEs) ──
   let vulnBody;
   if (d.defender !== 1) vulnBody = '<div class="drow"><span class="dk">Scan</span><span class="p-mute">no Defender sensor</span></div>';
+  else if (d.noTvm) vulnBody = '<div class="drow"><span class="dk">CVEs</span><span class="p-mute">not in this export — see Vulnerabilities</span></div>';
   else if (!d.cveCount) vulnBody = '<div class="drow"><span class="dk">CVEs</span><span class="di-pill p-ok">none found</span></div>';
   else {
     const parts = [];
@@ -4123,7 +4342,7 @@ function paint(){
   const grade = score>=70?"D":score>=50?"C":score>=30?"B":"A";
   const band = '<div class="di-band"><div class="di-score"><span class="n">' + score + '</span><span class="g">GRADE ' + grade + '</span></div>'
     + '<div><div class="h1">Device posture · every signal per asset</div><div class="lede">' + D.devices.length + ' devices · ' + hi + ' high-risk · ' + unm + ' unmanaged · ' + nc + ' non-compliant' + (D.hasMde ? '' : ' · <span style="color:var(--sev-high)">connect Defender for risk + exposure levels</span>') + ' · <span style="color:var(--muted)">click a row for the full posture card</span></div></div></div>';
-  const src = D.live ? (D.hasMde ? "Live — Entra + Intune + Defender." : "Live — Entra + Intune (Defender not connected).") : "Demo data.";
+  const src = D.imported ? ("Imported CSV · " + D.devices.length + " devices (" + (D.hasMde ? "Entra + Intune + Defender exports" : "Entra + Intune exports") + ") — not a live scan.") : D.live ? (D.hasMde ? "Live — Entra + Intune + Defender." : "Live — Entra + Intune (Defender not connected).") : "Demo data.";
   const mdeBanner = (D.live && !D.hasMde) ? '<div class="di-err" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">'
     + '<span style="flex:1;min-width:260px"><b>Defender not connected — risk &amp; exposure are unavailable.</b> '
     + (D.mdeErr ? esc(D.mdeErr.message || String(D.mdeErr)) : "The Defender (MDE) API returned no data.")
@@ -4151,6 +4370,7 @@ function wire(){
 
 async function analyze(){
   const root = document.getElementById("dev-root");
+  if (window.EP && EP.IMPORT && EP.IMPORT.devices){ render({ devices: EP.IMPORT.devices, live:false, imported:true, hasMde: EP.IMPORT.hasMde }); return; }
   if (window.EP && EP.DEMO){ render({ devices: demoDevices(), live:false, hasMde:true }); return; }
   if (root) root.innerHTML = '<div class="di-load"><b>Reading devices across Entra, Intune and Defender…</b></div>';
   try { render(await collect()); }
