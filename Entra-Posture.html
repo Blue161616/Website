@@ -4078,6 +4078,17 @@ window.EP = (function () {
     const v = views[name];
     if (!v) return;
     const applyFocus = () => { if (v.focus) { const f = consumeFocus(name); if (f != null) { try { v.focus(f); } catch (e) { console.error("[" + name + "] focus failed", e); } } } };
+    if (IMPORTED) {   // imported-config mode: render ready views from the import store; notice for the rest
+      if (IMPORT_READY.has(name)) {
+        const root = window.document.getElementById("view-" + name), r = root && root.querySelector("#results"); if (r) r.classList.remove("hidden");
+        if (!v.loaded && v.load) { v.loaded = true; try { await v.load(); } catch (e) { console.error("[" + name + "] import render failed", e); } }
+        applyFocus();
+      } else {
+        const root = window.document.getElementById("view-" + name), r = root && (root.querySelector("#results") || root);
+        if (r) { if (r.classList) r.classList.remove("hidden"); r.innerHTML = '<div class="ep-view-empty" style="padding:28px">This view isn’t wired to imported data yet — <b>Conditional Access</b> is. Users, Workloads and the rest come next.</div>'; }
+      }
+      return;
+    }
     if (v.loaded || DEMO || !account || !v.load) { applyFocus(); return; }   // already loaded / demo self-render → focus now
     v.loaded = true;
     // Each app un-hides its own #results inside the onSignedIn routine the shell replaces, so do it here.
@@ -4096,11 +4107,11 @@ window.EP = (function () {
     active = name;
     document.querySelectorAll(".ep-nav button.nav").forEach(b => b.classList.toggle("on", b.dataset.view === name));
     $("epViewTitle").textContent = VIEW_TITLES[name] || "Entra Posture";
-    if (!DEMO && !account) { $("epConnect").style.display = ""; document.querySelectorAll(".ep-view").forEach(v => v.classList.remove("on")); return; }
+    if (!DEMO && !account && !IMPORTED) { $("epConnect").style.display = ""; document.querySelectorAll(".ep-view").forEach(v => v.classList.remove("on")); return; }
     $("epConnect").style.display = "none";
     document.querySelectorAll(".ep-view").forEach(v => v.classList.toggle("on", v.id === "view-" + name));
-    if (name === "overview") { renderOverview(); return; }
-    if (name === "compliance") { renderCompliance(); return; }
+    if (name === "overview") { if (IMPORTED && !IMPORT_READY.has("overview")) { const b = $("ov-body"); if (b) b.innerHTML = '<div class="ep-view-empty" style="padding:28px">The Overview reads imported data in a later slice — open <b>Conditional Access</b> to see the imported policies now.</div>'; return; } renderOverview(); return; }
+    if (name === "compliance") { if (IMPORTED && !IMPORT_READY.has("compliance")) return; renderCompliance(); return; }
     loadView(name);
   }
 
@@ -5936,13 +5947,138 @@ window.EP = (function () {
     $("epRepGo").addEventListener("click", genReport);
     document.addEventListener("keydown", e => { if (e.key === "Escape") { closeCfg(); closeRep(); } });
     if (DEMO) { $("epDemoBar").classList.add("on"); $("epConnect").style.display = "none"; $("epReportBtn").style.display = ""; }
+    if (IMPORT_FLAG) importInit();   // reveal the hidden import panel on the connect card
     cfgStat(); cfgPing();   // reflect the saved AI config on the Configuration button at load
     show("overview");
+  }
+
+  // ============================ Hidden import (scale-testing) ============================
+  // A non-advertised path (?import) to drive Entra Posture from exported configuration instead of a live
+  // sign-in — for testing / demoing at a customer's scale with only the read access a Security
+  // Administrator has. READ-ONLY, no new scope; the dataset is labelled "Imported", never "Live". First
+  // wired: Conditional Access, from the portal's "Export policies" JSON (an array of policy objects in
+  // the Graph shape). Users / enterprise-apps CSV come in later slices. Mirrors the Device Posture import.
+  const IMPORT_FLAG = /[?&]import(=1)?(&|$)/.test(location.search);
+  const IMPORT_READY = new Set(["ca", "ca-opt"]);   // views wired to imported data (ca-opt reuses CA's policies)
+  let IMPORTED = false, IMPORT = null;
+
+  function csvParse(text) {
+    text = String(text || "").replace(/^﻿/, "");
+    const rows = []; let row = [], cur = "", q = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (q) { if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; }
+      else if (c === '"') q = true;
+      else if (c === ",") { row.push(cur); cur = ""; }
+      else if (c === "\n") { row.push(cur); rows.push(row); row = []; cur = ""; }
+      else if (c === "\r") { /* skip */ }
+      else cur += c;
+    }
+    if (cur.length || row.length) { row.push(cur); rows.push(row); }
+    if (!rows.length) return { headers: [], rows: [] };
+    let hi = 0, maxc = 0; rows.slice(0, 5).forEach((r, i) => { if (r.length > maxc) { maxc = r.length; hi = i; } });
+    const headers = rows[hi].map(h => String(h).trim()), data = rows.slice(hi + 1);
+    return { headers, rows: data.filter(r => r.some(c => String(c).trim() !== "")).map(r => { const o = {}; headers.forEach((h, i) => o[h] = r[i] != null ? r[i] : ""); return o; }) };
+  }
+  const _nh = h => String(h || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  function _nmap(hs) { const m = {}; hs.forEach(h => { const k = _nh(h); if (!(k in m)) m[k] = h; }); return m; }
+  function _hasAny(nm, aliases) { return aliases.some(a => nm[_nh(a)] != null); }
+  // The CA "Export policies" JSON can be a bare array, a Graph { value: [...] } wrapper, a { policies: [...] }
+  // wrapper, or a single policy object — normalise all of them to an array.
+  function _extractArray(j) {
+    if (Array.isArray(j)) return j;
+    if (j && Array.isArray(j.value)) return j.value;
+    if (j && Array.isArray(j.policies)) return j.policies;
+    if (j && (j.grantControls || j.conditions)) return [j];
+    return [];
+  }
+  function classifyJson(arr) {
+    if (!arr.length) return "unknown";
+    const s = arr[0] || {};
+    if (s.grantControls || (s.conditions && s.state)) return "caPolicies";
+    if (s.ipRanges || s.countriesAndRegions || /namedlocation/i.test(String(s["@odata.type"] || ""))) return "namedLocations";
+    return "unknown";
+  }
+  function classifyCsv(headers) {   // for later slices (users / enterprise apps)
+    const nm = _nmap(headers);
+    if (_hasAny(nm, ["userPrincipalName", "User principal name", "UPN"])) return "users";
+    if (_hasAny(nm, ["appId", "Application ID"]) || (_hasAny(nm, ["displayName", "Name"]) && _hasAny(nm, ["publisherName", "Publisher"]))) return "apps";
+    return "unknown";
+  }
+  function importLoad(parsed) {
+    IMPORT = { raw: parsed, meta: { files: parsed.files, counts: { caPolicies: parsed.caPolicies.length, namedLocations: parsed.namedLocations.length } } };
+    IMPORTED = true;
+    const bar = $("epDemoBar");
+    if (bar) { bar.innerHTML = '<span class="tag">Imported</span><span class="n">' + parsed.caPolicies.length + ' Conditional Access policies from the export you provided — not a live scan. Nothing was fetched from Graph; read-only. <a href="?">Leave import mode</a></span>'; bar.classList.add("on"); }
+    const conn = $("epConnect"); if (conn) conn.style.display = "none";
+    const rb = $("epReportBtn"); if (rb) rb.style.display = "";
+    Object.keys(views).forEach(n => { views[n].loaded = false; });
+    show("ca");
+  }
+  function importInit() {
+    const card = document.querySelector("#epConnect .card"); if (!card || $("epImport")) return;
+    const gRow = (f, where, feeds) => '<div style="display:grid;grid-template-columns:150px 1fr;gap:3px 12px;padding:7px 11px;border-top:1px solid var(--border)">'
+      + '<div style="color:var(--text);font-weight:600">' + f + '</div><div style="color:var(--muted)">' + where + '<div style="color:var(--accent);margin-top:2px;font-size:10.5px">→ ' + feeds + '</div></div></div>';
+    const gHead = t => '<div style="background:rgba(127,160,210,.08);padding:6px 11px;font-weight:700;color:var(--text);font-size:11px">' + t + '</div>';
+    const guideHtml = '<details style="margin:2px 0 12px"><summary style="cursor:pointer;color:var(--accent);font-weight:700;font-size:11.5px">Where to export each file (portal paths) ▾</summary>'
+      + '<div style="margin-top:8px;border:1px solid var(--border);border-radius:9px;overflow:hidden;font-size:11.5px">'
+      + gHead("Microsoft Entra · entra.microsoft.com")
+      + gRow("Conditional Access policies", "Protection → Conditional Access → Policies → Export policies (JSON)", "Conditional Access")
+      + gRow("Named locations (optional)", "Conditional Access → Named locations → export", "CA (resolves excluded locations)")
+      + '</div><div style="margin-top:8px;color:var(--muted);font-size:10.5px;line-height:1.5">Security Administrator can read Conditional Access. Users and enterprise-apps CSV import land in a later slice.</div></details>';
+    const panel = document.createElement("div"); panel.id = "epImport";
+    panel.style.cssText = "margin-top:16px;padding:15px 16px;border:1px dashed var(--border);border-radius:12px;background:rgba(127,160,210,.05)";
+    panel.innerHTML = '<div style="font-weight:800;font-size:13px;color:var(--text);margin-bottom:4px">Import exported configuration <span style="font-weight:600;font-size:11px;color:var(--muted)">· scale-test · read-only · labelled “Imported”, never “Live”</span></div>'
+      + '<div style="font-size:11.5px;color:var(--muted);line-height:1.5;margin-bottom:10px">Drop the <b>Conditional Access policy export</b> (JSON). Files are detected by their shape; nothing is uploaded.</div>'
+      + guideHtml
+      + '<div id="epImpDrop" style="padding:18px;border:1.5px dashed var(--border);border-radius:10px;text-align:center;color:var(--muted);font-size:12px;cursor:pointer">Drop JSON / CSV files here, or <u>browse</u><input id="epImpFile" type="file" accept=".json,.csv,application/json,text/csv" multiple style="display:none"></div>'
+      + '<div id="epImpDiag" style="margin-top:10px"></div>'
+      + '<div style="margin-top:12px"><button id="epImpGo" disabled style="opacity:.5">Load dataset →</button></div>';
+    card.appendChild(panel);
+    const drop = panel.querySelector("#epImpDrop"), fileIn = panel.querySelector("#epImpFile"), go = panel.querySelector("#epImpGo"), diag = panel.querySelector("#epImpDiag");
+    const parsed = { caPolicies: [], namedLocations: [], users: [], apps: [], roles: [], files: [] };
+    const TLABEL = { caPolicies: "Conditional Access policies", namedLocations: "Named locations", users: "Users (later slice)", apps: "Enterprise apps (later slice)", unknown: "Unrecognised — skipped" };
+    async function addFiles(list) {
+      for (const f of list) {
+        let text = ""; try { text = await f.text(); } catch (e) { continue; }
+        const isJson = /\.json$/i.test(f.name) || /^\s*[\[{]/.test(text);
+        if (isJson) {
+          let j = null; try { j = JSON.parse(text); } catch (e) { parsed.files.push({ name: f.name, type: "unknown", rows: 0, note: "invalid JSON" }); continue; }
+          const arr = _extractArray(j), type = classifyJson(arr);
+          if (type === "caPolicies") parsed.caPolicies = parsed.caPolicies.concat(arr);
+          else if (type === "namedLocations") parsed.namedLocations = parsed.namedLocations.concat(arr);
+          parsed.files.push({ name: f.name, type, rows: arr.length });
+        } else {
+          const { headers, rows } = csvParse(text), type = classifyCsv(headers);
+          if (type === "users") parsed.users = parsed.users.concat(rows);
+          else if (type === "apps") parsed.apps = parsed.apps.concat(rows);
+          parsed.files.push({ name: f.name, type, rows: rows.length });
+        }
+      }
+      renderDiag();
+    }
+    function renderDiag() {
+      if (!parsed.files.length) { diag.innerHTML = ""; go.disabled = true; go.style.opacity = ".5"; return; }
+      diag.innerHTML = parsed.files.map(f => {
+        const ok = IMPORT_READY.has("ca") && f.type === "caPolicies" || f.type === "namedLocations", good = f.type !== "unknown", col = good ? "var(--sev-low)" : "var(--sev-high)";
+        return '<div style="display:flex;gap:9px;align-items:baseline;font-size:11.5px;padding:3px 0;line-height:1.4"><span style="color:' + col + ';font-weight:800;flex-shrink:0">' + (good ? "✓" : "?") + '</span>'
+          + '<span style="color:var(--text);font-weight:600;min-width:150px;flex-shrink:0">' + esc(f.name) + '</span>'
+          + '<span style="color:var(--muted)">' + TLABEL[f.type] + ' · ' + f.rows + (f.type === "caPolicies" ? " policies" : " rows") + (f.note ? " · " + esc(f.note) : "") + '</span></div>';
+      }).join("");
+      go.disabled = !parsed.caPolicies.length; go.style.opacity = parsed.caPolicies.length ? "1" : ".5";
+    }
+    drop.addEventListener("click", () => fileIn.click());
+    fileIn.addEventListener("change", () => addFiles(fileIn.files));
+    ["dragover", "dragenter"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.style.borderColor = "var(--accent)"; }));
+    drop.addEventListener("dragleave", e => { e.preventDefault(); drop.style.borderColor = "var(--border)"; });
+    drop.addEventListener("drop", e => { e.preventDefault(); drop.style.borderColor = "var(--border)"; if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files); });
+    go.addEventListener("click", () => importLoad(parsed));
   }
 
   return { registerView, viewApi, ensureLoaded, makeAsk, token, tokenSilent, tokenOptional, graphBase, setStatus, esc, DEMO,
     scopedDoc, msalShim, ACCOUNT, llm, llmComplete, goto, mitre: mitreFor,
     get account() { return account; }, get signedIn() { return !!account; },
+    get IMPORT() { return IMPORT; }, get IMPORTED() { return IMPORTED; },
     _boot: boot };
 })();
 document.addEventListener("DOMContentLoaded", () => window.EP._boot());
@@ -16417,6 +16553,7 @@ function copyFindings(ctx) {
 
 // ═════════════════════════ Load ═════════════════════════
 async function run() {
+  if (window.EP && EP.IMPORT && EP.IMPORT.raw && EP.IMPORT.raw.caPolicies) { importRender(); return; }
   setStatus('<span class="spinner"></span> Reading the Conditional Access configuration…');
   $('content').innerHTML = '';
   try {
@@ -16549,6 +16686,18 @@ function startDemo() {
   try { $('gate').style.display = 'none'; $('app').style.display = ''; } catch (e) {}
   try { $('who-user').textContent = 'Demo tenant — contoso.demo'; } catch (e) {}
   LAST = demoContext();
+  LAST.findings = buildFindings(LAST);
+  render(LAST);
+}
+
+// Imported Conditional Access: the portal "Export policies" JSON (policy objects in the Graph shape),
+// read-only. Named locations optionally imported too; security-defaults / auth-methods aren't in the
+// policy export, so those findings read "not assessed" — same as a live run that lacks those scopes.
+function importRender() {
+  try { $('gate').style.display = 'none'; $('app').style.display = ''; } catch (e) {}
+  try { $('who-user').textContent = 'Imported — Conditional Access policy export'; } catch (e) {}
+  const policies = (window.EP.IMPORT.raw.caPolicies) || [], namedLocations = (window.EP.IMPORT.raw.namedLocations) || [];
+  LAST = { policies, namedLocations, secDefaults: null, authMethods: null, nlErr: null, secErr: null, amErr: null, imported: true, demo: false, at: new Date() };
   LAST.findings = buildFindings(LAST);
   render(LAST);
 }
