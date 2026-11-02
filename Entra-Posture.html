@@ -5959,7 +5959,7 @@ window.EP = (function () {
   // wired: Conditional Access, from the portal's "Export policies" JSON (an array of policy objects in
   // the Graph shape). Users / enterprise-apps CSV come in later slices. Mirrors the Device Posture import.
   const IMPORT_FLAG = /[?&]import(=1)?(&|$)/.test(location.search);
-  const IMPORT_READY = new Set(["ca", "ca-opt", "user", "overview"]);   // views wired to imported data (ca-opt reuses CA's policies)
+  const IMPORT_READY = new Set(["ca", "ca-opt", "user", "workload", "overview"]);   // views wired to imported data (ca-opt reuses CA's policies)
   let IMPORTED = false, IMPORT = null;
 
   function csvParse(text) {
@@ -5997,6 +5997,9 @@ window.EP = (function () {
     const s = arr[0] || {};
     if (s.grantControls || (s.conditions && s.state)) return "caPolicies";
     if (s.ipRanges || s.countriesAndRegions || /namedlocation/i.test(String(s["@odata.type"] || ""))) return "namedLocations";
+    if (s.clientId !== undefined && s.consentType !== undefined) return "oauth2PermissionGrants";
+    if (s.servicePrincipalType !== undefined || s.appOwnerOrganizationId !== undefined || s.appRoleAssignmentRequired !== undefined) return "servicePrincipals";
+    if (s.appId !== undefined && s.servicePrincipalType === undefined && (s.requiredResourceAccess !== undefined || s.web !== undefined || s.publicClient !== undefined || s.keyCredentials !== undefined)) return "applications";
     // Order matters: userRegistrationDetails and riskyUsers also carry userPrincipalName, so match their
     // distinctive fields BEFORE the generic "users" check or they'd be misread as member accounts.
     if (s.roleDefinitionId && (s.roleEligibilityScheduleId !== undefined || s.endDateTime !== undefined || s.memberType !== undefined || s.scheduleInfo !== undefined)) return "roleEligibility";
@@ -6006,18 +6009,56 @@ window.EP = (function () {
     if (s.userPrincipalName) return "users";
     return "unknown";
   }
-  function classifyCsv(headers) {   // for later slices (users / enterprise apps)
+  function classifyCsv(headers) {
     const nm = _nmap(headers);
+    // Risky users — the portal "Risky users → Download" CSV (User ID / Username / Risk state / Risk level).
+    // Identity Protection risk has no Graph bulk export for a reader, but the blade's Download button does.
+    if (_hasAny(nm, ["Risk state", "riskState"]) || _hasAny(nm, ["Risk level", "riskLevel"])) return "riskyUsers";
+    // PIM "Roles" export — one CSV holding both Active and Eligible directory-role assignments, by role NAME
+    // and UPN (no GUIDs). The reader-friendly path for standing roles + PIM-eligible, which 403 via Graph.
+    if (_hasAny(nm, ["Role Name", "roleName"]) && _hasAny(nm, ["Assignment State", "Principal name", "Member type"])) return "pimRoles";
     if (_hasAny(nm, ["userPrincipalName", "User principal name", "UPN"])) return "users";
     if (_hasAny(nm, ["appId", "Application ID"]) || (_hasAny(nm, ["displayName", "Name"]) && _hasAny(nm, ["publisherName", "Publisher"]))) return "apps";
     return "unknown";
   }
+  function _col(o, nm, aliases) { for (const a of aliases) { const h = nm[_nh(a)]; if (h != null && o[h] != null && String(o[h]).trim() !== "") return String(o[h]).trim(); } return ""; }
+  // Portal risky-users CSV row → the Graph identityProtection/riskyUsers shape the User view's importAnalyze reads.
+  // riskState is normalised to the Graph camelCase values so the User view's "drop none/remediated/dismissed"
+  // filter behaves the same for an imported CSV as for a live scan; riskLevel is lowered to match ("High"→"high").
+  function mapRiskyUserCsv(o, nm) {
+    const raw = _col(o, nm, ["Risk state", "riskState"]).toLowerCase().replace(/[^a-z]/g, "");
+    const state = raw === "confirmedcompromised" ? "confirmedCompromised" : raw === "atrisk" ? "atRisk"
+      : raw === "remediated" ? "remediated" : raw === "dismissed" ? "dismissed"
+      : (raw === "" || raw === "none" || raw === "safe" || raw === "norisk") ? "none" : raw;
+    return {
+      id: _col(o, nm, ["User ID", "UserId", "id", "ObjectId"]),
+      userPrincipalName: _col(o, nm, ["Username", "User principal name", "userPrincipalName", "UPN"]),
+      riskLevel: _col(o, nm, ["Risk level", "riskLevel"]).toLowerCase() || "unknown",
+      riskState: state,
+      riskDetail: _col(o, nm, ["Risk detail", "riskDetail"])
+    };
+  }
+  // PIM "Roles" CSV row → a role grant the User view's importAnalyze can resolve by name + UPN (no GUIDs
+  // in the portal export). Assignment State drives active-vs-eligible; service-principal / guest rows carry
+  // no UPN and are simply skipped downstream, matching the live member-only scope.
+  function mapRoleCsv(o, nm) {
+    const st = _col(o, nm, ["Assignment State", "State", "assignmentState"]).toLowerCase();
+    return {
+      roleName: _col(o, nm, ["Role Name", "roleName", "Role"]),
+      upn: _col(o, nm, ["Principal name", "userPrincipalName", "UPN", "Email"]),
+      displayName: _col(o, nm, ["User/Group Name", "Principal", "displayName", "Name"]),
+      memberType: _col(o, nm, ["Member type", "memberType"]),
+      kind: st === "eligible" ? "eligible" : "active",
+      csvRole: true
+    };
+  }
   function importLoad(parsed) {
-    IMPORT = { raw: parsed, meta: { files: parsed.files, counts: { caPolicies: parsed.caPolicies.length, users: parsed.users.length } } };
+    IMPORT = { raw: parsed, meta: { files: parsed.files, counts: { caPolicies: parsed.caPolicies.length, users: parsed.users.length, servicePrincipals: parsed.servicePrincipals.length } } };
     IMPORTED = true;
     const parts = [];
     if (parsed.caPolicies.length) parts.push(parsed.caPolicies.length + " CA policies");
     if (parsed.users.length) parts.push(parsed.users.length + " users");
+    if (parsed.servicePrincipals.length) parts.push(parsed.servicePrincipals.length + " apps");
     const summary = parts.join(" · ") || "configuration";
     const bar = $("epDemoBar");
     if (bar) { bar.innerHTML = '<span class="tag">Imported</span><span class="n">' + summary + ' from the exports you provided — not a live scan. Nothing was fetched from Graph; read-only. <a href="?">Leave import mode</a></span>'; bar.classList.add("on"); }
@@ -6043,13 +6084,20 @@ window.EP = (function () {
       "",
       'G "identity/conditionalAccess/policies" "ca-policies.json"',
       'G "identity/conditionalAccess/namedLocations" "named-locations.json"',
-      'G "policies/identitySecurityDefaultsEnforcementPolicy" "security-defaults.json"',
-      'G "policies/authenticationMethodsPolicy" "auth-methods.json"',
       'G "users?`$select=id,displayName,userPrincipalName,accountEnabled,userType,onPremisesSyncEnabled,createdDateTime,passwordPolicies,assignedPlans,signInActivity&`$top=999" "users.json"',
       'G "roleManagement/directory/roleAssignments?`$expand=principal" "role-assignments.json"',
-      'G "roleManagement/directory/roleEligibilityScheduleInstances?`$expand=principal" "role-eligible.json"',
       'G "reports/authenticationMethods/userRegistrationDetails?`$top=999" "mfa-registration.json"',
-      'G "identityProtection/riskyUsers?`$top=500" "risky-users.json"',
+      "",
+      "# Risk, PIM-eligible, security-defaults and the auth-methods policy have NO reader-friendly Graph export",
+      "# (they 403 for Global/Security Reader and land as empty 0 KB files). Get the first two from the portal",
+      "# and drop the CSVs on the import panel — the importer reads them natively:",
+      "#   Entra - Protection - Risky users - Download   ->  risk flags (RiskyUsers CSV)",
+      "#   Entra - ID Governance - PIM - Roles - Export  ->  standing + PIM-eligible admin roles (Roles CSV)",
+      "",
+      "# --- Workload view (enterprise apps) ---",
+      'G "servicePrincipals?`$expand=appRoleAssignments&`$top=999" "service-principals.json"',
+      'G "oauth2PermissionGrants?`$top=999" "oauth2-grants.json"',
+      'G "applications?`$expand=owners,federatedIdentityCredentials&`$top=999" "applications.json"',
       "explorer $dir"
     ].join("\n");
     const PS_MG = [
@@ -6061,18 +6109,18 @@ window.EP = (function () {
       '$dir = "$HOME\\Downloads\\entra-export"',
       "New-Item -ItemType Directory -Force -Path $dir | Out-Null",
       "",
-      "# --- Conditional Access (+ parity extras) ---",
+      "# --- Conditional Access ---",
       'Invoke-MgGraphRequest -Method GET -Uri "v1.0/identity/conditionalAccess/policies" -OutputFilePath "$dir\\ca-policies.json"',
       'Invoke-MgGraphRequest -Method GET -Uri "v1.0/identity/conditionalAccess/namedLocations" -OutputFilePath "$dir\\named-locations.json"',
-      'Invoke-MgGraphRequest -Method GET -Uri "v1.0/policies/identitySecurityDefaultsEnforcementPolicy" -OutputFilePath "$dir\\security-defaults.json"',
-      'Invoke-MgGraphRequest -Method GET -Uri "v1.0/policies/authenticationMethodsPolicy" -OutputFilePath "$dir\\auth-methods.json"',
       "",
       "# --- User view ---",
       'Invoke-MgGraphRequest -Method GET -Uri "v1.0/users?`$select=id,displayName,userPrincipalName,accountEnabled,userType,onPremisesSyncEnabled,createdDateTime,passwordPolicies,assignedPlans,signInActivity&`$top=999" -OutputFilePath "$dir\\users.json"',
       'Invoke-MgGraphRequest -Method GET -Uri "v1.0/roleManagement/directory/roleAssignments?`$expand=principal" -OutputFilePath "$dir\\role-assignments.json"',
-      'Invoke-MgGraphRequest -Method GET -Uri "v1.0/roleManagement/directory/roleEligibilityScheduleInstances?`$expand=principal" -OutputFilePath "$dir\\role-eligible.json"',
       'Invoke-MgGraphRequest -Method GET -Uri "v1.0/reports/authenticationMethods/userRegistrationDetails?`$top=999" -OutputFilePath "$dir\\mfa-registration.json"',
-      'Invoke-MgGraphRequest -Method GET -Uri "v1.0/identityProtection/riskyUsers?`$top=500" -OutputFilePath "$dir\\risky-users.json"',
+      "",
+      "# Risk + PIM-eligible 403 for a reader — use the portal CSVs instead (drop them on the import panel):",
+      "#   Entra - Protection - Risky users - Download   ->  RiskyUsers CSV",
+      "#   Entra - ID Governance - PIM - Roles - Export  ->  Roles CSV (standing + eligible)",
       "",
       "explorer $dir"
     ].join("\n");
@@ -6092,14 +6140,16 @@ window.EP = (function () {
       + gRow("Connect (User view)", '<code ' + C + '>Connect-MgGraph -Scopes "User.Read.All","RoleManagement.Read.Directory","AuditLog.Read.All","IdentityRiskyUser.Read.All"</code>', "Global Reader covers these")
       + gRow("Users (members)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/users?$select=id,displayName,userPrincipalName,accountEnabled,userType,onPremisesSyncEnabled,createdDateTime,passwordPolicies,assignedPlans,signInActivity&amp;$top=999" -OutputFilePath users.json</code>', "User view (members)")
       + gRow("Role assignments", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/roleManagement/directory/roleAssignments?$expand=principal" -OutputFilePath role-assignments.json</code>', "who holds admin roles")
-      + gRow("PIM-eligible (optional)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/roleManagement/directory/roleEligibilityScheduleInstances?$expand=principal" -OutputFilePath role-eligible.json</code>', "eligible admins")
       + gRow("MFA registration (optional)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/reports/authenticationMethods/userRegistrationDetails?$top=999" -OutputFilePath mfa-registration.json</code>', "per-user MFA")
-      + gRow("Risky users (optional)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/identityProtection/riskyUsers?$top=500" -OutputFilePath risky-users.json</code>', "Identity Protection")
+      + gRow("Risky users (portal)", 'Graph 403s for a reader. <b>Entra → Protection → Risky users → Download</b> → drop the CSV here.', "Identity Protection risk flags")
+      + gRow("PIM-eligible (portal)", 'Graph 403s for a reader. <b>Entra → ID Governance → PIM → Roles → Export</b> → drop the CSV here (one file carries standing + eligible).', "standing + eligible admin roles")
+      + gHead("For the Workload view — service principals + delegated grants + app registrations")
+      + gRow("Workload exports", '<code ' + C + '>Service principals (?$expand=appRoleAssignments), oauth2PermissionGrants, applications (?$expand=owners,federatedIdentityCredentials) — all in the Copy script above.</code>', "enterprise apps, permissions, credentials")
       + '</div><div style="margin-top:8px;color:var(--muted);font-size:10.5px;line-height:1.5">Needs the Microsoft.Graph module (<code>Install-Module Microsoft.Graph -Scope CurrentUser</code>). Use <b>Invoke-MgGraphRequest</b> (raw JSON), not <code>Get-Mg… | ConvertTo-Json</code> (which renames the fields). Group-based role grants and per-user CA coverage need live group reads, so they read "not assessed" in an import.</div></details>';
     const panel = document.createElement("div"); panel.id = "epImport";
     panel.style.cssText = "margin-top:16px;padding:15px 16px;border:1px dashed var(--border);border-radius:12px;background:rgba(127,160,210,.05)";
     panel.innerHTML = '<div style="font-weight:800;font-size:13px;color:var(--text);margin-bottom:4px">Import exported configuration <span style="font-weight:600;font-size:11px;color:var(--muted)">· scale-test · read-only · labelled “Imported”, never “Live”</span></div>'
-      + '<div style="font-size:11.5px;color:var(--muted);line-height:1.5;margin-bottom:10px">Drop the <b>Conditional Access</b> and/or <b>User</b> view JSON exports (paths below). Files are detected by their shape; nothing is uploaded.</div>'
+      + '<div style="font-size:11.5px;color:var(--muted);line-height:1.5;margin-bottom:10px">Drop the <b>Conditional Access</b> and/or <b>User</b> view JSON exports (paths below). Files are detected by their shape; nothing is uploaded. Identity Protection risk has no JSON export for a reader role — drop the portal <b>Risky users → Download</b> CSV alongside the User-view files and the imported users light up as at-risk.</div>'
       + guideHtml
       + '<div style="margin:0 0 10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap"><button id="epImpCopyAz" style="background:var(--accent);color:#06101f;font-weight:700;border:none;border-radius:7px;padding:7px 13px;cursor:pointer;font-size:12px">⎘ Copy export script · Azure CLI (recommended)</button><button id="epImpCopyMg" style="background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:7px;padding:7px 11px;cursor:pointer;font-size:11.5px">Graph PowerShell version</button><span id="epImpCopyMsg" style="font-size:11px;color:var(--sev-low)"></span></div>'
       + '<div id="epImpDrop" style="padding:18px;border:1.5px dashed var(--border);border-radius:10px;text-align:center;color:var(--muted);font-size:12px;cursor:pointer">Drop JSON / CSV files here, or <u>browse</u><input id="epImpFile" type="file" accept=".json,.csv,application/json,text/csv" multiple style="display:none"></div>'
@@ -6107,9 +6157,9 @@ window.EP = (function () {
       + '<div style="margin-top:12px"><button id="epImpGo" disabled style="opacity:.5">Load dataset →</button></div>';
     card.appendChild(panel);
     const drop = panel.querySelector("#epImpDrop"), fileIn = panel.querySelector("#epImpFile"), go = panel.querySelector("#epImpGo"), diag = panel.querySelector("#epImpDiag");
-    const parsed = { caPolicies: [], namedLocations: [], secDefaults: null, authMethods: null, users: [], roleAssignments: [], roleEligibility: [], userRegistrationDetails: [], riskyUsers: [], apps: [], roles: [], files: [] };
-    const TLABEL = { caPolicies: "Conditional Access policies", namedLocations: "Named locations", secDefaults: "Security defaults", authMethods: "Authentication methods policy", users: "Users (members)", roleAssignments: "Directory role assignments", roleEligibility: "PIM-eligible roles", userRegistrationDetails: "MFA registration", riskyUsers: "Risky users", apps: "Enterprise apps (later slice)", unknown: "Unrecognised — skipped" };
-    const UNIT = { caPolicies: " policies", namedLocations: " locations", authMethods: " methods", users: " users", roleAssignments: " assignments", roleEligibility: " eligible", userRegistrationDetails: " users", riskyUsers: " users", apps: " rows", unknown: " rows" };
+    const parsed = { caPolicies: [], namedLocations: [], secDefaults: null, authMethods: null, users: [], roleAssignments: [], roleEligibility: [], userRegistrationDetails: [], riskyUsers: [], servicePrincipals: [], oauth2PermissionGrants: [], applications: [], roles: [], files: [] };
+    const TLABEL = { caPolicies: "Conditional Access policies", namedLocations: "Named locations", secDefaults: "Security defaults", authMethods: "Authentication methods policy", users: "Users (members)", roleAssignments: "Directory role assignments", roleEligibility: "PIM-eligible roles", pimRoles: "Role assignments (PIM export)", userRegistrationDetails: "MFA registration", riskyUsers: "Risky users", servicePrincipals: "Service principals (enterprise apps)", oauth2PermissionGrants: "Delegated permission grants", applications: "App registrations", unknown: "Unrecognised — skipped" };
+    const UNIT = { caPolicies: " policies", namedLocations: " locations", authMethods: " methods", users: " users", roleAssignments: " assignments", roleEligibility: " eligible", pimRoles: " rows (active + eligible)", userRegistrationDetails: " users", riskyUsers: " users", servicePrincipals: " apps", oauth2PermissionGrants: " grants", applications: " registrations", unknown: " rows" };
     async function addFiles(list) {
       for (const f of list) {
         let text = ""; try { text = await f.text(); } catch (e) { continue; }
@@ -6127,11 +6177,15 @@ window.EP = (function () {
           else if (type === "roleEligibility") parsed.roleEligibility = parsed.roleEligibility.concat(arr);
           else if (type === "userRegistrationDetails") parsed.userRegistrationDetails = parsed.userRegistrationDetails.concat(arr);
           else if (type === "riskyUsers") parsed.riskyUsers = parsed.riskyUsers.concat(arr);
+          else if (type === "servicePrincipals") parsed.servicePrincipals = parsed.servicePrincipals.concat(arr);
+          else if (type === "oauth2PermissionGrants") parsed.oauth2PermissionGrants = parsed.oauth2PermissionGrants.concat(arr);
+          else if (type === "applications") parsed.applications = parsed.applications.concat(arr);
           parsed.files.push({ name: f.name, type, rows: arr.length });
         } else {
-          const { headers, rows } = csvParse(text), type = classifyCsv(headers);
+          const { headers, rows } = csvParse(text), type = classifyCsv(headers), nmc = _nmap(headers);
           if (type === "users") parsed.users = parsed.users.concat(rows);
-          else if (type === "apps") parsed.apps = parsed.apps.concat(rows);
+          else if (type === "riskyUsers") rows.forEach(r => parsed.riskyUsers.push(mapRiskyUserCsv(r, nmc)));
+          else if (type === "pimRoles") rows.forEach(r => { const row = mapRoleCsv(r, nmc); if (!row.roleName) return; if (row.kind === "eligible") parsed.roleEligibility.push(row); else parsed.roleAssignments.push(row); });
           parsed.files.push({ name: f.name, type, rows: rows.length });
         }
       }
@@ -6145,7 +6199,7 @@ window.EP = (function () {
           + '<span style="color:var(--text);font-weight:600;min-width:150px;flex-shrink:0">' + esc(f.name) + '</span>'
           + '<span style="color:var(--muted)">' + TLABEL[f.type] + ' · ' + (f.type === "secDefaults" ? "loaded" : (f.rows + (UNIT[f.type] || " rows"))) + (f.note ? " · " + esc(f.note) : "") + '</span></div>';
       }).join("");
-      const canLoad = parsed.caPolicies.length || parsed.users.length;
+      const canLoad = parsed.caPolicies.length || parsed.users.length || parsed.servicePrincipals.length;
       go.disabled = !canLoad; go.style.opacity = canLoad ? "1" : ".5";
     }
     drop.addEventListener("click", () => fileIn.click());
@@ -7037,7 +7091,21 @@ function importAnalyze() {
     });
     const applyRole = (uid, role, kind) => { const u = byId[uid]; if (u) u.roles.push({ name: role.name, tier: role.tier, ro: !!role.ro, kind: kind, via: "direct", approval: false }); };
     let groupGrants = 0;
-    const takeRole = (a, kind) => { const r = PRIV_ROLES[a.roleDefinitionId]; if (!r) return; const p = a.principal || {}, pt = principalType(p); if (pt === "user") applyRole(p.id, r, kind); else if (pt === "group") groupGrants++; };
+    // Resolvers for the PIM portal CSV, which carries role NAMES and UPNs instead of the GUIDs the JSON exports use.
+    const byUpn = {}; Object.values(byId).forEach((u) => { if (u.upn) byUpn[String(u.upn).toLowerCase()] = u.id; });
+    const roleByName = {}; Object.keys(PRIV_ROLES).forEach((g) => { roleByName[PRIV_ROLES[g].name.toLowerCase()] = PRIV_ROLES[g]; });
+    const takeRole = (a, kind) => {
+      let r = a.roleDefinitionId ? PRIV_ROLES[a.roleDefinitionId] : null;
+      if (!r && a.roleName) r = roleByName[String(a.roleName).toLowerCase()];   // PIM CSV: resolve by role name
+      if (!r) return;   // not a role SightLine tracks as privileged — skipped either way, as in a live scan
+      if (a.csvRole) {   // PIM CSV row: resolve the principal to a member by UPN; SP / guest / non-member rows have no match
+        const uid = a.upn ? byUpn[String(a.upn).toLowerCase()] : null;
+        if (uid) applyRole(uid, r, kind);
+        return;
+      }
+      const p = a.principal || {}, pt = principalType(p);
+      if (pt === "user") applyRole(p.id, r, kind); else if (pt === "group") groupGrants++;
+    };
     assignments.forEach((a) => takeRole(a, "active"));
     eligible.forEach((a) => takeRole(a, "eligible"));
     const KIND_RANK = { active: 0, eligible: 1 };
@@ -9300,8 +9368,108 @@ EP.registerView("workload", (function () {
     setStatus('Demo data \u2014 ' + cache.results.length + ' enterprise app(s), nothing fetched.');
   }
 
+  // -------------------- Imported audit (service principals + delegated grants + app registrations) --------------------
+  // Reads three Graph JSON exports — servicePrincipals (with appRoleAssignments expanded + appRoles, which
+  // doubles as the app-role catalog for resolving permission names), oauth2PermissionGrants, applications
+  // (with owners + federatedIdentityCredentials) — rebuilds each row and runs the SAME enrichment/score path
+  // as a live audit. Workload-identity risk, CA coverage, SP-held directory roles and usage read "not assessed".
+  function importAudit(){
+    try {
+      var R = window.EP.IMPORT.raw;
+      var sps = R.servicePrincipals || [], grants = R.oauth2PermissionGrants || [], apps = R.applications || [];
+      cache.wiPolicies = []; cache.caAvailable = false;
+      var grantsByClient = {}, principalByClient = {};
+      grants.forEach(function(g){
+        if(g.consentType === 'AllPrincipals'){ (grantsByClient[g.clientId] = grantsByClient[g.clientId]||[]).push(g); }
+        else { if(!principalByClient[g.clientId]) principalByClient[g.clientId] = {}; var byRes = principalByClient[g.clientId];
+          if(!byRes[g.resourceId]) byRes[g.resourceId] = { scopeSet:{}, principalIds:{} };
+          (g.scope||'').split(/\s+/).filter(Boolean).forEach(function(s){ byRes[g.resourceId].scopeSet[s] = true; });
+          if(g.principalId) byRes[g.resourceId].principalIds[g.principalId] = true; }
+      });
+      var resourceSPCache = {}, resourceNames = {};
+      sps.forEach(function(sp){ resourceSPCache[sp.id] = { appId: sp.appId, displayName: sp.displayName, appRoles: sp.appRoles||[] }; resourceNames[sp.id] = sp.displayName; });
+      var appRegByAppId = {}; apps.forEach(function(a){ if(a.appId) appRegByAppId[a.appId] = a; });
+      // Home tenant: the org that owns the app registrations (a SP whose appId has a matching registration).
+      var appIdSet = {}; apps.forEach(function(a){ if(a.appId) appIdSet[String(a.appId).toLowerCase()] = true; });
+      var myTid = null;
+      for(var i=0;i<sps.length;i++){ if(sps[i].appId && appIdSet[String(sps[i].appId).toLowerCase()]){ myTid = sps[i].appOwnerOrganizationId; break; } }
+      if(!myTid){ var tc = {}, best = 0; sps.forEach(function(sp){ var t = sp.appOwnerOrganizationId; if(t && !MS_TENANTS[t]) tc[t] = (tc[t]||0)+1; }); Object.keys(tc).forEach(function(t){ if(tc[t]>best){ best = tc[t]; myTid = t; } }); }
+      var appRoleLookup = {};
+      Object.keys(resourceSPCache).forEach(function(spId){ (resourceSPCache[spId].appRoles||[]).forEach(function(role){ appRoleLookup[spId+'_'+role.id] = { resourceName:resourceSPCache[spId].displayName, resourceAppId:resourceSPCache[spId].appId, roleName:role.displayName, roleValue:role.value||'' }; }); });
+      var results = sps.map(function(sp){
+        var spGrants = grantsByClient[sp.id], princByRes = principalByClient[sp.id];
+        var hasGrant = !!(spGrants && spGrants.length) || !!princByRes;
+        var allScopes = [], delegatedDetail = [];
+        var resAppId = function(resId){ return (resourceSPCache[resId]||{}).appId || null; };
+        (spGrants||[]).forEach(function(g){ var scopes = (g.scope||'').split(/\s+/).filter(Boolean).sort(); allScopes = allScopes.concat(scopes); if(scopes.length){ var rAppId=resAppId(g.resourceId); delegatedDetail.push({ resourceName: resourceNames[g.resourceId]||'(unknown)', resourceAppId: rAppId, retired: isRetiredApi(rAppId), scopes: scopes.join(', '), consentType: 'AllPrincipals' }); } });
+        if(princByRes) Object.keys(princByRes).forEach(function(resId){ var entry = princByRes[resId], scopes = Object.keys(entry.scopeSet).sort(); allScopes = allScopes.concat(scopes); var rAppId=resAppId(resId); delegatedDetail.push({ resourceName: resourceNames[resId]||'(unknown)', resourceAppId: rAppId, retired: isRetiredApi(rAppId), scopes: scopes.join(', '), consentType: 'Principal', principalCount: Object.keys(entry.principalIds).length }); });
+        var appPermissions = (sp.appRoleAssignments || []).map(function(a){
+          var resAId = (resourceSPCache[a.resourceId]||{}).appId || null;
+          if(a.appRoleId==='00000000-0000-0000-0000-000000000000') return { resourceName:a.resourceDisplayName||'(unknown)', resourceAppId:resAId, retired:isRetiredApi(resAId), roleName:'Default access', roleValue:'' };
+          var info = appRoleLookup[a.resourceId+'_'+a.appRoleId];
+          return info ? { resourceName:info.resourceName, resourceAppId:info.resourceAppId, retired:isRetiredApi(info.resourceAppId), roleName:info.roleName, roleValue:info.roleValue } : { resourceName:a.resourceDisplayName||'(unknown)', resourceAppId:resAId, retired:isRetiredApi(resAId), roleName:'(unknown)', roleValue:'' };
+        });
+        allScopes = allScopes.concat(appPermissions.map(function(p){ return p.roleValue; }).filter(Boolean));
+        var vp = sp.verifiedPublisher && sp.verifiedPublisher.displayName ? sp.verifiedPublisher.displayName : null;
+        var r = {
+          id: sp.id, appId: sp.appId, displayName: sp.displayName, publisherName: sp.publisherName,
+          directoryRoles: [], signInActivity: null, wiRisk: null, caCoverage: caCoverageFor(sp.id),
+          accountEnabled: sp.accountEnabled, appOwnerOrganizationId: sp.appOwnerOrganizationId,
+          isFirstPartyMicrosoft: isMsFirstParty(sp), firstPartyByAppId: !MS_TENANTS[sp.appOwnerOrganizationId] && !!MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()], firstPartyByVerifiedMs: !MS_TENANTS[sp.appOwnerOrganizationId] && !MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()] && isVerifiedMicrosoft(sp), createdDateTime: sp.createdDateTime,
+          appRoleAssignmentRequired: sp.appRoleAssignmentRequired, _hasGrant: hasGrant,
+          delegatedDetail: delegatedDetail, appPermissions: appPermissions, allScopes: allScopes,
+          passwordCreds: sp.passwordCredentials || [], keyCreds: sp.keyCredentials || [], fic: [],
+          signInAudience: sp.signInAudience || null, verifiedPublisherName: vp, isVerifiedPublisher: !!vp,
+          disabledByMicrosoft: !!(sp.disabledByMicrosoftStatus && sp.disabledByMicrosoftStatus !== 'null'),
+          owners: [], localApp: false, appObjId: null, allowPublicClient: false, implicitGrant: false, redirectUris: [], spaUris: [], webUris: [],
+          portalUrl: 'https://entra.microsoft.com/#view/Microsoft_AAD_IAM/ManagedAppMenuBlade/~/Overview/objectId/' + sp.id + '/appId/' + sp.appId,
+          appRegUrl: 'https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/Overview/appId/' + sp.appId
+        };
+        var reg = appRegByAppId[sp.appId];
+        if(reg){
+          r.localApp = true; r.appObjId = reg.id;
+          r.allowPublicClient = !!(reg.allowPublicClient || reg.isFallbackPublicClient);
+          r.implicitGrant = !!(reg.web && reg.web.implicitGrantSettings && (reg.web.implicitGrantSettings.enableAccessTokenIssuance || reg.web.implicitGrantSettings.enableIdTokenIssuance));
+          var uris = [];
+          if(reg.web && reg.web.redirectUris) uris = uris.concat(reg.web.redirectUris);
+          if(reg.spa && reg.spa.redirectUris) uris = uris.concat(reg.spa.redirectUris);
+          if(reg.publicClient && reg.publicClient.redirectUris) uris = uris.concat(reg.publicClient.redirectUris);
+          r.redirectUris = uris; r.spaUris = (reg.spa && reg.spa.redirectUris) || []; r.webUris = (reg.web && reg.web.redirectUris) || [];
+          if(reg.signInAudience) r.signInAudience = reg.signInAudience;
+          r.owners = (reg.owners||[]).map(function(o){ return { displayName: o.displayName, upn: o.userPrincipalName }; });
+          if(reg.verifiedPublisher && reg.verifiedPublisher.displayName){ r.verifiedPublisherName = reg.verifiedPublisher.displayName; r.isVerifiedPublisher = true; }
+          if((reg.passwordCredentials && reg.passwordCredentials.length) || (reg.keyCredentials && reg.keyCredentials.length)){ r.passwordCreds = reg.passwordCredentials || []; r.keyCreds = reg.keyCredentials || []; }
+          r.fic = (reg.federatedIdentityCredentials||[]).map(function(c){ return { name:c.name, issuer:c.issuer, subject:c.subject, audiences:c.audiences||[] }; });
+        }
+        var liveScopes = [];
+        (r.delegatedDetail||[]).forEach(function(d){ if(!d.retired) liveScopes = liveScopes.concat((d.scopes||'').split(', ').filter(Boolean)); });
+        (r.appPermissions||[]).forEach(function(p){ if(!p.retired && p.roleValue) liveScopes.push(p.roleValue); });
+        r.liveScopes = liveScopes; r.caps = computeReconCaps(liveScopes);
+        return r;
+      });
+      results.forEach(function(r){
+        r.isExternal = !!(myTid && r.appOwnerOrganizationId && r.appOwnerOrganizationId !== myTid);
+        var aud = r.isExternal ? AUDIENCE_INFO['_inferred'] : (AUDIENCE_INFO[r.signInAudience] || (r.localApp ? AUDIENCE_INFO['AzureADMyOrg'] : AUDIENCE_INFO['_inferred']));
+        r.tenancy = aud.tenancy; r.audienceLabel = aud.label; r.audienceTip = aud.tip; r.audienceConsumer = aud.consumer;
+        r.tenancyRank = r.tenancy === 'single' ? 0 : (r.audienceConsumer ? 2 : 1);
+        r.permScore = computePermScore(r);
+        r.inertPermScore = computeInertPermScore(r);
+        r.hasRetiredGrant = (r.delegatedDetail||[]).some(function(d){ return d.retired; }) || (r.appPermissions||[]).some(function(p){ return p.retired && p.roleName !== 'Default access'; });
+        r.factors = computeFactors(r);
+        r.riskScore = computeRisk(r);
+        r.riskWeight = computeRiskWeight(r, r.riskScore);
+      });
+      cache.scannedAt = Date.now(); cache.results = results;
+      cache.wiRiskAvailable = false; cache.rolesAvailable = false; cache.auditAvailable = false;
+      cache.workloadLicense = { available: null }; cache.baseline = null; cache.imported = true;
+      hide('configCard'); show('results'); render();
+      setStatus('Imported — ' + results.length + ' enterprise app(s), read-only.');
+    } catch(e){ try { setStatus('Import error: ' + (e && e.message || e), true); } catch(_){} }
+  }
+
   // -------------------- Audit --------------------
   async function runAudit(){
+    if (window.EP && EP.IMPORT && EP.IMPORT.raw && (EP.IMPORT.raw.servicePrincipals || []).length) { importAudit(); return; }
     clearError(); el('btn-refresh').disabled = true; setStatus('Acquiring token…', false, true);
     try {
       var token = await getToken();
