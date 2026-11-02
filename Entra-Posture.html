@@ -4085,7 +4085,7 @@ window.EP = (function () {
         applyFocus();
       } else {
         const root = window.document.getElementById("view-" + name), r = root && (root.querySelector("#results") || root);
-        if (r) { if (r.classList) r.classList.remove("hidden"); r.innerHTML = '<div class="ep-view-empty" style="padding:28px">This view isn’t wired to imported data yet — <b>Conditional Access</b> is. Users, Workloads and the rest come next.</div>'; }
+        if (r) { if (r.classList) r.classList.remove("hidden"); r.innerHTML = '<div class="ep-view-empty" style="padding:28px">This view isn’t wired to imported data yet — <b>Conditional Access</b> and <b>Users</b> are. Workloads and the rest come next.</div>'; }
       }
       return;
     }
@@ -5959,7 +5959,7 @@ window.EP = (function () {
   // wired: Conditional Access, from the portal's "Export policies" JSON (an array of policy objects in
   // the Graph shape). Users / enterprise-apps CSV come in later slices. Mirrors the Device Posture import.
   const IMPORT_FLAG = /[?&]import(=1)?(&|$)/.test(location.search);
-  const IMPORT_READY = new Set(["ca", "ca-opt"]);   // views wired to imported data (ca-opt reuses CA's policies)
+  const IMPORT_READY = new Set(["ca", "ca-opt", "user"]);   // views wired to imported data (ca-opt reuses CA's policies)
   let IMPORTED = false, IMPORT = null;
 
   function csvParse(text) {
@@ -5997,6 +5997,11 @@ window.EP = (function () {
     const s = arr[0] || {};
     if (s.grantControls || (s.conditions && s.state)) return "caPolicies";
     if (s.ipRanges || s.countriesAndRegions || /namedlocation/i.test(String(s["@odata.type"] || ""))) return "namedLocations";
+    if (s.userPrincipalName) return "users";
+    if (s.roleDefinitionId && (s.roleEligibilityScheduleId !== undefined || s.endDateTime !== undefined || s.memberType !== undefined || s.scheduleInfo !== undefined)) return "roleEligibility";
+    if (s.roleDefinitionId && (s.principalId !== undefined || s.principal !== undefined)) return "roleAssignments";
+    if (s.isMfaRegistered !== undefined || s.methodsRegistered !== undefined) return "userRegistrationDetails";
+    if (s.riskLevel !== undefined || s.riskState !== undefined) return "riskyUsers";
     return "unknown";
   }
   function classifyCsv(headers) {   // for later slices (users / enterprise apps)
@@ -6006,14 +6011,18 @@ window.EP = (function () {
     return "unknown";
   }
   function importLoad(parsed) {
-    IMPORT = { raw: parsed, meta: { files: parsed.files, counts: { caPolicies: parsed.caPolicies.length, namedLocations: parsed.namedLocations.length } } };
+    IMPORT = { raw: parsed, meta: { files: parsed.files, counts: { caPolicies: parsed.caPolicies.length, users: parsed.users.length } } };
     IMPORTED = true;
+    const parts = [];
+    if (parsed.caPolicies.length) parts.push(parsed.caPolicies.length + " CA policies");
+    if (parsed.users.length) parts.push(parsed.users.length + " users");
+    const summary = parts.join(" · ") || "configuration";
     const bar = $("epDemoBar");
-    if (bar) { bar.innerHTML = '<span class="tag">Imported</span><span class="n">' + parsed.caPolicies.length + ' Conditional Access policies from the export you provided — not a live scan. Nothing was fetched from Graph; read-only. <a href="?">Leave import mode</a></span>'; bar.classList.add("on"); }
+    if (bar) { bar.innerHTML = '<span class="tag">Imported</span><span class="n">' + summary + ' from the exports you provided — not a live scan. Nothing was fetched from Graph; read-only. <a href="?">Leave import mode</a></span>'; bar.classList.add("on"); }
     const conn = $("epConnect"); if (conn) conn.style.display = "none";
     const rb = $("epReportBtn"); if (rb) rb.style.display = "";
     Object.keys(views).forEach(n => { views[n].loaded = false; });
-    show("ca");
+    show(parsed.caPolicies.length ? "ca" : (parsed.users.length ? "user" : "ca"));
   }
   function importInit() {
     const card = document.querySelector("#epConnect .card"); if (!card || $("epImport")) return;
@@ -6029,20 +6038,27 @@ window.EP = (function () {
       + gRow("Named locations (optional)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/identity/conditionalAccess/namedLocations" -OutputFilePath named-locations.json</code>', "CA (resolves excluded locations)")
       + gRow("Security defaults (optional)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/policies/identitySecurityDefaultsEnforcementPolicy" -OutputFilePath security-defaults.json</code>', "CA (security-defaults finding)")
       + gRow("Auth methods (optional)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/policies/authenticationMethodsPolicy" -OutputFilePath auth-methods.json</code>', "CA (auth-baseline findings)")
-      + '</div><div style="margin-top:8px;color:var(--muted);font-size:10.5px;line-height:1.5">Needs the Microsoft.Graph module (<code>Install-Module Microsoft.Graph -Scope CurrentUser</code>). Use <b>Invoke-MgGraphRequest</b> (raw JSON), not <code>Get-Mg… | ConvertTo-Json</code> (which renames the fields). Users and enterprise-apps CSV import land in a later slice.</div></details>';
+      + gHead("For the User view — needs directory read (Global Reader), own Connect-MgGraph")
+      + gRow("Connect (User view)", '<code ' + C + '>Connect-MgGraph -Scopes "User.Read.All","RoleManagement.Read.Directory","AuditLog.Read.All","IdentityRiskyUser.Read.All"</code>', "Global Reader covers these")
+      + gRow("Users (members)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/users?$select=id,displayName,userPrincipalName,accountEnabled,userType,onPremisesSyncEnabled,createdDateTime,passwordPolicies,assignedPlans,signInActivity&amp;$top=999" -OutputFilePath users.json</code>', "User view (members)")
+      + gRow("Role assignments", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/roleManagement/directory/roleAssignments?$expand=principal" -OutputFilePath role-assignments.json</code>', "who holds admin roles")
+      + gRow("PIM-eligible (optional)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/roleManagement/directory/roleEligibilityScheduleInstances?$expand=principal" -OutputFilePath role-eligible.json</code>', "eligible admins")
+      + gRow("MFA registration (optional)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/reports/authenticationMethods/userRegistrationDetails?$top=999" -OutputFilePath mfa-registration.json</code>', "per-user MFA")
+      + gRow("Risky users (optional)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/identityProtection/riskyUsers?$top=500" -OutputFilePath risky-users.json</code>', "Identity Protection")
+      + '</div><div style="margin-top:8px;color:var(--muted);font-size:10.5px;line-height:1.5">Needs the Microsoft.Graph module (<code>Install-Module Microsoft.Graph -Scope CurrentUser</code>). Use <b>Invoke-MgGraphRequest</b> (raw JSON), not <code>Get-Mg… | ConvertTo-Json</code> (which renames the fields). Group-based role grants and per-user CA coverage need live group reads, so they read "not assessed" in an import.</div></details>';
     const panel = document.createElement("div"); panel.id = "epImport";
     panel.style.cssText = "margin-top:16px;padding:15px 16px;border:1px dashed var(--border);border-radius:12px;background:rgba(127,160,210,.05)";
     panel.innerHTML = '<div style="font-weight:800;font-size:13px;color:var(--text);margin-bottom:4px">Import exported configuration <span style="font-weight:600;font-size:11px;color:var(--muted)">· scale-test · read-only · labelled “Imported”, never “Live”</span></div>'
-      + '<div style="font-size:11.5px;color:var(--muted);line-height:1.5;margin-bottom:10px">Drop the <b>Conditional Access policy export</b> (JSON). Files are detected by their shape; nothing is uploaded.</div>'
+      + '<div style="font-size:11.5px;color:var(--muted);line-height:1.5;margin-bottom:10px">Drop the <b>Conditional Access</b> and/or <b>User</b> view JSON exports (paths below). Files are detected by their shape; nothing is uploaded.</div>'
       + guideHtml
       + '<div id="epImpDrop" style="padding:18px;border:1.5px dashed var(--border);border-radius:10px;text-align:center;color:var(--muted);font-size:12px;cursor:pointer">Drop JSON / CSV files here, or <u>browse</u><input id="epImpFile" type="file" accept=".json,.csv,application/json,text/csv" multiple style="display:none"></div>'
       + '<div id="epImpDiag" style="margin-top:10px"></div>'
       + '<div style="margin-top:12px"><button id="epImpGo" disabled style="opacity:.5">Load dataset →</button></div>';
     card.appendChild(panel);
     const drop = panel.querySelector("#epImpDrop"), fileIn = panel.querySelector("#epImpFile"), go = panel.querySelector("#epImpGo"), diag = panel.querySelector("#epImpDiag");
-    const parsed = { caPolicies: [], namedLocations: [], secDefaults: null, authMethods: null, users: [], apps: [], roles: [], files: [] };
-    const TLABEL = { caPolicies: "Conditional Access policies", namedLocations: "Named locations", secDefaults: "Security defaults", authMethods: "Authentication methods policy", users: "Users (later slice)", apps: "Enterprise apps (later slice)", unknown: "Unrecognised — skipped" };
-    const UNIT = { caPolicies: " policies", namedLocations: " locations", authMethods: " methods", users: " rows", apps: " rows", unknown: " rows" };
+    const parsed = { caPolicies: [], namedLocations: [], secDefaults: null, authMethods: null, users: [], roleAssignments: [], roleEligibility: [], userRegistrationDetails: [], riskyUsers: [], apps: [], roles: [], files: [] };
+    const TLABEL = { caPolicies: "Conditional Access policies", namedLocations: "Named locations", secDefaults: "Security defaults", authMethods: "Authentication methods policy", users: "Users (members)", roleAssignments: "Directory role assignments", roleEligibility: "PIM-eligible roles", userRegistrationDetails: "MFA registration", riskyUsers: "Risky users", apps: "Enterprise apps (later slice)", unknown: "Unrecognised — skipped" };
+    const UNIT = { caPolicies: " policies", namedLocations: " locations", authMethods: " methods", users: " users", roleAssignments: " assignments", roleEligibility: " eligible", userRegistrationDetails: " users", riskyUsers: " users", apps: " rows", unknown: " rows" };
     async function addFiles(list) {
       for (const f of list) {
         let text = ""; try { text = await f.text(); } catch (e) { continue; }
@@ -6055,6 +6071,11 @@ window.EP = (function () {
           const arr = _extractArray(j), type = classifyJson(arr);
           if (type === "caPolicies") parsed.caPolicies = parsed.caPolicies.concat(arr);
           else if (type === "namedLocations") parsed.namedLocations = parsed.namedLocations.concat(arr);
+          else if (type === "users") parsed.users = parsed.users.concat(arr);
+          else if (type === "roleAssignments") parsed.roleAssignments = parsed.roleAssignments.concat(arr);
+          else if (type === "roleEligibility") parsed.roleEligibility = parsed.roleEligibility.concat(arr);
+          else if (type === "userRegistrationDetails") parsed.userRegistrationDetails = parsed.userRegistrationDetails.concat(arr);
+          else if (type === "riskyUsers") parsed.riskyUsers = parsed.riskyUsers.concat(arr);
           parsed.files.push({ name: f.name, type, rows: arr.length });
         } else {
           const { headers, rows } = csvParse(text), type = classifyCsv(headers);
@@ -6073,7 +6094,8 @@ window.EP = (function () {
           + '<span style="color:var(--text);font-weight:600;min-width:150px;flex-shrink:0">' + esc(f.name) + '</span>'
           + '<span style="color:var(--muted)">' + TLABEL[f.type] + ' · ' + (f.type === "secDefaults" ? "loaded" : (f.rows + (UNIT[f.type] || " rows"))) + (f.note ? " · " + esc(f.note) : "") + '</span></div>';
       }).join("");
-      go.disabled = !parsed.caPolicies.length; go.style.opacity = parsed.caPolicies.length ? "1" : ".5";
+      const canLoad = parsed.caPolicies.length || parsed.users.length;
+      go.disabled = !canLoad; go.style.opacity = canLoad ? "1" : ".5";
     }
     drop.addEventListener("click", () => fileIn.click());
     fileIn.addEventListener("change", () => addFiles(fileIn.files));
@@ -6771,6 +6793,7 @@ function principalType(p) {
 function principalLabel(p) { return (p && (p.displayName || p.userPrincipalName || p.appDisplayName)) || "(unknown principal)"; }
 
 async function analyze() {
+  if (window.EP && EP.IMPORT && EP.IMPORT.raw && (EP.IMPORT.raw.users || []).length) { importAnalyze(); return; }
   try {
     $("loadBtn").disabled = true;
     $("notices").innerHTML = "";
@@ -6930,6 +6953,48 @@ async function analyze() {
   } finally {
     $("loadBtn").disabled = false;
   }
+}
+
+// Imported Users: rebuild the per-account model from Graph JSON exports — members (/users), directory
+// role assignments + PIM-eligible instances (roleManagement/directory/…), MFA registration
+// (reports/authenticationMethods/userRegistrationDetails) and optional risky users — then run the SAME
+// finalize + score + render path as a live scan. Group-based role grants (principal = group) and
+// per-user CA coverage need live group-membership reads, so those stay "not assessed".
+function importAnalyze() {
+  try {
+    const R = window.EP.IMPORT.raw;
+    const members = R.users || [], assignments = R.roleAssignments || [], eligible = R.roleEligibility || [], regs = R.userRegistrationDetails || [], risky = R.riskyUsers || [];
+    const byId = {};
+    members.forEach((u) => {
+      if (!u || !u.id) return;
+      if (u.userType && String(u.userType).toLowerCase() === "guest") return;   // match the live member-only scope
+      byId[u.id] = {
+        id: u.id, name: u.displayName || u.userPrincipalName || "(user)", upn: u.userPrincipalName || "",
+        enabled: u.accountEnabled !== false, onPrem: !!u.onPremisesSyncEnabled, created: u.createdDateTime || null,
+        lastSignIn: (u.signInActivity && (u.signInActivity.lastSignInDateTime || u.signInActivity.lastNonInteractiveSignInDateTime)) || null,
+        pwdNeverExpires: /DisablePasswordExpiration/i.test(u.passwordPolicies || ""),
+        p2Seat: (u.assignedPlans || []).some((pl) => String(pl.servicePlanId || "").toLowerCase() === P2_PLAN && /^Enabled$/i.test(pl.capabilityStatus || "")),
+        roles: [], mfa: null, risk: null, caCovered: null
+      };
+    });
+    const applyRole = (uid, role, kind) => { const u = byId[uid]; if (u) u.roles.push({ name: role.name, tier: role.tier, ro: !!role.ro, kind: kind, via: "direct", approval: false }); };
+    let groupGrants = 0;
+    const takeRole = (a, kind) => { const r = PRIV_ROLES[a.roleDefinitionId]; if (!r) return; const p = a.principal || {}, pt = principalType(p); if (pt === "user") applyRole(p.id, r, kind); else if (pt === "group") groupGrants++; };
+    assignments.forEach((a) => takeRole(a, "active"));
+    eligible.forEach((a) => takeRole(a, "eligible"));
+    const KIND_RANK = { active: 0, eligible: 1 };
+    Object.values(byId).forEach((u) => { u.roles.sort((a, b) => (KIND_RANK[a.kind] || 0) - (KIND_RANK[b.kind] || 0)); const seen = {}, out = []; u.roles.forEach((r) => { if (!seen[r.name]) { seen[r.name] = 1; out.push(r); } }); u.roles = out; });
+    regs.forEach((rg) => { if (rg && byId[rg.id]) byId[rg.id].mfa = classifyMfa(rg); });
+    risky.forEach((r) => { const st = r && r.riskState || ""; if (r && byId[r.id] && st !== "none" && st !== "remediated" && st !== "dismissed") byId[r.id].risk = { level: r.riskLevel || "unknown", state: st, detail: r.riskDetail || "" }; });
+    MODEL.authAvailable = regs.length > 0; MODEL.mfaAvailable = regs.length > 0; MODEL.pimAvailable = true;
+    MODEL.riskAvailable = risky.length > 0; MODEL.caAvailable = false; MODEL.approvalAvailable = false;
+    MODEL.p2 = { available: null }; MODEL.groupRoleGrants = groupGrants; MODEL.imported = true;
+    const list = Object.values(byId);
+    list.forEach((u) => { computeUserFlags(u); u.posture = userRisk(u); u.postureTier = postureTier(u.posture); });
+    MODEL.users = list; MODEL.generatedAt = new Date();
+    computeStats(); render();
+    setStatus("Imported — " + list.length + " member account(s) scored" + (groupGrants ? " · " + groupGrants + " group-based role grant(s) not resolved (needs live group reads)." : "."));
+  } catch (e) { setStatus("Import error: " + (e.message || e), true); }
 }
 
 const STALE_DAYS = 90;
