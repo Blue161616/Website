@@ -380,6 +380,7 @@
 #view-devices .r-None { color:var(--muted); }
 #view-devices .di-dev { font-weight:600; }
 #view-devices .di-dev .jt { display:block; font-size:10px; color:var(--muted); font-weight:400; }
+#view-devices .di-inet { font-size:8.5px; font-weight:800; letter-spacing:.03em; padding:1px 6px; border-radius:5px; background:rgba(255,193,94,.18); color:var(--sev-med); margin-left:7px; white-space:nowrap; vertical-align:middle; }
 #view-devices .di-sub { font-size:11px; color:var(--muted); }
 #view-devices .di-os .v2 { display:block; font-size:10px; color:var(--muted); }
 #view-devices .di-src { display:inline-flex; gap:4px; }
@@ -3440,18 +3441,23 @@ function demoDevices(){
   return raw.map((r, ix) => ({ id:"dev"+ix, name:r[0], os:r[1], osVer:r[2], joinType:r[3], owner:r[4], user:r[5], managedBy:r[6],
     entra:r[7][0], intune:r[7][1], defender:r[7][2], compliance:r[8], risk:r[9], riskSub:String(r[9]).toLowerCase(), exposure:r[10],
     criticality:r[11], sensor:r[12], internet:r[13], lastSeenDays:r[14], stale:(r[14]!=null && r[14]>30),
-    onboarding:r[7][2]?"Onboarded":"—", aadId:"—", lastSyncDays:r[7][1]?r[14]:null, lastMdeDays:r[7][2]?r[14]:null }));
+    onboarding:r[7][2]?"Onboarded":"—", aadId:"—", lastSyncDays:r[7][1]?r[14]:null, lastMdeDays:r[7][2]?r[14]:null,
+    threat: r[7][2] ? (r[10]==="High" ? "High" : r[10]==="Medium" ? "Low" : "None") : null,
+    cve: r[7][2] ? (r[10]==="High" ? "Critical" : r[10]==="Medium" ? "High" : "None") : null,
+    cveCount: r[7][2] ? (r[10]==="High" ? 9 : r[10]==="Medium" ? 3 : 0) : null,
+    configFail: r[7][2] ? ((r[8]==="noncompliant" || r[8]==="unevaluated") ? 4 : 1) : null }));
 }
 
 let DALL = null;   // unified device list
 const EXPANDED = {};   // device id -> true when its detail row is open
-const STATE = { q:"", os:"", risk:"", exp:"", comp:"", onb:"", net:"", owner:"", sensor:"", quick:"", sortCol:"risk", sortDir:"desc" };
+const STATE = { q:"", os:"", risk:"", exp:"", comp:"", onb:"", net:"", owner:"", sensor:"", threat:"", cve:"", config:"", quick:"", sortCol:"risk", sortDir:"desc" };
 const SORTKEY = {
   risk: d => RISK_N[RISK_BAND(d.risk)] || 0,
   device: d => (d.name||"").toLowerCase(),
   os: d => (d.os||"").toLowerCase(),
   compliance: d => ({ noncompliant:4, grace:3, unevaluated:2, "—":1, compliant:0 }[d.compliance] != null ? { noncompliant:4, grace:3, unevaluated:2, "—":1, compliant:0 }[d.compliance] : 1),
   exposure: d => ({ High:4, Medium:3, Low:2, None:1, "—":0 }[d.exposure] != null ? { High:4, Medium:3, Low:2, None:1, "—":0 }[d.exposure] : 0),
+  threat: d => ({ High:4, Medium:3, Low:2, None:1 }[d.threat] != null ? { High:4, Medium:3, Low:2, None:1 }[d.threat] : 0),
   lastseen: d => d.lastSeenDays == null ? 1e9 : d.lastSeenDays
 };
 const SORT_DEFDIR = { device:"asc", os:"asc", lastseen:"asc" };   // others default descending (worst first)
@@ -3525,6 +3531,33 @@ async function huntDevices(){
   if (!r.ok){ let d=""; try{ d=((await r.json()).error||{}).message||""; }catch(e){} const e2=new Error("Defender hunting "+r.status+(d?" — "+d:"")); e2.status=r.status; throw e2; }
   const j = await r.json(); return j.results || [];
 }
+// Defender THREAT level per device = max severity of the device's ACTIVE alerts (the signal behind the
+// Defender portal "Risk level"). Read via advanced hunting (AlertEvidence ⋈ AlertInfo), keyed by MDE
+// DeviceId. Optional: failure leaves threat unset ("—"), no regression.
+async function huntThreat(){
+  const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
+  const q = "AlertEvidence | where isnotempty(DeviceId) | join kind=inner (AlertInfo | where Timestamp > ago(30d) and Status != 'Resolved') on AlertId | summarize Sev = max(case(Severity == 'High', 3, Severity == 'Medium', 2, Severity == 'Low', 1, 0)) by DeviceId";
+  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", {
+    method: "POST", headers: { Authorization: "Bearer " + at, "Content-Type": "application/json" }, body: JSON.stringify({ Query: q }) });
+  if (!r.ok){ const e2 = new Error("threat " + r.status); e2.status = r.status; throw e2; }
+  return (await r.json()).results || [];
+}
+// Per-device max CVE severity + count (Defender TVM via advanced hunting), keyed by MDE DeviceId.
+async function huntCves(){
+  const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
+  const q = "DeviceTvmSoftwareVulnerabilities | summarize Sev = max(case(VulnerabilitySeverityLevel == 'Critical', 4, VulnerabilitySeverityLevel == 'High', 3, VulnerabilitySeverityLevel == 'Medium', 2, VulnerabilitySeverityLevel == 'Low', 1, 0)), Cves = dcount(CveId) by DeviceId";
+  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  if (!r.ok){ const e2 = new Error("cves " + r.status); e2.status = r.status; throw e2; }
+  return (await r.json()).results || [];
+}
+// Per-device failing secure-config count (Defender TVM via advanced hunting), keyed by MDE DeviceId.
+async function huntConfig(){
+  const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
+  const q = "DeviceTvmSecureConfigurationAssessment | where IsApplicable == 1 and IsCompliant == 0 | summarize Fails = dcount(ConfigurationId) by DeviceId";
+  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  if (!r.ok){ const e2 = new Error("config " + r.status); e2.status = r.status; throw e2; }
+  return (await r.json()).results || [];
+}
 function normOS(s){ s = String(s||"").toLowerCase();
   if (s.includes("server")) return "Windows Server";
   if (s.includes("windows") || s.includes("win")) return "Windows";
@@ -3541,6 +3574,11 @@ async function collect(){
   try { intune = await gGetAll("/deviceManagement/managedDevices?$select=id,deviceName,azureADDeviceId,operatingSystem,osVersion,complianceState,isEncrypted,lastSyncDateTime,managedDeviceOwnerType,userPrincipalName,managementAgent&$top=200", ["DeviceManagementManagedDevices.Read.All"]); } catch(e){ intune = []; }
   let machines = null, mdeErr = null;
   try { machines = await huntDevices(); } catch(e){ mdeErr = e; machines = null; }
+  let threatRows = null, cveRows = null, cfgRows = null;
+  if (machines){ [threatRows, cveRows, cfgRows] = await Promise.all([ huntThreat().catch(()=>null), huntCves().catch(()=>null), huntConfig().catch(()=>null) ]); }
+  const threatBy = {}; if (threatRows) threatRows.forEach(x => { const id = String(x.DeviceId||"").toLowerCase(); if (id) threatBy[id] = x.Sev||0; });
+  const cveBy = {}; if (cveRows) cveRows.forEach(x => { const id = String(x.DeviceId||"").toLowerCase(); if (id) cveBy[id] = { sev: x.Sev||0, n: x.Cves||0 }; });
+  const cfgBy = {}; if (cfgRows) cfgRows.forEach(x => { const id = String(x.DeviceId||"").toLowerCase(); if (id) cfgBy[id] = x.Fails||0; });
   const inBy = {}; intune.forEach(d => { const k = String(d.azureADDeviceId||"").toLowerCase(); if (k) inBy[k] = d; });
   const mdeBy = {}; if (machines) machines.forEach(m => { const k = String(m.AadDeviceId||m.aadDeviceId||"").toLowerCase(); if (k) mdeBy[k] = m; });
   const now = Date.now(), STALE = 30 * 864e5;
@@ -3554,6 +3592,13 @@ async function collect(){
     const mExp = mf("ExposureLevel","exposureLevel"), mSensor = mf("SensorHealthState","healthStatus"), mOnb = mf("OnboardingStatus","onboardingStatus"),
           mCrit = mf("CriticalityLevel") || mf("DeviceValue","deviceValue"), mNet = mf("IsInternetFacing","isInternetFacing"),
           mOsV = mf("OSVersion","version"), mOsP = mf("OSPlatform","osPlatform"), mRisk = mf("RiskScore","riskScore"), mTs = mf("Timestamp","lastSeen");
+    const _mid = m ? String(m.DeviceId || m.id || "").toLowerCase() : null;
+    const _tsev = m ? (threatBy[_mid] != null ? threatBy[_mid] : 0) : null;   // Defender active-alert severity
+    const threat = _tsev == null ? null : _tsev >= 3 ? "High" : _tsev >= 2 ? "Medium" : _tsev >= 1 ? "Low" : "None";
+    const _cve = m ? (cveBy[_mid] || null) : null;
+    const cve = _cve == null ? null : _cve.sev >= 4 ? "Critical" : _cve.sev >= 3 ? "High" : _cve.sev >= 2 ? "Medium" : _cve.sev >= 1 ? "Low" : "None";
+    const cveCount = _cve ? _cve.n : null;
+    const configFail = m ? (cfgBy[_mid] != null ? cfgBy[_mid] : 0) : null;
     const cs = String((i && i.complianceState) || "").toLowerCase();
     const compliance = !i ? "—" : cs === "compliant" ? "compliant" : cs === "noncompliant" || cs === "error" || cs === "conflict" ? "noncompliant" : cs === "ingraceperiod" ? "grace" : cs === "unknown" || cs === "notapplicable" ? "unevaluated" : cs || "—";
     const lastSyncDays = dd(i && i.lastSyncDateTime), lastMdeDays = dd(mTs), lastSignDays = dd(d.approximateLastSignInDateTime);
@@ -3584,7 +3629,7 @@ async function collect(){
       criticality: mCrit || "—", sensor: m ? (mSensor || "—") : (machines ? "—" : null),
       onboarding: m ? (mOnb || "Onboarded") : (machines ? "Not onboarded" : "—"), aadId: d.deviceId || "—", intuneId: i ? i.id : null,
       entra: 1, intune: i ? 1 : 0, defender: machines ? (m ? 1 : 0) : null,
-      compliance, risk, riskSub, exposure: mExp || "—",
+      compliance, risk, riskSub, exposure: mExp || "—", threat, cve, cveCount, configFail,
       internet: m ? (typeof mNet === "boolean" ? mNet : String(mNet).toLowerCase()==="true" ? true : String(mNet).toLowerCase()==="false" ? false : null) : null,
       lastSeenDays: seen, lastSyncDays, lastMdeDays, stale: seen != null && seen > 30
     };
@@ -3604,6 +3649,10 @@ function applyFilters(list){
     if (S.comp && d.compliance !== S.comp) return false;
     if (S.owner && d.owner !== S.owner) return false;
     if (S.sensor && d.sensor !== S.sensor) return false;
+    if (S.threat && d.threat !== S.threat) return false;
+    if (S.cve && d.cve !== S.cve) return false;
+    if (S.config === "fail" && !(d.configFail > 0)) return false;
+    if (S.config === "ok" && !(d.configFail === 0)) return false;
     if (S.onb === "no" && d.defender !== 0) return false;
     if (S.onb === "yes" && d.defender !== 1) return false;
     if (S.net === "yes" && d.internet !== true) return false;
@@ -3624,6 +3673,7 @@ function compBadge(c){
   return '<span class="di-pill p-mute">—</span>';
 }
 function expBadge(e){ const cls = e==="High"?"p-bad":e==="Medium"?"p-warn":e==="Low"?"p-ok":"p-mute"; return '<span class="di-pill '+cls+'">'+esc(e)+'</span>'; }
+function threatBadge(t){ if (t == null) return '<span class="di-pill p-mute">—</span>'; const cls = t==="High"?"p-bad":t==="Medium"?"p-warn":t==="Low"?"p-warn":"p-ok"; return '<span class="di-pill '+cls+'">'+esc(t==="None"?"none":t)+'</span>'; }
 function srcChips(d){
   const chip = (lbl, on) => '<span class="di-chip ' + (on==null?"":on?"on":"off") + '" title="' + lbl + '">' + lbl[0] + '</span>';
   return '<span class="di-src">' + chip("Entra", d.entra) + chip("Intune", d.intune) + chip("Defender", d.defender) + '</span>';
@@ -3633,7 +3683,9 @@ function detailRow(d, cols){
   const net = d.internet===true?"Internet-facing":d.internet===false?"Internal":"—";
   const grid = kv("Join type", esc(d.joinType)) + kv("Managed by", esc(d.managedBy)) + kv("Ownership", esc(d.owner))
     + kv("Primary user", esc(d.user)) + kv("OS version", esc(d.osVer)) + kv("Risk", esc(d.risk))
-    + kv("Exposure", esc(d.exposure)) + kv("Criticality", esc(d.criticality)) + kv("Sensor health", esc(d.sensor==null?"—":d.sensor))
+    + kv("Exposure", esc(d.exposure)) + kv("Defender threat", esc(d.threat==null?"—":(d.threat==="None"?"none (no active alerts)":d.threat)))
+    + kv("CVE severity", esc(d.cve==null?"—":d.cve) + (d.cveCount ? ' <span class="di-sub">· ' + d.cveCount + ' CVEs</span>' : "")) + kv("Failing configs", d.configFail==null?"—":String(d.configFail))
+    + kv("Criticality", esc(d.criticality)) + kv("Sensor health", esc(d.sensor==null?"—":d.sensor))
     + kv("Onboarding", esc(d.onboarding)) + kv("Internet-facing", net) + kv("Device AAD id", esc(d.aadId))
     + kv("Last Intune sync", ago(d.lastSyncDays)) + kv("Last Defender seen", ago(d.lastMdeDays));
   let why = "";
@@ -3674,12 +3726,15 @@ function paint(){
     + sel("exp", "Exposure: all", distinct(D.devices, d => d.exposure), STATE.exp)
     + sel("comp", "Compliance: all", distinct(D.devices, d => d.compliance), STATE.comp)
     + sel("owner", "Ownership: all", distinct(D.devices, d => d.owner), STATE.owner)
+    + sel("threat", "Threat: all", distinct(D.devices, d => d.threat), STATE.threat)
+    + sel("cve", "CVE: all", distinct(D.devices, d => d.cve), STATE.cve)
+    + (D.hasMde ? '<select data-f="config"><option value="">Config: all</option><option value="fail"' + (STATE.config==="fail"?" selected":"") + '>failing config</option><option value="ok"' + (STATE.config==="ok"?" selected":"") + '>config ok</option></select>' : "")
     + sel("sensor", "Sensor: all", distinct(D.devices, d => d.sensor), STATE.sensor)
     + (D.hasMde ? '<select data-f="onb"><option value="">Defender: all</option><option value="yes"' + (STATE.onb==="yes"?" selected":"") + '>onboarded</option><option value="no"' + (STATE.onb==="no"?" selected":"") + '>not onboarded</option></select>' : "")
     + (hasNet ? '<select data-f="net"><option value="">Internet-facing: all</option><option value="yes"' + (STATE.net==="yes"?" selected":"") + '>internet-facing</option><option value="no"' + (STATE.net==="no"?" selected":"") + '>internal</option></select>' : "")
     + '<span class="di-clear" data-clear="1">clear</span>'
     + '<span class="di-count">' + list.length + ' of ' + D.devices.length + ' devices</span></div>';
-  const COLS = 8;
+  const COLS = 9;
   // sortable: default risk ↓ (worst first); header click sets the column, re-click toggles direction
   const scol = STATE.sortCol || "risk", sdir = STATE.sortDir || "desc", kf = SORTKEY[scol] || SORTKEY.risk;
   const rows = list.slice().sort((a, b) => {
@@ -3688,15 +3743,15 @@ function paint(){
     return sdir === "desc" ? -c : c;
   });
   const th = (col, label) => { const on = scol === col; return '<th class="di-sortable" data-sort="' + col + '"' + (on ? ' style="color:var(--accent)"' : '') + '>' + label + (on ? (sdir === "desc" ? " ↓" : " ↑") : "") + '</th>'; };
-  const head = '<tr><th style="width:14px"></th>' + th("risk","Risk") + th("device","Device") + th("os","OS") + '<th>Sources</th>' + th("compliance","Compliance") + th("exposure","Exposure") + th("lastseen","Last seen") + '</tr>';
+  const head = '<tr><th style="width:14px"></th>' + th("risk","Risk") + th("device","Device") + th("os","OS") + '<th>Sources</th>' + th("compliance","Compliance") + th("exposure","Exposure") + th("threat","Threat") + th("lastseen","Last seen") + '</tr>';
   const body = rows.map(d => {
     const band = RISK_BAND(d.risk), open = !!EXPANDED[d.id];
     const main = '<tr class="di-main' + (open?" open":"") + '" data-dev="' + esc(d.id) + '">'
       + '<td><span class="di-caret">▸</span></td>'
       + '<td><span class="di-risk"><span class="b r-' + band + '">' + band + '</span><span class="s">' + esc(d.riskSub || d.risk) + '</span></span></td>'
-      + '<td class="di-dev">' + esc(d.name) + '<span class="jt">' + esc(d.joinType) + '</span></td>'
+      + '<td class="di-dev">' + esc(d.name) + (d.internet === true ? '<span class="di-inet" title="Reachable from the internet (Defender)">🌐 internet-facing</span>' : '') + '<span class="jt">' + esc(d.joinType) + '</span></td>'
       + '<td class="di-os">' + esc(d.os) + '<span class="v2">' + esc(d.osVer) + '</span></td>'
-      + '<td>' + srcChips(d) + '</td><td>' + compBadge(d.compliance) + '</td><td>' + expBadge(d.exposure) + '</td>'
+      + '<td>' + srcChips(d) + '</td><td>' + compBadge(d.compliance) + '</td><td>' + expBadge(d.exposure) + '</td><td>' + threatBadge(d.threat) + '</td>'
       + '<td class="di-sub"' + (d.stale?' style="color:var(--sev-high)"':'') + '>' + ago(d.lastSeenDays) + '</td></tr>';
     return main + (open ? detailRow(d, COLS) : "");
   }).join("") || '<tr><td colspan="' + COLS + '" style="padding:20px;color:var(--muted)">No devices match these filters.</td></tr>';
@@ -3708,7 +3763,7 @@ function paint(){
     + (D.mdeErr ? esc(D.mdeErr.message || String(D.mdeErr)) : "The Defender (MDE) API returned no data.")
     + ' Grant Microsoft Graph <b>ThreatHunting.Read.All</b> (advanced hunting — the Defender REST API can’t be called from a browser) and connect.</span>'
     + '<button data-connect style="flex:none;background:var(--accent);color:#06101f;font-weight:700;border:none;border-radius:7px;padding:7px 14px;cursor:pointer;font-size:12px">Connect Defender →</button></div>' : "";
-  const note = '<div class="di-note"><b>Read-only. ' + src + '</b> One row per device, merged across Entra, Intune and Defender — click a row to expand the full Intune + Defender detail. Risk is Defender’s riskScore where the device is onboarded, else a composite of unmanaged / non-compliant / stale (staleness is a hygiene flag, not a risk escalator). Last seen is the most recent of Defender telemetry, Intune sync or Entra sign-in.</div>';
+  const note = '<div class="di-note"><b>Read-only. ' + src + '</b> One row per device, merged across Entra, Intune and Defender — click a row to expand the full Intune + Defender detail. <b>Risk</b> is a composite of compliance / management raised by the live Defender exposure level (staleness is a hygiene flag, not a risk escalator). <b>Threat</b> is the highest severity of the device’s active Defender alerts (the signal behind the portal’s Risk level). Last seen is the most recent of Defender telemetry, Intune sync or Entra sign-in.</div>';
   root.innerHTML = band + mdeBanner + kpis + filters + '<table class="di-tbl"><thead>' + head + '</thead><tbody>' + body + '</tbody></table>' + note;
 }
 
@@ -3746,7 +3801,20 @@ function __dpDevSummary(){
     unmanaged, notOnb, hasMde: DALL.hasMde, live: DALL.live,
     score: null, grade: "–", lead: ds.length + " devices · " + hi + " high-risk · " + unmanaged + " unmanaged", sev: { crit:0, high:0, med:0, low:0 }, top: [] };
 }
-function __dpDevFocus(f){ try { if (f && f.quick){ STATE.quick = f.quick; paint(); } } catch(e){} }
+// Cross-link target: a domain view calls EP.goto("devices", {comp|exp|threat|cve|config|onb|quick|…}).
+// Clear the current filters, apply the ones handed in, and show the filtered device list.
+function __dpDevFocus(f){
+  try {
+    if (!f) return;
+    const keys = ["q","os","risk","exp","comp","onb","net","owner","sensor","threat","cve","config","quick"];
+    keys.forEach(k => STATE[k] = "");
+    keys.forEach(k => { if (f[k] != null) STATE[k] = f[k]; });
+    if (f.exposure != null) STATE.exp = f.exposure;   // alias
+    if (f.search != null) STATE.q = f.search;          // alias
+    paint();
+    const r = document.getElementById("dev-root"); if (r) r.scrollIntoView({ behavior:"smooth", block:"start" });
+  } catch(e){}
+}
 
 if (window.EP && EP.DEMO){ try { analyze(); } catch(e){ console.error("[devices demo]", e); } }
 
