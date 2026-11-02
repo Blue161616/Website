@@ -1936,7 +1936,7 @@ window.EP = (function () {
     for (const v of REPORT_VIEWS) {
       const view = views[v.name];
       try {
-        if (view && view.load && !view.loaded && !DEMO && account) {
+        if (view && view.load && !view.loaded && (IMPORTED || (!DEMO && account))) {
           repRow(v.name, "load", "collecting…");
           view.loaded = true;
           const root = document.getElementById("view-" + v.name);
@@ -3030,7 +3030,7 @@ window.EP = (function () {
     const lv = $("ovLive");
     if (lv) {
       const n = (data && Object.values(data).filter(Boolean).length) || 0;
-      lv.innerHTML = '<span class="ov-live-dot"></span>Live · refreshed ' + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + (n ? ' · ' + n + ' domains' : "");
+      lv.innerHTML = '<span class="ov-live-dot"></span>' + (IMPORTED ? "Imported" : "Live") + ' · refreshed ' + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + (n ? ' · ' + n + ' domains' : "");
     }
     ovAnimate();
     ovInitMiniGraph();   // mount the live Attack Paths mini-graph once its container is in the DOM
@@ -3170,7 +3170,7 @@ window.EP = (function () {
       // The Devices inventory isn't a scored domain, so it's loaded here (not via REPORT_VIEWS) and
       // folded into the overview as KPI callouts + a risk-distribution bar.
       let devSum = null;
-      try { const dv = views["devices"]; if (dv) { if (dv.load && !dv.loaded && !DEMO && account) { dv.loaded = true; await dv.load(); } devSum = dv.summary ? dv.summary() : null; } } catch (e) {}
+      try { const dv = views["devices"]; if (dv) { if (dv.load && !dv.loaded && (IMPORTED || (!DEMO && account))) { dv.loaded = true; await dv.load(); } devSum = dv.summary ? dv.summary() : null; } } catch (e) {}
       host.innerHTML = dpOverviewHtml(data, devSum);
     } catch (e) { host.innerHTML = '<div class="ov-err">Could not build the overview — ' + esc(e.message || e) + '</div>'; }
     finally { _ovBusy = false; }
@@ -3661,7 +3661,7 @@ window.EP = (function () {
   // feed Hardening + Vulnerabilities later) are detected by their headers and mapped tolerantly; a
   // per-file diagnostic shows exactly what matched so column drift is visible, not silent.
   const IMPORT_FLAG = /[?&]import(=1)?(&|$)/.test(location.search);
-  const IMPORT_READY = new Set(["devices", "hardening", "vuln"]);   // views wired to imported data (grows as they are built)
+  const IMPORT_READY = new Set(["devices", "coverage", "compliance", "hardening", "vuln", "overview"]);   // views wired to imported data
   let IMPORTED = false, IMPORT = null;
 
   function csvParse(text) {
@@ -4694,7 +4694,7 @@ function render(D){
     + (HASMDE ? tile(notOnb, "no Defender sensor", notOnb?"crit":"") : tile("—", "no Defender sensor", "na"))
     + tile(unmanaged, "not managed by Intune", unmanaged?"high":"")
     + tile(stale, "stale · no sync >30d", stale?"high":"") + '</div>';
-  const src = (window.EP && EP.DEMO) ? "Demo data." : ("Live — Entra + Intune" + (HASMDE ? " + Defender (advanced hunting)." : " via Microsoft Graph."));
+  const src = D.imported ? ("Imported CSV — Entra + Intune" + (HASMDE ? " + Defender exports." : " exports.")) : (window.EP && EP.DEMO) ? "Demo data." : ("Live — Entra + Intune" + (HASMDE ? " + Defender (advanced hunting)." : " via Microsoft Graph."));
   const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> Coverage is the union of Entra device objects, Intune managed devices and Defender machines. <b>By gap</b> lists what is missing (no EDR sensor, unmanaged, stale) with the exact devices and the fix; <b>By coverage</b> groups every device by which of Entra·Intune·Defender see it. '
     + (HASMDE ? 'A device Entra/Intune knows but Defender does not is an EDR blind spot; a Defender-only device is an endpoint Entra never enrolled.' : 'Defender onboarding needs <b>ThreatHunting.Read.All</b> (advanced hunting) to complete the picture.') + '</div>';
   root.innerHTML = band + tiles + toolbar() + activeTable() + note;
@@ -4718,6 +4718,10 @@ function wireView(){
 }
 async function analyze(){
   const root = document.getElementById("cov-root");
+  if (window.EP && EP.IMPORT && EP.IMPORT.devices) {
+    const devices = EP.IMPORT.devices.map(d => ({ name: d.name, os: d.os, entra: d.entra, intune: d.intune, mde: (d.defender == null ? null : d.defender), lastSyncDays: d.lastSyncDays, stale: d.stale }));
+    render({ live: false, imported: true, hasMde: EP.IMPORT.hasMde, devices }); return;
+  }
   if (window.EP && EP.DEMO) { render(DEMO); return; }
   if (root) root.innerHTML = '<div class="dp-note" style="margin:8px 0"><b>Reading Entra + Intune device coverage…</b></div>';
   try { render(await collect()); }
@@ -4961,6 +4965,20 @@ function activeTable(){
 
 // ---------- page render ----------
 function sevCounts(){ const c = { crit:0, high:0, med:0, low:0 }; REASON_ROWS.forEach(r => { if (c[r.sev]!=null) c[r.sev]++; }); return c; }
+// Build the Compliance workspace from an imported Intune Managed devices export (the richest compliance
+// source: Compliance state, Encrypted, JailBroken, Primary user, Last check-in). Same reason/score engine.
+function _impState(s){ s = String(s||"").toLowerCase().replace(/[^a-z]/g, ""); if (s === "compliant") return "compliant"; if (s.indexOf("grace") >= 0) return "ingraceperiod"; if (s === "notcompliant" || s === "noncompliant" || s === "error" || s === "conflict") return "noncompliant"; if (s.indexOf("notevaluated") >= 0 || s === "unknown" || s.indexOf("notapplicable") >= 0) return "unknown"; return s; }
+function _impEnc(s){ s = String(s||"").toLowerCase(); if (["yes","true","1"].indexOf(s) >= 0) return true; if (["no","false","0"].indexOf(s) >= 0) return false; return null; }
+function buildComplianceFromImport(rows){
+  const now = Date.now();
+  const devices = (rows || []).map(d => ({ name: d.name || "(device)", os: d.os || "", osVer: d.osVer || "—",
+    state: _impState(d.compliance), enc: _impEnc(d.encrypted), jail: /true|yes/i.test(d.jailbroken || ""),
+    user: d.upn || "—", lastSyncDays: (d.lastSync && !isNaN(Date.parse(d.lastSync))) ? Math.floor((now - Date.parse(d.lastSync)) / 864e5) : null, plat: normPlat(d.os) }));
+  const total = devices.length;
+  const score = total ? Math.round(100 * devices.reduce((a, d) => a + cwWeight(d), 0) / total) : 0;
+  const grade = score >= 70 ? "D" : score >= 50 ? "C" : score >= 30 ? "B" : "A";
+  return { score, grade, imported: true, live: false, devices };
+}
 function render(D){
   LAST = D;
   const root = document.getElementById("comp-root"); if (!root) return;
@@ -4985,7 +5003,7 @@ function render(D){
     + tile(nonComp, "non-compliant", nonComp?"high":"")
     + tile(noResult, "no compliance result", noResult?"crit":"")
     + tile(encOff, "disk encryption off", encOff?"high":"") + '</div>';
-  const src = (window.EP && EP.DEMO) ? "Demo data." : "Live — Intune via Microsoft Graph.";
+  const src = D.imported ? "Imported CSV — Intune Managed devices export." : (window.EP && EP.DEMO) ? "Demo data." : "Live — Intune via Microsoft Graph.";
   const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> Each row is a reason a device fails compliance — expand it for the exact devices and the fix. A device with no compliance result is unevaluated (no policy applied), surfaced here rather than counted as compliant. Per-setting Intune detail (the exact failing setting) lives on each device in the Devices page.</div>';
   root.innerHTML = band + tiles + toolbar() + activeTable() + note;
   repaint(); wireView();
@@ -5011,6 +5029,7 @@ function wireView(){
 }
 async function analyze(){
   const root = document.getElementById("comp-root");
+  if (window.EP && EP.IMPORT) { const rows = (EP.IMPORT.raw && EP.IMPORT.raw.intune) || []; render(rows.length ? buildComplianceFromImport(rows) : Object.assign({}, NEEDS_INTUNE, { err: "No Intune Managed devices export was imported — add it to populate Compliance." })); return; }
   if (window.EP && EP.DEMO) { render(DEMO); return; }
   if (root) root.innerHTML = '<div class="dp-note" style="margin:8px 0"><b>Reading Intune compliance…</b></div>';
   try { render(await collect()); }
