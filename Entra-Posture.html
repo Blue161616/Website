@@ -6026,11 +6026,33 @@ window.EP = (function () {
   }
   function importInit() {
     const card = document.querySelector("#epConnect .card"); if (!card || $("epImport")) return;
-    // One copy-paste PowerShell script that exports every file (CA + User view) into one folder. Backtick
+    // Two copy-paste export scripts, both writing every file (CA + User view) into one folder. The Azure CLI
+    // route is primary: the pre-authorized Azure CLI app usually needs NO admin consent, so it works for a
+    // Global Reader — unlike the Graph PowerShell SDK, whose app often hits an admin-approval wall. Backtick
     // escapes the $-prefixed OData params so a double-quoted PS string doesn't treat them as variables.
-    const PS = [
-      "# One-time only (if you don't have the module):",
-      "# Install-Module Microsoft.Graph -Scope CurrentUser",
+    const PS_AZ = [
+      "# Azure CLI route (recommended) — pre-authorized app, usually no admin consent; works for Global Reader.",
+      "# Install once if needed:  winget install -e --id Microsoft.AzureCLI",
+      "az login            # add  --use-device-code  if the browser sign-in is blocked",
+      "",
+      '$dir = "$HOME\\Downloads\\entra-export"',
+      "New-Item -ItemType Directory -Force -Path $dir | Out-Null",
+      'function G($p,$f){ $j = az rest --method GET --url "https://graph.microsoft.com/v1.0/$p" -o json; [IO.File]::WriteAllText("$dir\\$f", ($j -join "`n")) }',
+      "",
+      'G "identity/conditionalAccess/policies" "ca-policies.json"',
+      'G "identity/conditionalAccess/namedLocations" "named-locations.json"',
+      'G "policies/identitySecurityDefaultsEnforcementPolicy" "security-defaults.json"',
+      'G "policies/authenticationMethodsPolicy" "auth-methods.json"',
+      'G "users?`$select=id,displayName,userPrincipalName,accountEnabled,userType,onPremisesSyncEnabled,createdDateTime,passwordPolicies,assignedPlans,signInActivity&`$top=999" "users.json"',
+      'G "roleManagement/directory/roleAssignments?`$expand=principal" "role-assignments.json"',
+      'G "roleManagement/directory/roleEligibilityScheduleInstances?`$expand=principal" "role-eligible.json"',
+      'G "reports/authenticationMethods/userRegistrationDetails?`$top=999" "mfa-registration.json"',
+      'G "identityProtection/riskyUsers?`$top=500" "risky-users.json"',
+      "explorer $dir"
+    ].join("\n");
+    const PS_MG = [
+      "# Microsoft Graph PowerShell route — only if the Graph CLI app is admin-consented in your tenant.",
+      "# Install once if needed:  Install-Module Microsoft.Graph -Scope CurrentUser",
       "",
       'Connect-MgGraph -Scopes "Policy.Read.All","User.Read.All","RoleManagement.Read.Directory","AuditLog.Read.All","IdentityRiskyUser.Read.All"',
       "",
@@ -6077,7 +6099,7 @@ window.EP = (function () {
     panel.innerHTML = '<div style="font-weight:800;font-size:13px;color:var(--text);margin-bottom:4px">Import exported configuration <span style="font-weight:600;font-size:11px;color:var(--muted)">· scale-test · read-only · labelled “Imported”, never “Live”</span></div>'
       + '<div style="font-size:11.5px;color:var(--muted);line-height:1.5;margin-bottom:10px">Drop the <b>Conditional Access</b> and/or <b>User</b> view JSON exports (paths below). Files are detected by their shape; nothing is uploaded.</div>'
       + guideHtml
-      + '<div style="margin:0 0 10px;display:flex;align-items:center;gap:10px"><button id="epImpCopyPs" style="background:var(--accent);color:#06101f;font-weight:700;border:none;border-radius:7px;padding:7px 13px;cursor:pointer;font-size:12px">⎘ Copy full export script (PowerShell)</button><span id="epImpCopyMsg" style="font-size:11px;color:var(--sev-low)"></span></div>'
+      + '<div style="margin:0 0 10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap"><button id="epImpCopyAz" style="background:var(--accent);color:#06101f;font-weight:700;border:none;border-radius:7px;padding:7px 13px;cursor:pointer;font-size:12px">⎘ Copy export script · Azure CLI (recommended)</button><button id="epImpCopyMg" style="background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:7px;padding:7px 11px;cursor:pointer;font-size:11.5px">Graph PowerShell version</button><span id="epImpCopyMsg" style="font-size:11px;color:var(--sev-low)"></span></div>'
       + '<div id="epImpDrop" style="padding:18px;border:1.5px dashed var(--border);border-radius:10px;text-align:center;color:var(--muted);font-size:12px;cursor:pointer">Drop JSON / CSV files here, or <u>browse</u><input id="epImpFile" type="file" accept=".json,.csv,application/json,text/csv" multiple style="display:none"></div>'
       + '<div id="epImpDiag" style="margin-top:10px"></div>'
       + '<div style="margin-top:12px"><button id="epImpGo" disabled style="opacity:.5">Load dataset →</button></div>';
@@ -6091,7 +6113,7 @@ window.EP = (function () {
         let text = ""; try { text = await f.text(); } catch (e) { continue; }
         const isJson = /\.json$/i.test(f.name) || /^\s*[\[{]/.test(text);
         if (isJson) {
-          let j = null; try { j = JSON.parse(text); } catch (e) { parsed.files.push({ name: f.name, type: "unknown", rows: 0, note: "invalid JSON" }); continue; }
+          let j = null; try { j = JSON.parse(String(text).replace(/^﻿/, "")); } catch (e) { parsed.files.push({ name: f.name, type: "unknown", rows: 0, note: "invalid JSON" }); continue; }
           // Single-object tenant policies (optional, for CA parity): auth-methods policy + security-defaults.
           if (j && !Array.isArray(j) && Array.isArray(j.authenticationMethodConfigurations)) { parsed.authMethods = j; parsed.files.push({ name: f.name, type: "authMethods", rows: j.authenticationMethodConfigurations.length }); continue; }
           if (j && !Array.isArray(j) && typeof j.isEnabled === "boolean" && !j.grantControls && !j.conditions) { parsed.secDefaults = j; parsed.files.push({ name: f.name, type: "secDefaults", rows: 1 }); continue; }
@@ -6130,12 +6152,13 @@ window.EP = (function () {
     drop.addEventListener("dragleave", e => { e.preventDefault(); drop.style.borderColor = "var(--border)"; });
     drop.addEventListener("drop", e => { e.preventDefault(); drop.style.borderColor = "var(--border)"; if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files); });
     go.addEventListener("click", () => importLoad(parsed));
-    const copyBtn = panel.querySelector("#epImpCopyPs");
-    if (copyBtn) copyBtn.addEventListener("click", () => {
+    const copyScript = (btnId, script) => { const b = panel.querySelector(btnId); if (!b) return; b.addEventListener("click", () => {
       const done = () => { const m = panel.querySelector("#epImpCopyMsg"); if (m) { m.textContent = "Copied — paste into PowerShell"; setTimeout(() => { m.textContent = ""; }, 3000); } };
-      const fallback = () => { try { const ta = document.createElement("textarea"); ta.value = PS; ta.style.position = "fixed"; ta.style.opacity = "0"; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta); done(); } catch (e) {} };
-      try { if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(PS).then(done, fallback); else fallback(); } catch (e) { fallback(); }
-    });
+      const fallback = () => { try { const ta = document.createElement("textarea"); ta.value = script; ta.style.position = "fixed"; ta.style.opacity = "0"; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta); done(); } catch (e) {} };
+      try { if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(script).then(done, fallback); else fallback(); } catch (e) { fallback(); }
+    }); };
+    copyScript("#epImpCopyAz", PS_AZ);
+    copyScript("#epImpCopyMg", PS_MG);
   }
 
   return { registerView, viewApi, ensureLoaded, makeAsk, token, tokenSilent, tokenOptional, graphBase, setStatus, esc, DEMO,
