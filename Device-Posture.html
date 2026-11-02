@@ -3779,12 +3779,19 @@ window.EP = (function () {
   // Devices view computes. Per-device CVEs / config fails are not in portal DEVICE exports, so they stay
   // null (noTvm) — the Vulnerabilities / Hardening workspaces read those from their own exports.
   function buildDeviceRecords(p) {
-    const keys = new Map();
-    const keyOf = (aad, name) => (aad && aad.length) ? "aad:" + aad : "name:" + _normName(name);
+    const keys = new Map(), nameIdx = {};
     const upsert = (k, slot, v) => { const o = keys.get(k) || {}; o[slot] = v; keys.set(k, o); };
-    p.entra.forEach(e => upsert(keyOf(e.aad, e.name), "e", e));
-    p.intune.forEach(i => { let k = keyOf(i.aad, i.name); if (!keys.has(k) && i.aad) { const nk = "name:" + _normName(i.name); if (keys.has(nk)) k = nk; } upsert(k, "i", i); });
-    p.defender.forEach(m => { let k = keyOf(m.aad, m.name); if (!keys.has(k)) { const nk = "name:" + _normName(m.name); if (keys.has(nk)) k = nk; } upsert(k, "m", m); });
+    const regName = (name, k) => { const nk = _normName(name); if (nk && !nameIdx[nk]) nameIdx[nk] = k; };
+    // Resolve a device to an existing record: by AAD id first, then by normalised name (so a Defender row
+    // with no AAD id, or different casing, still merges with the Entra/Intune device of the same name).
+    const resolveKey = (aad, name) => {
+      if (aad && keys.has("aad:" + aad)) return "aad:" + aad;
+      const nk = _normName(name); if (nk && nameIdx[nk]) return nameIdx[nk];
+      return (aad && aad.length) ? "aad:" + aad : "name:" + nk;
+    };
+    p.entra.forEach(e => { const k = resolveKey(e.aad, e.name); upsert(k, "e", e); regName(e.name, k); });
+    p.intune.forEach(i => { const k = resolveKey(i.aad, i.name); upsert(k, "i", i); regName(i.name, k); });
+    p.defender.forEach(m => { const k = resolveKey(m.aad, m.name); upsert(k, "m", m); regName(m.name, k); });
     const hasMde = p.defender.length > 0, out = []; let ix = 0;
     keys.forEach(rec => {
       const e = rec.e, i = rec.i, m = rec.m;
@@ -5155,14 +5162,15 @@ function buildCategories(controls){
   const map = {};
   controls.forEach(c => {
     const k = (c.cat||"Other").toLowerCase();
-    const g = map[k] || (map[k] = { label: c.cat||"Other", ctrlIds: [], devices: new Set(), crit:0, high:0, worst:0 });
+    const g = map[k] || (map[k] = { label: c.cat||"Other", ctrlIds: [], devices: new Set(), crit:0, high:0, worst:0, maxFail:0 });
     g.ctrlIds.push(c.id);
     (c.deviceNames||[]).forEach(d => g.devices.add(d));
+    if ((c.failDevices||0) > g.maxFail) g.maxFail = c.failDevices;   // import fallback: no device names, use max failing count
     const r = SEV_RANK[c.sev]||0; if (r > g.worst) g.worst = r;
     if (c.sev === "Critical") g.crit++; else if (c.sev === "High") g.high++;
   });
   return Object.keys(map).map(k => { const g = map[k]; return {
-    label: g.label, ctrlIds: g.ctrlIds, ctrlCount: g.ctrlIds.length, devices: g.devices.size, deviceNames: [...g.devices],
+    label: g.label, ctrlIds: g.ctrlIds, ctrlCount: g.ctrlIds.length, devices: g.devices.size || g.maxFail, deviceNames: [...g.devices],
     crit: g.crit, high: g.high, worstSev: g.worst>=4?"Critical":g.worst>=3?"High":g.worst>=2?"Medium":"Low" };
   });
 }
@@ -5422,6 +5430,15 @@ function tidySoftware(sw){
   if (i > 0 && s.slice(0, i).toLowerCase() === s.slice(i + 1).toLowerCase()) return s.slice(i + 1);
   return s;
 }
+// Collapse the near-duplicate OS version products (windows_server_2019/2022/…, windows_10/11) into one
+// product each, so the by-software view isn't dominated by a dozen Windows rows. Everything else is left
+// as-is. Applies to live and import alike (both group through buildSoftware).
+function collapseSoftware(sw){
+  const s = String(sw||"").toLowerCase();
+  if (/windows[ _]?server/.test(s)) return "Microsoft Windows Server";
+  if (/windows[ _]?1[01]\b/.test(s) || /windows[ _]?10/.test(s) || /windows[ _]?11/.test(s)) return "Microsoft Windows";
+  return sw;
+}
 
 // ---- demo data: one row per CVE (what the live rollup produces) ----
 function demoCves(){
@@ -5461,10 +5478,12 @@ const STATE = { view:"software", q:"", sev:"", exploit:"", sortCol:"sev", sortDi
 function buildSoftware(cves){
   const map = {};
   cves.forEach(c => {
-    (c.software && c.software.length ? c.software : ["(unknown software)"]).forEach(sw => {
+    (c.software && c.software.length ? c.software : ["(unknown software)"]).forEach(sw0 => {
+      const sw = collapseSoftware(sw0);
       const k = sw.toLowerCase();
-      const s = map[k] || (map[k] = { label: sw, cveIds: [], devices: new Set(), crit:0, high:0, worst:0, update:"", exploit:false });
-      s.cveIds.push(c.cve);
+      const s = map[k] || (map[k] = { label: sw, cveIds: [], cveSet: new Set(), devices: new Set(), crit:0, high:0, worst:0, update:"", exploit:false });
+      if (s.cveSet.has(c.cve)) return;   // a CVE can list several collapsed-OS versions — count it once per product
+      s.cveSet.add(c.cve); s.cveIds.push(c.cve);
       (c.deviceNames||[]).forEach(d => s.devices.add(d));
       s.devCount = Math.max(s.devCount || 0, c.devices || 0);   // import fallback: no device names, use max per-CVE exposure
       const rank = SEV_RANK[c.sev] || 0; if (rank > s.worst) s.worst = rank;
@@ -5498,7 +5517,7 @@ async function huntCves(){
     + " ZeroDay=max(case(array_index_of(CveTags, 'ZeroDay') >= 0, 1, 0)) by CveId"
     + " | join kind=leftouter (DeviceTvmSoftwareVulnerabilitiesKB | summarize Cvss=max(toreal(CvssScore)),"
     + " Exploit=max(case(IsExploitAvailable, 1, 0)), Published=max(PublishedDate) by CveId) on CveId"
-    + " | top 500 by Devices";
+    + " | top 8000 by Devices";   // effectively uncapped for a normal tenant (portal shows the full org CVE count)
   const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
   if (!r.ok){ let d=""; try{ d=((await r.json()).error||{}).message||""; }catch(e){} const e2=new Error("CVE rollup "+r.status+(d?" — "+d:"")); e2.status=r.status; throw e2; }
   return ((await r.json()).results || []).map(x => ({
