@@ -3570,6 +3570,10 @@ async function huntConfig(){
   if (!r.ok){ const e2 = new Error("config " + r.status); e2.status = r.status; throw e2; }
   return (await r.json()).results || [];
 }
+// Normalise a device name for matching: lowercase + strip any DNS/domain suffix (host.domain → host).
+// Lets us join a Defender machine to an Entra/Intune device by name when AAD ids don't line up
+// (e.g. Workgroup servers have no AadDeviceId, and casing differs: Entra "SRV000" vs Defender "srv000").
+function normName(s){ s = String(s||"").trim().toLowerCase(); const dot = s.indexOf("."); if (dot > 0) s = s.slice(0, dot); return s; }
 function normOS(s){ s = String(s||"").toLowerCase();
   if (s.includes("server")) return "Windows Server";
   if (s.includes("windows") || s.includes("win")) return "Windows";
@@ -3593,19 +3597,24 @@ async function collect(){
   const cfgBy = {}; if (cfgRows) cfgRows.forEach(x => { const id = String(x.DeviceId||"").toLowerCase(); if (id) cfgBy[id] = x.Fails||0; });
   const inBy = {}; intune.forEach(d => { const k = String(d.azureADDeviceId||"").toLowerCase(); if (k) inBy[k] = d; });
   const mdeBy = {}; if (machines) machines.forEach(m => { const k = String(m.AadDeviceId||m.aadDeviceId||"").toLowerCase(); if (k) mdeBy[k] = m; });
+  const mdeByName = {}; if (machines) machines.forEach(m => { const nk = normName(m.DeviceName || m.computerDnsName); if (nk && !mdeByName[nk]) mdeByName[nk] = m; });
   const now = Date.now(), STALE = 30 * 864e5;
   const dd = d => d ? Math.floor((now - Date.parse(d)) / 864e5) : null;
   const active = entra.filter(d => d.accountEnabled !== false);
   const devs = active.map((d, ix) => {
     const key = String(d.deviceId||"").toLowerCase();
-    const i = inBy[key], m = mdeBy[key];
+    const i = inBy[key];
+    const nameKey = normName(d.displayName || (i && i.deviceName));
+    const m = mdeBy[key] || (nameKey ? mdeByName[nameKey] : null);   // AAD id match first, then name (Workgroup / no AadDeviceId)
     // Defender (advanced-hunting DeviceInfo) fields are PascalCase; tolerate legacy machine-API casing too.
     const mf = (a, b) => m ? (m[a] != null ? m[a] : (b && m[b] != null ? m[b] : null)) : null;
     const mExp = mf("ExposureLevel","exposureLevel"), mSensor = mf("SensorHealthState","healthStatus"), mOnb = mf("OnboardingStatus","onboardingStatus"),
           mCrit = mf("CriticalityLevel") || mf("DeviceValue","deviceValue"), mNet = mf("IsInternetFacing","isInternetFacing"),
           mOsV = mf("OSVersion","version"), mOsP = mf("OSPlatform","osPlatform"), mRisk = mf("RiskScore","riskScore"), mTs = mf("Timestamp","lastSeen");
     const _mid = m ? String(m.DeviceId || m.id || "").toLowerCase() : null;
-    const _tsev = m ? (threatBy[_mid] != null ? threatBy[_mid] : 0) : null;   // Defender active-alert severity
+    // Threat = Defender active-alert severity. Distinguish "no active alerts" (None) from "couldn't read"
+    // (—): only score 0 as None when the alert query actually succeeded; a failed query stays unknown.
+    const _tsev = (m && threatRows != null) ? (threatBy[_mid] != null ? threatBy[_mid] : 0) : null;
     const threat = _tsev == null ? null : _tsev >= 3 ? "High" : _tsev >= 2 ? "Medium" : _tsev >= 1 ? "Low" : "None";
     const _cve = m ? (cveBy[_mid] || null) : null;
     const cve = _cve == null ? null : _cve.sev >= 4 ? "Critical" : _cve.sev >= 3 ? "High" : _cve.sev >= 2 ? "Medium" : _cve.sev >= 1 ? "Low" : "None";
@@ -3890,9 +3899,10 @@ async function gGetAll(path, scopes){
 }
 // Defender onboarding per device, via Graph advanced hunting (DeviceInfo) — CORS-friendly, keyed by
 // AadDeviceId. Optional: failure leaves Defender "not assessed".
+function normName(s){ s = String(s||"").trim().toLowerCase(); const dot = s.indexOf("."); if (dot > 0) s = s.slice(0, dot); return s; }
 async function huntOnboarding(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
-  const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, OnboardingStatus) by AadDeviceId";
+  const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by DeviceId | project AadDeviceId, DeviceName, OnboardingStatus";
   const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
   if (!r.ok){ const e2 = new Error("onboarding " + r.status); e2.status = r.status; throw e2; }
   return (await r.json()).results || [];
@@ -3907,8 +3917,9 @@ async function collect(){
   try { machines = await huntOnboarding(); } catch(e){ machines = null; }
   const inByAad = {};
   intune.forEach(d => { const k = String(d.azureADDeviceId || "").toLowerCase(); if (k) inByAad[k] = d; });
-  const mdeByAad = {}; if (machines) machines.forEach(m => { const k = String(m.AadDeviceId || "").toLowerCase(); if (k) mdeByAad[k] = m; });
-  const onbOf = d => { if (!machines) return null; const m = mdeByAad[String(d.deviceId || "").toLowerCase()]; return m && String(m.OnboardingStatus || "").toLowerCase() === "onboarded" ? 1 : 0; };
+  const mdeByAad = {}, mdeByName = {};
+  if (machines) machines.forEach(m => { const k = String(m.AadDeviceId || "").toLowerCase(); if (k) mdeByAad[k] = m; const nk = normName(m.DeviceName); if (nk && !mdeByName[nk]) mdeByName[nk] = m; });
+  const onbOf = d => { if (!machines) return null; const m = mdeByAad[String(d.deviceId || "").toLowerCase()] || mdeByName[normName(d.displayName)]; return m && String(m.OnboardingStatus || "").toLowerCase() === "onboarded" ? 1 : 0; };
   const now = Date.now(), STALE = 30 * 864e5;
   const active = entra.filter(d => d.accountEnabled !== false);
   const total = active.length;
