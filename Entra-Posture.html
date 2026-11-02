@@ -4346,7 +4346,7 @@ window.EP = (function () {
     for (const v of REPORT_VIEWS) {
       const view = views[v.name];
       try {
-        if (view && view.load && !view.loaded && !DEMO && account) {
+        if (view && view.load && !view.loaded && (IMPORTED ? IMPORT_READY.has(v.name) : (!DEMO && account))) {
           repRow(v.name, "load", "collecting…");
           view.loaded = true;
           const root = document.getElementById("view-" + v.name);
@@ -5959,7 +5959,7 @@ window.EP = (function () {
   // wired: Conditional Access, from the portal's "Export policies" JSON (an array of policy objects in
   // the Graph shape). Users / enterprise-apps CSV come in later slices. Mirrors the Device Posture import.
   const IMPORT_FLAG = /[?&]import(=1)?(&|$)/.test(location.search);
-  const IMPORT_READY = new Set(["ca", "ca-opt", "user"]);   // views wired to imported data (ca-opt reuses CA's policies)
+  const IMPORT_READY = new Set(["ca", "ca-opt", "user", "overview"]);   // views wired to imported data (ca-opt reuses CA's policies)
   let IMPORTED = false, IMPORT = null;
 
   function csvParse(text) {
@@ -6022,10 +6022,36 @@ window.EP = (function () {
     const conn = $("epConnect"); if (conn) conn.style.display = "none";
     const rb = $("epReportBtn"); if (rb) rb.style.display = "";
     Object.keys(views).forEach(n => { views[n].loaded = false; });
-    show(parsed.caPolicies.length ? "ca" : (parsed.users.length ? "user" : "ca"));
+    show("overview");
   }
   function importInit() {
     const card = document.querySelector("#epConnect .card"); if (!card || $("epImport")) return;
+    // One copy-paste PowerShell script that exports every file (CA + User view) into one folder. Backtick
+    // escapes the $-prefixed OData params so a double-quoted PS string doesn't treat them as variables.
+    const PS = [
+      "# One-time only (if you don't have the module):",
+      "# Install-Module Microsoft.Graph -Scope CurrentUser",
+      "",
+      'Connect-MgGraph -Scopes "Policy.Read.All","User.Read.All","RoleManagement.Read.Directory","AuditLog.Read.All","IdentityRiskyUser.Read.All"',
+      "",
+      '$dir = "$HOME\\Downloads\\entra-export"',
+      "New-Item -ItemType Directory -Force -Path $dir | Out-Null",
+      "",
+      "# --- Conditional Access (+ parity extras) ---",
+      'Invoke-MgGraphRequest -Method GET -Uri "v1.0/identity/conditionalAccess/policies" -OutputFilePath "$dir\\ca-policies.json"',
+      'Invoke-MgGraphRequest -Method GET -Uri "v1.0/identity/conditionalAccess/namedLocations" -OutputFilePath "$dir\\named-locations.json"',
+      'Invoke-MgGraphRequest -Method GET -Uri "v1.0/policies/identitySecurityDefaultsEnforcementPolicy" -OutputFilePath "$dir\\security-defaults.json"',
+      'Invoke-MgGraphRequest -Method GET -Uri "v1.0/policies/authenticationMethodsPolicy" -OutputFilePath "$dir\\auth-methods.json"',
+      "",
+      "# --- User view ---",
+      'Invoke-MgGraphRequest -Method GET -Uri "v1.0/users?`$select=id,displayName,userPrincipalName,accountEnabled,userType,onPremisesSyncEnabled,createdDateTime,passwordPolicies,assignedPlans,signInActivity&`$top=999" -OutputFilePath "$dir\\users.json"',
+      'Invoke-MgGraphRequest -Method GET -Uri "v1.0/roleManagement/directory/roleAssignments?`$expand=principal" -OutputFilePath "$dir\\role-assignments.json"',
+      'Invoke-MgGraphRequest -Method GET -Uri "v1.0/roleManagement/directory/roleEligibilityScheduleInstances?`$expand=principal" -OutputFilePath "$dir\\role-eligible.json"',
+      'Invoke-MgGraphRequest -Method GET -Uri "v1.0/reports/authenticationMethods/userRegistrationDetails?`$top=999" -OutputFilePath "$dir\\mfa-registration.json"',
+      'Invoke-MgGraphRequest -Method GET -Uri "v1.0/identityProtection/riskyUsers?`$top=500" -OutputFilePath "$dir\\risky-users.json"',
+      "",
+      "explorer $dir"
+    ].join("\n");
     const gRow = (f, where, feeds) => '<div style="display:grid;grid-template-columns:150px 1fr;gap:3px 12px;padding:7px 11px;border-top:1px solid var(--border)">'
       + '<div style="color:var(--text);font-weight:600">' + f + '</div><div style="color:var(--muted)">' + where + '<div style="color:var(--accent);margin-top:2px;font-size:10.5px">→ ' + feeds + '</div></div></div>';
     const gHead = t => '<div style="background:rgba(127,160,210,.08);padding:6px 11px;font-weight:700;color:var(--text);font-size:11px">' + t + '</div>';
@@ -6051,6 +6077,7 @@ window.EP = (function () {
     panel.innerHTML = '<div style="font-weight:800;font-size:13px;color:var(--text);margin-bottom:4px">Import exported configuration <span style="font-weight:600;font-size:11px;color:var(--muted)">· scale-test · read-only · labelled “Imported”, never “Live”</span></div>'
       + '<div style="font-size:11.5px;color:var(--muted);line-height:1.5;margin-bottom:10px">Drop the <b>Conditional Access</b> and/or <b>User</b> view JSON exports (paths below). Files are detected by their shape; nothing is uploaded.</div>'
       + guideHtml
+      + '<div style="margin:0 0 10px;display:flex;align-items:center;gap:10px"><button id="epImpCopyPs" style="background:var(--accent);color:#06101f;font-weight:700;border:none;border-radius:7px;padding:7px 13px;cursor:pointer;font-size:12px">⎘ Copy full export script (PowerShell)</button><span id="epImpCopyMsg" style="font-size:11px;color:var(--sev-low)"></span></div>'
       + '<div id="epImpDrop" style="padding:18px;border:1.5px dashed var(--border);border-radius:10px;text-align:center;color:var(--muted);font-size:12px;cursor:pointer">Drop JSON / CSV files here, or <u>browse</u><input id="epImpFile" type="file" accept=".json,.csv,application/json,text/csv" multiple style="display:none"></div>'
       + '<div id="epImpDiag" style="margin-top:10px"></div>'
       + '<div style="margin-top:12px"><button id="epImpGo" disabled style="opacity:.5">Load dataset →</button></div>';
@@ -6103,6 +6130,12 @@ window.EP = (function () {
     drop.addEventListener("dragleave", e => { e.preventDefault(); drop.style.borderColor = "var(--border)"; });
     drop.addEventListener("drop", e => { e.preventDefault(); drop.style.borderColor = "var(--border)"; if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files); });
     go.addEventListener("click", () => importLoad(parsed));
+    const copyBtn = panel.querySelector("#epImpCopyPs");
+    if (copyBtn) copyBtn.addEventListener("click", () => {
+      const done = () => { const m = panel.querySelector("#epImpCopyMsg"); if (m) { m.textContent = "Copied — paste into PowerShell"; setTimeout(() => { m.textContent = ""; }, 3000); } };
+      const fallback = () => { try { const ta = document.createElement("textarea"); ta.value = PS; ta.style.position = "fixed"; ta.style.opacity = "0"; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta); done(); } catch (e) {} };
+      try { if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(PS).then(done, fallback); else fallback(); } catch (e) { fallback(); }
+    });
   }
 
   return { registerView, viewApi, ensureLoaded, makeAsk, token, tokenSilent, tokenOptional, graphBase, setStatus, esc, DEMO,
