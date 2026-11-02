@@ -3661,7 +3661,7 @@ window.EP = (function () {
   // feed Hardening + Vulnerabilities later) are detected by their headers and mapped tolerantly; a
   // per-file diagnostic shows exactly what matched so column drift is visible, not silent.
   const IMPORT_FLAG = /[?&]import(=1)?(&|$)/.test(location.search);
-  const IMPORT_READY = new Set(["devices"]);   // views wired to imported data (grows as they are built)
+  const IMPORT_READY = new Set(["devices", "hardening", "vuln"]);   // views wired to imported data (grows as they are built)
   let IMPORTED = false, IMPORT = null;
 
   function csvParse(text) {
@@ -3678,8 +3678,11 @@ window.EP = (function () {
     }
     if (cur.length || row.length) { row.push(cur); rows.push(row); }
     if (!rows.length) return { headers: [], rows: [] };
-    const headers = rows.shift().map(h => String(h).trim());
-    return { headers, rows: rows.filter(r => r.some(c => String(c).trim() !== "")).map(r => { const o = {}; headers.forEach((h, i) => o[h] = r[i] != null ? r[i] : ""); return o; }) };
+    // Some exports (e.g. the TVM vulnerabilities CSV) prepend a title line before the real header.
+    // Pick the header as the first of the first few rows that has the most columns.
+    let hi = 0, maxc = 0; rows.slice(0, 5).forEach((r, i) => { if (r.length > maxc) { maxc = r.length; hi = i; } });
+    const headers = rows[hi].map(h => String(h).trim()), data = rows.slice(hi + 1);
+    return { headers, rows: data.filter(r => r.some(c => String(c).trim() !== "")).map(r => { const o = {}; headers.forEach((h, i) => o[h] = r[i] != null ? r[i] : ""); return o; }) };
   }
   const _nh = h => String(h || "").toLowerCase().replace(/[^a-z0-9]/g, "");
   function _nmap(headers) { const m = {}; headers.forEach(h => { const k = _nh(h); if (!(k in m)) m[k] = h; }); return m; }
@@ -3710,25 +3713,58 @@ window.EP = (function () {
     threat: ["Risk level", "riskScore"],
     criticality: ["Device value", "Criticality level", "criticalityLevel", "deviceValue", "Business criticality"],
     internet: ["Internet facing", "isInternetFacing", "Internet-facing"],
-    lastSeen: ["Last seen", "Last device update", "lastSeen"]
+    lastSeen: ["Last seen", "Last device update", "lastSeen"],
+    // Defender Recommendations export (Hardening)
+    recName: ["Name", "Security recommendation", "Recommendation"],
+    recCategory: ["Category"],
+    recExposed: ["Exposed devices"],
+    recScore: ["Devices Score impact", "Score impact"],
+    recPoints: ["Points achieved"],
+    recOs: ["OS platform"],
+    recCritical: ["Exposed critical device"],
+    recTags: ["Tags"],
+    // Defender Weaknesses / TVM vulnerabilities export (Vulnerabilities)
+    cveName: ["Name", "CVE ID", "CVEID"],
+    cveSeverity: ["Severity"],
+    cvss: ["CVSS v3", "CVSS", "CVSS v2"],
+    cveSoftware: ["Related Software", "Related software", "Software"],
+    cveExposed: ["Exposed Machines", "Exposed devices", "Exposed machines"],
+    cvePublished: ["Published"],
+    cveExploit: ["Has Exploit"],
+    cveThreats: ["Has Known Threats"]
   };
   const CSV_TYPE_FIELDS = {
     entra: ["name", "aad", "os", "osVer", "trust", "isCompliant", "lastSignIn", "enabled"],
     intune: ["name", "aad", "os", "osVer", "compliance", "encrypted", "jailbroken", "lastSync", "owner", "upn", "agent", "intuneId"],
-    defender: ["name", "aad", "machineId", "os", "osVer", "sensor", "onboarding", "exposure", "criticality", "internet", "lastSeen"]
+    defender: ["name", "aad", "machineId", "os", "osVer", "sensor", "onboarding", "exposure", "criticality", "internet", "lastSeen"],
+    weaknesses: ["cveName", "cveSeverity", "cvss", "cveSoftware", "cveExposed", "cvePublished", "cveExploit", "cveThreats"],
+    recommendations: ["recName", "recCategory", "recExposed", "recScore", "recPoints", "recOs", "recCritical", "recTags"]
   };
   function classifyCsv(headers) {
     const nm = _nmap(headers);
+    // CVE/weaknesses and recommendations first (their columns are distinctive), then the device files.
+    if ((_hasAny(nm, ["CVSS v3", "CVSS", "CVSS v2", "Epss score"]) && _hasAny(nm, ["Exposed Machines", "Exposed devices"])) || _hasAny(nm, ["CVE ID", "CVEID"])) return "weaknesses";
+    if ((_hasAny(nm, ["Devices Score impact", "Points achieved", "Remediation activities"])) && _hasAny(nm, ["Exposed devices"]) && _hasAny(nm, ["Category"])) return "recommendations";
     if (_hasAny(nm, CSV_FIELDS.onboarding) || _hasAny(nm, CSV_FIELDS.sensor) || _hasAny(nm, CSV_FIELDS.exposure)) return "defender";
-    if (_hasAny(nm, ["CVE ID", "CVEID", "CVE"])) return "weaknesses";
-    if (_hasAny(nm, ["Recommendation", "Security recommendation"]) && _hasAny(nm, ["Exposed devices", "Exposed devices count"])) return "recommendations";
-    if (_hasAny(nm, ["Software name", "Software"]) && _hasAny(nm, ["Vendor", "Publisher"])) return "software";
+    if (_hasAny(nm, ["Software name"]) && _hasAny(nm, ["Vendor", "Publisher"])) return "software";
     if (_hasAny(nm, CSV_FIELDS.compliance) && (_hasAny(nm, CSV_FIELDS.agent) || _hasAny(nm, CSV_FIELDS.intuneId) || _hasAny(nm, ["Primary user UPN"]))) return "intune";
     if (_hasAny(nm, CSV_FIELDS.trust) || (_hasAny(nm, CSV_FIELDS.aad) && _hasAny(nm, CSV_FIELDS.os))) return "entra";
     return "unknown";
   }
   const _mapRow = (keys) => (o, nm) => { const r = {}; keys.forEach(k => r[k] = _get(o, nm, CSV_FIELDS[k])); if (r.aad) r.aad = r.aad.toLowerCase(); return r; };
   const mapEntra = _mapRow(CSV_TYPE_FIELDS.entra), mapIntune = _mapRow(CSV_TYPE_FIELDS.intune), mapDefender = _mapRow(CSV_TYPE_FIELDS.defender);
+  const _num = s => { const m = String(s == null ? "" : s).replace(/[, ]/g, "").match(/-?\d+(\.\d+)?/); return m ? parseFloat(m[0]) : null; };
+  const _xofy = s => { const m = String(s || "").match(/([\d.]+)\s*out of\s*([\d.]+)/i); if (m) return { x: parseFloat(m[1]), y: parseFloat(m[2]) }; const n = _num(s); return { x: n, y: n }; };
+  function mapWeakness(o, nm) {
+    return { cve: _get(o, nm, CSV_FIELDS.cveName), sev: _get(o, nm, CSV_FIELDS.cveSeverity), cvss: _num(_get(o, nm, CSV_FIELDS.cvss)),
+      software: _get(o, nm, CSV_FIELDS.cveSoftware), exposed: _num(_get(o, nm, CSV_FIELDS.cveExposed)),
+      published: _get(o, nm, CSV_FIELDS.cvePublished), exploit: /true|yes|^1$/i.test(_get(o, nm, CSV_FIELDS.cveExploit)), threats: /true|yes|^1$/i.test(_get(o, nm, CSV_FIELDS.cveThreats)) };
+  }
+  function mapRecommendation(o, nm) {
+    const ex = _xofy(_get(o, nm, CSV_FIELDS.recExposed)), pt = _xofy(_get(o, nm, CSV_FIELDS.recPoints));
+    return { name: _get(o, nm, CSV_FIELDS.recName), category: _get(o, nm, CSV_FIELDS.recCategory), fail: ex.x, total: ex.y, pAch: pt.x, pMax: pt.y,
+      scoreImpact: _get(o, nm, CSV_FIELDS.recScore), critical: _num(_get(o, nm, CSV_FIELDS.recCritical)), os: _get(o, nm, CSV_FIELDS.recOs), tags: _get(o, nm, CSV_FIELDS.recTags) };
+  }
   // normalisers (shell-local; mirror the Devices view's own)
   function _days(s) { if (!s) return null; const t = Date.parse(s); if (isNaN(t)) return null; const d = Math.floor((Date.now() - t) / 864e5); return d < 0 ? 0 : d; }
   function _os(s) { s = String(s || "").toLowerCase(); if (s.includes("server")) return "Windows Server"; if (s.includes("win")) return "Windows"; if (s.includes("ipad")) return "iPadOS"; if (s.includes("iphone") || s === "ios") return "iOS"; if (s.includes("mac")) return "macOS"; if (s.includes("android")) return "Android"; if (s.includes("linux")) return "Linux"; return s ? s.charAt(0).toUpperCase() + s.slice(1) : "Other"; }
@@ -3823,8 +3859,8 @@ window.EP = (function () {
         if (type === "entra") rows.forEach(r => parsed.entra.push(mapEntra(r, nm)));
         else if (type === "intune") rows.forEach(r => parsed.intune.push(mapIntune(r, nm)));
         else if (type === "defender") rows.forEach(r => parsed.defender.push(mapDefender(r, nm)));
-        else if (type === "weaknesses") parsed.weaknesses = parsed.weaknesses.concat(rows);
-        else if (type === "recommendations") parsed.recommendations = parsed.recommendations.concat(rows);
+        else if (type === "weaknesses") rows.forEach(r => parsed.weaknesses.push(mapWeakness(r, nm)));
+        else if (type === "recommendations") rows.forEach(r => parsed.recommendations.push(mapRecommendation(r, nm)));
         else if (type === "software") parsed.software = parsed.software.concat(rows);
         const fields = CSV_TYPE_FIELDS[type] || [], matched = fields.filter(fn => _hasAny(nm, CSV_FIELDS[fn]));
         const used = new Set(); matched.forEach(fn => CSV_FIELDS[fn].forEach(a => { if (nm[_nh(a)]) used.add(nm[_nh(a)]); }));
@@ -5222,6 +5258,37 @@ function renderTriage(){
 }
 
 // ---------- page render ----------
+// Build the Hardening workspace from an imported Defender Recommendations export (one row per control:
+// Name, Category, "Exposed devices X out of Y", "Points achieved A out of M", score impact, tags). Only
+// failing controls (X>0) become rows; severity from the control's max points (its secure-score weight);
+// the overall score is the Defender secure-score complement (1 − Σachieved/Σmax). Per-device lists and
+// remediation text aren't in this export, so those are noted, not faked.
+function buildHardeningFromImport(recs){
+  const controls = []; let sumA = 0, sumM = 0, maxTotal = 0;
+  (recs || []).forEach(r => {
+    if (r.pMax != null && r.pAch != null) { sumA += r.pAch; sumM += r.pMax; }
+    if (r.total != null) maxTotal = Math.max(maxTotal, r.total);
+    if (!(r.fail > 0)) return;
+    const catFull = r.category || "Other";
+    const cat = catFull.replace(/\s*\(.*$/, "").trim() || "Other";
+    const sub = (catFull.match(/\(([^)]*)\)/) || [])[1] || "";
+    const impact = r.pMax != null ? Math.max(1, Math.min(10, Math.round(r.pMax))) : 5;
+    const benchmarks = r.tags ? r.tags.split(",").map(s => s.trim()).filter(t => t && !/internet facing|user impact/i.test(t)) : [];
+    controls.push({ id: "imp-" + controls.length + "-" + String(r.name || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40),
+      name: r.name, cat, sub, impact, sev: impactSev(impact), failDevices: r.fail, deviceNames: [],
+      risk: "Failing on " + r.fail + " of " + (r.total != null ? r.total : "?") + " applicable device" + (r.fail === 1 ? "" : "s")
+        + (r.critical ? " · " + r.critical + " critical" : "") + (r.scoreImpact && r.scoreImpact !== "-" ? " · secure-score impact " + r.scoreImpact : "")
+        + ". (Imported — the per-device list isn’t in the Recommendations export.)",
+      remediation: "Open this recommendation in the Microsoft Defender portal (Vulnerability management → Recommendations) for the affected devices and remediation steps.",
+      mitre: [], benchmarks: benchmarks });
+  });
+  const secure = sumM ? sumA / sumM : null;
+  const score = secure != null ? Math.round(100 - 100 * secure) : (controls.length ? 50 : 0);
+  const grade = score >= 70 ? "D" : score >= 50 ? "C" : score >= 30 ? "B" : "A";
+  return { score, grade, imported: true, live: false, devicesAssessed: maxTotal || null, devicesFailing: null, controls,
+    lede: controls.length + " secure-configuration control" + (controls.length === 1 ? "" : "s") + " failing"
+      + (maxTotal ? " across up to " + maxTotal + " devices" : "") + (secure != null ? " · Defender secure score " + Math.round(100 * secure) + "%" : "") + " (imported)." };
+}
 function render(D){
   LAST = D;
   const root = document.getElementById("hard-root"); if (!root) return;
@@ -5243,7 +5310,7 @@ function render(D){
     + tile(D.devicesFailing!=null?D.devicesFailing:"–", "devices with a failing control", D.devicesFailing?"high":"")
     + tile(CONTROLS.length, "failing controls", CONTROLS.length?"high":"")
     + tile(critCount, "critical controls", critCount?"crit":"", critCount?"crit":"") + '</div>';
-  const src = (window.EP && EP.DEMO) ? "Demo data." : "Live — Defender secure-config via advanced hunting.";
+  const src = D.imported ? "Imported CSV — Defender Recommendations export." : (window.EP && EP.DEMO) ? "Demo data." : "Live — Defender secure-config via advanced hunting.";
   const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> Each row is a security control from the Defender secure-configuration assessment — the gaps that turn a covered device into a soft one. Expand a control for its risk, the failing devices and the exact remediation. Severity is derived from the control’s configuration impact (1–10).</div>';
   root.innerHTML = band + tiles + toolbar() + activeTable() + renderTriage() + note;
   repaint(); wireView();
@@ -5274,6 +5341,7 @@ function wireView(){
 }
 async function analyze(){
   const root = document.getElementById("hard-root");
+  if (window.EP && EP.IMPORT) { render(buildHardeningFromImport((EP.IMPORT.raw && EP.IMPORT.raw.recommendations) || [])); return; }
   if (window.EP && EP.DEMO) { render(DEMO); return; }
   if (root) root.innerHTML = '<div class="dp-note" style="margin:8px 0"><b>Reading Defender secure-config (advanced hunting)…</b></div>';
   try { render(await collect()); }
@@ -5359,6 +5427,7 @@ function buildSoftware(cves){
       const s = map[k] || (map[k] = { label: sw, cveIds: [], devices: new Set(), crit:0, high:0, worst:0, update:"", exploit:false });
       s.cveIds.push(c.cve);
       (c.deviceNames||[]).forEach(d => s.devices.add(d));
+      s.devCount = Math.max(s.devCount || 0, c.devices || 0);   // import fallback: no device names, use max per-CVE exposure
       const rank = SEV_RANK[c.sev] || 0; if (rank > s.worst) s.worst = rank;
       if (c.sev === "Critical") s.crit++; else if (c.sev === "High") s.high++;
       if (!s.update && c.update) s.update = c.update;
@@ -5366,7 +5435,7 @@ function buildSoftware(cves){
     });
   });
   return Object.keys(map).map(k => { const s = map[k]; const names = [...s.devices]; const inet = names.filter(isInet); return {
-    label: s.label, cveIds: s.cveIds, cveCount: s.cveIds.length, devices: s.devices.size, deviceNames: names,
+    label: s.label, cveIds: s.cveIds, cveCount: s.cveIds.length, devices: s.devices.size || s.devCount || 0, deviceNames: names,
     crit: s.crit, high: s.high, worstSev: s.worst>=4?"Critical":s.worst>=3?"High":s.worst>=2?"Medium":"Low", update: s.update, exploit: s.exploit,
     internet: inet.length > 0, internetCount: inet.length };
   });
@@ -5577,6 +5646,26 @@ function paintSoftware(){
   host.innerHTML = rows.map(softwareRow).join("");
 }
 
+// Build the CVE workspace from an imported Defender Weaknesses export (one row per CVE: Name, Severity,
+// CVSS v3, Has Exploit, Related Software "vendor:product;…", Exposed Machines count). Device names aren't
+// in the export, so each CVE carries its exposure COUNT (the software view falls back to it); the exposure
+// score is severity-weighted by that count, and the device total comes from the imported device inventory.
+function buildVulnFromImport(ws){
+  const cves = (ws || []).map(w => ({
+    cve: w.cve, sev: normSev(w.sev), cvss: (w.cvss != null ? w.cvss : null),
+    exploit: !!w.exploit, zeroday: !!w.threats, devices: w.exposed || 0, deviceNames: [],
+    software: w.software ? [...new Set(String(w.software).split(";").map(p => tidySoftware(p.split(":").pop().trim())).filter(Boolean))] : [],
+    update: "", published: w.published ? String(w.published) : null
+  })).filter(c => c.cve);
+  const weight = s => s === "Critical" ? 1 : s === "High" ? 0.6 : s === "Medium" ? 0.3 : s === "Low" ? 0.1 : 0;
+  let num = 0, den = 0, maxExp = 0;
+  cves.forEach(c => { const e = c.devices || 1; num += weight(c.sev) * e; den += e; maxExp = Math.max(maxExp, c.devices || 0); });
+  const score = den ? Math.round(100 * num / den) : 0, grade = score >= 70 ? "D" : score >= 50 ? "C" : score >= 30 ? "B" : "A";
+  const totalDev = (window.EP && EP.IMPORT && EP.IMPORT.devices) ? EP.IMPORT.devices.length : maxExp;
+  const crit = cves.filter(c => c.sev === "Critical").length, exp = cves.filter(c => c.exploit || c.zeroday).length;
+  return { imported: true, live: false, score, grade, dev: { total: totalDev, crit: null, high: null }, cves, internetNames: [],
+    lede: cves.length + " distinct CVE" + (cves.length === 1 ? "" : "s") + " — " + crit + " critical, " + exp + " with a public exploit · device counts are per-CVE exposure (imported)." };
+}
 // ---------- page render ----------
 function render(D){
   LAST = D; CVES = D.cves || [];
@@ -5602,7 +5691,7 @@ function render(D){
     + '<div class="dp-tile ' + goAttr({ cve:"Critical" }) + '><div class="v">' + (D.dev?D.dev.total:"—") + '</div><div class="l">devices with TVM data</div></div>'
     + '</div>';
   const xlink = '<div class="dp-note" style="border-left-color:var(--accent);background:rgba(63,169,255,.05);padding:8px 12px"><b>↔ SightLine.</b> This is <i>installed-software</i> CVEs. For the ones also <i>reachable from outside</i> (open port ∩ present CVE), cross-reference SightLine’s Verified Exploitable — that intersection is "exploitable now".</div>';
-  const src = (window.EP && EP.DEMO) ? "Demo data." : "Live — Defender TVM via advanced hunting.";
+  const src = D.imported ? "Imported CSV — Defender Weaknesses export (per-CVE; device names aren’t in the export)." : (window.EP && EP.DEMO) ? "Demo data." : "Live — Defender TVM via advanced hunting.";
   const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> CVEs rolled up from Defender TVM (DeviceTvmSoftwareVulnerabilities + KB), one row per CVE. Requires Defender for Endpoint P2. Device chips open the Devices page filtered to that device.</div>';
   root.innerHTML = band + tiles + toolbar() + activeTable() + renderTriage() + xlink + note;
   repaint();
@@ -5634,6 +5723,7 @@ function wireView(){
 }
 async function analyze(){
   const root = document.getElementById("vuln-root");
+  if (window.EP && EP.IMPORT) { render(buildVulnFromImport((EP.IMPORT.raw && EP.IMPORT.raw.weaknesses) || [])); return; }
   if (window.EP && EP.DEMO) { render(DEMO); return; }
   if (root) root.innerHTML = '<div class="dp-note" style="margin:8px 0"><b>Reading Defender TVM (advanced hunting)…</b></div>';
   try { render(await collect()); }
