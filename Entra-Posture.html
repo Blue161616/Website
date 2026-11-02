@@ -6011,6 +6011,9 @@ window.EP = (function () {
   }
   function classifyCsv(headers) {
     const nm = _nmap(headers);
+    // Risky workload identities — the portal "Risky workload identities → Download" CSV. It carries Risk state/level
+    // like the risky-users CSV, so key off "Service principal ID" and match it FIRST to disambiguate the two.
+    if (_hasAny(nm, ["Service principal ID", "servicePrincipalId"]) && _hasAny(nm, ["Risk state", "Risk level"])) return "riskyServicePrincipals";
     // Risky users — the portal "Risky users → Download" CSV (User ID / Username / Risk state / Risk level).
     // Identity Protection risk has no Graph bulk export for a reader, but the blade's Download button does.
     if (_hasAny(nm, ["Risk state", "riskState"]) || _hasAny(nm, ["Risk level", "riskLevel"])) return "riskyUsers";
@@ -6052,6 +6055,22 @@ window.EP = (function () {
       csvRole: true
     };
   }
+  // Portal "Risky workload identities → Download" CSV row → the identityProtection/riskyServicePrincipals shape the
+  // Workload view reads. riskState normalised to Graph camelCase so computeFactors' confirmedCompromised/atRisk tests fire.
+  function mapRiskySpCsv(o, nm) {
+    const raw = _col(o, nm, ["Risk state", "riskState"]).toLowerCase().replace(/[^a-z]/g, "");
+    const state = raw === "confirmedcompromised" ? "confirmedCompromised" : raw === "atrisk" ? "atRisk"
+      : raw === "remediated" ? "remediated" : raw === "dismissed" ? "dismissed"
+      : (raw === "" || raw === "none" || raw === "safe" || raw === "norisk") ? "none" : raw;
+    return {
+      id: _col(o, nm, ["Service principal ID", "servicePrincipalId", "id", "ObjectId"]),
+      appId: _col(o, nm, ["App ID", "appId", "Application ID"]),
+      riskState: state,
+      riskLevel: _col(o, nm, ["Risk level", "riskLevel"]).toLowerCase() || "high",
+      riskDetail: _col(o, nm, ["Risk detail", "riskDetail"]),
+      updated: _col(o, nm, ["Risk last updated (UTC)", "Risk last updated", "riskLastUpdatedDateTime"])
+    };
+  }
   function importLoad(parsed) {
     IMPORT = { raw: parsed, meta: { files: parsed.files, counts: { caPolicies: parsed.caPolicies.length, users: parsed.users.length, servicePrincipals: parsed.servicePrincipals.length } } };
     IMPORTED = true;
@@ -6069,40 +6088,44 @@ window.EP = (function () {
   }
   function importInit() {
     const card = document.querySelector("#epConnect .card"); if (!card || $("epImport")) return;
-    // Two copy-paste export scripts. The Azure CLI route is primary: its pre-authorized app usually needs NO
-    // admin consent, so it works for a Global Reader. The Graph PowerShell route is the companion for the two
-    // Policy.Read.All policy exports (security-defaults, auth-methods) the az app can't reach — Policy.Read.All
-    // connects as a self-service delegated scope in PS. Backtick escapes the $-prefixed OData params so a
-    // double-quoted PS string doesn't treat them as variables.
+    // One Graph PowerShell export. Read.All scopes self-consent for a delegated user (no app registration needed);
+    // the paginating G follows @odata.nextLink so collections aren't truncated at the first page; Invoke-MgGraphRequest
+    // returns raw Graph JSON (camelCase preserved). Backtick escapes the $-prefixed OData params so a double-quoted PS
+    // string doesn't expand them. The G round-trip (ConvertTo-Json -Depth 60) is fidelity-tested on PS 5.1 and 7.
     const PS_ALL = [
-      "# Entra Posture — one export script. Azure CLI pulls the bulk (its pre-authorized app usually needs no admin",
-      "# consent, so a Global Reader can run it); a short Graph PowerShell tail grabs the two Policy.Read.All policy",
-      "# files the az app 403s on. You sign in twice (az, then Graph). Install once if needed:",
-      "#   winget install -e --id Microsoft.AzureCLI   /   Install-Module Microsoft.Graph -Scope CurrentUser",
+      "# Entra Posture — one Graph PowerShell export. Read.All scopes self-consent for a delegated user (no app",
+      "# registration); the paginating G follows @odata.nextLink so nothing is truncated at 100 rows. Install once",
+      "# if needed:  Install-Module Microsoft.Graph -Scope CurrentUser",
+      "",
+      'Connect-MgGraph -Scopes "Application.Read.All","Policy.Read.All","User.Read.All","RoleManagement.Read.Directory","AuditLog.Read.All","DelegatedPermissionGrant.Read.All"',
+      "#   if the browser sign-in is hidden or fails (WAM), add  -UseDeviceCode  to the line above.",
+      "#   if any one scope needs admin consent in your tenant, drop it — only its file is skipped, the rest still export.",
       "",
       '$dir = "$HOME\\Downloads\\entra-export"',
       "New-Item -ItemType Directory -Force -Path $dir | Out-Null",
       "",
-      "# --- Azure CLI: CA policies, named locations, users, roles, MFA, workloads ---",
-      "az login            # add  --use-device-code  if the browser sign-in is blocked",
-      'function G($p,$f){ $j = az rest --method GET --url "https://graph.microsoft.com/v1.0/$p" -o json; [IO.File]::WriteAllText("$dir\\$f", ($j -join "`n")) }',
+      "# Paginated collection fetch — follows @odata.nextLink and writes one combined { value: [...] } file.",
+      'function G($uri,$f){ $items=@(); $next="v1.0/$uri"; while($next){ $r=Invoke-MgGraphRequest -Method GET -Uri $next; if($r.value){ $items+=$r.value }; $next=$r.\'@odata.nextLink\' }; (@{ value = @($items) } | ConvertTo-Json -Depth 60) | Set-Content "$dir\\$f" -Encoding utf8 }',
+      "",
+      "# --- Conditional Access + users + roles + MFA ---",
       'G "identity/conditionalAccess/policies" "ca-policies.json"',
       'G "identity/conditionalAccess/namedLocations" "named-locations.json"',
       'G "users?`$select=id,displayName,userPrincipalName,accountEnabled,userType,onPremisesSyncEnabled,createdDateTime,passwordPolicies,assignedPlans,signInActivity&`$top=999" "users.json"',
       'G "roleManagement/directory/roleAssignments?`$expand=principal" "role-assignments.json"',
       'G "reports/authenticationMethods/userRegistrationDetails?`$top=999" "mfa-registration.json"',
+      "",
+      "# --- Workloads (enterprise apps) ---",
       'G "servicePrincipals?`$expand=appRoleAssignments&`$top=999" "service-principals.json"',
       'G "oauth2PermissionGrants?`$top=999" "oauth2-grants.json"',
-      'G "applications?`$expand=owners,federatedIdentityCredentials&`$top=999" "applications.json"',
+      'G "applications?`$expand=owners&`$top=999" "applications.json"',
       "",
-      "# --- Graph PowerShell: the two policy files Policy.Read.All reaches but the az app 403s on ---",
-      'Connect-MgGraph -Scopes "Policy.Read.All" | Out-Null',
+      "# --- Single-object tenant policies (written raw) ---",
       'Invoke-MgGraphRequest -Method GET -Uri "v1.0/policies/identitySecurityDefaultsEnforcementPolicy" -OutputFilePath "$dir\\security-defaults.json"',
       'Invoke-MgGraphRequest -Method GET -Uri "v1.0/policies/authenticationMethodsPolicy" -OutputFilePath "$dir\\auth-methods.json"',
       "",
       "explorer $dir",
       "",
-      "# Risk + PIM-eligible have no reader-friendly API export — get them from the portal and drop the CSVs on the panel:",
+      "# Risk + PIM-eligible have no reader export — get them from the portal and drop the CSVs on the panel:",
       "#   Entra - Protection - Risky users - Download   ->  RiskyUsers CSV",
       "#   Entra - ID Governance - PIM - Roles - Export  ->  Roles CSV (standing + eligible)"
     ].join("\n");
@@ -6126,12 +6149,12 @@ window.EP = (function () {
       + gRow("Risky users (portal)", 'Graph 403s for a reader. <b>Entra → Protection → Risky users → Download</b> → drop the CSV here.', "Identity Protection risk flags")
       + gRow("PIM-eligible (portal)", 'Graph 403s for a reader. <b>Entra → ID Governance → PIM → Roles → Export</b> → drop the CSV here (one file carries standing + eligible).', "standing + eligible admin roles")
       + gHead("For the Workload view — service principals + delegated grants + app registrations")
-      + gRow("Workload exports", '<code ' + C + '>Service principals (?$expand=appRoleAssignments), oauth2PermissionGrants, applications (?$expand=owners,federatedIdentityCredentials) — all in the Copy script above.</code>', "enterprise apps, permissions, credentials")
+      + gRow("Workload exports", '<code ' + C + '>Service principals (?$expand=appRoleAssignments), oauth2PermissionGrants, applications (?$expand=owners) — all in the Copy script above. Federated credentials need Application.ReadWrite.All (write), so they stay live-only.</code>', "enterprise apps, permissions, credentials")
       + '</div><div style="margin-top:8px;color:var(--muted);font-size:10.5px;line-height:1.5">Needs the Microsoft.Graph module (<code>Install-Module Microsoft.Graph -Scope CurrentUser</code>). Use <b>Invoke-MgGraphRequest</b> (raw JSON), not <code>Get-Mg… | ConvertTo-Json</code> (which renames the fields). Group-based role grants and per-user CA coverage need live group reads, so they read "not assessed" in an import.</div></details>';
     const panel = document.createElement("div"); panel.id = "epImport";
     panel.style.cssText = "margin-top:16px;padding:15px 16px;border:1px dashed var(--border);border-radius:12px;background:rgba(127,160,210,.05)";
     panel.innerHTML = '<div style="font-weight:800;font-size:13px;color:var(--text);margin-bottom:4px">Import exported configuration <span style="font-weight:600;font-size:11px;color:var(--muted)">· scale-test · read-only · labelled “Imported”, never “Live”</span></div>'
-      + '<div style="font-size:11.5px;color:var(--muted);line-height:1.5;margin-bottom:10px">Drop the <b>Conditional Access</b> and/or <b>User</b> view JSON exports (paths below). Files are detected by their shape; nothing is uploaded. Identity Protection risk has no JSON export for a reader role — drop the portal <b>Risky users → Download</b> CSV alongside the User-view files and the imported users light up as at-risk.</div>'
+      + '<div style="font-size:11.5px;color:var(--muted);line-height:1.5;margin-bottom:10px">Drop the <b>Conditional Access</b> and/or <b>User</b> view JSON exports (paths below). Files are detected by their shape; nothing is uploaded. Identity Protection risk has no JSON export for a reader role, but the blades have a <b>Download</b> button — drop the <b>Risky users</b> CSV (lights up at-risk members) and the <b>Risky workload identities</b> CSV (lights up compromised apps) alongside the other exports.</div>'
       + guideHtml
       + '<div style="margin:0 0 10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap"><button id="epImpCopyAll" style="background:var(--accent);color:#06101f;font-weight:700;border:none;border-radius:7px;padding:7px 13px;cursor:pointer;font-size:12px">⎘ Copy export script (PowerShell)</button><span id="epImpCopyMsg" style="font-size:11px;color:var(--sev-low)"></span></div>'
       + '<div id="epImpDrop" style="padding:18px;border:1.5px dashed var(--border);border-radius:10px;text-align:center;color:var(--muted);font-size:12px;cursor:pointer">Drop JSON / CSV files here, or <u>browse</u><input id="epImpFile" type="file" accept=".json,.csv,application/json,text/csv" multiple style="display:none"></div>'
@@ -6139,9 +6162,9 @@ window.EP = (function () {
       + '<div style="margin-top:12px"><button id="epImpGo" disabled style="opacity:.5">Load dataset →</button></div>';
     card.appendChild(panel);
     const drop = panel.querySelector("#epImpDrop"), fileIn = panel.querySelector("#epImpFile"), go = panel.querySelector("#epImpGo"), diag = panel.querySelector("#epImpDiag");
-    const parsed = { caPolicies: [], namedLocations: [], secDefaults: null, authMethods: null, users: [], roleAssignments: [], roleEligibility: [], userRegistrationDetails: [], riskyUsers: [], servicePrincipals: [], oauth2PermissionGrants: [], applications: [], roles: [], files: [] };
-    const TLABEL = { caPolicies: "Conditional Access policies", namedLocations: "Named locations", secDefaults: "Security defaults", authMethods: "Authentication methods policy", users: "Users (members)", roleAssignments: "Directory role assignments", roleEligibility: "PIM-eligible roles", pimRoles: "Role assignments (PIM export)", userRegistrationDetails: "MFA registration", riskyUsers: "Risky users", servicePrincipals: "Service principals (enterprise apps)", oauth2PermissionGrants: "Delegated permission grants", applications: "App registrations", unknown: "Unrecognised — skipped" };
-    const UNIT = { caPolicies: " policies", namedLocations: " locations", authMethods: " methods", users: " users", roleAssignments: " assignments", roleEligibility: " eligible", pimRoles: " rows (active + eligible)", userRegistrationDetails: " users", riskyUsers: " users", servicePrincipals: " apps", oauth2PermissionGrants: " grants", applications: " registrations", unknown: " rows" };
+    const parsed = { caPolicies: [], namedLocations: [], secDefaults: null, authMethods: null, users: [], roleAssignments: [], roleEligibility: [], userRegistrationDetails: [], riskyUsers: [], riskyServicePrincipals: [], servicePrincipals: [], oauth2PermissionGrants: [], applications: [], roles: [], files: [] };
+    const TLABEL = { caPolicies: "Conditional Access policies", namedLocations: "Named locations", secDefaults: "Security defaults", authMethods: "Authentication methods policy", users: "Users (members)", roleAssignments: "Directory role assignments", roleEligibility: "PIM-eligible roles", pimRoles: "Role assignments (PIM export)", userRegistrationDetails: "MFA registration", riskyUsers: "Risky users", riskyServicePrincipals: "Risky workload identities", servicePrincipals: "Service principals (enterprise apps)", oauth2PermissionGrants: "Delegated permission grants", applications: "App registrations", unknown: "Unrecognised — skipped" };
+    const UNIT = { caPolicies: " policies", namedLocations: " locations", authMethods: " methods", users: " users", roleAssignments: " assignments", roleEligibility: " eligible", pimRoles: " rows (active + eligible)", userRegistrationDetails: " users", riskyUsers: " users", riskyServicePrincipals: " apps", servicePrincipals: " apps", oauth2PermissionGrants: " grants", applications: " registrations", unknown: " rows" };
     async function addFiles(list) {
       for (const f of list) {
         let text = ""; try { text = await f.text(); } catch (e) { continue; }
@@ -6167,6 +6190,7 @@ window.EP = (function () {
           const { headers, rows } = csvParse(text), type = classifyCsv(headers), nmc = _nmap(headers);
           if (type === "users") parsed.users = parsed.users.concat(rows);
           else if (type === "riskyUsers") rows.forEach(r => parsed.riskyUsers.push(mapRiskyUserCsv(r, nmc)));
+          else if (type === "riskyServicePrincipals") rows.forEach(r => parsed.riskyServicePrincipals.push(mapRiskySpCsv(r, nmc)));
           else if (type === "pimRoles") rows.forEach(r => { const row = mapRoleCsv(r, nmc); if (!row.roleName) return; if (row.kind === "eligible") parsed.roleEligibility.push(row); else parsed.roleAssignments.push(row); });
           parsed.files.push({ name: f.name, type, rows: rows.length });
         }
@@ -9358,7 +9382,8 @@ EP.registerView("workload", (function () {
     try {
       var R = window.EP.IMPORT.raw;
       var sps = R.servicePrincipals || [], grants = R.oauth2PermissionGrants || [], apps = R.applications || [];
-      cache.wiPolicies = []; cache.caAvailable = false;
+      // Workload CA coverage is computable from the imported CA policies (ca-policies.json) — same path as live.
+      cache.wiPolicies = workloadPoliciesFrom(R.caPolicies || []); cache.caAvailable = !!(R.caPolicies && R.caPolicies.length);
       var grantsByClient = {}, principalByClient = {};
       grants.forEach(function(g){
         if(g.consentType === 'AllPrincipals'){ (grantsByClient[g.clientId] = grantsByClient[g.clientId]||[]).push(g); }
@@ -9377,6 +9402,25 @@ EP.registerView("workload", (function () {
       if(!myTid){ var tc = {}, best = 0; sps.forEach(function(sp){ var t = sp.appOwnerOrganizationId; if(t && !MS_TENANTS[t]) tc[t] = (tc[t]||0)+1; }); Object.keys(tc).forEach(function(t){ if(tc[t]>best){ best = tc[t]; myTid = t; } }); }
       var appRoleLookup = {};
       Object.keys(resourceSPCache).forEach(function(spId){ (resourceSPCache[spId].appRoles||[]).forEach(function(role){ appRoleLookup[spId+'_'+role.id] = { resourceName:resourceSPCache[spId].displayName, resourceAppId:resourceSPCache[spId].appId, roleName:role.displayName, roleValue:role.value||'' }; }); });
+      // Directory ROLE assignments held BY service principals — from the imported role-assignments.json ($expand=principal
+      // carries the SP holders). Role display names come from the built-in DIR_ROLE_NAMES map (no roleDefinitions export),
+      // so a custom role shows its GUID; tier still resolves via dirRoleTier. Same signal the live scan surfaces.
+      var dirRolesBySpId = {};
+      (R.roleAssignments || []).forEach(function(a){
+        var p = a.principal || {}; if(String(p['@odata.type'] || '').indexOf('servicePrincipal') < 0) return;
+        var rid = String(a.roleDefinitionId || '').toLowerCase(), nm = DIR_ROLE_NAMES[rid] || a.roleDefinitionId || '(role)';
+        (dirRolesBySpId[p.id] = dirRolesBySpId[p.id] || []).push({ name: nm, templateId: a.roleDefinitionId, tier: dirRoleTier(a.roleDefinitionId, nm), scoped: !!(a.directoryScopeId && a.directoryScopeId !== '/') });
+      });
+      var hasRoleData = (R.roleAssignments || []).length > 0;
+      // Risky workload identities — from the imported RiskyServicePrincipals CSV (portal "Risky workload identities →
+      // Download"). Keyed by both SP object id and appId so either column in the export resolves the service principal.
+      var riskBySpId = {};
+      (R.riskyServicePrincipals || []).forEach(function(x){
+        var e = { state: x.riskState || 'none', level: x.riskLevel || 'high', detail: x.riskDetail || 'none', updated: x.updated || null, processing: false };
+        if(x.id) riskBySpId[String(x.id).toLowerCase()] = e;
+        if(x.appId) riskBySpId[String(x.appId).toLowerCase()] = e;
+      });
+      var hasWiRisk = (R.riskyServicePrincipals || []).length > 0;
       var results = sps.map(function(sp){
         var spGrants = grantsByClient[sp.id], princByRes = principalByClient[sp.id];
         var hasGrant = !!(spGrants && spGrants.length) || !!princByRes;
@@ -9394,7 +9438,7 @@ EP.registerView("workload", (function () {
         var vp = sp.verifiedPublisher && sp.verifiedPublisher.displayName ? sp.verifiedPublisher.displayName : null;
         var r = {
           id: sp.id, appId: sp.appId, displayName: sp.displayName, publisherName: sp.publisherName,
-          directoryRoles: [], signInActivity: null, wiRisk: null, caCoverage: caCoverageFor(sp.id),
+          directoryRoles: dirRolesBySpId[sp.id] || [], signInActivity: null, wiRisk: riskBySpId[String(sp.id).toLowerCase()] || riskBySpId[String(sp.appId || '').toLowerCase()] || null, caCoverage: caCoverageFor(sp.id),
           accountEnabled: sp.accountEnabled, appOwnerOrganizationId: sp.appOwnerOrganizationId,
           isFirstPartyMicrosoft: isMsFirstParty(sp), firstPartyByAppId: !MS_TENANTS[sp.appOwnerOrganizationId] && !!MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()], firstPartyByVerifiedMs: !MS_TENANTS[sp.appOwnerOrganizationId] && !MS_FIRST_PARTY_APPS[(sp.appId||'').toLowerCase()] && isVerifiedMicrosoft(sp), createdDateTime: sp.createdDateTime,
           appRoleAssignmentRequired: sp.appRoleAssignmentRequired, _hasGrant: hasGrant,
@@ -9441,7 +9485,9 @@ EP.registerView("workload", (function () {
         r.riskWeight = computeRiskWeight(r, r.riskScore);
       });
       cache.scannedAt = Date.now(); cache.results = results;
-      cache.wiRiskAvailable = false; cache.rolesAvailable = false; cache.auditAvailable = false;
+      // rolesAvailable + wiRiskAvailable reflect the imported role-assignments / risky-SP CSV; usage + licence have no
+      // reader export → stay off (honest banners).
+      cache.wiRiskAvailable = hasWiRisk; cache.rolesAvailable = hasRoleData; cache.auditAvailable = false;
       cache.workloadLicense = { available: null }; cache.baseline = null; cache.imported = true;
       hide('configCard'); show('results'); render();
       setStatus('Imported — ' + results.length + ' enterprise app(s), read-only.');
