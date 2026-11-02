@@ -6004,6 +6004,8 @@ window.EP = (function () {
     // distinctive fields BEFORE the generic "users" check or they'd be misread as member accounts.
     if (s.roleDefinitionId && (s.roleEligibilityScheduleId !== undefined || s.endDateTime !== undefined || s.memberType !== undefined || s.scheduleInfo !== undefined)) return "roleEligibility";
     if (s.roleDefinitionId && (s.principalId !== undefined || s.principal !== undefined)) return "roleAssignments";
+    // directoryRoles?$expand=members (Directory.Read.All, reader-friendly) — role→members, flattened to roleAssignments.
+    if (s.roleTemplateId !== undefined && s.members !== undefined) return "directoryRoles";
     if (s.isMfaRegistered !== undefined || s.methodsRegistered !== undefined) return "userRegistrationDetails";
     if (s.riskLevel !== undefined || s.riskState !== undefined) return "riskyUsers";
     if (s.userPrincipalName) return "users";
@@ -6093,13 +6095,14 @@ window.EP = (function () {
     // returns raw Graph JSON (camelCase preserved). Backtick escapes the $-prefixed OData params so a double-quoted PS
     // string doesn't expand them. The G round-trip (ConvertTo-Json -Depth 60) is fidelity-tested on PS 5.1 and 7.
     const PS_ALL = [
-      "# Entra Posture — one Graph PowerShell export. Read.All scopes self-consent for a delegated user (no app",
-      "# registration); the paginating G follows @odata.nextLink so nothing is truncated at 100 rows. Install once",
-      "# if needed:  Install-Module Microsoft.Graph -Scope CurrentUser",
+      "# Entra Posture — one Graph PowerShell export. These three Read.All scopes self-consent for a delegated reader",
+      "# (Global/Security Reader) — no app registration, no admin consent. Directory.Read.All covers users, service",
+      "# principals, app registrations, delegated grants and directory-role members, so it replaces RoleManagement.Read.",
+      "# Directory + DelegatedPermissionGrant.Read.All (those two DO need admin consent). Install once if needed:",
+      "#   Install-Module Microsoft.Graph -Scope CurrentUser",
       "",
-      'Connect-MgGraph -Scopes "Application.Read.All","Policy.Read.All","User.Read.All","RoleManagement.Read.Directory","AuditLog.Read.All","DelegatedPermissionGrant.Read.All"',
+      'Connect-MgGraph -Scopes "Directory.Read.All","Policy.Read.All","AuditLog.Read.All"',
       "#   if the browser sign-in is hidden or fails (WAM), add  -UseDeviceCode  to the line above.",
-      "#   if any one scope needs admin consent in your tenant, drop it — only its file is skipped, the rest still export.",
       "",
       '$dir = "$HOME\\Downloads\\entra-export"',
       "New-Item -ItemType Directory -Force -Path $dir | Out-Null",
@@ -6111,7 +6114,7 @@ window.EP = (function () {
       'G "identity/conditionalAccess/policies" "ca-policies.json"',
       'G "identity/conditionalAccess/namedLocations" "named-locations.json"',
       'G "users?`$select=id,displayName,userPrincipalName,accountEnabled,userType,onPremisesSyncEnabled,createdDateTime,passwordPolicies,assignedPlans,signInActivity&`$top=999" "users.json"',
-      'G "roleManagement/directory/roleAssignments?`$expand=principal" "role-assignments.json"',
+      'G "directoryRoles?`$expand=members" "directory-roles.json"',
       'G "reports/authenticationMethods/userRegistrationDetails?`$top=999" "mfa-registration.json"',
       "",
       "# --- Workloads (enterprise apps) ---",
@@ -6141,10 +6144,10 @@ window.EP = (function () {
       + gRow("Named locations (optional)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/identity/conditionalAccess/namedLocations" -OutputFilePath named-locations.json</code>', "CA (resolves excluded locations)")
       + gRow("Security defaults (optional)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/policies/identitySecurityDefaultsEnforcementPolicy" -OutputFilePath security-defaults.json</code>', "CA (security-defaults finding)")
       + gRow("Auth methods (optional)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/policies/authenticationMethodsPolicy" -OutputFilePath auth-methods.json</code>', "CA (auth-baseline findings)")
-      + gHead("For the User view — needs directory read (Global Reader), own Connect-MgGraph")
-      + gRow("Connect (User view)", '<code ' + C + '>Connect-MgGraph -Scopes "User.Read.All","RoleManagement.Read.Directory","AuditLog.Read.All","IdentityRiskyUser.Read.All"</code>', "Global Reader covers these")
+      + gHead("For the User view — Directory.Read.All + AuditLog.Read.All (self-consent for a reader)")
+      + gRow("Connect (User view)", '<code ' + C + '>Connect-MgGraph -Scopes "Directory.Read.All","AuditLog.Read.All"</code>', "Global Reader covers these (no admin consent)")
       + gRow("Users (members)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/users?$select=id,displayName,userPrincipalName,accountEnabled,userType,onPremisesSyncEnabled,createdDateTime,passwordPolicies,assignedPlans,signInActivity&amp;$top=999" -OutputFilePath users.json</code>', "User view (members)")
-      + gRow("Role assignments", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/roleManagement/directory/roleAssignments?$expand=principal" -OutputFilePath role-assignments.json</code>', "who holds admin roles")
+      + gRow("Role holders", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/directoryRoles?$expand=members" -OutputFilePath directory-roles.json</code>', "who holds admin roles (users + apps) — Directory.Read.All, not RoleManagement.Read.Directory which needs admin consent")
       + gRow("MFA registration (optional)", '<code ' + C + '>Invoke-MgGraphRequest -Method GET -Uri "v1.0/reports/authenticationMethods/userRegistrationDetails?$top=999" -OutputFilePath mfa-registration.json</code>', "per-user MFA")
       + gRow("Risky users (portal)", 'Graph 403s for a reader. <b>Entra → Protection → Risky users → Download</b> → drop the CSV here.', "Identity Protection risk flags")
       + gRow("PIM-eligible (portal)", 'Graph 403s for a reader. <b>Entra → ID Governance → PIM → Roles → Export</b> → drop the CSV here (one file carries standing + eligible).', "standing + eligible admin roles")
@@ -6163,8 +6166,8 @@ window.EP = (function () {
     card.appendChild(panel);
     const drop = panel.querySelector("#epImpDrop"), fileIn = panel.querySelector("#epImpFile"), go = panel.querySelector("#epImpGo"), diag = panel.querySelector("#epImpDiag");
     const parsed = { caPolicies: [], namedLocations: [], secDefaults: null, authMethods: null, users: [], roleAssignments: [], roleEligibility: [], userRegistrationDetails: [], riskyUsers: [], riskyServicePrincipals: [], servicePrincipals: [], oauth2PermissionGrants: [], applications: [], roles: [], files: [] };
-    const TLABEL = { caPolicies: "Conditional Access policies", namedLocations: "Named locations", secDefaults: "Security defaults", authMethods: "Authentication methods policy", users: "Users (members)", roleAssignments: "Directory role assignments", roleEligibility: "PIM-eligible roles", pimRoles: "Role assignments (PIM export)", userRegistrationDetails: "MFA registration", riskyUsers: "Risky users", riskyServicePrincipals: "Risky workload identities", servicePrincipals: "Service principals (enterprise apps)", oauth2PermissionGrants: "Delegated permission grants", applications: "App registrations", unknown: "Unrecognised — skipped" };
-    const UNIT = { caPolicies: " policies", namedLocations: " locations", authMethods: " methods", users: " users", roleAssignments: " assignments", roleEligibility: " eligible", pimRoles: " rows (active + eligible)", userRegistrationDetails: " users", riskyUsers: " users", riskyServicePrincipals: " apps", servicePrincipals: " apps", oauth2PermissionGrants: " grants", applications: " registrations", unknown: " rows" };
+    const TLABEL = { caPolicies: "Conditional Access policies", namedLocations: "Named locations", secDefaults: "Security defaults", authMethods: "Authentication methods policy", users: "Users (members)", roleAssignments: "Directory role assignments", directoryRoles: "Directory roles (+ members)", roleEligibility: "PIM-eligible roles", pimRoles: "Role assignments (PIM export)", userRegistrationDetails: "MFA registration", riskyUsers: "Risky users", riskyServicePrincipals: "Risky workload identities", servicePrincipals: "Service principals (enterprise apps)", oauth2PermissionGrants: "Delegated permission grants", applications: "App registrations", unknown: "Unrecognised — skipped" };
+    const UNIT = { caPolicies: " policies", namedLocations: " locations", authMethods: " methods", users: " users", roleAssignments: " assignments", directoryRoles: " roles", roleEligibility: " eligible", pimRoles: " rows (active + eligible)", userRegistrationDetails: " users", riskyUsers: " users", riskyServicePrincipals: " apps", servicePrincipals: " apps", oauth2PermissionGrants: " grants", applications: " registrations", unknown: " rows" };
     async function addFiles(list) {
       for (const f of list) {
         let text = ""; try { text = await f.text(); } catch (e) { continue; }
@@ -6179,6 +6182,7 @@ window.EP = (function () {
           else if (type === "namedLocations") parsed.namedLocations = parsed.namedLocations.concat(arr);
           else if (type === "users") parsed.users = parsed.users.concat(arr);
           else if (type === "roleAssignments") parsed.roleAssignments = parsed.roleAssignments.concat(arr);
+          else if (type === "directoryRoles") arr.forEach(role => (role.members || []).forEach(m => parsed.roleAssignments.push({ roleDefinitionId: role.roleTemplateId, principal: m })));
           else if (type === "roleEligibility") parsed.roleEligibility = parsed.roleEligibility.concat(arr);
           else if (type === "userRegistrationDetails") parsed.userRegistrationDetails = parsed.userRegistrationDetails.concat(arr);
           else if (type === "riskyUsers") parsed.riskyUsers = parsed.riskyUsers.concat(arr);
