@@ -572,6 +572,9 @@
 #view-vuln .cv-tools { display:flex; flex-wrap:wrap; gap:7px; align-items:center; margin:2px 0 10px; }
 #view-vuln .cv-tools input, #view-vuln .cv-tools select { padding:7px 10px; border:1px solid var(--border); border-radius:8px; background:var(--card); color:var(--text); font-size:12px; }
 #view-vuln .cv-tools input { flex:1; min-width:180px; }
+#view-vuln .cv-toggle { display:inline-flex; border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+#view-vuln .cv-toggle button { font-size:11px; font-weight:700; padding:5px 12px; background:var(--card); color:var(--muted); border:none; cursor:pointer; }
+#view-vuln .cv-toggle button.on { background:var(--accent); color:#061018; }
 #view-vuln .cv-count { font-size:11px; color:var(--muted); margin-left:auto; white-space:nowrap; }
 #view-vuln .cv-wrap { border:1px solid var(--border); border-radius:11px; overflow:hidden; }
 #view-vuln .cv-tbl { width:100%; border-collapse:collapse; font-size:12.5px; }
@@ -3879,7 +3882,11 @@ function paint(){
       + '<td>' + srcChips(d) + '</td><td>' + compBadge(d.compliance) + '</td><td>' + expBadge(d.exposure) + '</td><td>' + threatBadge(d.threat) + '</td>'
       + '<td class="di-sub"' + (d.stale?' style="color:var(--sev-high)"':'') + '>' + ago(d.lastSeenDays) + '</td></tr>';
     return main + (open ? detailRow(d, COLS) : "");
-  }).join("") || '<tr><td colspan="' + COLS + '" style="padding:20px;color:var(--muted)">No devices match these filters.</td></tr>';
+  }).join("") || ('<tr><td colspan="' + COLS + '" style="padding:20px;color:var(--muted)">'
+    + (((STATE.net === "yes" || STATE.net === "no") && D.devices.every(d => d.internet == null))
+        ? 'Defender hasn’t reported internet-facing status for any device yet — that field is populated by Defender device discovery / Vulnerability Management. Choose <b>unknown (not reported)</b> to list these devices.'
+        : 'No devices match these filters.')
+    + '</td></tr>');
   const band = '<div class="di-band"><div class="di-score"><span class="n">' + D.devices.length + '</span><span class="g">DEVICES</span></div>'
     + '<div><div class="h1">Device inventory · classified by risk</div><div class="lede">' + hi + ' high-risk · ' + unm + ' unmanaged · ' + nc + ' non-compliant' + (D.hasMde ? '' : ' · <span style="color:var(--sev-high)">connect Defender for risk + exposure levels</span>') + ' · <span style="color:var(--muted)">click a row for full detail</span></div></div></div>';
   const src = D.live ? (D.hasMde ? "Live — Entra + Intune + Defender." : "Live — Entra + Intune (Defender not connected).") : "Demo data.";
@@ -4438,8 +4445,31 @@ const DEMO = {
 const NEEDS_DEFENDER = { needsDefender:true, score:null, grade:"–",
   lede: "Device CVEs come from Defender TVM, read via Graph advanced hunting (ThreatHunting.Read.All)." };
 
-let LAST = null, CVES = [], _wired = false;
-const STATE = { q:"", sev:"", exploit:"", sortCol:"sev", sortDir:"desc", expanded:{} };
+let LAST = null, CVES = [], SOFTWARE = [], CVE_MAP = {}, _wired = false;
+const STATE = { view:"software", q:"", sev:"", exploit:"", sortCol:"sev", sortDir:"desc", expanded:{}, swExpanded:{} };
+
+// Software overview, derived from the CVE rollup (no extra query): group every CVE under each software
+// product it affects, so the default view is ~dozens of products — each the unit you actually patch —
+// instead of hundreds of individual CVEs. Device count is the union of affected devices across its CVEs.
+function buildSoftware(cves){
+  const map = {};
+  cves.forEach(c => {
+    (c.software && c.software.length ? c.software : ["(unknown software)"]).forEach(sw => {
+      const k = sw.toLowerCase();
+      const s = map[k] || (map[k] = { label: sw, cveIds: [], devices: new Set(), crit:0, high:0, worst:0, update:"", exploit:false });
+      s.cveIds.push(c.cve);
+      (c.deviceNames||[]).forEach(d => s.devices.add(d));
+      const rank = SEV_RANK[c.sev] || 0; if (rank > s.worst) s.worst = rank;
+      if (c.sev === "Critical") s.crit++; else if (c.sev === "High") s.high++;
+      if (!s.update && c.update) s.update = c.update;
+      if (c.exploit || c.zeroday) s.exploit = true;
+    });
+  });
+  return Object.keys(map).map(k => { const s = map[k]; return {
+    label: s.label, cveIds: s.cveIds, cveCount: s.cveIds.length, devices: s.devices.size, deviceNames: [...s.devices],
+    crit: s.crit, high: s.high, worstSev: s.worst>=4?"Critical":s.worst>=3?"High":s.worst>=2?"Medium":"Low", update: s.update, exploit: s.exploit };
+  });
+}
 
 // ---------- live collection ----------
 async function huntTvm(){
@@ -4552,21 +4582,79 @@ function paintCves(){
   host.innerHTML = rows.map(cveRow).join("");
 }
 function th(col, label){ const on = STATE.sortCol===col; return '<th data-sort="'+col+'">'+label+(on?'<span class="ar">'+(STATE.sortDir==="asc"?"▲":"▼")+'</span>':'')+'</th>'; }
-function cveTable(){
-  return '<div class="dp-h2">CVEs across the estate <span class="dp-hint">click a row for software, devices &amp; the fix</span></div>'
+function toolbar(){
+  const sw = STATE.view === "software";
+  return '<div class="dp-h2">' + (sw ? "Software across the estate" : "CVEs across the estate")
+    + '<span class="cv-toggle"><button type="button" data-view="software" class="' + (sw?"on":"") + '">By software</button>'
+    + '<button type="button" data-view="cve" class="' + (sw?"":"on") + '">By CVE</button></span></div>'
     + '<div class="cv-tools">'
-    + '<input id="cv-q" placeholder="Search CVE id or software…" spellcheck="false" value="' + esc(STATE.q) + '">'
+    + '<input id="cv-q" placeholder="' + (sw ? "Search software or CVE id…" : "Search CVE id or software…") + '" spellcheck="false" value="' + esc(STATE.q) + '">'
     + '<select id="cv-sev"><option value="">Severity: all</option>' + ["Critical","High","Medium","Low"].map(s => '<option value="'+s+'"'+(STATE.sev===s?" selected":"")+'>'+s+'</option>').join("") + '</select>'
-    + '<select id="cv-exploit"><option value="">Exploit: all</option><option value="exploit"'+(STATE.exploit==="exploit"?" selected":"")+'>public exploit</option><option value="zero"'+(STATE.exploit==="zero"?" selected":"")+'>zero-day</option></select>'
-    + '<span class="cv-count" id="cv-count"></span></div>'
-    + '<div class="cv-wrap"><table class="cv-tbl"><thead><tr><th style="width:14px"></th>'
-    + th("sev","Severity") + th("cve","CVE") + th("cvss","CVSS") + '<th>Software</th>' + th("devices","Devices") + '</tr></thead>'
-    + '<tbody id="cv-body"></tbody></table></div>';
+    + '<select id="cv-exploit"><option value="">Exploit: all</option><option value="exploit"'+(STATE.exploit==="exploit"?" selected":"")+'>public exploit</option>'
+    + (sw ? '' : '<option value="zero"'+(STATE.exploit==="zero"?" selected":"")+'>zero-day</option>') + '</select>'
+    + '<span class="cv-count" id="cv-count"></span></div>';
+}
+function activeTable(){
+  const head = STATE.view === "software"
+    ? th("sev","Severity") + th("software","Software") + th("cves","CVEs") + '<th>Exploit</th>' + th("devices","Devices")
+    : th("sev","Severity") + th("cve","CVE") + th("cvss","CVSS") + '<th>Software</th>' + th("devices","Devices");
+  return '<div class="cv-wrap"><table class="cv-tbl"><thead><tr><th style="width:14px"></th>' + head + '</tr></thead><tbody id="cv-body"></tbody></table></div>';
+}
+// ---------- software view ----------
+function applySwFilters(list){
+  const S = STATE, q = S.q.trim().toLowerCase();
+  return list.filter(s => {
+    if (S.sev && s.worstSev !== S.sev) return false;
+    if (S.exploit && !s.exploit) return false;
+    if (q && !(s.label.toLowerCase().includes(q) || s.cveIds.some(id => id.toLowerCase().includes(q)))) return false;
+    return true;
+  });
+}
+function sortSoftware(list){
+  const col = STATE.sortCol, dir = STATE.sortDir === "asc" ? 1 : -1;
+  const key = s => col==="cves" ? s.cveCount : col==="devices" ? s.devices
+    : col==="software" ? s.label.toLowerCase() : (SEV_RANK[s.worstSev]||0)*100000 + s.cveCount;
+  return list.slice().sort((a,b) => { const ka=key(a), kb=key(b); return ka<kb?-dir:ka>kb?dir:0; });
+}
+function softwareRow(s){
+  const open = !!STATE.swExpanded[s.label];
+  const exp = s.exploit ? '<span class="cv-badge cv-exploit">PUBLIC EXPLOIT</span>' : '<span style="color:var(--muted)">—</span>';
+  const main = '<tr class="cv-trow" data-sw="' + esc(s.label) + '">'
+    + '<td><span class="cv-chev">' + (open?'▾':'▸') + '</span></td>'
+    + '<td><span class="cv-sev sev-' + (SEV_CLS[s.worstSev]||"low") + '">' + s.worstSev.toUpperCase() + '</span></td>'
+    + '<td class="cv-id" style="white-space:normal">' + esc(s.label) + '</td>'
+    + '<td class="cv-num">' + s.cveCount + (s.crit ? ' <span style="color:var(--sev-crit)">· ' + s.crit + ' crit</span>' : '') + '</td>'
+    + '<td>' + exp + '</td>'
+    + '<td class="cv-num">' + s.devices + '</td></tr>';
+  if (!open) return main;
+  const cves = s.cveIds.map(id => CVE_MAP[id]).filter(Boolean).sort((a,b) => (SEV_RANK[b.sev]||0)-(SEV_RANK[a.sev]||0) || (b.cvss||0)-(a.cvss||0));
+  const cveLines = cves.map(c => '<div class="cv-kv" style="margin:3px 0">'
+    + '<span class="cv-sev sev-' + (SEV_CLS[c.sev]||"low") + '" style="margin-right:7px">' + c.sev.toUpperCase() + '</span>'
+    + '<span class="cv-id">' + esc(c.cve) + '</span>'
+    + (c.cvss!=null ? ' <span class="cv-num" style="color:var(--muted)">CVSS ' + c.cvss.toFixed(1) + '</span>' : '')
+    + (c.exploit ? '<span class="cv-badge cv-exploit">PUBLIC EXPLOIT</span>' : '')
+    + (c.zeroday ? '<span class="cv-badge cv-zero">ZERO-DAY</span>' : '') + '</div>').join("");
+  const devChips = (s.deviceNames||[]).length ? s.deviceNames.map(n => '<span class="cv-chip" data-dev="' + esc(n) + '">' + esc(n) + '</span>').join("") : '<span style="color:var(--muted);font-size:12px">—</span>';
+  const detail = '<tr class="cv-detail"><td></td><td colspan="5">'
+    + '<div class="cv-kv"><b>' + s.cveCount + ' CVE' + (s.cveCount===1?"":"s") + ' in ' + esc(s.label) + ' (worst first):</b></div>' + cveLines
+    + '<div class="cv-kv" style="margin-top:9px"><b>Affected devices (' + s.devices + '):</b><br>' + devChips + '</div>'
+    + (s.update ? '<div class="cv-fixbox"><b>Fix:</b> ' + esc(s.update) + '</div>' : '<div class="cv-fixbox">Update <b>' + esc(s.label) + '</b> to the latest vendor release.</div>')
+    + '</td></tr>';
+  return main + detail;
+}
+function paintSoftware(){
+  const host = document.getElementById("cv-body"); if (!host) return;
+  const rows = sortSoftware(applySwFilters(SOFTWARE));
+  const cnt = document.getElementById("cv-count"); if (cnt) cnt.textContent = rows.length + " of " + SOFTWARE.length + " products";
+  if (!rows.length){ host.innerHTML = '<tr><td colspan="6" class="cv-empty">No software matches these filters.</td></tr>'; return; }
+  host.innerHTML = rows.map(softwareRow).join("");
 }
 
 // ---------- page render ----------
 function render(D){
   LAST = D; CVES = D.cves || [];
+  CVE_MAP = {}; CVES.forEach(c => { CVE_MAP[c.cve] = c; });
+  SOFTWARE = buildSoftware(CVES);
   const root = document.getElementById("vuln-root"); if (!root) return;
   const band = '<div class="dp-band"><div class="dp-score"><span class="n">' + (D.score==null?"–":D.score) + '</span><span class="g">GRADE ' + esc(D.grade) + '</span></div>'
     + '<div><div class="h1">Vulnerabilities · CVE workspace</div><div class="lede">' + esc(D.lede) + '</div></div></div>';
@@ -4576,42 +4664,44 @@ function render(D){
       + (D.err ? '<br><span style="color:var(--sev-high)">' + esc(D.err) + '</span>' : '') + '</div>';
     return;
   }
-  const crit = CVES.filter(c => c.sev==="Critical").length, exp = CVES.filter(c => c.exploit||c.zeroday).length, zero = CVES.filter(c => c.zeroday).length;
+  const crit = CVES.filter(c => c.sev==="Critical").length, exp = CVES.filter(c => c.exploit||c.zeroday).length;
+  // Critical + exploit tiles are in-page filters: they jump to the By-CVE list filtered to those rows
+  // (so "1 with a public exploit" answers "which?" in one click).
   const tiles = '<div class="dp-tiles">'
     + '<div class="dp-tile"><div class="v">' + CVES.length + '</div><div class="l">distinct CVEs</div></div>'
-    + '<div class="dp-tile ' + (crit?"crit":"") + goAttr({ cve:"Critical" }) + '><div class="v">' + crit + '</div><div class="l">critical CVEs</div></div>'
-    + '<div class="dp-tile ' + (exp?"crit":"") + '"><div class="v">' + exp + '</div><div class="l">with a public exploit / zero-day</div></div>'
-    + '<div class="dp-tile ' + (D.dev && D.dev.crit?"high":"") + goAttr({ cve:"Critical" }) + '><div class="v">' + (D.dev?D.dev.total:"—") + '</div><div class="l">devices with TVM data</div></div>'
+    + '<div class="dp-tile dp-click ' + (crit?"crit":"") + '" data-kpi="crit"><div class="v">' + crit + '</div><div class="l">critical CVEs</div></div>'
+    + '<div class="dp-tile dp-click ' + (exp?"crit":"") + '" data-kpi="exploit"><div class="v">' + exp + '</div><div class="l">with a public exploit / zero-day</div></div>'
+    + '<div class="dp-tile ' + goAttr({ cve:"Critical" }) + '><div class="v">' + (D.dev?D.dev.total:"—") + '</div><div class="l">devices with TVM data</div></div>'
     + '</div>';
   const xlink = '<div class="dp-note" style="border-left-color:var(--accent);background:rgba(63,169,255,.05);padding:8px 12px"><b>↔ SightLine.</b> This is <i>installed-software</i> CVEs. For the ones also <i>reachable from outside</i> (open port ∩ present CVE), cross-reference SightLine’s Verified Exploitable — that intersection is "exploitable now".</div>';
   const src = (window.EP && EP.DEMO) ? "Demo data." : "Live — Defender TVM via advanced hunting.";
   const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> CVEs rolled up from Defender TVM (DeviceTvmSoftwareVulnerabilities + KB), one row per CVE. Requires Defender for Endpoint P2. Device chips open the Devices page filtered to that device.</div>';
-  root.innerHTML = band + tiles + cveTable() + renderTriage() + xlink + note;
-  paintCves();
+  root.innerHTML = band + tiles + toolbar() + activeTable() + renderTriage() + xlink + note;
+  repaint();
   wireView();
 }
+function repaint(){ if (STATE.view === "software") paintSoftware(); else paintCves(); }
 function goAttr(go){ return go ? ' dp-click" data-go=\'' + JSON.stringify(go).replace(/'/g, "&#39;") + '\'' : '"'; }
 function wireView(){
   const root = document.getElementById("vuln-root"); if (!root || _wired) return; _wired = true;
   root.addEventListener("click", e => {
-    const chev = e.target.closest(".cv-trow");
+    const view = e.target.closest("[data-view]");
+    const kpi  = e.target.closest("[data-kpi]");
     const chip = e.target.closest("[data-dev]");
-    const go = e.target.closest("[data-go]");
+    const go   = e.target.closest("[data-go]");
+    const h    = e.target.closest("th[data-sort]");
+    const row  = e.target.closest(".cv-trow");
+    if (view){ const v = view.getAttribute("data-view"); if (v !== STATE.view){ STATE.view = v; STATE.sortCol="sev"; STATE.sortDir="desc"; render(LAST); } return; }
+    if (kpi){ const k = kpi.getAttribute("data-kpi"); STATE.view="cve"; STATE.sortCol="sev"; STATE.sortDir="desc"; STATE.sev = k==="crit"?"Critical":""; STATE.exploit = k==="exploit"?"exploit":""; render(LAST); return; }
     if (chip){ e.stopPropagation(); if (window.EP && EP.goto) EP.goto("devices", { search: chip.getAttribute("data-dev") }); return; }
     if (go){ let f=null; try{ f=JSON.parse(go.getAttribute("data-go")); }catch(_){} if (window.EP && EP.goto) EP.goto("devices", f); return; }
-    if (chev){ const id = chev.getAttribute("data-cve"); STATE.expanded[id] = !STATE.expanded[id]; paintCves(); }
+    if (h){ const col = h.getAttribute("data-sort"); if (STATE.sortCol===col) STATE.sortDir = STATE.sortDir==="asc"?"desc":"asc"; else { STATE.sortCol=col; STATE.sortDir=(col==="cve"||col==="software")?"asc":"desc"; } render(LAST); return; }
+    if (row){ if (row.hasAttribute("data-sw")){ const id=row.getAttribute("data-sw"); STATE.swExpanded[id]=!STATE.swExpanded[id]; paintSoftware(); } else { const id=row.getAttribute("data-cve"); STATE.expanded[id]=!STATE.expanded[id]; paintCves(); } return; }
   });
-  root.addEventListener("input", e => { if (e.target.id === "cv-q"){ STATE.q = e.target.value; paintCves(); } });
+  root.addEventListener("input", e => { if (e.target.id === "cv-q"){ STATE.q = e.target.value; repaint(); } });
   root.addEventListener("change", e => {
-    if (e.target.id === "cv-sev"){ STATE.sev = e.target.value; paintCves(); }
-    else if (e.target.id === "cv-exploit"){ STATE.exploit = e.target.value; paintCves(); }
-  });
-  root.addEventListener("click", e => {
-    const h = e.target.closest("th[data-sort]"); if (!h) return;
-    const col = h.getAttribute("data-sort");
-    if (STATE.sortCol === col) STATE.sortDir = STATE.sortDir === "asc" ? "desc" : "asc";
-    else { STATE.sortCol = col; STATE.sortDir = (col==="cve") ? "asc" : "desc"; }
-    render(LAST);   // rebuild header arrows + body (STATE carries filters/sort/expanded)
+    if (e.target.id === "cv-sev"){ STATE.sev = e.target.value; repaint(); }
+    else if (e.target.id === "cv-exploit"){ STATE.exploit = e.target.value; repaint(); }
   });
 }
 async function analyze(){
@@ -4637,8 +4727,8 @@ function __dpVulnSummary(){
 function __dpVulnFocus(f){
   try {
     const r = document.getElementById("vuln-root"); if (r) r.scrollIntoView({ behavior:"smooth", block:"start" });
-    if (f && f.cve){ const sv = document.getElementById("cv-sev"); STATE.sev = f.cve; if (sv) sv.value = f.cve; paintCves(); }
-    if (f && f.exploit){ STATE.exploit = "exploit"; const se = document.getElementById("cv-exploit"); if (se) se.value = "exploit"; paintCves(); }
+    if (f && f.cve){ STATE.view="cve"; STATE.sev = f.cve; if (LAST) render(LAST); }
+    else if (f && f.exploit){ STATE.view="cve"; STATE.exploit = "exploit"; if (LAST) render(LAST); }
   } catch(e){}
 }
 if (window.EP && EP.DEMO) { try { analyze(); } catch(e){ console.error("[vuln demo]", e); } }
