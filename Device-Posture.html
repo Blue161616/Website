@@ -3840,7 +3840,7 @@ EP.registerView("coverage", (function () {
   let account = EP.ACCOUNT, msalInstance = EP.msalShim();
 
 const DEMO = {
-  score: 38, grade: "C",
+  score: 38, grade: "C", hasMde: true,
   lede: "214 devices seen across Entra, Intune and Defender — but 31 carry no EDR telemetry and 12 are unmanaged.",
   tiles: [
     { v: "214", l: "devices seen (any source)" },
@@ -3888,42 +3888,58 @@ async function gGetAll(path, scopes){
   }
   return out;
 }
+// Defender onboarding per device, via Graph advanced hunting (DeviceInfo) — CORS-friendly, keyed by
+// AadDeviceId. Optional: failure leaves Defender "not assessed".
+async function huntOnboarding(){
+  const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
+  const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, OnboardingStatus) by AadDeviceId";
+  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  if (!r.ok){ const e2 = new Error("onboarding " + r.status); e2.status = r.status; throw e2; }
+  return (await r.json()).results || [];
+}
 async function collect(){
-  // Entra device objects (canonical set) + Intune managed devices, joined by deviceId/azureADDeviceId.
+  // Entra device objects (canonical set) + Intune managed devices + Defender onboarding (advanced hunting).
   const entra = await gGetAll("/devices?$select=id,deviceId,displayName,operatingSystem,trustType,isManaged,approximateLastSignInDateTime,accountEnabled&$top=200", ["Device.Read.All"]);
   let intune = [];
   try { intune = await gGetAll("/deviceManagement/managedDevices?$select=id,deviceName,azureADDeviceId,operatingSystem,lastSyncDateTime&$top=200", ["DeviceManagementManagedDevices.Read.All"]); }
   catch(e){ intune = []; }   // Intune may be unlicensed — degrade to Entra-only
+  let machines = null;
+  try { machines = await huntOnboarding(); } catch(e){ machines = null; }
   const inByAad = {};
   intune.forEach(d => { const k = String(d.azureADDeviceId || "").toLowerCase(); if (k) inByAad[k] = d; });
+  const mdeByAad = {}; if (machines) machines.forEach(m => { const k = String(m.AadDeviceId || "").toLowerCase(); if (k) mdeByAad[k] = m; });
+  const onbOf = d => { if (!machines) return null; const m = mdeByAad[String(d.deviceId || "").toLowerCase()]; return m && String(m.OnboardingStatus || "").toLowerCase() === "onboarded" ? 1 : 0; };
   const now = Date.now(), STALE = 30 * 864e5;
   const active = entra.filter(d => d.accountEnabled !== false);
   const total = active.length;
-  let managed = 0, stale = 0;
+  let managed = 0, stale = 0, notOnb = 0;
   active.forEach(d => {
     const i = inByAad[String(d.deviceId || "").toLowerCase()];
     if (i) managed++;
+    if (machines && onbOf(d) === 0) notOnb++;
     const seen = i && i.lastSyncDateTime ? Date.parse(i.lastSyncDateTime) : (d.approximateLastSignInDateTime ? Date.parse(d.approximateLastSignInDateTime) : NaN);
     if (seen && (now - seen) > STALE) stale++;
   });
   const unmanaged = total - managed;
-  const bad = unmanaged * 1 + stale * 0.6;
+  const bad = unmanaged * 1 + stale * 0.6 + (machines ? notOnb * 1 : 0);
   const score = total ? Math.min(100, Math.round(100 * bad / total)) : 0;
   const grade = score >= 60 ? "D" : score >= 45 ? "C" : score >= 30 ? "B" : "A";
   const findings = [];
+  if (machines && notOnb) findings.push({ sev: "crit", title: notOnb + " devices have no Defender for Endpoint sensor", impact: "no EDR telemetry — invisible to Hardening & Vulnerabilities", search: "not onboarded" });
   if (unmanaged) findings.push({ sev: "high", title: unmanaged + " Entra-registered devices are not managed by Intune", impact: "no compliance policy can apply", search: "unmanaged" });
   if (stale) findings.push({ sev: "high", title: stale + " devices have not signed in / synced in 30+ days", impact: "posture signal is stale", search: "stale" });
-  findings.push({ sev: "low", title: "Defender onboarding not assessed — connect Defender (MDE) to find EDR blind spots", impact: "the biggest coverage gap is still unmeasured", search: "defender" });
+  if (!machines) findings.push({ sev: "low", title: "Defender onboarding not assessed — connect Defender to find EDR blind spots", impact: "the biggest coverage gap is still unmeasured", search: "defender" });
+  if (!findings.length) findings.push({ sev: "low", title: "Full coverage — every device is managed and onboarded", impact: "healthy", search: "" });
   const devices = active.slice(0, 8).map(d => ({
     n: d.displayName || d.deviceName || d.deviceId || "(device)", os: d.operatingSystem || "—",
-    entra: 1, intune: inByAad[String(d.deviceId || "").toLowerCase()] ? 1 : 0, mde: null
+    entra: 1, intune: inByAad[String(d.deviceId || "").toLowerCase()] ? 1 : 0, mde: onbOf(d)
   }));
   return {
-    score, grade,
-    lede: total + " Entra devices · " + managed + " managed by Intune, " + unmanaged + " unmanaged. Defender onboarding not assessed yet.",
+    score, grade, hasMde: !!machines,
+    lede: total + " Entra devices · " + managed + " managed by Intune, " + unmanaged + " unmanaged" + (machines ? ", " + notOnb + " not onboarded to Defender." : ". Defender onboarding not assessed."),
     tiles: [
       { v: String(total), l: "Entra devices (enabled)" },
-      { v: "—", l: "not onboarded to Defender", cls: "na" },
+      machines ? { v: String(notOnb), l: "not onboarded to Defender", cls: notOnb ? "crit" : "" } : { v: "—", l: "not onboarded to Defender", cls: "na" },
       { v: String(unmanaged), l: "Entra-registered, unmanaged", cls: unmanaged ? "high" : "" },
       { v: String(stale), l: "stale · no sync >30 days", cls: stale ? "high" : "" }
     ],
@@ -3942,8 +3958,9 @@ function render(D){
     + '<table class="dp-tbl"><thead><tr><th>Device</th><th>OS</th><th>Entra</th><th>Intune</th><th>Defender</th></tr></thead><tbody>'
     + D.devices.map(d => '<tr><td>' + esc(d.n) + '</td><td>' + esc(d.os) + '</td><td>' + mark(d.entra) + '</td><td>' + mark(d.intune) + '</td><td>' + mark(d.mde) + '</td></tr>').join("")
     + '</tbody></table>' : "";
-  const src = D.live ? "Live — Entra + Intune via Microsoft Graph." : (window.EP && EP.DEMO) ? "Demo data." : "Stub.";
-  const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> Coverage is the union of Entra device objects and Intune managed devices; the gap is what one source sees and another does not. Defender onboarding (the EDR column) needs the MDE connection — not available via Microsoft Graph, shown as "–".</div>';
+  const src = D.live ? ("Live — Entra + Intune" + (D.hasMde ? " + Defender (advanced hunting)." : " via Microsoft Graph.")) : (window.EP && EP.DEMO) ? "Demo data." : "Stub.";
+  const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> Coverage is the union of Entra device objects, Intune managed devices and Defender machines; the gap is what one source sees and another does not. '
+    + (D.hasMde ? 'The Defender (EDR) column shows onboarding from advanced hunting — a device Entra/Intune knows but Defender does not is an EDR blind spot.' : 'Defender onboarding needs <b>ThreatHunting.Read.All</b> (advanced hunting); until granted the EDR column shows "–".') + '</div>';
   root.innerHTML = band + tiles + finds + tbl + note;
   wireView();
 }
