@@ -3401,6 +3401,28 @@ window.EP = (function () {
     const body = rows.length ? '<div class="ov-chg-list">' + rows.map(ovChangeRow).join("") + '</div>' : '<div class="ov-chg-empty">No change since your last scan.</div>';
     return { recorded: recorded, body: body };
   }
+  // Estate-wide "fix first" AI: reuses OV_FIX_SYSTEM + ovFixDigest + parseFixPlan to re-rank the cross-domain
+  // top findings into a priority plan. Grounded in the candidates only; read-only; degrades with no model.
+  let DP_FIXPLAN = null, _dpFixBusy = false, _dpOv = null;
+  function dpFixTops(data){
+    const order = { crit:0, high:1, med:2, low:3 };
+    const tops = [];
+    REPORT_VIEWS.forEach(v => { const s = data[v.name]; ((s && s.top) || []).forEach(t => tops.push(Object.assign({ domain:v.label, view:v.name }, t))); });
+    tops.sort((a,b) => (order[a.sev] - order[b.sev]));
+    return tops.slice(0, 5).map((t,i) => Object.assign({ id:"dpf"+i, severity:t.sev }, t));
+  }
+  async function runDpFixAi(){
+    if (!(window.EP && EP.llmComplete) || _dpFixBusy || !_dpOv) return;
+    const cands = dpFixTops(_dpOv.data); if (!cands.length) return;
+    _dpFixBusy = true;
+    const st = $("dpFixAiStat"); if (st) st.innerHTML = ' <span class="spinner"></span> ranking…';
+    try {
+      const raw = await EP.llmComplete(OV_FIX_SYSTEM, ovFixDigest(cands), { temperature: 0.2, max_tokens: 500 });
+      DP_FIXPLAN = Object.assign(parseFixPlan(raw, cands), { at: Date.now() });
+      const host = $("ov-body"); if (host) host.innerHTML = dpOverviewHtml(_dpOv.data, _dpOv.dev);
+    } catch(e){ if (st) st.innerHTML = ' <span style="color:var(--sev-crit)">AI unavailable — ' + esc(e && (e.message||String(e))) + '</span>'; }
+    finally { _dpFixBusy = false; }
+  }
   function dpOverviewHtml(data, dev){
     const views = REPORT_VIEWS.map(v => ({ v, s: data[v.name] }));
     const scored = views.filter(x => x.s && x.s.score != null);
@@ -3446,18 +3468,24 @@ window.EP = (function () {
     const exposure = '<div class="dv-panel"><div class="dv-panel-h">Exposure overview<span style="font-weight:700;font-size:9.5px;color:var(--muted);letter-spacing:.03em">0–100 · LOWER IS BETTER</span></div><div class="dv-ex">'
       + exRow("Coverage", data.coverage, "coverage") + exRow("Compliance", data.compliance, "compliance")
       + exRow("Hardening", data.hardening, "hardening") + exRow("Vulnerabilities", data.vuln, "vuln") + devRow + '</div></div>';
-    // fix this first
-    const order = { crit: 0, high: 1, med: 2, low: 3 };
-    const tops = [];
-    views.forEach(x => ((x.s && x.s.top) || []).forEach(t => tops.push(Object.assign({ domain: x.v.label, view: x.v.name }, t))));
-    tops.sort((a, b) => (order[a.sev] - order[b.sev]));
-    const fix = tops.slice(0, 5).map((t, i) =>
+    // fix this first — estate-wide, optionally re-ranked into a priority plan by the local model (DP_FIXPLAN).
+    let tops = dpFixTops(data);
+    if (DP_FIXPLAN && DP_FIXPLAN.order && DP_FIXPLAN.order.length){
+      const byId = {}; tops.forEach(t => { byId[t.id] = t; });
+      const ordered = DP_FIXPLAN.order.map(id => byId[id]).filter(Boolean);
+      tops.forEach(t => { if (ordered.indexOf(t) < 0) ordered.push(t); });
+      tops = ordered;
+    }
+    const fix = tops.map((t, i) =>
       '<div class="dp-ov-fixrow" data-ovgo="' + t.view + '" data-ovfocus=\'' + JSON.stringify({ search: t.search || "" }).replace(/'/g, "&#39;") + '\'>'
       + '<span class="dp-ov-n">' + (i + 1) + '</span><span class="dp-ov-sev" style="color:' + dpSevColor(t.sev) + '">' + t.sev.toUpperCase() + '</span>'
       + '<span class="dp-ov-ti">' + esc(t.title) + '</span><span class="dp-ov-dom">' + esc(t.domain) + '</span><span class="dp-ov-go">Fix →</span></div>').join("");
     // Fix this first + Trend & changes, side by side (the Entra command-centre action row).
     const lead = tops.length ? '<div class="dp-ov-fixlead">If you do one thing: <b>' + esc(tops[0].title) + '</b></div>' : "";
-    const fixPanel = '<div class="ov-panel"><div class="ov-panel-h">Fix this first<span class="ov-chg-cap">top ' + Math.min(5, tops.length) + ' · ranked by risk</span></div><div class="ov-fix-body">' + lead
+    const aiReady = !!(window.EP && EP.llm && EP.llm.ready());
+    const aiLink = aiReady ? '<span class="ov-fix-ai" id="dpFixAi" role="button" tabindex="0" title="Rank these into a priority plan with your local model — grounded in these candidates, nothing leaves the machine.">✦ prioritise with AI</span><span id="dpFixAiStat"></span>' : "";
+    const planLine = (DP_FIXPLAN && DP_FIXPLAN.plan) ? '<div class="ov-fix-plan"><b>✦ AI plan.</b> ' + esc(DP_FIXPLAN.plan) + '</div>' : "";
+    const fixPanel = '<div class="ov-panel"><div class="ov-panel-h">Fix this first<span class="ov-chg-cap">top ' + Math.min(5, tops.length) + ' · ranked by risk' + (DP_FIXPLAN ? ' · ✦ AI' : '') + (aiLink ? ' · ' + aiLink : '') + '</span></div><div class="ov-fix-body">' + lead + planLine
       + '<div class="dp-ov-fix">' + (fix || '<div style="color:var(--muted);font-size:12px;padding:4px 2px">Nothing critical outstanding across the assessed domains.</div>') + '</div></div></div>';
     const snap = { t: Date.now(), score: worst, crit: crit, high: high, highRisk: dev ? dev.highRisk : null, unmanaged: dev ? dev.unmanaged : null };
     const chg = dpChangeData(snap);
@@ -3469,6 +3497,7 @@ window.EP = (function () {
     const host = $("ov-body"); if (!host) return;
     if (!_ovWired) {
       host.addEventListener("click", e => {
+        if (e.target.closest("#dpFixAi")) { runDpFixAi(); return; }
         const el = e.target.closest("[data-ovgo]"); if (!el) return;
         const name = el.getAttribute("data-ovgo"), fj = el.getAttribute("data-ovfocus");
         let f = null; if (fj) { try { f = JSON.parse(fj); } catch (_) {} }
@@ -3478,6 +3507,7 @@ window.EP = (function () {
       _ovWired = true;
     }
     if (_ovBusy) return;
+    if (force) DP_FIXPLAN = null;   // a fresh scan invalidates the prior AI ranking
     _ovBusy = true;
     host.innerHTML = '<div class="ov-loading"><span class="spinner"></span> Reading device posture across all domains…</div>';
     try {
@@ -3486,6 +3516,7 @@ window.EP = (function () {
       // folded into the overview as KPI callouts + a risk-distribution bar.
       let devSum = null;
       try { const dv = views["devices"]; if (dv) { if (dv.load && !dv.loaded && (IMPORTED || (!DEMO && account))) { dv.loaded = true; await dv.load(); } devSum = dv.summary ? dv.summary() : null; } } catch (e) {}
+      _dpOv = { data: data, dev: devSum };   // cache for the AI "prioritise" re-paint (no re-fetch)
       host.innerHTML = dpOverviewHtml(data, devSum);
     } catch (e) { host.innerHTML = '<div class="ov-err">Could not build the overview — ' + esc(e.message || e) + '</div>'; }
     finally { _ovBusy = false; }
