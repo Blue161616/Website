@@ -785,6 +785,11 @@
 #view-vuln .cv-chip { display:inline-block; font-size:10.5px; padding:2px 9px; border:1px solid var(--border); border-radius:999px; margin:3px 5px 0 0; color:var(--text); cursor:pointer; white-space:nowrap; }
 #view-vuln .cv-chip:hover { border-color:var(--accent); color:var(--accent); }
 #view-vuln .cv-fixbox { margin-top:9px; padding:9px 12px; border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:8px; background:var(--card); font-size:12px; color:var(--text); line-height:1.5; }
+#view-vuln .cv-swgrp { display:flex; align-items:center; gap:9px; padding:7px 11px; margin:6px 0 0; border:1px solid var(--border); border-radius:8px; background:var(--card); cursor:pointer; transition:border-color .15s; }
+#view-vuln .cv-swgrp:hover { border-color:var(--accent); }
+#view-vuln .cv-swgrp .nm { font-weight:700; color:var(--text); font-size:12.5px; white-space:normal; }
+#view-vuln .cv-swgrp .meta { color:var(--muted); font-size:11px; margin-left:auto; font-variant-numeric:tabular-nums; white-space:nowrap; }
+#view-vuln .cv-swbody { padding:0 2px 6px 14px; border-left:1px solid var(--border); margin:0 0 4px 10px; }
 #view-vuln .cv-grphdr { display:flex; align-items:center; gap:8px; margin:11px 0 6px; }
 #view-vuln .cv-grpct { font-size:10.5px; color:var(--muted); font-variant-numeric:tabular-nums; }
 #view-vuln .cv-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(184px,1fr)); gap:5px 8px; }
@@ -6203,7 +6208,7 @@ let LAST = null, CVES = [], SOFTWARE = [], DEVICES = [], CVE_MAP = {}, _wired = 
 let NET = new Set();   // lowercased names of internet-facing devices (Defender), for the 🌐 tag
 function isInet(n){ return NET.has(String(n||"").toLowerCase()); }
 // Device-centric by default (like the rest of the suite); By software / By CVE remain as alternate views.
-const STATE = { view:"device", q:"", sev:"", exploit:"", sortCol:"sev", sortDir:"desc", expanded:{}, swExpanded:{}, devExpanded:{} };
+const STATE = { view:"device", q:"", sev:"", exploit:"", sortCol:"sev", sortDir:"desc", expanded:{}, swExpanded:{}, devExpanded:{}, devSwExpanded:{} };
 
 // Software overview, derived from the CVE rollup (no extra query): group every CVE under each software
 // product it affects, so the default view is ~dozens of products — each the unit you actually patch —
@@ -6442,6 +6447,25 @@ function sortDevices(list){
     : col==="device" ? d.name.toLowerCase() : (SEV_RANK[d.worstSev]||0)*100000 + d.cveCount;
   return list.slice().sort((a,b) => { const ka=key(a), kb=key(b); return ka<kb?-dir:ka>kb?dir:0; });
 }
+// Within one device, group its CVEs by software product (worst-first) — the "software first, CVE deeper"
+// breakdown, so a device with thousands of CVEs reads as its ~dozens of products, each expandable to its CVEs.
+function deviceSoftwareGroups(d){
+  const map = {};
+  (d.cveIds||[]).forEach(id => {
+    const c = CVE_MAP[id]; if (!c) return;
+    ((c.software && c.software.length) ? c.software : ["(unknown software)"]).forEach(sw => {
+      const k = sw.toLowerCase();
+      const g = map[k] || (map[k] = { label:sw, cveIds:[], seen:new Set(), worst:0, crit:0, exploit:false });
+      if (g.seen.has(id)) return; g.seen.add(id); g.cveIds.push(id);
+      const rank = SEV_RANK[c.sev]||0; if (rank > g.worst) g.worst = rank;
+      if (c.sev === "Critical") g.crit++;
+      if (c.exploit || c.zeroday) g.exploit = true;
+    });
+  });
+  return Object.values(map).map(g => ({ label:g.label, cveIds:g.cveIds, crit:g.crit, exploit:g.exploit,
+    worstSev: g.worst>=4?"Critical":g.worst>=3?"High":g.worst>=2?"Medium":"Low" }))
+    .sort((a,b) => (SEV_RANK[b.worstSev]-SEV_RANK[a.worstSev]) || (b.cveIds.length-a.cveIds.length) || a.label.toLowerCase().localeCompare(b.label.toLowerCase()));
+}
 function deviceRow(d){
   const open = !!STATE.devExpanded[d.name];
   const exp = d.exploit ? '<span class="cv-badge cv-exploit">PUBLIC EXPLOIT</span>' : '<span style="color:var(--muted)">—</span>';
@@ -6454,10 +6478,21 @@ function deviceRow(d){
     + '<td>' + exp + '</td>'
     + '<td class="cv-num">' + d.swCount + '</td></tr>';
   if (!open) return main;
-  const swChips = (d.software||[]).length ? d.software.map(s => '<span class="cv-chip" style="cursor:default">' + esc(s) + '</span>').join("") : '<span style="color:var(--muted);font-size:12px">—</span>';
+  // Software first; each product expands to its CVEs (grouped by criticality) one level deeper.
+  const groups = deviceSoftwareGroups(d);
+  const swSections = groups.map(g => {
+    const key = d.name + "||" + g.label, sopen = !!STATE.devSwExpanded[key];
+    const exp = g.exploit ? '<span class="cv-badge cv-exploit">PUBLIC EXPLOIT</span>' : '';
+    const hdr = '<div class="cv-swgrp" data-devsw="' + esc(key) + '">'
+      + '<span class="cv-chev">' + (sopen?'▾':'▸') + '</span>'
+      + '<span class="cv-sev sev-' + (SEV_CLS[g.worstSev]||"low") + '">' + g.worstSev.toUpperCase() + '</span>'
+      + '<span class="nm">' + esc(g.label) + '</span>' + exp
+      + '<span class="meta">' + g.cveIds.length + ' CVE' + (g.cveIds.length===1?"":"s") + (g.crit ? ' · ' + g.crit + ' crit' : '') + '</span></div>';
+    return hdr + (sopen ? '<div class="cv-swbody">' + cveGridHtml(g.cveIds) + '</div>' : '');
+  }).join("");
   const detail = '<tr class="cv-detail"><td></td><td colspan="5">'
-    + '<div class="cv-kv"><b>' + d.cveCount + ' CVE' + (d.cveCount===1?"":"s") + ' on ' + esc(d.name) + ', grouped by criticality:</b></div>' + cveGridHtml(d.cveIds)
-    + '<div class="cv-kv" style="margin-top:12px"><b>Affected software (' + d.swCount + '):</b><br>' + swChips + '</div>'
+    + '<div class="cv-kv"><b>' + d.cveCount + ' CVE' + (d.cveCount===1?"":"s") + ' on ' + esc(d.name) + ' across ' + groups.length + ' software product' + (groups.length===1?"":"s") + ' — worst-first; expand a product for its CVEs:</b></div>'
+    + swSections
     + '<div style="margin-top:9px"><span class="cv-chip" data-dev="' + esc(d.name) + '" style="border-color:var(--accent);color:var(--accent)">Open ' + esc(d.name) + ' in Devices →</span></div>'
     + '</td></tr>';
   return main + detail;
@@ -6578,6 +6613,7 @@ function wireView(){
   root.addEventListener("click", e => {
     const view = e.target.closest("[data-view]");
     const kpi  = e.target.closest("[data-kpi]");
+    const devsw = e.target.closest("[data-devsw]");
     const chip = e.target.closest("[data-dev]");
     const go   = e.target.closest("[data-go]");
     const h    = e.target.closest("th[data-sort]");
@@ -6586,6 +6622,7 @@ function wireView(){
     if (kpi){ const k = kpi.getAttribute("data-kpi");
       if (k==="device"){ STATE.view="device"; STATE.sortCol="sev"; STATE.sortDir="desc"; STATE.sev=""; STATE.exploit=""; render(LAST); return; }
       STATE.view="cve"; STATE.sortCol="sev"; STATE.sortDir="desc"; STATE.sev = k==="crit"?"Critical":""; STATE.exploit = k==="exploit"?"exploit":""; render(LAST); return; }
+    if (devsw){ e.stopPropagation(); const k = devsw.getAttribute("data-devsw"); STATE.devSwExpanded[k] = !STATE.devSwExpanded[k]; paintDevices(); return; }
     if (chip){ e.stopPropagation(); if (window.EP && EP.goto) EP.goto("devices", { search: chip.getAttribute("data-dev") }); return; }
     if (go){ let f=null; try{ f=JSON.parse(go.getAttribute("data-go")); }catch(_){} if (window.EP && EP.goto) EP.goto("devices", f); return; }
     if (h){ const col = h.getAttribute("data-sort"); if (STATE.sortCol===col) STATE.sortDir = STATE.sortDir==="asc"?"desc":"asc"; else { STATE.sortCol=col; STATE.sortDir=(col==="cve"||col==="software")?"asc":"desc"; } render(LAST); return; }
