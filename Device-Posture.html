@@ -4404,6 +4404,27 @@ function normOS(s){ s = String(s||"").toLowerCase();
   if (s.includes("linux")) return "Linux";
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : "Other"; }
 
+// Real device criticality (what Defender's inventory shows under "Criticality level") comes from Microsoft
+// Security Exposure Management, surfaced in advanced hunting via ExposureGraphNodes — NOT DeviceInfo.AssetValue
+// (that legacy field is usually blank). criticalityLevel: 0=Very high, 1=High, 2=Medium, 3=Low; ruleNames says why.
+// Needs Exposure Management (read) RBAC; degrades silently (no crowns) if unavailable.
+const CRIT_LABELS = ["Very high", "High", "Medium", "Low"];
+async function enrichExposureCrit(devices){
+  let at; try { at = await EP.tokenSilent(["ThreatHunting.Read.All"]); } catch(e){ return; }
+  let rows = [];
+  try {
+    const q = "ExposureGraphNodes | where NodeLabel == 'device' | where NodeProperties has 'criticalityLevel'"
+      + " | extend L = toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), Rules = tostring(NodeProperties.rawData.criticalityLevel.ruleNames)"
+      + " | where L between (0 .. 3) | summarize L = min(L), Rules = take_any(Rules) by DeviceName = NodeName";
+    const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+    if (!r.ok) return; rows = (await r.json()).results || [];
+  } catch(e){ return; }
+  const by = {};
+  rows.forEach(x => { if (x.DeviceName == null) return; const L = +x.L; const rec = { level:L, label:CRIT_LABELS[L]||"", roles:parseRoles(x.Rules) };
+    by[String(x.DeviceName).toLowerCase()] = rec; by[normName(x.DeviceName)] = rec; });
+  devices.forEach(d => { const rec = by[String(d.name||"").toLowerCase()] || by[normName(d.name)]; if (!rec) return;
+    d.criticality = rec.label; d.roles = rec.roles; d.critical = rec.level <= 1; });   // crown Very high + High
+}
 async function collect(){
   const entra = await gGetAll("/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,approximateLastSignInDateTime,accountEnabled&$top=200", ["Device.Read.All"]);
   let intune = [];
@@ -4499,6 +4520,7 @@ async function collect(){
       lastSeenDays: seen, lastSyncDays, lastMdeDays, stale: seen != null && seen > 30
     };
   });
+  try { await enrichExposureCrit(devs); } catch(e){}
   return { devices: devs, live: true, hasMde: !!machines, mdeErr, threatErr };
 }
 
