@@ -7272,9 +7272,26 @@ function demoGraph(){
 const NEEDS_EXP = { needsExp:true };
 
 let LAST = null, NODES = [], EDGES = [], PATHS = [], NODE_MAP = {}, _cy = null, _wired = false;
+let GNODES = [], GEDGES = [];   // the DISPLAYED graph = only nodes/edges that lie ON an attack path (not the raw fetched subgraph)
 const STATE = { focus:"" };   // focused path id (highlights its nodes/edges in the graph)
 function nodeOf(id){ return NODE_MAP[id] || null; }
 function isCrit(n){ return !!(n && n.crit); }
+const GRAPH_MAX = 6;   // cap the graph to the worst N paths so it stays legible; the full list is shown below.
+// Build the display graph from the computed PATHS only: the union of path nodes + the consecutive edges on each
+// path. This keeps the picture = the attack paths (no "hairball" of every inbound edge to every critical asset).
+// Only the worst GRAPH_MAX paths are drawn (plus whichever path is focused), so large tenants stay readable.
+function buildPathGraph(){
+  const elabel = {}; EDGES.forEach(e => { elabel[e.from + "|" + e.to] = e.label; });
+  const shown = PATHS.slice(0, GRAPH_MAX);
+  if (STATE.focus && !shown.some(p => p.id === STATE.focus)){ const fp = PATHS.find(p => p.id === STATE.focus); if (fp) shown.push(fp); }
+  const nset = new Set(), nodes = [], edges = [], eseen = new Set();
+  shown.forEach(p => {
+    (p.seq||[]).forEach(id => { if (!nset.has(id)){ nset.add(id); const n = NODE_MAP[id]; if (n) nodes.push(n); } });
+    for (let i = 0; i < (p.seq||[]).length - 1; i++){ const a = p.seq[i], b = p.seq[i+1], k = a + "|" + b;
+      if (!eseen.has(k)){ eseen.add(k); edges.push({ from:a, to:b, label: elabel[k] || "" }); } }
+  });
+  GNODES = nodes; GEDGES = edges;
+}
 
 // diamond / crown glyph (data-URI SVG) coloured by kind; a gold crown marks critical assets.
 function glyph(c){ return "data:image/svg+xml;utf8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><rect x="2.6" y="2.6" width="6.8" height="6.8" rx="1.3" transform="rotate(45 6 6)" fill="'+c+'"/></svg>'); }
@@ -7282,12 +7299,12 @@ function crownGlyph(){ return "data:image/svg+xml;utf8," + encodeURIComponent('<
 
 function graphEls(){
   const els = [];
-  NODES.forEach(n => {
+  GNODES.forEach(n => {
     const crit = isCrit(n);
     els.push({ data:{ id:n.id, label:n.label, kind:n.kind, crit: crit?"1":"0",
       sub: crit ? (n.crit + (n.role?(" · "+n.role):"")) : (AP_KINDLBL[n.kind]||n.kind) } });
   });
-  EDGES.forEach((e, i) => els.push({ data:{ id:"e"+i, source:e.from, target:e.to, label:e.label } }));
+  GEDGES.forEach((e, i) => els.push({ data:{ id:"e"+i, source:e.from, target:e.to, label:e.label } }));
   return els;
 }
 function graphStyle(){
@@ -7312,8 +7329,8 @@ function graphStyle(){
 function destroyGraph(){ if (_cy){ try{ _cy.destroy(); }catch(_){} _cy = null; } }
 function initGraph(){
   destroyGraph();
-  const host = document.getElementById("ap-cy"); if (!host || typeof cytoscape === "undefined" || !NODES.length) return;
-  const roots = NODES.filter(n => !EDGES.some(e => e.to === n.id)).map(n => "#" + n.id);   // entry points (no inbound)
+  const host = document.getElementById("ap-cy"); if (!host || typeof cytoscape === "undefined" || !GNODES.length) return;
+  const roots = GNODES.filter(n => !GEDGES.some(e => e.to === n.id)).map(n => "#" + n.id);   // entry points (no inbound)
   _cy = cytoscape({ container:host, elements:graphEls(),
     layout:{ name:"breadthfirst", directed:true, roots: roots.join(", ") || undefined, padding:26, spacingFactor:1.25, nodeDimensionsIncludeLabels:true },
     minZoom:0.25, maxZoom:2.5, wheelSensitivity:0.25, pixelRatio:2, style:graphStyle() });
@@ -7441,6 +7458,7 @@ function render(D){
   destroyGraph();
   NODES = D.nodes || []; EDGES = D.edges || []; PATHS = D.paths || [];
   NODE_MAP = {}; NODES.forEach(n => { NODE_MAP[n.id] = n; });
+  buildPathGraph();   // display graph = only the nodes/edges on an attack path
   const root = document.getElementById("ap-root"); if (!root) return;
   const critTargets = PATHS.map(p => p.seq[p.seq.length-1]).filter((v,i,a) => a.indexOf(v)===i);
   const toVeryHigh = PATHS.filter(p => { const t = nodeOf(p.seq[p.seq.length-1]); return t && t.crit === "Very high"; }).length;
@@ -7466,8 +7484,11 @@ function render(D){
   const legend = [["internet","Internet"],["device","Device"],["user","Identity"],["guest","Guest"],["app","App / OAuth"],["cve","Vulnerability"]]
     .map(([k,l]) => '<span><i style="background:' + (AP_COLOR[k]||"#7C9CFF") + '"></i>' + l + '</span>').join("")
     + '<span><i class="crown" style="background:#FFD166"></i>Critical asset</span>';
-  const graph = NODES.length
-    ? '<div class="ap-graph"><div class="ap-graph-h">⤳ Enterprise exposure graph <span class="sub">entry points → critical assets · drag nodes, scroll to zoom, click a node to isolate its path</span>'
+  const graphSub = PATHS.length > GRAPH_MAX
+    ? ("top " + GRAPH_MAX + " of " + PATHS.length + " paths · drag · scroll to zoom · click a node to isolate · full list below")
+    : "entry points → critical assets · drag nodes, scroll to zoom, click a node to isolate its path";
+  const graph = GNODES.length
+    ? '<div class="ap-graph"><div class="ap-graph-h">⤳ Enterprise exposure graph <span class="sub">' + graphSub + '</span>'
       + (STATE.focus ? '<button class="ap-reset" id="ap-reset">✕ clear focus</button>' : '') + '</div>'
       + '<div class="ap-cy" id="ap-cy"></div>'
       + '<div class="ap-legend">' + legend + '</div></div>'
@@ -7481,7 +7502,7 @@ function render(D){
   const src = (window.EP && EP.DEMO) ? "Demo data." : "Live — Microsoft Security Exposure Management graph via advanced hunting.";
   const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> This is the suite’s cross-domain view: how an attacker moves from an <b>entry point</b> (internet-facing device, external guest, exploitable CVE) to a <b>critical asset</b> (the crowned Very-high / High devices from criticality). Paths are traced over Microsoft’s enterprise exposure graph; a <b>choke point</b> is one node on many paths — the highest-leverage fix. Threat (below) is what Defender sees <i>happening now</i>; this is <i>how it would spread</i>. Live-only richness scales with how many Defender workloads are deployed.</div>';
   root.innerHTML = band + tiles + graph + '<div class="dp-h2">Paths &amp; choke points</div><div class="ap-cols">' + pathPanel + chokePanel + '</div>' + note;
-  if (NODES.length) initGraph();
+  if (GNODES.length) initGraph();
   wireView();
 }
 function wireView(){
