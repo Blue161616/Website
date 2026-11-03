@@ -464,6 +464,13 @@
 #view-coverage .dp-tile.crit .v { color:var(--sev-crit); }
 #view-coverage .dp-tile.high .v { color:var(--sev-high); }
 #view-coverage .dp-tile.na .v { color:var(--muted); font-size:16px; }
+#view-coverage .dp-tile.ok .v { color:var(--sev-low); }
+#view-coverage .dp-tile.clickable { cursor:pointer; transition:border-color .15s, background .15s; }
+#view-coverage .dp-tile.clickable:hover { border-color:var(--accent); }
+#view-coverage .dp-tile.on { border-color:var(--accent); background:rgba(63,169,255,.1); }
+#view-coverage .dp-tile .kpi-sub { font-size:9.5px; color:var(--muted); margin-top:4px; line-height:1.35; opacity:.85; }
+#view-coverage .dp-tile.crit .l, #view-coverage .dp-tile.high .l { color:var(--text); }
+#view-coverage .hw-sub2 { display:block; font-weight:400; font-size:8.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.03em; margin-top:2px; }
 #view-coverage .dp-hint { font-size:9.5px; font-weight:500; color:var(--accent); text-transform:none; letter-spacing:0; margin-left:8px; }
 #view-coverage .dp-fix-steps { margin:0 0 9px; padding-left:20px; font-size:12px; color:var(--text); line-height:1.5; }
 #view-coverage .dp-fix-steps li { margin:2px 0; }
@@ -4626,7 +4633,16 @@ const COMBOS = [
   { key:"donly", sev:"crit", mde:true,  e:0,i:0,d:1, title:"Defender-only — not in Entra (unknown endpoint)", test:d => !d.entra && d.mde===1 }
 ];
 
-let STATE = { view:"device", q:"", sev:"", sortCol:"sev", sortDir:"desc", gExpanded:{}, cExpanded:{}, devExpanded:{}, devState:"", devOS:"", devGapsOnly:false };
+let STATE = { view:"device", q:"", sev:"", sortCol:"sev", sortDir:"desc", gExpanded:{}, cExpanded:{}, devExpanded:{}, devState:"", devOS:"", devGapsOnly:false, kpi:"" };
+// Risk-based KPI filters — each reads as a missing security CONTROL, not just "not covered":
+//   Entra = identity/inventory · Intune = compliance enforcement · Defender = protection (EDR).
+const KPI_TEST = {
+  unprot:    d => HASMDE && d.entra && d.mde === 0,                       // no Defender sensor → unprotected (EDR blind)
+  unmanaged: d => d.entra && d.intune === 0,                             // no Intune → no compliance enforcement
+  stale:     d => !!d.stale,                                             // posture signals too old to trust
+  covered:   d => d.entra && d.intune === 1 && d.mde === 1 && !d.stale   // identity + compliance + protection
+};
+const KPI_SHORT = { unprot:"Unprotected", unmanaged:"No compliance", stale:"Stale", covered:"Fully covered" };
 let LAST = null, DEVS = [], HASMDE = true, GAP_ROWS = [], COMBO_ROWS = [];
 
 // ---------- demo data: one row per device with its coverage flags ----------
@@ -4736,6 +4752,7 @@ function applyDevFilters(list){
     if (STATE.devOS && !(d.os||"").toLowerCase().startsWith(STATE.devOS.toLowerCase())) return false;
     if (STATE.devGapsOnly && deviceState(d).sev === "low") return false;
     if (STATE.devState && deviceState(d).key !== STATE.devState) return false;
+    if (STATE.kpi && KPI_TEST[STATE.kpi] && !KPI_TEST[STATE.kpi](d)) return false;
     return true;
   });
 }
@@ -4776,8 +4793,9 @@ function paintDevs(){
 function devTable(){
   const s = (col,l) => '<th data-sort="' + col + '">' + l + '</th>';
   const head = '<tr><th style="width:14px"></th>' + s("device","Device")
-    + '<th style="text-align:center" title="Entra device object">Entra</th><th style="text-align:center" title="Intune managed">Intune</th>'
-    + '<th style="text-align:center" title="Defender for Endpoint sensor">Defender</th>' + s("sync","Last sync") + s("status","Coverage state") + s("score","Score") + '</tr>';
+    + '<th style="text-align:center" title="Entra device object — the device is a known identity in the directory">Entra<span class="hw-sub2">Known</span></th>'
+    + '<th style="text-align:center" title="Intune managed — compliance policy, encryption and configuration are enforced">Intune<span class="hw-sub2">Compliance</span></th>'
+    + '<th style="text-align:center" title="Defender for Endpoint sensor — EDR threat detection &amp; response">Defender<span class="hw-sub2">Protection</span></th>' + s("sync","Last sync") + s("status","Coverage state") + s("score","Score") + '</tr>';
   return '<div class="cv-wrap"><table class="cv-tbl"><thead>' + head + '</thead><tbody id="cv-body"></tbody></table></div>'
     + '<div class="hw-foot"><b style="color:var(--sev-low)">✓</b> seen by that source · <b style="color:var(--sev-crit)">✕</b> missing · <b>—</b> not assessed. Score credits each of Entra / Intune / Defender and deducts for staleness; sorted least-covered first. Works across every OS — a device needs all three sources to be fully covered.</div>';
 }
@@ -4870,6 +4888,7 @@ function toolbar(){
       + '<input id="cv-q" placeholder="Search device…" value="' + esc(STATE.q) + '">'
       + '<select id="cv-os"><option value="">OS: all</option>' + osFamilies().map(osOpt).join("") + '</select>'
       + '<div class="cv-toggle"><button id="cv-gaps" class="' + (STATE.devGapsOnly?"on":"") + '">Gaps only</button></div>'
+      + (STATE.kpi ? '<button id="cv-clrkpi" class="hw-jump">' + esc(KPI_SHORT[STATE.kpi]||STATE.kpi) + ' ✕</button>' : '')
       + (STATE.devState ? '<button id="cv-clrstate" class="hw-jump">state: ' + esc(STATE_SHORT[STATE.devState]||STATE.devState) + ' ✕</button>' : '')
       + '<span class="cv-count" id="cv-count"></span></div>';
   }
@@ -4908,16 +4927,26 @@ function render(D){
     + (HASMDE ? ", " + notOnb + " with no Defender sensor" : ", Defender onboarding not assessed") + (defOnly ? " · " + defOnly + " Defender-only (not in Entra)" : "") + ".";
   const band = '<div class="dp-band"><div class="dp-score"><span class="n">' + D.score + '</span><span class="g">GRADE ' + esc(D.grade) + '</span></div>'
     + '<div><div class="h1">Coverage · onboarding workspace</div><div class="lede">' + esc(lede) + '</div></div></div>';
-  const tile = (v,l,cls) => '<div class="dp-tile ' + (cls||"") + '"><div class="v">' + v + '</div><div class="l">' + l + '</div></div>';
+  // Four risk-based KPIs, each a clickable filter into the device table. Ordered by risk:
+  // unprotected (no EDR) → unmanaged (no compliance) → stale → the healthy baseline.
+  const kUnprot = HASMDE ? DEVS.filter(KPI_TEST.unprot).length : null;
+  const kUnmanaged = DEVS.filter(KPI_TEST.unmanaged).length;
+  const kStale = DEVS.filter(KPI_TEST.stale).length;
+  const kCovered = DEVS.filter(KPI_TEST.covered).length;
+  const kpiCard = (key, v, label, sub, cls) => {
+    const clickable = v !== "—";
+    return '<div class="dp-tile ' + (cls||"") + (clickable?" clickable":"") + (STATE.kpi===key?" on":"") + '"' + (clickable?' data-kpi="' + key + '"':'') + '>'
+      + '<div class="v">' + v + '</div><div class="l">' + label + '</div><div class="kpi-sub">' + sub + '</div></div>';
+  };
   const tiles = '<div class="dp-tiles">'
-    + tile(total, "Entra devices (enabled)", "")
-    + (HASMDE ? tile(notOnb, "no Defender sensor", notOnb?"crit":"") : tile("—", "no Defender sensor", "na"))
-    + tile(unmanaged, "not managed by Intune", unmanaged?"high":"")
-    + tile(stale, "stale · no sync >30d", stale?"high":"") + '</div>';
+    + kpiCard("unprot", kUnprot==null?"—":kUnprot, "Unprotected", "no Defender EDR — threats go undetected", kUnprot?"crit":(kUnprot==null?"na":"ok"))
+    + kpiCard("unmanaged", kUnmanaged, "No compliance enforcement", "not managed by Intune — no policy baseline", kUnmanaged?"high":"ok")
+    + kpiCard("stale", kStale, "Stale posture", "no sync in 30+ days — signal is old", kStale?"high":"ok")
+    + kpiCard("covered", kCovered, "Fully covered", "identity · compliance · protection", "ok") + '</div>';
   const src = D.imported ? ("Imported CSV — Entra + Intune" + (HASMDE ? " + Defender exports." : " exports.")) : (window.EP && EP.DEMO) ? "Demo data." : ("Live — Entra + Intune" + (HASMDE ? " + Defender (advanced hunting)." : " via Microsoft Graph."));
-  const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> Coverage is the union of Entra device objects, Intune managed devices and Defender machines. <b>By gap</b> lists what is missing (no EDR sensor, unmanaged, stale) with the exact devices and the fix; <b>By coverage</b> groups every device by which of Entra·Intune·Defender see it. '
-    + (HASMDE ? 'A device Entra/Intune knows but Defender does not is an EDR blind spot; a Defender-only device is an endpoint Entra never enrolled.' : 'Defender onboarding needs <b>ThreatHunting.Read.All</b> (advanced hunting) to complete the picture.') + '</div>';
-  const body = STATE.view === "device" ? (covStrip() + toolbar() + devTable()) : (toolbar() + activeTable());
+  const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> Each source is a different security <b>control</b>, answering a different question: <b>Entra — is the device known?</b> (identity &amp; inventory) · <b>Intune — is it compliant?</b> (enforces policy, encryption, configuration) · <b>Defender — is it protected?</b> (EDR: threat detection &amp; response). Read the gaps by risk: <b style="color:var(--sev-crit)">no Defender</b> = unprotected — a threat on that device goes undetected (an EDR blind spot); <b style="color:var(--sev-high)">no Intune</b> = no compliance baseline is enforced (encryption, OS, config unchecked); <b style="color:var(--sev-high)">stale</b> = the posture signals are too old to trust. A device is only <b style="color:var(--sev-low)">fully covered</b> when all three see it and it is syncing. The KPIs above filter the list to each gap; <b>By gap</b> and <b>By coverage</b> give the grouped breakdowns with the exact fix.'
+    + (HASMDE ? '' : ' <b>Defender onboarding needs ThreatHunting.Read.All (advanced hunting) to complete the protection picture.</b>') + '</div>';
+  const body = STATE.view === "device" ? (toolbar() + devTable()) : (toolbar() + activeTable());
   root.innerHTML = band + tiles + body + note;
   repaint(); wireView();
 }
@@ -4930,12 +4959,16 @@ function wireView(){
     const h    = e.target.closest("th[data-sort]");
     const row  = e.target.closest(".cv-trow");
     const cst  = e.target.closest("[data-cstate]");
+    const kpi  = e.target.closest("[data-kpi]");
     const gaps = e.target.closest("#cv-gaps");
     const clr  = e.target.closest("#cv-clrstate");
+    const clrk = e.target.closest("#cv-clrkpi");
+    if (kpi){ const k = kpi.getAttribute("data-kpi"); STATE.kpi = STATE.kpi===k ? "" : k; if (STATE.view!=="device"){ STATE.view="device"; STATE.sortCol="sev"; STATE.sortDir="desc"; } render(LAST); return; }
     if (view){ const v = view.getAttribute("data-view"); if (v !== STATE.view){ STATE.view = v; STATE.sortCol="sev"; STATE.sortDir="desc"; render(LAST); } return; }
     if (cst){ const k = cst.getAttribute("data-cstate"); STATE.devState = STATE.devState===k ? "" : k; render(LAST); return; }
     if (gaps){ STATE.devGapsOnly = !STATE.devGapsOnly; render(LAST); return; }
     if (clr){ STATE.devState = ""; render(LAST); return; }
+    if (clrk){ STATE.kpi = ""; render(LAST); return; }
     if (dev){ e.stopPropagation(); if (window.EP && EP.goto) EP.goto("devices", { search: dev.getAttribute("data-dev") }); return; }
     if (h){ const col = h.getAttribute("data-sort"); if (STATE.sortCol===col) STATE.sortDir = STATE.sortDir==="asc"?"desc":"asc"; else { STATE.sortCol=col; STATE.sortDir=(col==="name"||col==="device"||col==="sync")?"asc":"desc"; } render(LAST); return; }
     if (row){ if (row.hasAttribute("data-dev-row")){ const id=row.getAttribute("data-dev-row"); STATE.devExpanded[id]=!STATE.devExpanded[id]; paintDevs(); } else if (row.hasAttribute("data-combo")){ const id=row.getAttribute("data-combo"); STATE.cExpanded[id]=!STATE.cExpanded[id]; paintCombos(); } else { const id=row.getAttribute("data-gap"); STATE.gExpanded[id]=!STATE.gExpanded[id]; paintGaps(); } return; }
