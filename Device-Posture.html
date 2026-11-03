@@ -486,6 +486,13 @@
 #view-coverage .cv-toggle { display:inline-flex; border:1px solid var(--border); border-radius:8px; overflow:hidden; }
 #view-coverage .cv-toggle button { font-size:11px; font-weight:700; padding:5px 12px; background:var(--card); color:var(--muted); border:none; cursor:pointer; }
 #view-coverage .cv-toggle button.on { background:var(--accent); color:#061018; }
+#view-coverage .cv-seg-bar { display:flex; align-items:center; gap:10px; margin:0 0 14px; }
+#view-coverage .cv-seg-bar .lbl { font-size:9px; font-weight:800; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); }
+#view-coverage .cv-seg { display:inline-flex; border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+#view-coverage .cv-seg button { font-size:11.5px; font-weight:700; padding:6px 14px; background:var(--card); color:var(--muted); border:none; cursor:pointer; display:flex; align-items:center; gap:6px; }
+#view-coverage .cv-seg button.on { background:var(--accent); color:#061018; }
+#view-coverage .cv-seg button + button { border-left:1px solid var(--border); }
+#view-coverage .cv-seg button .ct { font-size:10px; opacity:.75; font-variant-numeric:tabular-nums; }
 #view-coverage .cv-count { font-size:11px; color:var(--muted); margin-left:auto; white-space:nowrap; }
 #view-coverage .cv-wrap { border:1px solid var(--border); border-radius:11px; overflow:hidden; }
 #view-coverage .cv-tbl { width:100%; border-collapse:collapse; font-size:12.5px; }
@@ -4740,10 +4747,27 @@ EP.registerView("coverage", (function () {
 function esc(s){ return window.EP ? EP.esc(s) : String(s==null?"":s); }
 const SEV_RANK = { crit:4, high:3, med:2, low:1 };
 function normName(s){ s = String(s||"").trim().toLowerCase(); const dot = s.indexOf("."); if (dot>0) s = s.slice(0,dot); return s; }
+// Platform class — mirrors Defender's own device inventory tabs (DeviceCategory): Endpoint devices split into
+// "computer" vs "mobile"; IoT / OT / network-infrastructure devices are "iot" and hidden everywhere (they are
+// absent from the Entra-anchored Devices page too). The EDR / Defender sensor is a COMPUTER control; mobile
+// posture is Intune MDM + app protection, so mobile is never scored or flagged on the Defender dimension (it
+// would turn every phone red). The page defaults to Computers.
+//   category = DeviceInfo.DeviceCategory (Endpoint | Network device | IoT | Unknown)
+//   deviceType = DeviceInfo.DeviceType (Workstation | Server | Mobile | Tablet | NetworkDevice | …)
+//   os = operatingSystem / OSPlatform
+function platformClass(category, deviceType, os){
+  const cat = String(category||"").toLowerCase().replace(/[^a-z]/g,"");   // "endpoint" | "networkdevice" | "iot" | "unknown"
+  const dt  = String(deviceType||"").toLowerCase();
+  const s   = String(os||"").toLowerCase();
+  if (cat === "iot" || cat === "networkdevice" || /network/.test(dt)) return "iot";   // IoT / OT / network infra → hidden
+  // Endpoint (or unknown/empty category): split computer vs mobile by device type / OS. Never "iot" here, so a
+  // device missing a category is shown as a computer rather than wrongly hidden.
+  return (/mobile|tablet/.test(dt) || /ios|ipad|iphone|android/.test(s)) ? "mobile" : "computer";
+}
 
 // Coverage GAP catalogue — each predicate turns a device into a "missing coverage" row.
 const GAPS = [
-  { key:"nosensor", sev:"crit", mde:true, title:"No Defender for Endpoint sensor (EDR blind spot)", test:d => d.entra && d.mde === 0,
+  { key:"nosensor", sev:"crit", mde:true, title:"No Defender for Endpoint sensor (EDR blind spot)", test:d => d.entra && d.mde === 0 && d.platform === "computer",
     fix:{ h:"Onboard to Defender for Endpoint", steps:["Intune → Endpoint security → Onboard devices, or deploy the MDE onboarding package / connector to these endpoints.","Without an EDR sensor they are invisible to the Hardening and Vulnerabilities pages — no telemetry, no detections."], portal:["https://security.microsoft.com/securitysettings/endpoints/onboarding","Defender onboarding"] } },
   { key:"unmanaged", sev:"high", mde:false, title:"Not managed by Intune", test:d => d.entra && d.intune === 0,
     fix:{ h:"Enroll in Intune", steps:["Enroll the device in Intune (auto-enrolment via the Entra MDM scope, or manual enrolment).","Until it is managed, no compliance or configuration policy can apply to it."], portal:["https://intune.microsoft.com/#view/Microsoft_Intune_DeviceSettings/DevicesMenu/~/overview","Intune devices"] } },
@@ -4758,18 +4782,27 @@ const COMBOS = [
   { key:"eonly", sev:"high", mde:false, e:1,i:0,d:0, title:"Entra only — neither managed nor onboarded", test:d => d.entra && d.intune===0 && d.mde!==1 },
   { key:"donly", sev:"crit", mde:true,  e:0,i:0,d:1, title:"Defender-only — not in Entra (unknown endpoint)", test:d => !d.entra && d.mde===1 }
 ];
+// Mobile source-overlap set — Entra · Intune only (no Defender EDR dimension; see platformClass). Used for the
+// By-coverage overview and the device state when the Mobile segment is active.
+const MOBILE_COMBOS = [
+  { key:"mok",        sev:"low",  e:1,i:1, title:"Managed — Entra · Intune", test:d => d.entra && d.intune===1 },
+  { key:"munmanaged", sev:"high", e:1,i:0, title:"Entra only — not enrolled in Intune", test:d => d.entra && d.intune===0 },
+  { key:"mnoentra",   sev:"crit", e:0,i:0, title:"Not in Entra — unknown mobile device", test:d => !d.entra }
+];
 
-let STATE = { view:"device", q:"", sev:"", sortCol:"sync", sortDir:"asc", gExpanded:{}, cExpanded:{}, devExpanded:{}, devState:"", devOS:"", devGapsOnly:false, kpi:"", srcFilter:false, fEntra:"", fIntune:"", fDefender:"" };
+let STATE = { segment:"computer", view:"device", q:"", sev:"", sortCol:"sync", sortDir:"asc", gExpanded:{}, cExpanded:{}, devExpanded:{}, devState:"", devOS:"", devGapsOnly:false, kpi:"", srcFilter:false, fEntra:"", fIntune:"", fDefender:"" };
 // Risk-based KPI filters — each reads as a missing security CONTROL, not just "not covered":
 //   Entra = identity/inventory · Intune = compliance enforcement · Defender = protection (EDR).
 const KPI_TEST = {
-  unprot:    d => HASMDE && d.entra && d.mde === 0,                       // no Defender sensor → unprotected (EDR blind)
-  unmanaged: d => d.entra && d.intune === 0,                             // no Intune → no compliance enforcement
-  stale:     d => !!d.stale,                                             // posture signals too old to trust
-  covered:   d => d.entra && d.intune === 1 && d.mde === 1 && !d.stale   // identity + compliance + protection
+  unprot:    d => HASMDE && d.entra && d.mde === 0 && d.platform === "computer",   // no Defender sensor → unprotected (EDR blind) — computers only
+  unmanaged: d => d.entra && d.intune === 0,                                       // no Intune → no compliance enforcement
+  stale:     d => !!d.stale,                                                       // posture signals too old to trust
+  covered:   d => d.entra && d.intune === 1 && !d.stale && (d.platform === "mobile" || d.mde === 1)   // mobile: identity + compliance; computer: + protection
 };
 const KPI_SHORT = { unprot:"Unprotected", unmanaged:"No compliance", stale:"Stale", covered:"Fully covered" };
-let LAST = null, DEVS = [], HASMDE = true, GAP_ROWS = [], COMBO_ROWS = [];
+let LAST = null, DEVS = [], SEGDEVS = [], HASMDE = true, GAP_ROWS = [], COMBO_ROWS = [];
+// true when the Mobile segment is active — mobile is scored on Entra + Intune only (no Defender EDR dimension).
+function segIsMobile(){ return STATE.segment === "mobile"; }
 
 // ---------- demo data: one row per device with its coverage flags ----------
 function demoDevices(){
@@ -4785,6 +4818,10 @@ function demoDevices(){
   ];
   const devs = raw.map(r => ({ name:r[0], os:r[1], entra:1, intune:r[2], mde:r[3], lastSyncDays:r[4], stale:(r[4]!=null && r[4]>30) }));
   devs.push({ name:"lab-vm-ephemeral", os:"Windows Server", entra:0, intune:0, mde:1, lastSyncDays:2, stale:false });   // Defender-only
+  // IoT / OT devices (Defender device-discovery) — carry a DeviceCategory so they classify as "iot" and are
+  // hidden from the computer/mobile segments, exactly as they are absent from the Entra-anchored Devices page.
+  devs.push({ name:"CiscoOT", os:"IOS XE", entra:0, intune:0, mde:1, lastSyncDays:1, stale:false, category:"Network device", deviceType:"NetworkDevice" });
+  devs.push({ name:"dakboard", os:"Linux", entra:0, intune:0, mde:0, lastSyncDays:3, stale:false, category:"IoT", deviceType:"IoT" });
   return devs;
 }
 const DEMO = { live:false, hasMde:true, devices: demoDevices() };
@@ -4803,7 +4840,7 @@ async function gGetAll(path, scopes){
 }
 async function huntOnboarding(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
-  const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by DeviceId | project AadDeviceId, DeviceName, OnboardingStatus";
+  const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by DeviceId | project AadDeviceId, DeviceName, OnboardingStatus, DeviceCategory, DeviceType, OSPlatform";
   const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
   if (!r.ok){ const e2 = new Error("onboarding "+r.status); e2.status=r.status; throw e2; }
   return (await r.json()).results || [];
@@ -4816,41 +4853,58 @@ async function collect(){
   const inByAad = {}; intune.forEach(d => { const k = String(d.azureADDeviceId||"").toLowerCase(); if (k) inByAad[k] = d; });
   const mdeByAad = {}, mdeByName = {};
   if (machines) machines.forEach(m => { const k = String(m.AadDeviceId||"").toLowerCase(); if (k) mdeByAad[k] = m; const nk = normName(m.DeviceName); if (nk && !mdeByName[nk]) mdeByName[nk] = m; });
-  const onbOf = d => { if (!machines) return null; const m = mdeByAad[String(d.deviceId||"").toLowerCase()] || mdeByName[normName(d.displayName)]; return m && String(m.OnboardingStatus||"").toLowerCase()==="onboarded" ? 1 : 0; };
+  const mdeOf = d => { if (!machines) return null; return mdeByAad[String(d.deviceId||"").toLowerCase()] || mdeByName[normName(d.displayName)] || null; };
   const now = Date.now(), STALE = 30*864e5;
   const active = entra.filter(d => d.accountEnabled !== false);
   const devices = active.map(d => {
     const i = inByAad[String(d.deviceId||"").toLowerCase()];
+    const m = mdeOf(d);
     const seen = i && i.lastSyncDateTime ? Date.parse(i.lastSyncDateTime) : (d.approximateLastSignInDateTime ? Date.parse(d.approximateLastSignInDateTime) : NaN);
     const lastSyncDays = seen ? Math.floor((now - seen)/864e5) : null;
-    return { name: d.displayName || (i&&i.deviceName) || d.deviceId || "(device)", os: d.operatingSystem || (i&&i.operatingSystem) || "—",
-      entra:1, intune: i ? 1 : 0, mde: onbOf(d), lastSyncDays, stale: !!(seen && (now - seen) > STALE) };
+    return { name: d.displayName || (i&&i.deviceName) || d.deviceId || "(device)", os: d.operatingSystem || (i&&i.operatingSystem) || (m&&m.OSPlatform) || "—",
+      entra:1, intune: i ? 1 : 0, mde: (m && String(m.OnboardingStatus||"").toLowerCase()==="onboarded") ? 1 : (machines ? 0 : null),
+      category: m && m.DeviceCategory, deviceType: m && m.DeviceType, lastSyncDays, stale: !!(seen && (now - seen) > STALE) };
   });
-  // Defender-only machines not matched to any Entra device (endpoints Entra never enrolled).
+  // Defender-only machines not matched to any Entra device (endpoints Entra never enrolled). Carry their
+  // DeviceCategory / DeviceType so IoT / OT / network devices classify as "iot" and are hidden (render drops them).
   if (machines){
     const eIds = new Set(active.map(d => String(d.deviceId||"").toLowerCase()).filter(Boolean));
     const eNames = new Set(active.map(d => normName(d.displayName)).filter(Boolean));
     machines.forEach(m => { if (String(m.OnboardingStatus||"").toLowerCase() !== "onboarded") return;
       const ak = String(m.AadDeviceId||"").toLowerCase(), nk = normName(m.DeviceName);
-      if (!(ak && eIds.has(ak)) && !(nk && eNames.has(nk))) devices.push({ name: m.DeviceName || "(defender device)", os:"—", entra:0, intune:0, mde:1, lastSyncDays:null, stale:false }); });
+      if (!(ak && eIds.has(ak)) && !(nk && eNames.has(nk))) devices.push({ name: m.DeviceName || "(defender device)", os: m.OSPlatform || "—", entra:0, intune:0, mde:1, lastSyncDays:null, stale:false, category: m.DeviceCategory, deviceType: m.DeviceType }); });
   }
   return { live:true, hasMde: !!machines, devices };
 }
 
 // ---------- build gap + combo rows ----------
-function covWeight(d){ if (!d.entra) return 0; return d.mde === 0 ? 0.6 : d.intune === 0 ? 0.3 : d.stale ? 0.1 : 0; }
+// Severity weight for the exposure score. Mobile is weighted on Entra + Intune only (no Defender/EDR dimension).
+function covWeight(d){
+  if (!d.entra) return 0;
+  if (d.platform === "mobile") return d.intune === 0 ? 0.3 : d.stale ? 0.1 : 0;
+  return d.mde === 0 ? 0.6 : d.intune === 0 ? 0.3 : d.stale ? 0.1 : 0;
+}
 function buildGaps(devices, hasMde){
   return GAPS.filter(g => hasMde || !g.mde).map(g => { const ds = devices.filter(g.test); return { key:g.key, sev:g.sev, title:g.title, fix:g.fix, devices:ds, count:ds.length }; })
     .filter(g => g.count > 0);
 }
-function buildCombos(devices, hasMde){
-  return COMBOS.filter(c => hasMde || !c.mde).map(c => { const ds = devices.filter(c.test); return { key:c.key, sev:c.sev, title:c.title, e:c.e, i:c.i, d:c.d, devices:ds, count:ds.length }; })
+// mobile=true uses MOBILE_COMBOS (Entra · Intune only, no Defender dimension).
+function buildCombos(devices, hasMde, mobile){
+  const set = mobile ? MOBILE_COMBOS : COMBOS.filter(c => hasMde || !c.mde);
+  return set.map(c => { const ds = devices.filter(c.test); return { key:c.key, sev:c.sev, title:c.title, e:c.e, i:c.i, d:c.d, devices:ds, count:ds.length }; })
     .filter(c => c.count > 0);
 }
 
 // ---------- device-centric coverage matrix (OS-independent) ----------
-const STATE_SHORT = { all:"Fully covered", eid0:"EDR blind spot", ei0d:"Not managed", eonly:"Entra only", donly:"Defender-only", stale:"Covered · stale" };
+const STATE_SHORT = { all:"Fully covered", eid0:"EDR blind spot", ei0d:"Not managed", eonly:"Entra only", donly:"Defender-only", stale:"Covered · stale",
+  mok:"Managed", munmanaged:"Not in Intune", mnoentra:"Not in Entra", mstale:"Managed · stale" };
 function deviceState(d){
+  if (d.platform === "mobile"){
+    const c = MOBILE_COMBOS.find(x => x.test(d));
+    if (c && c.key === "mok" && d.stale) return { key:"mstale", sev:"high", label:"Managed · stale (no sync 30d+)" };
+    if (c) return { key:c.key, sev:c.sev, label:c.title };
+    return { key:"mok", sev:"low", label:"Managed" };
+  }
   const c = COMBOS.filter(x => HASMDE || !x.mde).find(x => x.test(d));
   if (c && c.key === "all" && d.stale) return { key:"stale", sev:"high", label:"Covered · stale (no sync 30d+)" };
   if (c) return { key:c.key, sev:c.sev, label:c.title };
@@ -4858,13 +4912,17 @@ function deviceState(d){
   return { key:"all", sev:"low", label:"Covered" };
 }
 function covScore(d){
+  if (d.platform === "mobile"){                               // Entra + Intune only (no Defender/EDR dimension)
+    if (!d.entra) return 34;
+    let s = 50 + (d.intune?50:0); if (d.stale) s -= 20; return Math.max(0, Math.min(100, s));
+  }
   if (!d.entra) return 34;                                   // Defender-only: seen by EDR, unknown to Entra
   if (!HASMDE){ let s = 50 + (d.intune?50:0); if (d.stale) s -= 20; return Math.max(0, s); }
   let s = 34 + (d.intune?33:0) + (d.mde===1?33:0);
   if (d.stale) s -= 15;
   return Math.max(0, Math.min(100, s));
 }
-function osFamilies(){ return [...new Set(DEVS.map(d => (d.os||"").replace(/\s*\d.*$/, "").trim()).filter(Boolean))].sort(); }
+function osFamilies(){ return [...new Set(SEGDEVS.map(d => (d.os||"").replace(/\s*\d.*$/, "").trim()).filter(Boolean))].sort(); }
 function covStrip(){
   const cards = COMBO_ROWS.map(c => '<div class="hw-s' + (STATE.devState===c.key?" on":"") + '" data-cstate="' + esc(c.key) + '" title="' + esc(c.title) + '">'
     + '<div class="l">' + esc(STATE_SHORT[c.key] || c.title) + '</div><div class="v' + (c.sev==="crit"||c.sev==="high"?" bad":"") + '">' + c.count + '</div>'
@@ -4904,7 +4962,7 @@ function deviceRow(d){
   const main = '<tr class="cv-trow" data-dev-row="' + esc(d.name) + '">'
     + '<td><span class="cv-chev">' + (open?'▾':'▸') + '</span></td>'
     + '<td class="hw-dev"><span class="nm">' + esc(d.name) + '</span><br><span class="os">' + esc(d.os) + '</span></td>'
-    + covCell(d.entra?1:0) + covCell(d.intune?1:0) + covCell(d.mde)
+    + covCell(d.entra?1:0) + covCell(d.intune?1:0) + covCell(d.platform==="mobile" ? null : d.mde)
     + '<td class="cv-num">' + (d.lastSyncDays==null?"—":(d.lastSyncDays+"d")) + (d.stale?'<span class="hw-stale">stale</span>':'') + '</td>'
     + '<td><span class="cv-sev sev-' + st.sev + '">' + esc(st.label) + '</span></td>'
     + '<td><span class="hw-sc" style="color:var(--sev-' + band + ')">' + sc + '</span></td></tr>';
@@ -4921,8 +4979,8 @@ function deviceRow(d){
 }
 function paintDevs(){
   const host = document.getElementById("cv-body"); if (!host) return;
-  const rows = sortDevs(applyDevFilters(DEVS));
-  const cnt = document.getElementById("cv-count"); if (cnt) cnt.textContent = rows.length + " of " + DEVS.length + " devices";
+  const rows = sortDevs(applyDevFilters(SEGDEVS));
+  const cnt = document.getElementById("cv-count"); if (cnt) cnt.textContent = rows.length + " of " + SEGDEVS.length + " devices";
   host.innerHTML = rows.length ? rows.map(deviceRow).join("") : '<tr><td colspan="8" class="cv-empty">No devices match these filters.</td></tr>';
 }
 function devTable(){
@@ -4992,7 +5050,7 @@ function paintGaps(){
 function comboRow(c){
   const open = !!STATE.cExpanded[c.key];
   const chip = (lbl, on) => '<span class="cov-c ' + (on?"on":"off") + '">' + lbl + '</span>';
-  const sig = '<span class="cov-cs">' + chip("E", c.e) + chip("I", c.i) + chip("D", c.d) + '</span>';
+  const sig = '<span class="cov-cs">' + chip("E", c.e) + chip("I", c.i) + (c.d==null ? '' : chip("D", c.d)) + '</span>';
   const main = '<tr class="cv-trow" data-combo="' + esc(c.key) + '">'
     + '<td><span class="cv-chev">' + (open?'▾':'▸') + '</span></td>'
     + '<td><span class="cv-sev sev-' + c.sev + '">' + c.sev.toUpperCase() + '</span></td>'
@@ -5055,47 +5113,68 @@ function render(D){
     LAST = null; return;
   }
   DEVS = D.devices || []; HASMDE = !!D.hasMde;
-  GAP_ROWS = buildGaps(DEVS, HASMDE);
-  COMBO_ROWS = buildCombos(DEVS, HASMDE);
-  const entraDevs = DEVS.filter(d => d.entra);
+  // Classify every device, then hide IoT / OT / network devices from every segment (as the Entra-anchored
+  // Devices page does). Segments: Computers (default) · Mobile · All.
+  DEVS.forEach(d => { d.platform = platformClass(d.category, d.deviceType, d.os); });
+  const ALLDEVS = DEVS.filter(d => d.platform !== "iot");
+  const segCounts = { computer: ALLDEVS.filter(d => d.platform==="computer").length, mobile: ALLDEVS.filter(d => d.platform==="mobile").length };
+  const seg = STATE.segment, mobile = seg === "mobile";
+  SEGDEVS = seg === "all" ? ALLDEVS : ALLDEVS.filter(d => d.platform === seg);
+  GAP_ROWS = buildGaps(SEGDEVS, HASMDE);
+  // By-coverage overview: computer model (E·I·D) for computers, mobile model (E·I) for mobile; "All" shows both.
+  COMBO_ROWS = seg === "all"
+    ? buildCombos(ALLDEVS.filter(d=>d.platform==="computer"), HASMDE, false).concat(buildCombos(ALLDEVS.filter(d=>d.platform==="mobile"), false, true))
+    : buildCombos(SEGDEVS, HASMDE, mobile);
+  const entraDevs = SEGDEVS.filter(d => d.entra);
   const total = entraDevs.length;
-  const notOnb = HASMDE ? entraDevs.filter(d => d.mde === 0).length : null;
+  const notOnb = (HASMDE && !mobile) ? SEGDEVS.filter(d => d.platform==="computer" && d.entra && d.mde === 0).length : null;
   const unmanaged = entraDevs.filter(d => d.intune === 0).length;
-  const stale = DEVS.filter(d => d.stale).length;
-  const defOnly = DEVS.filter(d => !d.entra).length;
+  const defOnly = SEGDEVS.filter(d => !d.entra).length;
   D.score = total ? Math.round(100 * entraDevs.reduce((a,d)=>a+covWeight(d),0) / total) : 0;
   D.grade = D.score>=70?"D":D.score>=50?"C":D.score>=30?"B":"A";
-  const lede = total + " Entra device" + (total===1?"":"s") + " · " + (total-unmanaged) + " managed by Intune, " + unmanaged + " unmanaged"
-    + (HASMDE ? ", " + notOnb + " with no Defender sensor" : ", Defender onboarding not assessed") + (defOnly ? " · " + defOnly + " Defender-only (not in Entra)" : "") + ".";
+  const noun = mobile ? "mobile device" : seg==="computer" ? "computer" : "device";
+  const lede = total + " " + noun + (total===1?"":"s") + " · " + (total-unmanaged) + " managed by Intune, " + unmanaged + " unmanaged"
+    + (mobile ? "" : (HASMDE ? ", " + notOnb + " with no Defender sensor" : ", Defender onboarding not assessed"))
+    + (defOnly ? " · " + defOnly + " not in Entra" : "") + ".";
   const band = '<div class="dp-band">' + EP.scoreGauge(D.score)
     + '<div><div class="h1">Coverage · onboarding workspace</div><div class="lede">' + esc(lede) + '</div></div></div>';
+  // platform segment bar (computers default)
+  const segBtn = (val, label, ct) => '<button type="button" data-seg="' + val + '" class="' + (STATE.segment===val?"on":"") + '">' + label + (ct!=null?'<span class="ct">' + ct + '</span>':'') + '</button>';
+  const segBar = '<div class="cv-seg-bar"><span class="lbl">Platform</span><span class="cv-seg">'
+    + segBtn("computer","💻 Computers", segCounts.computer)
+    + segBtn("mobile","📱 Mobile", segCounts.mobile)
+    + segBtn("all","All", segCounts.computer + segCounts.mobile) + '</span></div>';
   // Four risk-based KPIs, each a clickable filter into the device table. Ordered by risk:
-  // unprotected (no EDR) → unmanaged (no compliance) → stale → the healthy baseline.
-  const kUnprot = HASMDE ? DEVS.filter(KPI_TEST.unprot).length : null;
-  const kUnmanaged = DEVS.filter(KPI_TEST.unmanaged).length;
-  const kStale = DEVS.filter(KPI_TEST.stale).length;
-  const kCovered = DEVS.filter(KPI_TEST.covered).length;
+  // unprotected (no EDR) → unmanaged (no compliance) → stale → the healthy baseline. On Mobile the EDR tile is N/A.
+  const kUnprot = (HASMDE && !mobile) ? SEGDEVS.filter(KPI_TEST.unprot).length : null;
+  const kUnmanaged = SEGDEVS.filter(KPI_TEST.unmanaged).length;
+  const kStale = SEGDEVS.filter(KPI_TEST.stale).length;
+  const kCovered = SEGDEVS.filter(KPI_TEST.covered).length;
   const kpiCard = (key, v, label, sub, cls) => {
     const clickable = v !== "—";
     return '<div class="dp-tile ' + (cls||"") + (clickable?" clickable":"") + (STATE.kpi===key?" on":"") + '"' + (clickable?' data-kpi="' + key + '"':'') + '>'
       + '<div class="v">' + v + '</div><div class="l">' + label + '</div><div class="kpi-sub">' + sub + '</div></div>';
   };
   const tiles = '<div class="dp-tiles">'
-    + kpiCard("unprot", kUnprot==null?"—":kUnprot, "Unprotected", "no Defender EDR — threats go undetected", kUnprot?"crit":(kUnprot==null?"na":"ok"))
+    + (mobile
+        ? kpiCard("unprot", "—", "EDR not applicable", "mobile uses Intune MDM + app protection", "na")
+        : kpiCard("unprot", kUnprot==null?"—":kUnprot, "Unprotected", "no Defender EDR — threats go undetected", kUnprot?"crit":(kUnprot==null?"na":"ok")))
     + kpiCard("unmanaged", kUnmanaged, "No compliance enforcement", "not managed by Intune — no policy baseline", kUnmanaged?"high":"ok")
     + kpiCard("stale", kStale, "Stale posture", "no sync in 30+ days — signal is old", kStale?"high":"ok")
-    + kpiCard("covered", kCovered, "Fully covered", "identity · compliance · protection", "ok") + '</div>';
+    + kpiCard("covered", kCovered, "Fully covered", mobile ? "identity · compliance (Intune)" : "identity · compliance · protection", "ok") + '</div>';
   const src = D.imported ? ("Imported CSV — Entra + Intune" + (HASMDE ? " + Defender exports." : " exports.")) : (window.EP && EP.DEMO) ? "Demo data." : ("Live — Entra + Intune" + (HASMDE ? " + Defender (advanced hunting)." : " via Microsoft Graph."));
   const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> Each source is a different security <b>control</b>, answering a different question: <b>Entra — is the device known?</b> (identity &amp; inventory) · <b>Intune — is it compliant?</b> (enforces policy, encryption, configuration) · <b>Defender — is it protected?</b> (EDR: threat detection &amp; response). Read the gaps by risk: <b style="color:var(--sev-crit)">no Defender</b> = unprotected — a threat on that device goes undetected (an EDR blind spot); <b style="color:var(--sev-high)">no Intune</b> = no compliance baseline is enforced (encryption, OS, config unchecked); <b style="color:var(--sev-high)">stale</b> = the posture signals are too old to trust. A device is only <b style="color:var(--sev-low)">fully covered</b> when all three see it and it is syncing. The KPIs above filter the list to each gap; <b>By gap</b> and <b>By coverage</b> give the grouped breakdowns with the exact fix.'
+    + ' <b>Mobile</b> is assessed on Entra + Intune only — the Defender/EDR sensor is a computer control, so phones aren’t flagged for lacking it. <b>IoT / OT / network</b> devices are managed in Defender, not here (as on the Devices page).'
     + (HASMDE ? '' : ' <b>Defender onboarding needs ThreatHunting.Read.All (advanced hunting) to complete the protection picture.</b>') + '</div>';
   const body = STATE.view === "device" ? (toolbar() + devTable()) : (toolbar() + activeTable());
-  root.innerHTML = band + tiles + body + note;
+  root.innerHTML = band + segBar + tiles + body + note;
   repaint(); wireView();
 }
 let _wired = false;
 function wireView(){
   const root = document.getElementById("cov-root"); if (!root || _wired) return; _wired = true;
   root.addEventListener("click", e => {
+    const seg  = e.target.closest("[data-seg]");
     const view = e.target.closest("[data-view]");
     const dev  = e.target.closest("[data-dev]");
     const h    = e.target.closest("th[data-sort]");
@@ -5105,6 +5184,7 @@ function wireView(){
     const gaps = e.target.closest("#cv-gaps");
     const clr  = e.target.closest("#cv-clrstate");
     const clrk = e.target.closest("#cv-clrkpi");
+    if (seg){ const s = seg.getAttribute("data-seg"); if (s !== STATE.segment){ STATE.segment = s; STATE.kpi=""; STATE.devState=""; STATE.devOS=""; render(LAST); } return; }
     if (kpi){ const k = kpi.getAttribute("data-kpi"); STATE.kpi = STATE.kpi===k ? "" : k; if (STATE.view!=="device"){ STATE.view="device"; STATE.sortCol="sync"; STATE.sortDir="asc"; } render(LAST); return; }
     if (view){ const v = view.getAttribute("data-view"); if (v !== STATE.view){ STATE.view = v; STATE.sortCol = v==="device"?"sync":"sev"; STATE.sortDir = v==="device"?"asc":"desc"; render(LAST); } return; }
     if (cst){ const k = cst.getAttribute("data-cstate"); STATE.devState = STATE.devState===k ? "" : k; render(LAST); return; }
@@ -5140,10 +5220,17 @@ async function analyze(){
 // ---------- shell integration (Overview + Report) ----------
 function __dpCovSummary(){
   if (!LAST || LAST.needsCov) return null;
-  return { label:"Coverage", score:LAST.score, grade:LAST.grade,
-    lead: (GAP_ROWS.reduce((a,g)=>a+g.count,0)) + " coverage gaps across " + DEVS.filter(d=>d.entra).length + " Entra devices.",
-    sev: sevCounts(),
-    top: GAP_ROWS.filter(g => g.sev==="crit" || g.sev==="high").sort((a,b)=>(SEV_RANK[b.sev]-SEV_RANK[a.sev])||(b.count-a.count)).slice(0,6)
+  // Overview is whole-estate (all non-IoT devices), independent of the active platform segment.
+  const all = (DEVS||[]).filter(d => d.platform !== "iot");
+  const entra = all.filter(d => d.entra);
+  const score = entra.length ? Math.round(100 * entra.reduce((a,d)=>a+covWeight(d),0) / entra.length) : 0;
+  const grade = score>=70?"D":score>=50?"C":score>=30?"B":"A";
+  const gaps = buildGaps(all, HASMDE);
+  const sev = { crit:0, high:0, med:0, low:0 }; gaps.forEach(g => { if (sev[g.sev]!=null) sev[g.sev]++; });
+  return { label:"Coverage", score, grade,
+    lead: gaps.reduce((a,g)=>a+g.count,0) + " coverage gaps across " + entra.length + " devices.",
+    sev,
+    top: gaps.filter(g => g.sev==="crit" || g.sev==="high").sort((a,b)=>(SEV_RANK[b.sev]-SEV_RANK[a.sev])||(b.count-a.count)).slice(0,6)
       .map(g => ({ title: g.title + " (" + g.count + " device" + (g.count===1?"":"s") + ")", sev: g.sev, impact:"", search: g.key })) };
 }
 function __dpCovFocus(f){
@@ -6181,16 +6268,32 @@ function collapseSoftware(sw){
   if (/windows[ _]?1[01]\b/.test(s) || /windows[ _]?10/.test(s) || /windows[ _]?11/.test(s)) return "Microsoft Windows";
   return sw;
 }
-// Platform segment — computers (Windows / macOS / Linux) vs mobile (iOS / Android). TVM is overwhelmingly a
-// COMPUTER signal (Defender reports little or no software-CVE data for iOS / Android), so the page defaults
-// to Computers and segments the whole workspace: device, software and CVE views all scope to one platform.
-function platformClass(os){
-  const s = String(os||"").toLowerCase();
-  if (/ios|ipad|iphone|android/.test(s)) return "mobile";
-  return "computer";   // windows / macos / linux / unknown → computer (TVM's default surface)
+// Platform class — mirrors Defender's own device inventory (DeviceCategory): Endpoint devices split into
+// "computer" vs "mobile"; IoT / OT / network-infrastructure devices are "iot" and hidden everywhere (they are
+// absent from the Entra-anchored Devices page too). TVM is overwhelmingly a COMPUTER signal (little / no CVE
+// data for iOS / Android), so the page defaults to Computers and segments the whole workspace.
+//   category = DeviceInfo.DeviceCategory (Endpoint | Network device | IoT | Unknown)
+//   deviceType = DeviceInfo.DeviceType · os = DeviceInfo.OSPlatform
+function platformClass(category, deviceType, os){
+  const cat = String(category||"").toLowerCase().replace(/[^a-z]/g,"");
+  const dt  = String(deviceType||"").toLowerCase();
+  const s   = String(os||"").toLowerCase();
+  if (cat === "iot" || cat === "networkdevice" || /network/.test(dt)) return "iot";   // IoT / OT / network infra → hidden
+  return (/mobile|tablet/.test(dt) || /ios|ipad|iphone|android/.test(s)) ? "mobile" : "computer";
 }
-let PLATFORM = {};   // lowercased device name → "computer" | "mobile"
+let PLATFORM = {};   // lowercased device name → "computer" | "mobile" | "iot"
 function platformOf(name){ return PLATFORM[String(name||"").toLowerCase()] || "computer"; }
+// Drop IoT / OT / network devices from a CVE set everywhere (as the Devices page does): prune iot device names
+// and drop CVEs left with none. CVEs with no device names (import) can't be classified, so they're kept as-is.
+function visibleCves(cves){
+  return cves.map(c => {
+    const all = c.deviceNames || [];
+    if (!all.length) return c;
+    const names = all.filter(n => platformOf(n) !== "iot");
+    if (!names.length) return null;
+    return Object.assign({}, c, { deviceNames: names, devices: names.length });
+  }).filter(Boolean);
+}
 // Scope a CVE set to one platform: keep only CVEs that hit a device on that platform, and prune each CVE's
 // deviceNames (and its device count) to that platform so counts, chips and the software/device rollups match.
 // "all" returns the set unchanged. CVEs with no device names (import) can't be classified, so they only ever
@@ -6233,17 +6336,26 @@ function demoMobileCves(){
     { cve:"CVE-2024-23296", sev:"High", cvss:7.8, exploit:true, zeroday:true, devices:1, deviceNames:["iPhone"],                 software:["Apple iOS RTKit"],  update:"Update iOS to 17.4 or later", published:"2024-03-05" }
   ];
 }
-// device name (lowercased) → platform, so the demo can split computers from mobile
+// IoT / OT demo CVEs — carried by devices classed "iot" so they are hidden from every segment (proving the
+// exclusion), exactly as IoT devices are absent from the Entra-anchored Devices page.
+function demoIotCves(){
+  return [
+    { cve:"CVE-2023-20198", sev:"Critical", cvss:10.0, exploit:true, zeroday:true, devices:1, deviceNames:["CiscoOT"], software:["Cisco IOS XE Web UI"], update:"Apply Cisco fixed release / disable HTTP server", published:"2023-10-16" },
+    { cve:"CVE-2024-3273",  sev:"High",     cvss:7.3, exploit:true, zeroday:false, devices:1, deviceNames:["dakboard"], software:["D-Link NAS firmware"], update:"Replace end-of-life device (no vendor fix)", published:"2024-04-04" }
+  ];
+}
+// device name (lowercased) → platform (computer | mobile | iot), so the demo can split and hide IoT
 const DEMO_PLATFORM = {
   "blue16-i9-64gb-2tbssd":"computer", "blue16-atomman":"computer", "srv000":"computer", "win-i3oa1c8bv5i":"computer",
   "blue16-mstlpt02":"computer", "miranda-medion":"computer", "eden-inuc":"computer", "kiosk-recep-3":"computer", "nedscaper-97507":"computer",
-  "iphone 13 derk":"mobile", "iphone 15 derk":"mobile", "iphone":"mobile"
+  "iphone 13 derk":"mobile", "iphone 15 derk":"mobile", "iphone":"mobile",
+  "ciscoot":"iot", "dakboard":"iot"
 };
 const DEMO = {
   score: 61, grade: "C", live: false,
   lede: "14 distinct CVEs across the estate — 3 critical, 6 with a public exploit, 4 flagged zero-day. Exposure score 61/100.",
   dev: { total: 11, crit: 4, high: 6 },
-  cves: demoCves().concat(demoMobileCves()),
+  cves: demoCves().concat(demoMobileCves()).concat(demoIotCves()),
   platformByName: DEMO_PLATFORM,
   internetNames: ["Blue16-i9-64GB-2TBSSD","WIN-I3OA1C8BV5I","SRV000"]
 };
@@ -6314,7 +6426,7 @@ function buildDevices(cves){
 // ---------- live collection ----------
 async function huntTvm(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
-  const q = "DeviceTvmSoftwareVulnerabilities | summarize Critical=dcountif(CveId, VulnerabilitySeverityLevel=='Critical'), High=dcountif(CveId, VulnerabilitySeverityLevel=='High'), Medium=dcountif(CveId, VulnerabilitySeverityLevel=='Medium'), Cves=dcount(CveId), OSPlatform=any(OSPlatform) by DeviceId, DeviceName";
+  const q = "DeviceTvmSoftwareVulnerabilities | summarize Critical=dcountif(CveId, VulnerabilitySeverityLevel=='Critical'), High=dcountif(CveId, VulnerabilitySeverityLevel=='High'), Medium=dcountif(CveId, VulnerabilitySeverityLevel=='Medium'), Cves=dcount(CveId) by DeviceId, DeviceName";
   const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
   if (!r.ok){ let d=""; try{ d=((await r.json()).error||{}).message||""; }catch(e){} const e2=new Error("TVM "+r.status+(d?" — "+d:"")); e2.status=r.status; throw e2; }
   return (await r.json()).results || [];
@@ -6350,11 +6462,21 @@ async function huntInternetFacing(){
   if (!r.ok) throw new Error("internet-facing " + r.status);
   return ((await r.json()).results || []).map(x => x.DeviceName).filter(Boolean);
 }
+// Device name → platform class, from DeviceInfo (DeviceCategory / DeviceType / OSPlatform) — the signal that
+// splits Defender's own "Computers & Mobile" tab from Network / IoT. Lets the page hide IoT / OT devices.
+// Optional: on failure classification just defaults to computer (no device is wrongly hidden).
+async function huntDeviceClass(){
+  const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
+  const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, DeviceCategory, DeviceType, OSPlatform) by DeviceName";
+  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  if (!r.ok) throw new Error("device class " + r.status);
+  return (await r.json()).results || [];
+}
 async function collect(){
-  const [tvm, cves, netNames] = await Promise.all([ huntTvm(), huntCves(), huntInternetFacing().catch(() => []) ]);
-  // device name → platform (computer / mobile), from the TVM per-device OSPlatform
+  const [tvm, cves, netNames, devClass] = await Promise.all([ huntTvm(), huntCves(), huntInternetFacing().catch(() => []), huntDeviceClass().catch(() => []) ]);
+  // device name → platform (computer / mobile / iot), from DeviceInfo DeviceCategory / DeviceType / OSPlatform
   const platformByName = {};
-  tvm.forEach(x => { if (x.DeviceName) platformByName[String(x.DeviceName).toLowerCase()] = platformClass(x.OSPlatform); });
+  devClass.forEach(x => { if (x.DeviceName) platformByName[String(x.DeviceName).toLowerCase()] = platformClass(x.DeviceCategory, x.DeviceType, x.OSPlatform); });
   const totalDev = tvm.length;
   const critDev = tvm.filter(x => (x.Critical||0) > 0).length;
   const highDev = tvm.filter(x => (x.High||0) > 0).length;
@@ -6635,18 +6757,21 @@ function render(D){
   LAST = D; CVES = D.cves || [];
   NET = new Set((D.internetNames||[]).map(n => String(n).toLowerCase()));
   PLATFORM = D.platformByName || {};
-  CVE_MAP = {}; CVES.forEach(c => { CVE_MAP[c.cve] = c; });
   // Platform segment: only when we actually have device names to classify (import has none → whole estate).
   const hasDeviceNames = CVES.some(c => (c.deviceNames||[]).length);
+  // Visible universe = all CVEs with IoT / OT / network devices pruned out (hidden everywhere, as on the
+  // Devices page). Everything below — segments, counts, tiles, CVE_MAP — is built from this base.
+  const BASE = hasDeviceNames ? visibleCves(CVES) : CVES;
+  CVE_MAP = {}; BASE.forEach(c => { CVE_MAP[c.cve] = c; });
   const seg = hasDeviceNames ? STATE.segment : "all";
-  SEGCVES = cvesForSegment(CVES, seg);
+  SEGCVES = cvesForSegment(BASE, seg);
   SOFTWARE = buildSoftware(SEGCVES);
   DEVICES = buildDevices(SEGCVES);
   // Import has no device names, so the device view can't populate — fall back to the software view there.
   if (STATE.view === "device" && !DEVICES.length && !hasDeviceNames) STATE.view = "software";
-  // Per-platform device counts (devices carrying any CVE) for the segment toggle labels.
+  // Per-platform device counts (devices carrying any CVE) for the segment toggle labels — IoT already excluded.
   const segDev = { computer:new Set(), mobile:new Set() };
-  CVES.forEach(c => (c.deviceNames||[]).forEach(n => { const p = platformOf(n); if (segDev[p]) segDev[p].add(String(n).toLowerCase()); }));
+  BASE.forEach(c => (c.deviceNames||[]).forEach(n => { const p = platformOf(n); if (segDev[p]) segDev[p].add(String(n).toLowerCase()); }));
   const segCounts = { computer:segDev.computer.size, mobile:segDev.mobile.size };
   const root = document.getElementById("vuln-root"); if (!root) return;
   const lede = hasDeviceNames ? ledeFor(SEGCVES, seg, DEVICES.length) : D.lede;
@@ -6660,7 +6785,8 @@ function render(D){
   }
   const crit = SEGCVES.filter(c => c.sev==="Critical").length, exp = SEGCVES.filter(c => c.exploit||c.zeroday).length;
   // devices-with-TVM tile: whole estate for "all", else the segment's device count
-  const devTile = (seg === "all") ? (D.dev ? D.dev.total : "—") : DEVICES.length;
+  // devices-with-TVM tile: for "all", the non-IoT device count (IoT is hidden); else the segment's device count.
+  const devTile = (seg === "all") ? (hasDeviceNames ? (segCounts.computer + segCounts.mobile) : (D.dev ? D.dev.total : "—")) : DEVICES.length;
   // Critical + exploit tiles are in-page filters: they jump to the By-CVE list filtered to those rows
   // (so "1 with a public exploit" answers "which?" in one click).
   const tiles = '<div class="dp-tiles">'
@@ -6682,7 +6808,7 @@ function render(D){
     : "";
   const xlink = '<div class="dp-note" style="border-left-color:var(--accent);background:rgba(63,169,255,.05);padding:8px 12px"><b>↔ SightLine.</b> This is <i>installed-software</i> CVEs. For the ones also <i>reachable from outside</i> (open port ∩ present CVE), cross-reference SightLine’s Verified Exploitable — that intersection is "exploitable now".</div>';
   const src = D.imported ? "Imported CSV — Defender Weaknesses export (per-CVE; device names aren’t in the export)." : (window.EP && EP.DEMO) ? "Demo data." : "Live — Defender TVM via advanced hunting.";
-  const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> CVEs rolled up from Defender TVM (DeviceTvmSoftwareVulnerabilities + KB), one row per CVE. Requires Defender for Endpoint P2. TVM is a computer signal; mobile data is thin by design. Device chips open the Devices page filtered to that device.</div>';
+  const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> CVEs rolled up from Defender TVM (DeviceTvmSoftwareVulnerabilities + KB), one row per CVE. Requires Defender for Endpoint P2. TVM is a computer signal; mobile data is thin by design. <b>IoT / OT / network</b> devices are managed in Defender, not here (as on the Devices page). Device chips open the Devices page filtered to that device.</div>';
   root.innerHTML = band + segBar + tiles + (segEmpty || (toolbar() + activeTable() + renderTriage())) + xlink + note;
   if (!segEmpty) repaint();
   wireView();
@@ -6732,13 +6858,13 @@ async function analyze(){
 }
 function sevCounts(){
   const c = { crit:0, high:0, med:0, low:0 };
-  CVES.forEach(v => { const k = v.sev==="Critical"?"crit":v.sev==="High"?"high":v.sev==="Medium"?"med":"low"; c[k]++; });
+  visibleCves(CVES).forEach(v => { const k = v.sev==="Critical"?"crit":v.sev==="High"?"high":v.sev==="Medium"?"med":"low"; c[k]++; });
   return c;
 }
 function __dpVulnSummary(){
   if (!LAST) return null;
   if (LAST.needsDefender) return { label:"Vulnerabilities", score:null, grade:"–", lead:"Not assessed — connect Defender (MDE).", sev:{ crit:0, high:0, med:0, low:0 }, top:[] };
-  const top = CVES.filter(c => c.sev==="Critical" || c.exploit || c.zeroday).slice(0, 5).map(c => ({
+  const top = visibleCves(CVES).filter(c => c.sev==="Critical" || c.exploit || c.zeroday).slice(0, 5).map(c => ({
     title: c.cve + (c.exploit?" (public exploit)":c.zeroday?" (zero-day)":"") + " — " + c.devices + " device" + (c.devices===1?"":"s"),
     sev: c.sev==="Critical"?"crit":c.sev==="High"?"high":"med", impact: c.software[0]||"", search: "critical" }));
   return { label:"Vulnerabilities", score:LAST.score, grade:LAST.grade, lead:LAST.lede, sev:sevCounts(), top };
