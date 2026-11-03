@@ -4413,17 +4413,19 @@ async function enrichExposureCrit(devices){
   let at; try { at = await EP.tokenSilent(["ThreatHunting.Read.All"]); } catch(e){ return; }
   let rows = [];
   try {
-    const q = "ExposureGraphNodes | where NodeLabel == 'device' | where NodeProperties has 'criticalityLevel'"
-      + " | extend L = toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), Rules = tostring(NodeProperties.rawData.criticalityLevel.ruleNames)"
-      + " | where L between (0 .. 3) | summarize L = min(L), Rules = take_any(Rules) by DeviceName = NodeName";
+    // Device nodes carry rawData.deviceName regardless of NodeLabel (device / microsoft.compute/virtualmachines /
+    // ec2.instance / arc …), so key on that rather than guessing the label.
+    const q = "ExposureGraphNodes | where NodeProperties has 'criticalityLevel' and NodeProperties has 'deviceName'"
+      + " | extend L = toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), DN = tostring(NodeProperties.rawData.deviceName), Rules = tostring(NodeProperties.rawData.criticalityLevel.ruleNames)"
+      + " | where isnotempty(DN) and L between (0 .. 3) | summarize L = min(L), Rules = take_any(Rules) by DN";
     const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
     if (!r.ok) return; rows = (await r.json()).results || [];
   } catch(e){ return; }
   const by = {};
-  rows.forEach(x => { if (x.DeviceName == null) return; const L = +x.L; const rec = { level:L, label:CRIT_LABELS[L]||"", roles:parseRoles(x.Rules) };
-    by[String(x.DeviceName).toLowerCase()] = rec; by[normName(x.DeviceName)] = rec; });
+  rows.forEach(x => { if (x.DN == null) return; const L = +x.L; const rec = { level:L, label:CRIT_LABELS[L]||"", why:parseRoles(x.Rules) };
+    by[String(x.DN).toLowerCase()] = rec; by[normName(x.DN)] = rec; });
   devices.forEach(d => { const rec = by[String(d.name||"").toLowerCase()] || by[normName(d.name)]; if (!rec) return;
-    d.criticality = rec.label; d.roles = rec.roles; d.critical = rec.level <= 1; });   // crown Very high + High
+    d.criticality = rec.label; d.critWhy = rec.why; d.critical = rec.level <= 1; });   // crown Very high + High; why = classification rules
 }
 async function collect(){
   const entra = await gGetAll("/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,approximateLastSignInDateTime,accountEnabled&$top=200", ["Device.Read.All"]);
@@ -4698,7 +4700,7 @@ function paint(){
       + '<td><span class="di-caret">▸</span></td>'
       + '<td><span class="di-risk" title="Risk: ' + esc(band) + ' — ' + esc((d.riskWhy || []).join(" · ")) + '"><span class="b r-' + band + '">' + band + '</span><span class="s">' + esc(d.riskSub || d.risk) + '</span></span></td>'
       + '<td class="di-dev">' + esc(d.name)
-        + (d.critical ? '<span class="di-crit" title="Critical asset — Defender high value or a sensitive role">👑 critical</span>' : '')
+        + (d.critical ? '<span class="di-crit" title="Critical asset' + ((d.critWhy && d.critWhy.length) ? ' — ' + esc(d.critWhy.join(' · ')) : ' (Defender criticality)') + '">👑 ' + esc(d.criticality || "critical") + '</span>' : '')
         + ((d.roles && d.roles.length) ? '<span class="di-role" title="Device role (Defender)">' + esc(d.roles[0]) + (d.roles.length>1?' +'+(d.roles.length-1):'') + '</span>' : '')
         + (d.internet === true ? '<span class="di-inet" title="Reachable from the internet (Defender)">🌐 internet-facing</span>' : '') + '<span class="jt">' + esc(d.joinType) + '</span></td>'
       + '<td class="di-os">' + esc(d.os) + '<span class="v2">' + esc(d.osVer) + '</span></td>'
