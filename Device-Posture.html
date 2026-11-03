@@ -874,6 +874,12 @@
 #view-attackpaths .ap-graph-h .sub { font-weight:400; font-size:11.5px; color:var(--muted); }
 #view-attackpaths .ap-reset { margin-left:auto; cursor:pointer; color:var(--muted); font-size:11.5px; border:1px solid var(--border); border-radius:7px; padding:3px 11px; background:transparent; }
 #view-attackpaths .ap-reset:hover { color:var(--text); border-color:var(--accent); }
+#view-attackpaths .ap-explain { margin-left:auto; cursor:pointer; color:var(--accent); font-size:11.5px; font-weight:700; border:1px solid var(--border); border-radius:7px; padding:3px 11px; background:transparent; white-space:nowrap; }
+#view-attackpaths .ap-explain:hover { border-color:var(--accent); }
+#view-attackpaths .ap-narr { margin:0 14px 10px; padding:9px 12px; border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:8px; background:rgba(63,169,255,.06); font-size:12px; color:var(--text); line-height:1.5; }
+#view-attackpaths .ap-narr b { color:var(--accent); font-weight:700; }
+#view-attackpaths .ap-narr .cap { display:block; margin-top:5px; font-size:10px; color:var(--muted); }
+#view-attackpaths .ap-narr-busy { color:var(--muted); }
 #view-attackpaths .ap-cy { height:230px; width:100%; background-color:#050D22; background-image:radial-gradient(rgba(127,160,210,.13) 1px, transparent 1px); background-size:18px 18px; }
 #view-attackpaths .ap-legend { display:flex; flex-wrap:wrap; gap:4px 14px; padding:8px 14px; border-top:1px solid var(--border); font-size:10.5px; color:var(--muted); align-items:center; }
 #view-attackpaths .ap-legend span { display:inline-flex; align-items:center; gap:5px; }
@@ -4295,6 +4301,18 @@ function demoWhy(r){
 
 let DALL = null;   // unified device list
 const EXPANDED = {};   // device id -> true when its detail row is open
+// Grounded AI "what to fix first" per device (read-only, local model). Mirrors the Overview Fix feature:
+// code computes every signal; the model only narrates the priority order. Cached per device id; degrades to
+// the computed riskWhy bullets when no model is connected.
+const FIXAI = {};        // device id -> { text } | { error }
+let _fixaiBusy = "";     // device id currently generating (one at a time)
+const FIXAI_SYSTEM = [
+  "You are a security analyst. From ONLY the facts given about ONE device, write 2 to 4 short sentences:",
+  "what to fix first, then what to fix next, and why — in priority order (highest risk first).",
+  "Lead with the concrete gaps present: no Defender sensor, non-compliant, high Defender exposure, critical CVEs, internet-facing, a privileged / critical asset, or stale.",
+  "Never invent a fix, a CVE, a number, a policy or a host. Read-only: recommend actions, never claim anything was changed.",
+  "Plain prose, no markdown, no preamble."
+].join("\n");
 const STATE = { q:"", os:"", risk:"", exp:"", comp:"", onb:"", net:"", owner:"", sensor:"", threat:"", cve:"", config:"", tag:"", quick:"", cls:"", sortCol:"risk", sortDir:"desc" };
 // Device class: computers (Windows / Windows Server / macOS / Linux) vs mobile (iOS / iPadOS / Android).
 function devClass(os){ return (os === "iOS" || os === "iPadOS" || os === "Android") ? "mobile" : "computer"; }
@@ -4719,10 +4737,35 @@ function detailRow(d, cols){
   const riskFoot = '<div class="di-riskwhy"><span class="rb r-' + band + '">' + band + ' risk</span>'
     + ((d.riskWhy && d.riskWhy.length) ? ' — ' + esc(d.riskWhy.join(" · ")) : "")
     + (sig.length ? '<div class="di-sigs">' + sig.join('<span class="di-sigsep">·</span>') + '</div>' : "") + '</div>';
+  // ── grounded AI "what to fix first" (read-only; only when a local model is connected) ──
+  const aiReady = !!(window.EP && EP.llm && EP.llm.ready());
+  let aiBlock = "";
+  if (aiReady){
+    const cached = FIXAI[d.id], busy = _fixaiBusy === d.id;
+    if (cached && cached.error) aiBlock = '<div class="di-why di-why-load" style="margin-top:10px">✦ AI unavailable — ' + esc(cached.error) + '</div>';
+    else if (cached && cached.text) aiBlock = '<div class="di-why di-why-load" style="margin-top:10px"><div class="di-why-h" style="color:var(--accent)">✦ ' + esc(EP.llm.provider) + ' · ' + esc(EP.llm.model) + ' — grounded in this device’s signals, nothing invented</div><div class="di-why-p">' + esc(cached.text) + '</div></div>';
+    else aiBlock = '<div style="margin-top:10px"><span class="di-why-link" data-fixai="' + esc(d.id) + '" role="button" tabindex="0" style="cursor:pointer" title="Ask your local model to prioritise this device’s fixes — grounded in its signals, nothing leaves the machine.">' + (busy ? '<span class="spinner"></span> thinking…' : '✦ What to fix first') + '</span></div>';
+  }
   return '<tr class="di-detrow"><td colspan="' + cols + '"><div class="di-card">' + idrow
-    + '<div class="di-dims">' + covPanel + compPanel + hardPanel + vulnPanel + '</div>' + riskFoot + '</div></td></tr>';
+    + '<div class="di-dims">' + covPanel + compPanel + hardPanel + vulnPanel + '</div>' + riskFoot + aiBlock + '</div></td></tr>';
 }
 
+function fixaiDigest(d){
+  return JSON.stringify({ device: d.name, os: (d.os||"") + " " + (d.osVer||""), risk: RISK_BAND(d.risk), riskWhy: d.riskWhy || [],
+    exposure: d.exposure, cve: { critical: d.cveCrit, high: d.cveHigh, medium: d.cveMed, total: d.cveCount },
+    compliance: d.compliance, coverage: { entra: d.entra, intune: d.intune, defender: d.defender, onboarding: d.onboarding, sensor: d.sensor },
+    criticality: d.criticality, roles: d.roles || [], criticalAsset: !!d.critical,
+    internetFacing: d.internet, internetReason: d.internetReason, stale: !!d.stale, lastSeenDays: d.lastSeenDays }, null, 1);
+}
+async function runFixAi(id){
+  if (!(window.EP && EP.llmComplete) || _fixaiBusy || !DALL) return;   // one at a time
+  const d = DALL.devices.find(x => x.id === id); if (!d) return;
+  _fixaiBusy = id; paint();
+  try { const raw = await EP.llmComplete(FIXAI_SYSTEM, fixaiDigest(d), { temperature: 0.2, max_tokens: 320 });
+    FIXAI[id] = { text: String(raw || "").trim() || "(no response)" }; }
+  catch(e){ FIXAI[id] = { error: e.message || String(e) }; }
+  finally { _fixaiBusy = ""; paint(); }
+}
 function paint(){
   const root = document.getElementById("dev-root"); if (!root || !DALL) return;
   const D = DALL, list = applyFilters(D.devices);
@@ -4838,6 +4881,7 @@ function wire(){
     if (e.target.closest("[data-clear]")){ Object.keys(STATE).forEach(x => STATE[x] = ""); paint(); return; }
     if (e.target.closest("[data-connect]")){ _mdeMode = "interactive"; analyze(); return; }   // one interactive consent for the Defender API
     const hs = e.target.closest("[data-sort]"); if (hs){ const col = hs.getAttribute("data-sort"); if (STATE.sortCol === col){ STATE.sortDir = STATE.sortDir === "asc" ? "desc" : "asc"; } else { STATE.sortCol = col; STATE.sortDir = SORT_DEFDIR[col] || "desc"; } paint(); return; }
+    const fx = e.target.closest("[data-fixai]"); if (fx){ e.stopPropagation(); runFixAi(fx.getAttribute("data-fixai")); return; }
     const row = e.target.closest(".di-main"); if (row){ const id = row.getAttribute("data-dev"); EXPANDED[id] = !EXPANDED[id]; if (EXPANDED[id] && DALL){ const d = DALL.devices.find(x => x.id === id); if (d) ensureComplianceDetail(d); } paint(); return; }
   });
   root.addEventListener("change", e => { const s = e.target.closest("[data-f]"); if (s){ STATE[s.getAttribute("data-f")] = s.value; paint(); } });
@@ -6492,12 +6536,13 @@ function render(D){
   FIRMWARE = (window.EP && EP.DEMO) ? DEMO_FIRMWARE : (D.firmware || []);
   if (D.imported && !DEVICES.length && STATE.view === "device") STATE.view = "category";   // import is control-level only
   const critCount = CONTROLS.filter(c => c.sev === "Critical").length;
-  const tile = (v, l, cls, kpi) => '<div class="dp-tile ' + (cls||"") + (kpi?" dp-click":"") + '"' + (kpi?' data-kpi="'+kpi+'"':'') + '><div class="v">' + v + '</div><div class="l">' + l + (kpi?' <span class="dp-hint">see them →</span>':'') + '</div></div>';
+  // The headline KPI line is clickable: each tile drills into the matching view (devices / controls / critical).
+  const tile = (v, l, cls, nav) => '<div class="dp-tile ' + (cls||"") + (nav?" dp-click":"") + '"' + (nav?' data-nav="'+nav+'"':'') + '><div class="v">' + v + '</div><div class="l">' + l + (nav?' <span class="dp-hint">see them →</span>':'') + '</div></div>';
   const tiles = '<div class="dp-tiles">'
     + tile(D.devicesAssessed!=null?D.devicesAssessed:"–", "devices assessed", "")
-    + tile(D.devicesFailing!=null?D.devicesFailing:"–", "devices with a failing control", D.devicesFailing?"high":"")
-    + tile(CONTROLS.length, "failing controls", CONTROLS.length?"high":"")
-    + tile(critCount, "critical controls", critCount?"crit":"", critCount?"crit":"") + '</div>';
+    + tile(D.devicesFailing!=null?D.devicesFailing:"–", "devices with a failing control", D.devicesFailing?"high":"", D.devicesFailing?"dev-fail":"")
+    + tile(CONTROLS.length, "failing controls", CONTROLS.length?"high":"", CONTROLS.length?"ctrl-all":"")
+    + tile(critCount, "critical controls", critCount?"crit":"", critCount?"ctrl-crit":"") + '</div>';
   const src = D.imported ? "Imported CSV — Defender Recommendations export." : (window.EP && EP.DEMO) ? "Demo data." : "Live — Defender secure-config via advanced hunting.";
   const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> Each row is a security control from the Defender secure-configuration assessment — the gaps that turn a covered device into a soft one. Expand a control for its risk, the failing devices and the exact remediation. Severity is derived from the control’s configuration impact (1–10). <b>Computers only:</b> secure-configuration (ASR, baselines, BitLocker, firewall) is a Windows concept — iOS / Android have no equivalent, so mobile hardening is tracked as its <b>Compliance</b> posture instead.</div>';
   // Static platform-scope label — Hardening is computers-only, so a pill (not a toggle) keeps it visually
@@ -6514,7 +6559,7 @@ function wireView(){
   const root = document.getElementById("hard-root"); if (!root || _wired) return; _wired = true;
   root.addEventListener("click", e => {
     const view = e.target.closest("[data-view]");
-    const kpi  = e.target.closest("[data-kpi]");
+    const nav  = e.target.closest("[data-nav]");
     const jump = e.target.closest("[data-ctrl-jump]");
     const chip = e.target.closest("[data-dev]");
     const h    = e.target.closest("th[data-sort]");
@@ -6528,7 +6573,10 @@ function wireView(){
     if (dmin2){ STATE.devMin2 = !STATE.devMin2; render(LAST); return; }
     if (dif){ STATE.devIF = !STATE.devIF; render(LAST); return; }
     if (dclr){ STATE.devGroup = ""; render(LAST); return; }
-    if (kpi){ STATE.view="control"; STATE.sortCol="sev"; STATE.sortDir="desc"; STATE.sev = kpi.getAttribute("data-kpi")==="crit"?"Critical":""; render(LAST); return; }
+    if (nav){ const k = nav.getAttribute("data-nav");
+      if (k==="dev-fail"){ STATE.view="device"; STATE.devGroup=""; STATE.devMin2=false; STATE.devIF=false; }
+      else { STATE.view="control"; STATE.sortCol="sev"; STATE.sortDir="desc"; STATE.cat=""; STATE.sev = (k==="ctrl-crit")?"Critical":""; }
+      render(LAST); return; }
     if (jump){ e.stopPropagation(); const id = jump.getAttribute("data-ctrl-jump"); STATE.view="control"; STATE.sev=""; STATE.cat=""; STATE.q=""; STATE.ctrlExpanded = { [id]: true }; render(LAST);
       const r = document.getElementById("hard-root"); if (r) r.scrollIntoView({ behavior:"smooth", block:"start" }); return; }
     if (chip){ e.stopPropagation(); if (window.EP && EP.goto) EP.goto("devices", { search: chip.getAttribute("data-dev") }); return; }
@@ -7381,6 +7429,28 @@ const NEEDS_EXP = { needsExp:true };
 let LAST = null, NODES = [], EDGES = [], PATHS = [], NODE_MAP = {}, _cy = null, _wired = false;
 let GNODES = [], GEDGES = [];   // the DISPLAYED graph = the ONE active attack path (not the whole fetched subgraph)
 const STATE = { focus:"", pathFilter:"" };   // focus = selected path id (empty = worst); pathFilter = KPI filter ("" | "veryhigh")
+let NARR = {}, _narrBusy = "";   // AI path narration keyed by path id; _narrBusy = id being narrated
+// Grounded AI narration — the local model explains ONE attack path from the computed nodes/edges/cut only.
+const NARR_SYSTEM = [
+  "You are a security analyst explaining ONE attack path over Microsoft's enterprise exposure graph, to a defender.",
+  "Write 2-3 short plain-English sentences: how an attacker moves from the entry point to the critical asset, step by step, then name the single highest-value fix (the cut).",
+  "Use ONLY the nodes, edges and cut given. Never invent a host, identity, CVE, permission or number.",
+  "Read-only: recommend the fix, never claim anything was changed."
+].join("\n");
+function narrDigest(p){
+  const seq = (p.seq||[]).map((id,i) => { const n = nodeOf(id)||{}; return { step:i+1, name: displayLabel(n), kind: AP_KINDLBL[n.kind]||n.kind, critical: !!n.crit, criticality: n.crit||null }; });
+  const edges = [];
+  for (let i=0;i<(p.seq||[]).length-1;i++){ const a=p.seq[i], b=p.seq[i+1]; const e = EDGES.find(x => x.from===a && x.to===b); edges.push({ from: displayLabel(nodeOf(a)), to: displayLabel(nodeOf(b)), how: (e&&e.label)||"" }); }
+  const t = nodeOf(p.seq[p.seq.length-1]) || {};
+  return JSON.stringify({ target: displayLabel(t), targetCriticality: t.crit||"", severity: p.sev, hops: (p.seq||[]).length-1, steps: seq, edges, cut: p.cut ? p.cut.fix : "" }, null, 1);
+}
+async function runNarr(){
+  const p = activePath(); if (!p || !(window.EP && EP.llmComplete) || _narrBusy) return;
+  _narrBusy = p.id; render(LAST);
+  try { const raw = await EP.llmComplete(NARR_SYSTEM, narrDigest(p), { temperature: 0.2, max_tokens: 200 }); NARR[p.id] = String(raw||"").trim() || "(no narration returned)"; }
+  catch(e){ NARR[p.id] = "AI unavailable — " + (e && (e.message||String(e))); }
+  _narrBusy = ""; render(LAST);
+}
 function nodeOf(id){ return NODE_MAP[id] || null; }
 function isCrit(n){ return !!(n && n.crit); }
 function isVeryHighTarget(p){ const t = NODE_MAP[p.seq[p.seq.length-1]]; return !!(t && t.crit === "Very high"); }
@@ -7594,8 +7664,15 @@ function render(D){
   const graphSub = fpaths.length
     ? ('showing path to ' + (actTarget?esc(displayLabel(actTarget)):'critical asset') + ' · ' + (actIdx+1) + ' of ' + fpaths.length + (pf==="veryhigh"?" Very-high":"") + ' · click a path below to switch')
     : "";
+  const aiReady = !!(window.EP && EP.llm && EP.llm.ready());
+  const narrTxt = act ? NARR[act.id] : null;
+  const explain = (aiReady && act) ? '<span class="ap-explain" id="ap-explain" role="button" tabindex="0" title="Narrate this path with your local model — grounded in the path above, nothing leaves the machine.">✦ Explain this path</span>' : '';
+  const narrBox = narrTxt
+    ? '<div class="ap-narr"><b>✦ AI.</b> ' + esc(narrTxt) + '<span class="cap">Grounded in this path' + ((window.EP&&EP.llm)?(' · ' + esc(EP.llm.provider) + ' · ' + esc(EP.llm.model)):'') + ' — nothing invented.</span></div>'
+    : ((act && _narrBusy===act.id) ? '<div class="ap-narr ap-narr-busy">✦ narrating this path…</div>' : '');
   const graph = GNODES.length
-    ? '<div class="ap-graph"><div class="ap-graph-h">⤳ Enterprise exposure graph <span class="sub">' + graphSub + '</span></div>'
+    ? '<div class="ap-graph"><div class="ap-graph-h">⤳ Enterprise exposure graph <span class="sub">' + graphSub + '</span>' + explain + '</div>'
+      + narrBox
       + '<div class="ap-cy" id="ap-cy"></div>'
       + '<div class="ap-legend">' + legend + '</div></div>'
     : '<div class="ap-panel"><div class="ap-empty">No exposure-graph nodes to draw.</div></div>';
@@ -7615,6 +7692,8 @@ function wireView(){
   const root = document.getElementById("ap-root"); if (!root || _wired) return; _wired = true;
   const scrollTo = sel => { const el = document.querySelector(sel); if (el) el.scrollIntoView({ behavior:"smooth", block:"center" }); };
   root.addEventListener("click", e => {
+    const explainBtn = e.target.closest("#ap-explain");
+    if (explainBtn){ runNarr(); return; }
     const kpiEl = e.target.closest("[data-kpi]");
     if (kpiEl){ const k = kpiEl.getAttribute("data-kpi");
       if (k === "veryhigh"){ STATE.pathFilter = STATE.pathFilter==="veryhigh" ? "" : "veryhigh"; STATE.focus=""; render(LAST); scrollTo(".ap-graph"); }
