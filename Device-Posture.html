@@ -1240,6 +1240,7 @@
   <button class="nav" data-view="vuln">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 4 2.8 20h18.4L12 4Z" stroke-linejoin="round"/><path d="M12 10v4M12 17h.01" stroke-linecap="round"/></svg>
     Vulnerabilities</button>
+  <div class="ep-nav-sect">Active threats</div>
   <button class="nav" data-view="threat">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="7"/><path d="M12 2v3.5M12 18.5V22M2 12h3.5M18.5 12H22" stroke-linecap="round"/><circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none"/></svg>
     Threat</button>
@@ -6783,19 +6784,22 @@ async function hunt(q){
 async function huntAlerts(){
   // AlertInfo has no Status column in advanced hunting (status lives in the incidents API), so every alert
   // in the window is treated as an active/recent threat. No ServiceSource filter — we want EVERY Defender alert
-  // that maps to a device (XDR correlation surfaces endpoint threats under several sources); the device-entity
-  // inner join is what keeps this device-centric (alerts with no Device entity — e.g. identity/AI-agent alerts —
-  // belong to an identity surface, not here). Device evidence often carries a DeviceId with an EMPTY DeviceName,
-  // so we accept either and coalesce the name to the id — otherwise endpoint alerts get wrongly swept into the
-  // identity bucket. Columns used are all valid AlertInfo/AlertEvidence fields.
+  // that maps to a device (XDR correlation surfaces endpoint threats under several sources). The device link in
+  // AlertEvidence lives on DeviceId across evidence rows of ANY EntityType (not only EntityType=='Device'), so
+  // we join on isnotempty(DeviceId) — exactly as the Devices page does — and resolve DeviceId → DeviceName via
+  // DeviceInfo. Filtering on EntityType=='Device' missed the link entirely and swept endpoint alerts into the
+  // identity bucket. Alerts with NO DeviceId on any evidence row are the true identity/agent surface (handled by
+  // huntIdentityAlerts). Columns used are all valid AlertInfo/AlertEvidence/DeviceInfo fields.
   const q = "AlertInfo | where Timestamp > ago(30d)"
-    + " | join kind=inner (AlertEvidence | where EntityType == 'Device' and (isnotempty(DeviceName) or isnotempty(DeviceId)) | extend DeviceName = coalesce(DeviceName, DeviceId) | distinct AlertId, DeviceName) on AlertId"
-    + " | summarize Title=any(Title), Severity=any(Severity), Category=any(Category), DetectionSource=any(DetectionSource), Techniques=any(AttackTechniques), LastSeen=max(Timestamp) by AlertId, DeviceName"
+    + " | join kind=inner (AlertEvidence | where Timestamp > ago(30d) and isnotempty(DeviceId) | distinct AlertId, DeviceId) on AlertId"
+    + " | join kind=leftouter (DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, DeviceName) by DeviceId) on DeviceId"
+    + " | summarize Title=any(Title), Severity=any(Severity), Category=any(Category), DetectionSource=any(DetectionSource), Techniques=any(AttackTechniques), LastSeen=max(Timestamp), DeviceName=any(DeviceName) by AlertId, DeviceId"
+    + " | extend DeviceName = coalesce(DeviceName, DeviceId)"
     + " | top 2000 by LastSeen";
   const now = Date.now();
   return (await hunt(q)).map(x => ({ alertId:x.AlertId, title:x.Title||"(alert)", severity:normSev(x.Severity), category:x.Category||"Other",
     source:x.DetectionSource||"", status:"", techniques: Array.isArray(x.Techniques)?x.Techniques:(x.Techniques?[x.Techniques]:[]),
-    device:x.DeviceName, lastSeenDays: x.LastSeen ? Math.floor((now - Date.parse(x.LastSeen))/864e5) : null }));
+    device:x.DeviceName || x.DeviceId, lastSeenDays: x.LastSeen ? Math.floor((now - Date.parse(x.LastSeen))/864e5) : null }));
 }
 // Real OS per device (DeviceInfo) + internet-facing set (the filtered query — same rule as the Devices page).
 async function huntMeta(){
@@ -6827,13 +6831,14 @@ async function huntEntities(){
   } catch(e){}
   return by;
 }
-// Active Defender alerts with NO device entity (user/agent/identity alerts), with their account — so they can
-// be surfaced in their own section instead of being silently dropped by the device-centric join above.
+// Active Defender alerts with NO device at all (no DeviceId on any evidence row) — the true user/agent/identity
+// surface, with their account — so they can be surfaced separately instead of being lumped with device alerts.
+// Mirror of huntAlerts' device test (isnotempty(DeviceId)), negated, so the two sets partition the alerts.
 async function huntIdentityAlerts(){
   const now = Date.now();
   try {
     const q = "AlertInfo | where Timestamp > ago(30d)"
-      + " | join kind=leftouter (AlertEvidence | where EntityType == 'Device' and (isnotempty(DeviceName) or isnotempty(DeviceId)) | distinct AlertId) on AlertId"
+      + " | join kind=leftouter (AlertEvidence | where Timestamp > ago(30d) and isnotempty(DeviceId) | distinct AlertId) on AlertId"
       + " | where isempty(AlertId1)"
       + " | join kind=leftouter (AlertEvidence | where EntityType == 'User' | summarize Acct=take_any(coalesce(AccountUpn, AccountName)) by AlertId) on AlertId"
       + " | project AlertId, Title, Severity, Category, DetectionSource, ServiceSource, AttackTechniques, Timestamp, Acct"
