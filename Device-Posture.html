@@ -6576,8 +6576,14 @@ function demoAlerts(){
   ];
 }
 const DEMO_OS = { "Blue16-i9-64GB-2TBSSD":"Windows", "BLUE16-ATOMMAN":"Windows", "SRV000":"Windows Server", "WIN-I3OA1C8BV5I":"Windows Server", "eden-inuc":"Windows", "KIOSK-RECEP-3":"Windows" };
-const DEMO = { live:false, alerts:demoAlerts(), osByName:DEMO_OS, internetNames:["Blue16-i9-64GB-2TBSSD","WIN-I3OA1C8BV5I","SRV000"] };
-const NEEDS_DEFENDER = { needsDefender:true, alerts:[], osByName:{}, internetNames:[] };
+// Active Defender alerts that target a USER or AGENT, not an endpoint (no Device entity) — shown in their own
+// section so a tenant whose only threats are identity/agent alerts isn't left staring at an empty device matrix.
+const DEMO_IDENTITY = [
+  { alertId:"di2", title:"Suspicious obfuscated or hidden payload detected in AI agent activity", severity:"High",   account:"Derk@blue16.nl", category:"DefenseEvasion", source:"Defender for Cloud Apps", techniques:["T1027"], lastSeenDays:0 },
+  { alertId:"di1", title:"AI agent tool invocation blocked by Microsoft Defender",                severity:"Medium", account:"Derk@blue16.nl", category:"Execution",      source:"Defender for Cloud Apps", techniques:["T1059"], lastSeenDays:0 }
+];
+const DEMO = { live:false, alerts:demoAlerts(), identityAlerts:DEMO_IDENTITY, osByName:DEMO_OS, internetNames:["Blue16-i9-64GB-2TBSSD","WIN-I3OA1C8BV5I","SRV000"] };
+const NEEDS_DEFENDER = { needsDefender:true, alerts:[], identityAlerts:[], osByName:{}, internetNames:[] };
 
 let LAST = null, DEVICES = [], CATS = [], TECHS = [], ACTIVE = [], RESOLVED = 0, _wired = false;
 let NET = new Set(), OSBY = {};
@@ -6728,11 +6734,27 @@ async function huntEntities(){
   } catch(e){}
   return by;
 }
+// Active Defender alerts with NO device entity (user/agent/identity alerts), with their account — so they can
+// be surfaced in their own section instead of being silently dropped by the device-centric join above.
+async function huntIdentityAlerts(){
+  const now = Date.now();
+  try {
+    const q = "AlertInfo | where Timestamp > ago(30d)"
+      + " | join kind=leftouter (AlertEvidence | where EntityType == 'Device' and isnotempty(DeviceName) | distinct AlertId) on AlertId"
+      + " | where isempty(AlertId1)"
+      + " | join kind=leftouter (AlertEvidence | where EntityType == 'User' | summarize Acct=take_any(coalesce(AccountUpn, AccountName)) by AlertId) on AlertId"
+      + " | project AlertId, Title, Severity, Category, DetectionSource, ServiceSource, AttackTechniques, Timestamp, Acct"
+      + " | top 200 by Timestamp";
+    return (await hunt(q)).map(x => ({ alertId:x.AlertId, title:x.Title||"(alert)", severity:normSev(x.Severity), category:x.Category||"Other",
+      source:x.DetectionSource || x.ServiceSource || "", status:"", account:x.Acct || "", techniques: Array.isArray(x.AttackTechniques)?x.AttackTechniques:(x.AttackTechniques?[x.AttackTechniques]:[]),
+      lastSeenDays: x.Timestamp ? Math.floor((now - Date.parse(x.Timestamp))/864e5) : null }));
+  } catch(e){ return []; }
+}
 async function collect(){
-  const [alerts, meta, entBy] = await Promise.all([ huntAlerts(), huntMeta(), huntEntities() ]);
+  const [alerts, meta, entBy, identityAlerts] = await Promise.all([ huntAlerts(), huntMeta(), huntEntities(), huntIdentityAlerts() ]);
   // dedup entities per alert and attach
   alerts.forEach(a => { const seen = new Set(); a.entities = (entBy[a.alertId]||[]).filter(e => { const k = e.type+":"+e.label; if (seen.has(k)) return false; seen.add(k); return true; }).slice(0, 8); });
-  return { live:true, alerts, osByName:meta.osByName, internetNames:meta.internetNames };
+  return { live:true, alerts, identityAlerts, osByName:meta.osByName, internetNames:meta.internetNames };
 }
 
 // ---------- device table ----------
@@ -6758,6 +6780,7 @@ function alertBlock(a){
     + '<span class="th-alert-t">' + esc(a.title) + '</span>'
     + (a.status ? '<span class="th-status ' + st + '">' + esc(a.status) + '</span>' : '') + '</div>'
     + '<div class="th-alert-m"><span><b style="color:var(--muted)">Category</b> ' + esc(catLabel(a.category)) + '</span>'
+    + (a.account ? '<span><b style="color:var(--muted)">Account</b> ' + esc(a.account) + '</span>' : '')
     + (a.source ? '<span><b style="color:var(--muted)">Source</b> ' + esc(a.source) + '</span>' : '')
     + '<span><b style="color:var(--muted)">Seen</b> ' + ago(a.lastSeenDays) + '</span>'
     + (mitre ? '<span>' + mitre + '</span>' : '')
@@ -6854,11 +6877,13 @@ function render(D){
   CATS = buildCategories(ACTIVE);
   TECHS = buildTechniques(ACTIVE);
   const score = pageScore(DEVICES);
+  const identityAlerts = (D.identityAlerts || []).slice().sort((a,b)=>SEV_RANK[b.severity]-SEV_RANK[a.severity]);
   const root = document.getElementById("threat-root"); if (!root) return;
   const highCritDev = DEVICES.filter(KPI_TEST.highcrit).length;
+  const idNote = identityAlerts.length ? (" · " + identityAlerts.length + " identity/agent alert" + (identityAlerts.length===1?"":"s") + " (below)") : "";
   const lede = DEVICES.length
-    ? DEVICES.length + " device" + (DEVICES.length===1?"":"s") + " under active attack · " + ACTIVE.length + " active alert" + (ACTIVE.length===1?"":"s") + " · " + highCritDev + " high/critical" + (RESOLVED?(" · " + RESOLVED + " resolved in 30d"):"") + "."
-    : "No active Defender alerts in the last 30 days" + (RESOLVED?(" · " + RESOLVED + " resolved"):"") + ".";
+    ? DEVICES.length + " device" + (DEVICES.length===1?"":"s") + " under active attack · " + ACTIVE.length + " active alert" + (ACTIVE.length===1?"":"s") + " · " + highCritDev + " high/critical" + (RESOLVED?(" · " + RESOLVED + " resolved in 30d"):"") + idNote + "."
+    : ("No active endpoint threats in the last 30 days" + (RESOLVED?(" · " + RESOLVED + " resolved"):"") + idNote + ".");
   const band = '<div class="dp-band">' + EP.scoreGauge(score)
     + '<div><div class="h1">Threat · active alerts</div><div class="lede">' + esc(lede) + '</div></div></div>';
   if (D.needsDefender){
@@ -6877,7 +6902,12 @@ function render(D){
     + kpiCard("active", DEVICES.length, "Devices attacked", "any active alert (clear filter)", DEVICES.length?"high":"ok") + '</div>';
   const src = (window.EP && EP.DEMO) ? "Demo data." : "Live — device-mapped Defender alerts via advanced hunting.";
   const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> The only <i>active</i> signal in the suite — Coverage / Compliance / Hardening / Vulnerabilities are what <i>could</i> be exploited; this is what Defender sees happening now. Devices are sorted worst-first and the compounding is shown — an alert on an <b>internet-facing</b> device is the top of the list. Every alert links out to Defender to investigate; SightLine never resolves alerts. Active threats are <b>live-only</b> (alerts aren’t in any portal export, so demo / import mode show a sample).</div>';
-  root.innerHTML = band + tiles + graphPanel() + '<div class="dp-h2">Active threats across the estate</div>' + toolbar() + activeTable() + note;
+  const idSection = identityAlerts.length ? (
+    '<div class="dp-h2" style="margin-top:22px">Identity &amp; agent alerts <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">· not mapped to a device</span></div>'
+    + '<div class="dp-note" style="margin:0 0 10px;border-left-color:var(--accent)">These active Defender alerts target a <b>user or agent</b>, not an endpoint (no device entity), so they sit outside the device matrix above. The identity surface owns them — review in Entra Posture or Defender.</div>'
+    + identityAlerts.map(alertBlock).join("")
+  ) : "";
+  root.innerHTML = band + tiles + graphPanel() + '<div class="dp-h2">Active threats across the estate</div>' + toolbar() + activeTable() + idSection + note;
   repaint();
   if (STATE.graphDevice) initGraph();
   wireView();
