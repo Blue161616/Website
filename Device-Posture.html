@@ -845,6 +845,8 @@
 #view-threat .cv-dev .os { font-size:10.5px; color:var(--muted); }
 #view-threat .cv-badge { font-size:8px; font-weight:800; letter-spacing:.03em; padding:1px 6px; border-radius:5px; margin-left:6px; white-space:nowrap; }
 #view-threat .cv-inet { background:rgba(63,169,255,.16); color:var(--accent); }
+#view-threat .cv-agent { background:rgba(192,140,255,.16); color:#c08cff; }
+#view-threat .cv-userid { background:rgba(90,209,230,.16); color:#5ad1e6; }
 #view-threat .cv-num { font-variant-numeric:tabular-nums; }
 #view-threat .cv-chev { color:var(--muted); font-size:11px; width:12px; display:inline-block; }
 #view-threat .cv-cats { color:var(--muted); font-size:11.5px; }
@@ -6577,23 +6579,57 @@ function demoAlerts(){
 }
 const DEMO_OS = { "Blue16-i9-64GB-2TBSSD":"Windows", "BLUE16-ATOMMAN":"Windows", "SRV000":"Windows Server", "WIN-I3OA1C8BV5I":"Windows Server", "eden-inuc":"Windows", "KIOSK-RECEP-3":"Windows" };
 // Active Defender alerts that target a USER or AGENT, not an endpoint (no Device entity) — shown in their own
-// section so a tenant whose only threats are identity/agent alerts isn't left staring at an empty device matrix.
+// section with their own KPIs + attack graph, so a tenant whose only threats are identity/agent alerts isn't
+// left staring at an empty device matrix. Entities mirror what AlertEvidence surfaces for the same alert and
+// feed the per-identity graph (account/agent → alert → entities).
 const DEMO_IDENTITY = [
-  { alertId:"di2", title:"Suspicious obfuscated or hidden payload detected in AI agent activity", severity:"High",   account:"Derk@blue16.nl", category:"DefenseEvasion", source:"Defender for Cloud Apps", techniques:["T1027"], lastSeenDays:0 },
-  { alertId:"di1", title:"AI agent tool invocation blocked by Microsoft Defender",                severity:"Medium", account:"Derk@blue16.nl", category:"Execution",      source:"Defender for Cloud Apps", techniques:["T1059"], lastSeenDays:0 }
+  // AI-agent surface — Defender for Cloud Apps / App Governance (the alerts this page already demoed) + the
+  // WebProbe-style custom detections on API endpoints that the identity/agent surface owns.
+  { alertId:"di2", title:"Suspicious obfuscated or hidden payload detected in AI agent activity", severity:"High",   account:"Derk@blue16.nl",            category:"DefenseEvasion", source:"Defender for Cloud Apps", techniques:["T1027"], lastSeenDays:0,
+    entities:[{type:"agent",label:"Finance Copilot agent"},{type:"url",label:"/api/agents/invoke"},{type:"user",label:"Derk@blue16.nl"}] },
+  { alertId:"di1", title:"AI agent tool invocation blocked by Microsoft Defender",                severity:"Medium", account:"Derk@blue16.nl",            category:"Execution",      source:"Defender for Cloud Apps", techniques:["T1059"], lastSeenDays:0,
+    entities:[{type:"agent",label:"Finance Copilot agent"},{type:"process",label:"tool:web.fetch"}] },
+  { alertId:"di3", title:"OAuth app granted high-privilege Graph scopes by a user",               severity:"High",   account:"svc_automation@blue16.nl",  category:"Persistence",    source:"App Governance",         techniques:["T1098.001"], lastSeenDays:1,
+    entities:[{type:"agent",label:"ReportBot (app)"},{type:"user",label:"svc_automation@blue16.nl"}] },
+  // User-identity surface — Entra ID Protection / Cloud Apps risk, no device entity.
+  { alertId:"di4", title:"Atypical travel detected for user sign-in",                             severity:"Medium", account:"anne@blue16.nl",            category:"InitialAccess",  source:"Entra ID Protection",    techniques:["T1078.004"], lastSeenDays:2,
+    entities:[{type:"user",label:"anne@blue16.nl"},{type:"ip",label:"102.89.33.17"}] },
+  { alertId:"di5", title:"Unusual mass download flagged for user",                                severity:"High",   account:"anne@blue16.nl",            category:"Collection",     source:"Defender for Cloud Apps", techniques:["T1530"], lastSeenDays:1,
+    entities:[{type:"user",label:"anne@blue16.nl"},{type:"ip",label:"102.89.33.17"},{type:"url",label:"blue16.sharepoint.com/sites/Finance"}] }
 ];
 const DEMO = { live:false, alerts:demoAlerts(), identityAlerts:DEMO_IDENTITY, osByName:DEMO_OS, internetNames:["Blue16-i9-64GB-2TBSSD","WIN-I3OA1C8BV5I","SRV000"] };
 const NEEDS_DEFENDER = { needsDefender:true, alerts:[], identityAlerts:[], osByName:{}, internetNames:[] };
 
-let LAST = null, DEVICES = [], CATS = [], TECHS = [], ACTIVE = [], RESOLVED = 0, _wired = false;
+let LAST = null, DEVICES = [], CATS = [], TECHS = [], ACTIVE = [], RESOLVED = 0, IDENTITIES = [], _wired = false;
 let NET = new Set(), OSBY = {};
 function isInet(n){ return NET.has(String(n||"").toLowerCase()); }
-const STATE = { view:"device", q:"", sev:"", kpi:"", sortCol:"score", sortDir:"desc", devExpanded:{}, catExpanded:{}, techExpanded:{}, graphDevice:"" };
+const STATE = { view:"device", q:"", sev:"", kpi:"", sortCol:"score", sortDir:"desc", devExpanded:{}, catExpanded:{}, techExpanded:{}, graphDevice:"",
+  idQ:"", idSev:"", idKpi:"", idExpanded:{}, graphIdentity:"" };
 // Per-device attack graph (Cytoscape, loaded by the shell). Device at the centre → its alerts → the entities
 // each alert touched (users, IPs, URLs, files, processes). The Microsoft incident-graph picture, keyed on the device.
-const ENT_COLOR = { device:"#93ACD3", alert:"#FF5C7A", user:"#4FB8FF", ip:"#FF9A6B", url:"#5EE6B0", file:"#B48CFF", process:"#5AC8FF" };
-let _cy = null;
+const ENT_COLOR = { device:"#93ACD3", alert:"#FF5C7A", user:"#4FB8FF", ip:"#FF9A6B", url:"#5EE6B0", file:"#B48CFF", process:"#5AC8FF", identity:"#5AD1E6", agent:"#C08CFF" };
+let _cy = null, _cyId = null;
 function destroyGraph(){ if (_cy){ try{ _cy.destroy(); }catch(_){} _cy = null; } }
+function destroyGraphId(){ if (_cyId){ try{ _cyId.destroy(); }catch(_){} _cyId = null; } }
+// diamond glyph (data-URI SVG) coloured by node kind — the Microsoft incident-graph tag marker.
+function diGlyph(c){ return "data:image/svg+xml;utf8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><rect x="2.6" y="2.6" width="6.8" height="6.8" rx="1.3" transform="rotate(45 6 6)" fill="'+c+'"/></svg>'); }
+// Shared Cytoscape style — one stylesheet for both the device graph (root kind "device") and the identity /
+// agent graph (root kinds "identity" / "agent"); unused root selectors simply don't match.
+function graphStyleArr(){
+  return [
+    { selector:"node", style:{ "shape":"round-rectangle","background-color":"#0C1E45","background-opacity":0.96,"border-width":1,"border-color":"rgba(143,172,211,.4)",
+      "label":"data(label)","color":"#EAF2FF","font-size":8,"font-weight":600,"font-family":"IBM Plex Sans, sans-serif","text-valign":"center","text-halign":"center","text-wrap":"ellipsis","text-max-width":128,"text-margin-x":8,"width":"label","height":20,"padding":"9px",
+      "background-image": ele => diGlyph(ENT_COLOR[ele.data("kind")]||"#7C9CFF"),"background-width":9,"background-height":9,"background-position-x":"8px","background-position-y":"50%","background-clip":"none" } },
+    { selector:'node[kind="device"]', style:{ "border-color":"#FF4D6D","border-width":2,"color":"#FFD1D9","font-size":9.5 } },
+    { selector:'node[kind="identity"]', style:{ "border-color":"#5AD1E6","border-width":2,"color":"#D6F6FF","font-size":9.5 } },
+    { selector:'node[kind="agent"]', style:{ "border-color":"#C08CFF","border-width":2,"color":"#ECE0FF","font-size":9.5 } },
+    { selector:'node[sev="crit"]', style:{ "border-color":"#FF4D6D" } },
+    { selector:'node[sev="high"]', style:{ "border-color":"#FF9A6B" } },
+    { selector:'node[sev="med"]', style:{ "border-color":"#FFC15E" } },
+    { selector:'node[sev="low"]', style:{ "border-color":"#5EE6B0" } },
+    { selector:"edge", style:{ "width":1.3,"line-color":"rgba(143,227,255,.4)","line-style":"dashed","target-arrow-color":"rgba(143,227,255,.7)","target-arrow-shape":"triangle","arrow-scale":0.8,"curve-style":"bezier","label":"data(label)","font-size":6,"font-weight":600,"color":"#8FE3FF","text-rotation":"autorotate","text-background-color":"#0A1C42","text-background-opacity":0.85,"text-background-padding":2 } }
+  ];
+}
 function graphEls(d){
   const els = [{ data:{ id:"dev", label:d.name, kind:"device" } }], entSeen = {};
   d.alerts.forEach(a => {
@@ -6608,25 +6644,37 @@ function graphEls(d){
   });
   return els;
 }
+// Identity / agent graph elements — root = the account/agent → its alerts → the entities each touched.
+function graphIdEls(g){
+  const rootKind = g.isAgent ? "agent" : "identity";
+  const els = [{ data:{ id:"idroot", label:g.name, kind:rootKind } }], entSeen = {};
+  g.alerts.forEach(a => {
+    const aid = "ial:" + a.alertId;
+    els.push({ data:{ id:aid, label:(a.title.length>36?a.title.slice(0,34)+"…":a.title), kind:"alert", sev:(SEV_CLS[a.severity]||"low") } });
+    els.push({ data:{ id:"ied_"+aid, source:"idroot", target:aid, label:a.severity.toLowerCase() } });
+    (a.entities||[]).forEach(e => {
+      const eid = "ien:" + e.type + ":" + e.label;
+      if (!entSeen[eid]){ entSeen[eid] = 1; els.push({ data:{ id:eid, label:e.label, kind:e.type } }); }
+      els.push({ data:{ id:"ie_"+aid+"_"+eid, source:aid, target:eid, label:e.type } });
+    });
+  });
+  return els;
+}
 function initGraph(){
   destroyGraph();
   const host = document.getElementById("th-cy"); if (!host || typeof cytoscape === "undefined") return;
   const d = DEVICES.find(x => x.name === STATE.graphDevice); if (!d) return;
-  const DI = c => "data:image/svg+xml;utf8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><rect x="2.6" y="2.6" width="6.8" height="6.8" rx="1.3" transform="rotate(45 6 6)" fill="'+c+'"/></svg>');
   _cy = cytoscape({ container:host, elements:graphEls(d), layout:{ name:"breadthfirst", directed:true, roots:"#dev", padding:24, spacingFactor:1.2 },
-    minZoom:0.3, maxZoom:2.5, wheelSensitivity:0.25, pixelRatio:2,
-    style:[
-      { selector:"node", style:{ "shape":"round-rectangle","background-color":"#0C1E45","background-opacity":0.96,"border-width":1,"border-color":"rgba(143,172,211,.4)",
-        "label":"data(label)","color":"#EAF2FF","font-size":8,"font-weight":600,"font-family":"IBM Plex Sans, sans-serif","text-valign":"center","text-halign":"center","text-wrap":"ellipsis","text-max-width":128,"text-margin-x":8,"width":"label","height":20,"padding":"9px",
-        "background-image": ele => DI(ENT_COLOR[ele.data("kind")]||"#7C9CFF"),"background-width":9,"background-height":9,"background-position-x":"8px","background-position-y":"50%","background-clip":"none" } },
-      { selector:'node[kind="device"]', style:{ "border-color":"#FF4D6D","border-width":2,"color":"#FFD1D9","font-size":9.5 } },
-      { selector:'node[sev="crit"]', style:{ "border-color":"#FF4D6D" } },
-      { selector:'node[sev="high"]', style:{ "border-color":"#FF9A6B" } },
-      { selector:'node[sev="med"]', style:{ "border-color":"#FFC15E" } },
-      { selector:'node[sev="low"]', style:{ "border-color":"#5EE6B0" } },
-      { selector:"edge", style:{ "width":1.3,"line-color":"rgba(143,227,255,.4)","line-style":"dashed","target-arrow-color":"rgba(143,227,255,.7)","target-arrow-shape":"triangle","arrow-scale":0.8,"curve-style":"bezier","label":"data(label)","font-size":6,"font-weight":600,"color":"#8FE3FF","text-rotation":"autorotate","text-background-color":"#0A1C42","text-background-opacity":0.85,"text-background-padding":2 } }
-    ] });
+    minZoom:0.3, maxZoom:2.5, wheelSensitivity:0.25, pixelRatio:2, style:graphStyleArr() });
   setTimeout(() => { if (_cy){ try{ _cy.resize(); _cy.fit(undefined,26); _cy.zoom(Math.max(0.5,Math.min(1.3,_cy.zoom()))); _cy.center(); }catch(_){} } }, 70);
+}
+function initGraphId(){
+  destroyGraphId();
+  const host = document.getElementById("thid-cy"); if (!host || typeof cytoscape === "undefined") return;
+  const g = IDENTITIES.find(x => x.name === STATE.graphIdentity); if (!g) return;
+  _cyId = cytoscape({ container:host, elements:graphIdEls(g), layout:{ name:"breadthfirst", directed:true, roots:"#idroot", padding:24, spacingFactor:1.2 },
+    minZoom:0.3, maxZoom:2.5, wheelSensitivity:0.25, pixelRatio:2, style:graphStyleArr() });
+  setTimeout(() => { if (_cyId){ try{ _cyId.resize(); _cyId.fit(undefined,26); _cyId.zoom(Math.max(0.5,Math.min(1.3,_cyId.zoom()))); _cyId.center(); }catch(_){} } }, 70);
 }
 function graphPanel(){
   if (!STATE.graphDevice) return "";
@@ -6634,6 +6682,16 @@ function graphPanel(){
   const legend = [["device","Device"],["alert","Alert"],["user","User"],["ip","IP"],["url","URL"],["file","File"],["process","Process"]].map(([k,l]) => '<span><i style="background:'+ENT_COLOR[k]+'"></i>'+l+'</span>').join("");
   return '<div class="th-graph"><div class="th-graph-h">⤳ Attack graph — ' + esc(d.name) + ' <span class="sub">' + d.activeCount + ' alert' + (d.activeCount===1?"":"s") + ' · entities touched</span><button class="th-graph-x" id="th-graph-close">✕ close</button></div>'
     + '<div class="th-cy" id="th-cy"></div>'
+    + '<div class="th-legend">' + legend + '<span style="margin-left:auto">drag nodes · scroll to zoom</span></div></div>';
+}
+// Identity / agent attack graph panel — the mirror of graphPanel() for the no-device alerts section.
+function graphPanelId(){
+  if (!STATE.graphIdentity) return "";
+  const g = IDENTITIES.find(x => x.name === STATE.graphIdentity); if (!g) return "";
+  const rootKind = g.isAgent ? "agent" : "identity";
+  const legend = [[rootKind, g.isAgent?"Agent / app":"Identity"],["alert","Alert"],["user","User"],["ip","IP"],["url","URL"],["file","File"],["process","Process"]].map(([k,l]) => '<span><i style="background:'+ENT_COLOR[k]+'"></i>'+l+'</span>').join("");
+  return '<div class="th-graph" id="th-graph-id"><div class="th-graph-h">⤳ Attack graph — ' + esc(g.name) + ' <span class="sub">' + (g.isAgent?"agent / app · ":"identity · ") + g.activeCount + ' alert' + (g.activeCount===1?"":"s") + ' · entities touched</span><button class="th-graph-x" id="th-graph-close-id">✕ close</button></div>'
+    + '<div class="th-cy" id="thid-cy"></div>'
     + '<div class="th-legend">' + legend + '<span style="margin-left:auto">drag nodes · scroll to zoom</span></div></div>';
 }
 
@@ -6680,6 +6738,36 @@ function buildTechniques(active){
   return Object.values(map).map(g => ({ id:g.id, alerts:g.alerts, count:g.alerts.length, devices:[...g.devices], deviceCount:g.devices.size,
     worstSev: g.worst>=4?"Critical":g.worst>=3?"High":g.worst>=2?"Medium":"Low" }));
 }
+
+// ---- identity / agent (no-device) alerts ----
+// Heuristic: is this an AI-agent / OAuth-app alert (vs a plain user-identity alert)? Title keywords only —
+// source alone is ambiguous (Defender for Cloud Apps raises both agent and user-risk alerts).
+function isAgentAlert(a){ return /\bagent\b|copilot|\bai\b|oauth app|app governance|autonomous|non-?human/i.test((a.title||"") + " " + (a.source||"")); }
+// Group the no-device alerts by account/agent — the identity analog of buildDevices(). isAgent = the whole
+// group is an agent/app identity (every alert on it is an agent alert); agentCount keeps the per-group tally.
+function buildIdentities(list){
+  const map = {};
+  list.forEach(a => {
+    const key = (a.account||"").trim() || "Unattributed";
+    const g = map[key] || (map[key] = { name:key, alerts:[], cats:new Set(), techs:new Set(), worst:0, lastSeenDays:null, agentCount:0 });
+    g.alerts.push(a); g.cats.add(a.category); (a.techniques||[]).forEach(t => g.techs.add(t));
+    const rk = SEV_RANK[a.severity]||0; if (rk > g.worst) g.worst = rk;
+    if (isAgentAlert(a)) g.agentCount++;
+    if (a.lastSeenDays != null && (g.lastSeenDays == null || a.lastSeenDays < g.lastSeenDays)) g.lastSeenDays = a.lastSeenDays;
+  });
+  return Object.values(map).map(g => {
+    const worstSev = g.worst>=4?"Critical":g.worst>=3?"High":g.worst>=2?"Medium":"Low";
+    return { name:g.name, alerts:g.alerts.slice().sort((a,b)=>(SEV_RANK[b.severity]-SEV_RANK[a.severity])||((a.lastSeenDays||0)-(b.lastSeenDays||0))),
+      activeCount:g.alerts.length, cats:[...g.cats], techs:[...g.techs], worstSev, isAgent:(g.agentCount>0 && g.agentCount===g.alerts.length), agentCount:g.agentCount, lastSeenDays:g.lastSeenDays };
+  }).sort((a,b)=>(SEV_RANK[b.worstSev]-SEV_RANK[a.worstSev])||(b.activeCount-a.activeCount));
+}
+const ID_KPI_TEST = {
+  idhighcrit: g => SEV_RANK[g.worstSev] >= 3,     // a High or Critical identity/agent alert
+  idagent:    g => g.isAgent,                      // an AI-agent / OAuth-app identity
+  idmulti:    g => g.activeCount >= 2,             // several alerts on one identity — sustained
+  idall:      g => true                             // any identity alert (baseline — clears the filter)
+};
+const ID_KPI_SHORT = { idhighcrit:"High/Critical", idagent:"Agent/app", idmulti:"Multiple alerts", idall:"All identities" };
 
 // ---------- live collection ----------
 async function hunt(q){
@@ -6752,8 +6840,9 @@ async function huntIdentityAlerts(){
 }
 async function collect(){
   const [alerts, meta, entBy, identityAlerts] = await Promise.all([ huntAlerts(), huntMeta(), huntEntities(), huntIdentityAlerts() ]);
-  // dedup entities per alert and attach
-  alerts.forEach(a => { const seen = new Set(); a.entities = (entBy[a.alertId]||[]).filter(e => { const k = e.type+":"+e.label; if (seen.has(k)) return false; seen.add(k); return true; }).slice(0, 8); });
+  // dedup entities per alert and attach — to both device alerts (device graph) and identity alerts (identity graph)
+  const attach = a => { const seen = new Set(); a.entities = (entBy[a.alertId]||[]).filter(e => { const k = e.type+":"+e.label; if (seen.has(k)) return false; seen.add(k); return true; }).slice(0, 8); };
+  alerts.forEach(attach); identityAlerts.forEach(attach);
   return { live:true, alerts, identityAlerts, osByName:meta.osByName, internetNames:meta.internetNames };
 }
 
@@ -6864,10 +6953,60 @@ function activeTable(){
   return '<div class="cv-wrap"><table class="cv-tbl"><thead><tr>' + head + '</tr></thead><tbody id="th-body"></tbody></table></div>';
 }
 
+// ---------- identity / agent table (mirror of the device table, scoped to the identity section) ----------
+function applyIdFilters(list){
+  const S = STATE, q = S.idQ.trim().toLowerCase();
+  return list.filter(g => {
+    if (S.idSev && g.worstSev !== S.idSev) return false;
+    if (S.idKpi && ID_KPI_TEST[S.idKpi] && !ID_KPI_TEST[S.idKpi](g)) return false;
+    if (q && !(g.name.toLowerCase().includes(q) || g.cats.some(c => catLabel(c).toLowerCase().includes(q)) || g.alerts.some(a => (a.title||"").toLowerCase().includes(q)))) return false;
+    return true;
+  });
+}
+function identityRow(g){
+  const open = !!STATE.idExpanded[g.name];
+  const cats = g.cats.map(catLabel).slice(0,3).join(" · ") + (g.cats.length>3 ? " +" + (g.cats.length-3) : "");
+  const badge = g.isAgent ? '<span class="cv-badge cv-agent" title="AI agent / OAuth-app identity">🤖 agent</span>'
+                          : '<span class="cv-badge cv-userid" title="User identity">👤 user</span>'
+                            + (g.agentCount ? '<span class="cv-badge cv-agent" title="' + g.agentCount + ' agent/app alert(s)">🤖 ' + g.agentCount + '</span>' : '');
+  const main = '<tr class="cv-trow" data-id-row="' + esc(g.name) + '">'
+    + '<td><span class="cv-chev">' + (open?'▾':'▸') + '</span></td>'
+    + '<td class="cv-dev"><span class="nm">' + esc(g.name) + '</span>' + badge + '</td>'
+    + '<td><span class="cv-sev sev-' + (SEV_CLS[g.worstSev]||"low") + '">' + g.worstSev.toUpperCase() + '</span></td>'
+    + '<td class="cv-num">' + g.activeCount + '</td>'
+    + '<td class="cv-cats">' + esc(cats) + '</td>'
+    + '<td class="cv-num">' + ago(g.lastSeenDays) + '</td></tr>';
+  if (!open) return main;
+  const detail = '<tr class="cv-detail"><td></td><td colspan="5">'
+    + '<div class="cv-kv"><b>' + g.activeCount + ' active alert' + (g.activeCount===1?"":"s") + ' on ' + esc(g.name) + ':</b></div>'
+    + g.alerts.map(alertBlock).join("")
+    + '<div style="margin-top:9px"><span class="cv-chip" data-idgraph="' + esc(g.name) + '" style="border-color:var(--accent);color:var(--accent)">⤳ Attack graph →</span></div>'
+    + '</td></tr>';
+  return main + detail;
+}
+function paintIds(){
+  const host = document.getElementById("thid-body"); if (!host) return;
+  const rows = applyIdFilters(IDENTITIES);
+  const cnt = document.getElementById("thid-count"); if (cnt) cnt.textContent = rows.length + " of " + IDENTITIES.length + (IDENTITIES.length===1?" identity":" identities");
+  host.innerHTML = rows.length ? rows.map(identityRow).join("") : '<tr><td colspan="6" class="cv-empty">No identity matches these filters.</td></tr>';
+}
+function idToolbar(){
+  return '<div class="cv-tools">'
+    + '<input id="thid-q" placeholder="Search identity, alert or category…" spellcheck="false" value="' + esc(STATE.idQ) + '">'
+    + '<select id="thid-sev"><option value="">Severity: all</option>' + ["Critical","High","Medium","Low"].map(s => '<option value="'+s+'"'+(STATE.idSev===s?" selected":"")+'>'+s+'</option>').join("") + '</select>'
+    + (STATE.idKpi ? '<button id="thid-clrkpi" class="cv-chip" style="cursor:pointer">' + esc(ID_KPI_SHORT[STATE.idKpi]||STATE.idKpi) + ' ✕</button>' : '')
+    + '<span class="cv-count" id="thid-count"></span></div>';
+}
+function idTable(){
+  return '<div class="cv-wrap"><table class="cv-tbl"><thead><tr>'
+    + '<th style="width:14px"></th><th>Identity / agent</th><th>Severity</th><th>Alerts</th><th>Categories</th><th>Last activity</th>'
+    + '</tr></thead><tbody id="thid-body"></tbody></table></div>';
+}
+
 // ---------- page render ----------
 function render(D){
   LAST = D;
-  destroyGraph();   // the innerHTML rewrite below drops the old canvas; recreate it after
+  destroyGraph(); destroyGraphId();   // the innerHTML rewrite below drops the old canvases; recreate them after
   OSBY = D.osByName || {};
   NET = new Set((D.internetNames||[]).map(n => String(n).toLowerCase()));
   const all = D.alerts || [];
@@ -6878,6 +7017,7 @@ function render(D){
   TECHS = buildTechniques(ACTIVE);
   const score = pageScore(DEVICES);
   const identityAlerts = (D.identityAlerts || []).slice().sort((a,b)=>SEV_RANK[b.severity]-SEV_RANK[a.severity]);
+  IDENTITIES = buildIdentities(identityAlerts);
   const root = document.getElementById("threat-root"); if (!root) return;
   const highCritDev = DEVICES.filter(KPI_TEST.highcrit).length;
   const idNote = identityAlerts.length ? (" · " + identityAlerts.length + " identity/agent alert" + (identityAlerts.length===1?"":"s") + " (below)") : "";
@@ -6902,14 +7042,29 @@ function render(D){
     + kpiCard("active", DEVICES.length, "Devices attacked", "any active alert (clear filter)", DEVICES.length?"high":"ok") + '</div>';
   const src = (window.EP && EP.DEMO) ? "Demo data." : "Live — device-mapped Defender alerts via advanced hunting.";
   const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> The only <i>active</i> signal in the suite — Coverage / Compliance / Hardening / Vulnerabilities are what <i>could</i> be exploited; this is what Defender sees happening now. Devices are sorted worst-first and the compounding is shown — an alert on an <b>internet-facing</b> device is the top of the list. Every alert links out to Defender to investigate; SightLine never resolves alerts. Active threats are <b>live-only</b> (alerts aren’t in any portal export, so demo / import mode show a sample).</div>';
-  const idSection = identityAlerts.length ? (
+  // ---- identity / agent section: its own KPI strip + attack graph + table (mirror of the device half) ----
+  const highCritId = IDENTITIES.filter(ID_KPI_TEST.idhighcrit).length;
+  const agentId = IDENTITIES.filter(ID_KPI_TEST.idagent).length;
+  const multiId = IDENTITIES.filter(ID_KPI_TEST.idmulti).length;
+  const idKpiCard = (key, v, label, sub, cls) => '<div class="dp-tile ' + (cls||"") + ' clickable' + (STATE.idKpi===key?" on":"") + '" data-idkpi="' + key + '"><div class="v">' + v + '</div><div class="l">' + label + '</div><div class="kpi-sub">' + sub + '</div></div>';
+  const idTiles = '<div class="dp-tiles">'
+    + idKpiCard("idhighcrit", highCritId, "High / Critical", "a high-severity identity alert", highCritId?"crit":"ok")
+    + idKpiCard("idagent", agentId, "Agent / app", "AI-agent or OAuth-app identity", agentId?"high":"ok")
+    + idKpiCard("idmulti", multiId, "Multiple alerts", "2+ alerts on one identity", multiId?"high":"ok")
+    + idKpiCard("idall", IDENTITIES.length, "Identities affected", "any identity alert (clear filter)", IDENTITIES.length?"high":"ok") + '</div>';
+  const idSection = IDENTITIES.length ? (
     '<div class="dp-h2" style="margin-top:22px">Identity &amp; agent alerts <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">· not mapped to a device</span></div>'
-    + '<div class="dp-note" style="margin:0 0 10px;border-left-color:var(--accent)">These active Defender alerts target a <b>user or agent</b>, not an endpoint (no device entity), so they sit outside the device matrix above. The identity surface owns them — review in Entra Posture or Defender.</div>'
-    + identityAlerts.map(alertBlock).join("")
+    + '<div class="dp-note" style="margin:0 0 12px;border-left-color:var(--accent)">These active Defender alerts target a <b>user or agent</b>, not an endpoint (no device entity), so they sit outside the device matrix above. Their own KPIs, matrix and attack graph are below — the identity surface owns them (review in Entra Posture or Defender).</div>'
+    + idTiles + graphPanelId() + idToolbar() + idTable()
   ) : "";
-  root.innerHTML = band + tiles + graphPanel() + '<div class="dp-h2">Active threats across the estate</div>' + toolbar() + activeTable() + idSection + note;
-  repaint();
-  if (STATE.graphDevice) initGraph();
+  // The device half renders exactly as before when devices exist; when there are none (e.g. every active alert
+  // is identity/agent), collapse its empty KPIs/matrix to a one-line note so the top doesn't read empty.
+  const deviceBlock = DEVICES.length
+    ? (tiles + graphPanel() + '<div class="dp-h2">Active threats across the estate</div>' + toolbar() + activeTable())
+    : '<div class="dp-note" style="margin:2px 0 6px"><b>No device-mapped alerts in the last 30 days.</b> Every active threat is on the identity / agent surface — see below.</div>';
+  root.innerHTML = band + deviceBlock + idSection + note;
+  if (DEVICES.length){ repaint(); if (STATE.graphDevice) initGraph(); }
+  if (IDENTITIES.length){ paintIds(); if (STATE.graphIdentity) initGraphId(); }
   wireView();
 }
 function wireView(){
@@ -6920,25 +7075,40 @@ function wireView(){
     const clrk = e.target.closest("#th-clrkpi");
     const graph= e.target.closest("[data-graph]");
     const gclose = e.target.closest("#th-graph-close");
+    const idkpi  = e.target.closest("[data-idkpi]");
+    const idclrk = e.target.closest("#thid-clrkpi");
+    const idgraph= e.target.closest("[data-idgraph]");
+    const idgclose = e.target.closest("#th-graph-close-id");
     const chip = e.target.closest("[data-dev]");
     const h    = e.target.closest("th[data-sort]");
     const row  = e.target.closest(".cv-trow");
     if (graph){ e.stopPropagation(); STATE.graphDevice = graph.getAttribute("data-graph"); render(LAST); const g = document.querySelector(".th-graph"); if (g) g.scrollIntoView({ behavior:"smooth", block:"center" }); return; }
     if (gclose){ STATE.graphDevice = ""; render(LAST); return; }
+    if (idgraph){ e.stopPropagation(); STATE.graphIdentity = idgraph.getAttribute("data-idgraph"); render(LAST); const g = document.getElementById("th-graph-id"); if (g) g.scrollIntoView({ behavior:"smooth", block:"center" }); return; }
+    if (idgclose){ STATE.graphIdentity = ""; render(LAST); return; }
     if (kpi){ const k = kpi.getAttribute("data-kpi"); STATE.kpi = (STATE.kpi===k || k==="active") ? "" : k; STATE.view="device"; render(LAST); return; }
     if (clrk){ STATE.kpi=""; render(LAST); return; }
+    if (idkpi){ const k = idkpi.getAttribute("data-idkpi"); STATE.idKpi = (STATE.idKpi===k || k==="idall") ? "" : k; render(LAST); const s = document.getElementById("thid-body"); if (s && s.closest(".cv-wrap")) s.closest(".cv-wrap").scrollIntoView({ behavior:"smooth", block:"center" }); return; }
+    if (idclrk){ STATE.idKpi=""; render(LAST); return; }
     if (view){ const v = view.getAttribute("data-view"); if (v !== STATE.view){ STATE.view = v; render(LAST); } return; }
     if (chip){ e.stopPropagation(); if (window.EP && EP.goto) EP.goto("devices", { search: chip.getAttribute("data-dev") }); return; }
     if (h){ const col = h.getAttribute("data-sort"); if (STATE.sortCol===col) STATE.sortDir = STATE.sortDir==="asc"?"desc":"asc"; else { STATE.sortCol=col; STATE.sortDir=(col==="device")?"asc":"desc"; } paintDevs(); return; }
     if (row){
       if (row.hasAttribute("data-dev-row")){ const id=row.getAttribute("data-dev-row"); STATE.devExpanded[id]=!STATE.devExpanded[id]; paintDevs(); }
+      else if (row.hasAttribute("data-id-row")){ const id=row.getAttribute("data-id-row"); STATE.idExpanded[id]=!STATE.idExpanded[id]; paintIds(); }
       else if (row.hasAttribute("data-cat")){ const id=row.getAttribute("data-cat"); STATE.catExpanded[id]=!STATE.catExpanded[id]; paintGroups("cat"); }
       else if (row.hasAttribute("data-tech")){ const id=row.getAttribute("data-tech"); STATE.techExpanded[id]=!STATE.techExpanded[id]; paintGroups("tech"); }
       return;
     }
   });
-  root.addEventListener("input", e => { if (e.target.id === "th-q"){ STATE.q = e.target.value; repaint(); } });
-  root.addEventListener("change", e => { if (e.target.id === "th-sev"){ STATE.sev = e.target.value; repaint(); } });
+  root.addEventListener("input", e => {
+    if (e.target.id === "th-q"){ STATE.q = e.target.value; repaint(); }
+    else if (e.target.id === "thid-q"){ STATE.idQ = e.target.value; paintIds(); }
+  });
+  root.addEventListener("change", e => {
+    if (e.target.id === "th-sev"){ STATE.sev = e.target.value; repaint(); }
+    else if (e.target.id === "thid-sev"){ STATE.idSev = e.target.value; paintIds(); }
+  });
 }
 async function analyze(){
   const root = document.getElementById("threat-root");
