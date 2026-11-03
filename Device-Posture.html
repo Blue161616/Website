@@ -459,7 +459,7 @@
 #view-coverage .dp-score .g { font-size:10px; letter-spacing:.14em; color:var(--muted); margin-top:3px; }
 #view-coverage .dp-band .h1 { font-size:17px; font-weight:800; color:var(--text); }
 #view-coverage .dp-band .lede { font-size:12.5px; color:var(--muted); margin-top:3px; max-width:640px; line-height:1.5; }
-#view-coverage .dp-tiles { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin:0 0 16px; }
+#view-coverage .dp-tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:0 0 16px; }
 #view-coverage .dp-tile { border:1px solid var(--border); border-radius:11px; padding:12px 14px; background:var(--card); }
 #view-coverage .dp-tile .v { font-size:22px; font-weight:800; color:var(--text); font-variant-numeric:tabular-nums; }
 #view-coverage .dp-tile .l { font-size:11px; color:var(--muted); margin-top:3px; line-height:1.4; }
@@ -526,6 +526,7 @@
 #view-coverage .cov-c.on { background:rgba(94,230,176,.18); color:var(--sev-low); border-color:transparent; }
 #view-coverage .cov-c.off { color:var(--sev-crit); border-color:rgba(255,90,110,.35); }
 #view-coverage .cov-c.na { color:var(--muted); opacity:.6; }
+#view-coverage .cov-c.warn { color:var(--sev-high); border-color:rgba(255,154,107,.45); }
 @media (max-width:760px) {
 #view-coverage .dp-tiles { grid-template-columns:repeat(2,1fr); }
 #view-coverage .cv-drow { flex-wrap:wrap; }
@@ -542,6 +543,7 @@
 #view-coverage .hw-dev .os { font-size:10px; color:var(--muted); font-weight:500; }
 #view-coverage .hw-sc { display:inline-flex; align-items:center; justify-content:center; width:34px; height:24px; border-radius:7px; font-weight:800; font-size:12px; font-variant-numeric:tabular-nums; border:1px solid var(--border); }
 #view-coverage .hw-stale { font-size:8px; font-weight:800; letter-spacing:.03em; padding:1px 5px; border-radius:5px; background:rgba(255,154,107,.16); color:var(--sev-high); margin-left:6px; }
+#view-coverage .hw-excl { font-size:8px; font-weight:800; letter-spacing:.03em; padding:1px 5px; border-radius:5px; background:rgba(180,140,255,.18); color:#C9B0FF; margin-left:6px; }
 #view-coverage .hw-foot { margin-top:11px; font-size:11px; color:var(--muted); border-left:2px solid var(--border); padding:3px 0 3px 12px; line-height:1.5; }
 #view-coverage .hw-jump { display:inline-block; font-size:10.5px; padding:2px 9px; border:1px solid var(--border); border-radius:999px; cursor:pointer; color:var(--text); }
 #view-coverage .hw-jump:hover { border-color:var(--accent); color:var(--accent); }
@@ -4879,6 +4881,7 @@ EP.registerView("coverage", (function () {
 function esc(s){ return window.EP ? EP.esc(s) : String(s==null?"":s); }
 const SEV_RANK = { crit:4, high:3, med:2, low:1 };
 function normName(s){ s = String(s||"").trim().toLowerCase(); const dot = s.indexOf("."); if (dot>0) s = s.slice(0,dot); return s; }
+function truthy(v){ return v===true || /^(true|1|yes)$/i.test(String(v==null?"":v).trim()); }   // IsExcluded can arrive as bool or string
 // Device criticality (Defender AssetValue + DeviceRoles): High value or a sensitive role (DC / CA / Exchange /
 // DNS / SQL / …) makes a device critical, so a gap on it floats to the top. Read-only; same scope.
 function isSensitiveRole(r){ return /domain controller|certificat|\bca\b|exchange|\bdns\b|\bdhcp\b|\bsql\b|hyper-?v|identity|key vault/i.test(String(r||"")); }
@@ -4905,10 +4908,23 @@ function platformClass(category, deviceType, os){
   return (/mobile|tablet/.test(dt) || /ios|ipad|iphone|android/.test(s)) ? "mobile" : "computer";
 }
 
+// Defender EDR sensor health (DeviceInfo.SensorHealthState): "Active" is healthy; "Inactive" / "Misconfigured" /
+// "Impaired communications" / "No sensor data" all mean the sensor is onboarded but NOT reporting — a protection
+// blind spot (the device looks covered, but EDR is blind). Empty for non-onboarded devices. Computers only.
+function sensorUnhealthy(d){ return d.platform === "computer" && d.mde === 1 && !!d.sensorHealth && !/^active$/i.test(String(d.sensorHealth).trim()); }
+// Excluded from Microsoft Defender for Vulnerability Management (DeviceInfo.IsExcluded): the device silently drops
+// out of Hardening / Vulnerabilities, so a clean vuln score can just mean "excluded". Computers only (TVM is a
+// computer control). ExclusionReason carries the why.
+function isExcluded(d){ return d.platform === "computer" && !!d.excluded; }
+
 // Coverage GAP catalogue — each predicate turns a device into a "missing coverage" row.
 const GAPS = [
   { key:"nosensor", sev:"crit", mde:true, title:"No Defender for Endpoint sensor (EDR blind spot)", test:d => d.entra && d.mde === 0 && d.platform === "computer",
     fix:{ h:"Onboard to Defender for Endpoint", steps:["Intune → Endpoint security → Onboard devices, or deploy the MDE onboarding package / connector to these endpoints.","Without an EDR sensor they are invisible to the Hardening and Vulnerabilities pages — no telemetry, no detections."], portal:["https://security.microsoft.com/securitysettings/endpoints/onboarding","Defender onboarding"] } },
+  { key:"sensorunhealthy", sev:"crit", mde:true, title:"Defender sensor unhealthy — onboarded but not reporting", test:d => d.entra && sensorUnhealthy(d),
+    fix:{ h:"Repair the Defender for Endpoint sensor", steps:["These devices are onboarded, but the sensor state is not Active (inactive, misconfigured, impaired communications or no sensor data) — so EDR is effectively blind even though they look covered.","Check connectivity to the Defender cloud, the sensor service and the onboarding configuration; re-onboard if the sensor can't recover.","Until the sensor is Active, detection and response on these devices is unreliable."], portal:["https://security.microsoft.com/machines","Defender device inventory"] } },
+  { key:"tvmexcluded", sev:"high", mde:true, title:"Excluded from vulnerability management", test:d => d.entra && isExcluded(d),
+    fix:{ h:"Review the device exclusion", steps:["These devices are excluded from Microsoft Defender for Vulnerability Management, so they silently don't appear on the Hardening or Vulnerabilities pages — their CVEs and misconfigurations go uncounted.","Confirm the exclusion is still intentional; if not, remove it so the device is assessed again.","A clean vuln score on an excluded device means it wasn't scanned — not that it's secure."], portal:["https://security.microsoft.com/machines","Defender device inventory"] } },
   { key:"unmanaged", sev:"high", mde:false, title:"Not managed by Intune", test:d => d.entra && d.intune === 0,
     fix:{ h:"Enroll in Intune", steps:["Enroll the device in Intune (auto-enrolment via the Entra MDM scope, or manual enrolment).","Until it is managed, no compliance or configuration policy can apply to it."], portal:["https://intune.microsoft.com/#view/Microsoft_Intune_DeviceSettings/DevicesMenu/~/overview","Intune devices"] } },
   { key:"stale", sev:"high", mde:false, title:"Stale — no sign-in / sync in 30+ days", test:d => d.stale,
@@ -4935,11 +4951,13 @@ let STATE = { segment:"computer", view:"device", q:"", sev:"", sortCol:"sync", s
 //   Entra = identity/inventory · Intune = compliance enforcement · Defender = protection (EDR).
 const KPI_TEST = {
   unprot:    d => HASMDE && d.entra && d.mde === 0 && d.platform === "computer",   // no Defender sensor → unprotected (EDR blind) — computers only
+  sensorbad: d => HASMDE && d.entra && sensorUnhealthy(d),                         // onboarded but sensor not reporting → EDR blind
   unmanaged: d => d.entra && d.intune === 0,                                       // no Intune → no compliance enforcement
+  excluded:  d => d.entra && isExcluded(d),                                        // excluded from TVM → missing from Hardening / Vulnerabilities
   stale:     d => !!d.stale,                                                       // posture signals too old to trust
-  covered:   d => d.entra && d.intune === 1 && !d.stale && (d.platform === "mobile" || d.mde === 1)   // mobile: identity + compliance; computer: + protection
+  covered:   d => d.entra && d.intune === 1 && !d.stale && (d.platform === "mobile" || (d.mde === 1 && !sensorUnhealthy(d) && !isExcluded(d)))   // mobile: identity + compliance; computer: + healthy, scanned protection
 };
-const KPI_SHORT = { unprot:"Unprotected", unmanaged:"No compliance", stale:"Stale", covered:"Fully covered" };
+const KPI_SHORT = { unprot:"Unprotected", sensorbad:"Sensor unhealthy", unmanaged:"No compliance", excluded:"Excluded from TVM", stale:"Stale", covered:"Fully covered" };
 let LAST = null, DEVS = [], SEGDEVS = [], HASMDE = true, GAP_ROWS = [], COMBO_ROWS = [];
 // true when the Mobile segment is active — mobile is scored on Entra + Intune only (no Defender EDR dimension).
 function segIsMobile(){ return STATE.segment === "mobile"; }
@@ -4957,7 +4975,11 @@ function demoDevices(){
     ["HR-LAPTOP-22","Windows 11",0,0,8],["old-laptop-x1","Windows 10",0,0,95],["iPad Mini (2)","iPadOS 16",1,1,47]
   ];
   const CRIT = { "SRV000":{v:"High",r:["Domain Controller"]}, "WIN-I3OA1C8BV5I":{v:"High",r:["SQL Server"]} };
-  const devs = raw.map(r => { const c = CRIT[r[0]] || {}; return { name:r[0], os:r[1], entra:1, intune:r[2], mde:r[3], lastSyncDays:r[4], stale:(r[4]!=null && r[4]>30), assetValue:c.v, roles:c.r||[] }; });
+  // onboarded computers that look covered but aren't: a sick EDR sensor, and a device excluded from vuln scanning.
+  const SENSOR = { "miranda-medion":"Misconfigured" };
+  const EXCLUDED = { "blue16-mstlpt02":"Excluded by admin" };
+  const devs = raw.map(r => { const c = CRIT[r[0]] || {}; return { name:r[0], os:r[1], entra:1, intune:r[2], mde:r[3], lastSyncDays:r[4], stale:(r[4]!=null && r[4]>30), assetValue:c.v, roles:c.r||[],
+    sensorHealth: SENSOR[r[0]] || "", excluded: !!EXCLUDED[r[0]], exclusionReason: EXCLUDED[r[0]] || "" }; });
   devs.push({ name:"lab-vm-ephemeral", os:"Windows Server", entra:0, intune:0, mde:1, lastSyncDays:2, stale:false });   // Defender-only
   // IoT / OT devices (Defender device-discovery) — carry a DeviceCategory so they classify as "iot" and are
   // hidden from the computer/mobile segments, exactly as they are absent from the Entra-anchored Devices page.
@@ -4981,7 +5003,7 @@ async function gGetAll(path, scopes){
 }
 async function huntOnboarding(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
-  const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by DeviceId | project AadDeviceId, DeviceName, OnboardingStatus, DeviceCategory, DeviceType, OSPlatform";
+  const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by DeviceId | project AadDeviceId, DeviceName, OnboardingStatus, DeviceCategory, DeviceType, OSPlatform, SensorHealthState, IsExcluded, ExclusionReason";
   const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
   if (!r.ok){ const e2 = new Error("onboarding "+r.status); e2.status=r.status; throw e2; }
   return (await r.json()).results || [];
@@ -5019,7 +5041,8 @@ async function collect(){
     const lastSyncDays = seen ? Math.floor((now - seen)/864e5) : null;
     return { name: d.displayName || (i&&i.deviceName) || d.deviceId || "(device)", os: d.operatingSystem || (i&&i.operatingSystem) || (m&&m.OSPlatform) || "—",
       entra:1, intune: i ? 1 : 0, mde: (m && String(m.OnboardingStatus||"").toLowerCase()==="onboarded") ? 1 : (machines ? 0 : null),
-      category: m && m.DeviceCategory, deviceType: m && m.DeviceType, assetValue: m && m.AssetValue, roles: m ? parseRoles(m.DeviceRoles) : [], lastSyncDays, stale: !!(seen && (now - seen) > STALE) };
+      category: m && m.DeviceCategory, deviceType: m && m.DeviceType, assetValue: m && m.AssetValue, roles: m ? parseRoles(m.DeviceRoles) : [], lastSyncDays, stale: !!(seen && (now - seen) > STALE),
+      sensorHealth: (m && m.SensorHealthState) || "", excluded: truthy(m && m.IsExcluded), exclusionReason: (m && m.ExclusionReason) || "" };
   });
   // Defender-only machines not matched to any Entra device (endpoints Entra never enrolled). Carry their
   // DeviceCategory / DeviceType so IoT / OT / network devices classify as "iot" and are hidden (render drops them).
@@ -5028,7 +5051,7 @@ async function collect(){
     const eNames = new Set(active.map(d => normName(d.displayName)).filter(Boolean));
     machines.forEach(m => { if (String(m.OnboardingStatus||"").toLowerCase() !== "onboarded") return;
       const ak = String(m.AadDeviceId||"").toLowerCase(), nk = normName(m.DeviceName);
-      if (!(ak && eIds.has(ak)) && !(nk && eNames.has(nk))) devices.push({ name: m.DeviceName || "(defender device)", os: m.OSPlatform || "—", entra:0, intune:0, mde:1, lastSyncDays:null, stale:false, category: m.DeviceCategory, deviceType: m.DeviceType, assetValue: m.AssetValue, roles: parseRoles(m.DeviceRoles) }); });
+      if (!(ak && eIds.has(ak)) && !(nk && eNames.has(nk))) devices.push({ name: m.DeviceName || "(defender device)", os: m.OSPlatform || "—", entra:0, intune:0, mde:1, lastSyncDays:null, stale:false, category: m.DeviceCategory, deviceType: m.DeviceType, assetValue: m.AssetValue, roles: parseRoles(m.DeviceRoles), sensorHealth: m.SensorHealthState || "", excluded: truthy(m.IsExcluded), exclusionReason: m.ExclusionReason || "" }); });
   }
   try { await enrichExposureCrit(devices); } catch(e){}
   return { live:true, hasMde: !!machines, devices };
@@ -5039,7 +5062,10 @@ async function collect(){
 function covWeight(d){
   if (!d.entra) return 0;
   if (d.platform === "mobile") return d.intune === 0 ? 0.3 : d.stale ? 0.1 : 0;
-  return d.mde === 0 ? 0.6 : d.intune === 0 ? 0.3 : d.stale ? 0.1 : 0;
+  // An onboarded-but-unhealthy sensor is effectively no EDR — weight it like a missing sensor, not "covered".
+  let w = (d.mde === 0 || sensorUnhealthy(d)) ? 0.6 : d.intune === 0 ? 0.3 : d.stale ? 0.1 : 0;
+  if (isExcluded(d) && w < 0.25) w = 0.25;   // excluded from TVM is its own gap even when otherwise covered
+  return w;
 }
 function buildGaps(devices, hasMde){
   return GAPS.filter(g => hasMde || !g.mde).map(g => { const ds = devices.filter(g.test); return { key:g.key, sev:g.sev, title:g.title, fix:g.fix, devices:ds, count:ds.length }; })
@@ -5063,7 +5089,10 @@ function deviceState(d){
     return { key:"mok", sev:"low", label:"Managed" };
   }
   const c = COMBOS.filter(x => HASMDE || !x.mde).find(x => x.test(d));
-  if (c && c.key === "all" && d.stale) return { key:"stale", sev:"high", label:"Covered · stale (no sync 30d+)" };
+  if (c && c.key === "all"){
+    if (sensorUnhealthy(d)) return { key:"all", sev:"crit", label:"Covered · sensor unhealthy" };
+    if (d.stale) return { key:"stale", sev:"high", label:"Covered · stale (no sync 30d+)" };
+  }
   if (c) return { key:c.key, sev:c.sev, label:c.title };
   if (d.stale) return { key:"stale", sev:"high", label:"Stale — signal is old" };
   return { key:"all", sev:"low", label:"Covered" };
@@ -5075,8 +5104,9 @@ function covScore(d){
   }
   if (!d.entra) return 34;                                   // Defender-only: seen by EDR, unknown to Entra
   if (!HASMDE){ let s = 50 + (d.intune?50:0); if (d.stale) s -= 20; return Math.max(0, s); }
-  let s = 34 + (d.intune?33:0) + (d.mde===1?33:0);
+  let s = 34 + (d.intune?33:0) + ((d.mde===1 && !sensorUnhealthy(d))?33:0);   // no EDR credit if the sensor is unhealthy
   if (d.stale) s -= 15;
+  if (isExcluded(d)) s -= 10;
   return Math.max(0, Math.min(100, s));
 }
 function osFamilies(){ return [...new Set(SEGDEVS.map(d => (d.os||"").replace(/\s*\d.*$/, "").trim()).filter(Boolean))].sort(); }
@@ -5113,14 +5143,16 @@ function sortDevs(list){
     : col==="status" ? (SEV_RANK[deviceState(d).sev]||0) + (d.critical?0.5:0) : risk(d);
   return list.slice().sort((a,b)=>{ const ka=key(a), kb=key(b); return ka<kb?-dir:ka>kb?dir:0; });
 }
-function covCell(st){ return '<td style="text-align:center"><span class="cov-c ' + (st===1?"on":st===0?"off":"na") + '">' + (st===1?"✓":st===0?"✕":"—") + '</span></td>'; }
+function covCell(st){
+  if (st === "warn") return '<td style="text-align:center"><span class="cov-c warn" title="Onboarded, but the Defender sensor is unhealthy (not reporting)">⚠</span></td>';
+  return '<td style="text-align:center"><span class="cov-c ' + (st===1?"on":st===0?"off":"na") + '">' + (st===1?"✓":st===0?"✕":"—") + '</span></td>'; }
 function deviceRow(d){
   const open = !!STATE.devExpanded[d.name];
   const st = deviceState(d), sc = covScore(d), band = sc>=90?"low":sc>=60?"med":sc>=34?"high":"crit";
   const main = '<tr class="cv-trow" data-dev-row="' + esc(d.name) + '">'
     + '<td><span class="cv-chev">' + (open?'▾':'▸') + '</span></td>'
-    + '<td class="hw-dev"><span class="nm">' + esc(d.name) + '</span>' + critBadges(d) + '<br><span class="os">' + esc(d.os) + '</span></td>'
-    + covCell(d.entra?1:0) + covCell(d.intune?1:0) + covCell(d.platform==="mobile" ? null : d.mde)
+    + '<td class="hw-dev"><span class="nm">' + esc(d.name) + '</span>' + critBadges(d) + (isExcluded(d)?'<span class="hw-excl" title="Excluded from vulnerability management' + (d.exclusionReason?(' — ' + esc(d.exclusionReason)):'') + '">excluded</span>':'') + '<br><span class="os">' + esc(d.os) + '</span></td>'
+    + covCell(d.entra?1:0) + covCell(d.intune?1:0) + covCell(d.platform==="mobile" ? null : (sensorUnhealthy(d) ? "warn" : d.mde))
     + '<td class="cv-num">' + (d.lastSyncDays==null?"—":(d.lastSyncDays+"d")) + (d.stale?'<span class="hw-stale">stale</span>':'') + '</td>'
     + '<td><span class="cv-sev sev-' + st.sev + '">' + esc(st.label) + '</span></td>'
     + '<td><span class="hw-sc" style="color:var(--sev-' + band + ')">' + sc + '</span></td></tr>';
@@ -5168,8 +5200,8 @@ function sortRows(list){
 
 // ---------- device list (inside a gap / combo expand) ----------
 function eidChips(d){
-  const c = (lbl, st) => '<span class="cov-c ' + (st===1?"on":st===0?"off":"na") + '" title="' + lbl + (st===1?": yes":st===0?": no":": not assessed") + '">' + lbl[0] + '</span>';
-  return '<span class="cov-cs">' + c("Entra", d.entra?1:0) + c("Intune", d.intune?1:0) + c("Defender", d.mde) + '</span>';
+  const c = (lbl, st) => '<span class="cov-c ' + (st===1?"on":st===0?"off":st==="warn"?"warn":"na") + '" title="' + lbl + (st===1?": yes":st===0?": no":st==="warn"?": sensor unhealthy":": not assessed") + '">' + (st==="warn"?"⚠":lbl[0]) + '</span>';
+  return '<span class="cov-cs">' + c("Entra", d.entra?1:0) + c("Intune", d.intune?1:0) + c("Defender", sensorUnhealthy(d) ? "warn" : d.mde) + '</span>';
 }
 function devList(devices){
   return '<div class="cv-dl">' + devices.map(d => {
@@ -5305,6 +5337,8 @@ function render(D){
   // Four risk-based KPIs, each a clickable filter into the device table. Ordered by risk:
   // unprotected (no EDR) → unmanaged (no compliance) → stale → the healthy baseline. On Mobile the EDR tile is N/A.
   const kUnprot = (HASMDE && !mobile) ? SEGDEVS.filter(KPI_TEST.unprot).length : null;
+  const kSensorBad = (HASMDE && !mobile) ? SEGDEVS.filter(KPI_TEST.sensorbad).length : null;
+  const kExcluded  = (HASMDE && !mobile) ? SEGDEVS.filter(KPI_TEST.excluded).length : null;
   const kUnmanaged = SEGDEVS.filter(KPI_TEST.unmanaged).length;
   const kStale = SEGDEVS.filter(KPI_TEST.stale).length;
   const kCovered = SEGDEVS.filter(KPI_TEST.covered).length;
@@ -5317,11 +5351,13 @@ function render(D){
     + (mobile
         ? kpiCard("unprot", "—", "EDR not applicable", "mobile uses Intune MDM + app protection", "na")
         : kpiCard("unprot", kUnprot==null?"—":kUnprot, "Unprotected", "no Defender EDR — threats go undetected", kUnprot?"crit":(kUnprot==null?"na":"ok")))
+    + (mobile ? "" : kpiCard("sensorbad", kSensorBad==null?"—":kSensorBad, "Sensor unhealthy", "onboarded but EDR isn’t reporting", kSensorBad?"crit":"ok"))
     + kpiCard("unmanaged", kUnmanaged, "No compliance enforcement", "not managed by Intune — no policy baseline", kUnmanaged?"high":"ok")
+    + (mobile ? "" : kpiCard("excluded", kExcluded==null?"—":kExcluded, "Excluded from scanning", "dropped from vulnerability management", kExcluded?"high":"ok"))
     + kpiCard("stale", kStale, "Stale posture", "no sync in 30+ days — signal is old", kStale?"high":"ok")
     + kpiCard("covered", kCovered, "Fully covered", mobile ? "identity · compliance (Intune)" : "identity · compliance · protection", "ok") + '</div>';
   const src = D.imported ? ("Imported CSV — Entra + Intune" + (HASMDE ? " + Defender exports." : " exports.")) : (window.EP && EP.DEMO) ? "Demo data." : ("Live — Entra + Intune" + (HASMDE ? " + Defender (advanced hunting)." : " via Microsoft Graph."));
-  const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> Each source is a different security <b>control</b>, answering a different question: <b>Entra — is the device known?</b> (identity &amp; inventory) · <b>Intune — is it compliant?</b> (enforces policy, encryption, configuration) · <b>Defender — is it protected?</b> (EDR: threat detection &amp; response). Read the gaps by risk: <b style="color:var(--sev-crit)">no Defender</b> = unprotected — a threat on that device goes undetected (an EDR blind spot); <b style="color:var(--sev-high)">no Intune</b> = no compliance baseline is enforced (encryption, OS, config unchecked); <b style="color:var(--sev-high)">stale</b> = the posture signals are too old to trust. A device is only <b style="color:var(--sev-low)">fully covered</b> when all three see it and it is syncing. The KPIs above filter the list to each gap; <b>By gap</b> and <b>By coverage</b> give the grouped breakdowns with the exact fix.'
+  const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> Each source is a different security <b>control</b>, answering a different question: <b>Entra — is the device known?</b> (identity &amp; inventory) · <b>Intune — is it compliant?</b> (enforces policy, encryption, configuration) · <b>Defender — is it protected?</b> (EDR: threat detection &amp; response). Read the gaps by risk: <b style="color:var(--sev-crit)">no Defender</b> = unprotected — a threat on that device goes undetected (an EDR blind spot); <b style="color:var(--sev-high)">no Intune</b> = no compliance baseline is enforced (encryption, OS, config unchecked); <b style="color:var(--sev-high)">stale</b> = the posture signals are too old to trust. A device is only <b style="color:var(--sev-low)">fully covered</b> when all three see it and it is syncing. Two quieter blind spots sit on top of this: an onboarded device whose <b style="color:var(--sev-crit)">sensor is unhealthy</b> (not Active) is really unprotected — EDR is blind though the device looks covered; a device <b style="color:var(--sev-high)">excluded</b> from vulnerability management silently drops out of Hardening &amp; Vulnerabilities, so a clean score there can just mean it wasn’t scanned. The KPIs above filter the list to each gap; <b>By gap</b> and <b>By coverage</b> give the grouped breakdowns with the exact fix.'
     + ' <b>Mobile</b> is assessed on Entra + Intune only — the Defender/EDR sensor is a computer control, so phones aren’t flagged for lacking it. <b>IoT / OT / network</b> devices are managed in Defender, not here (as on the Devices page).'
     + (HASMDE ? '' : ' <b>Defender onboarding needs ThreatHunting.Read.All (advanced hunting) to complete the protection picture.</b>') + '</div>';
   const body = STATE.view === "device" ? (toolbar() + devTable()) : (toolbar() + activeTable());
@@ -7283,11 +7319,14 @@ const NEEDS_EXP = { needsExp:true };
 
 let LAST = null, NODES = [], EDGES = [], PATHS = [], NODE_MAP = {}, _cy = null, _wired = false;
 let GNODES = [], GEDGES = [];   // the DISPLAYED graph = the ONE active attack path (not the whole fetched subgraph)
-const STATE = { focus:"" };   // selected path id; empty = default to the worst (first) path
+const STATE = { focus:"", pathFilter:"" };   // focus = selected path id (empty = worst); pathFilter = KPI filter ("" | "veryhigh")
 function nodeOf(id){ return NODE_MAP[id] || null; }
 function isCrit(n){ return !!(n && n.crit); }
-// Which path the graph is showing: the explicitly selected one, else the worst (PATHS is sorted worst-first).
-function activePathId(){ return (STATE.focus && PATHS.some(p => p.id === STATE.focus)) ? STATE.focus : (PATHS[0] ? PATHS[0].id : ""); }
+function isVeryHighTarget(p){ const t = NODE_MAP[p.seq[p.seq.length-1]]; return !!(t && t.crit === "Very high"); }
+// The KPI tiles filter the path list; "veryhigh" keeps only paths that reach a Very-high (crown-jewel) asset.
+function filteredPaths(){ return STATE.pathFilter === "veryhigh" ? PATHS.filter(isVeryHighTarget) : PATHS; }
+// Which path the graph is showing: the explicitly selected one (if still visible under the filter), else the worst.
+function activePathId(){ const fp = filteredPaths(); if (STATE.focus && fp.some(p => p.id === STATE.focus)) return STATE.focus; return fp[0] ? fp[0].id : (PATHS[0] ? PATHS[0].id : ""); }
 function activePath(){ const id = activePathId(); return PATHS.find(p => p.id === id) || null; }
 // Build the display graph from ONE path (the active one): its nodes + the consecutive edges between them. Showing a
 // single path keeps every node large and readable; the user switches paths from the list below (click to isolate).
@@ -7476,28 +7515,31 @@ function render(D){
       + (D.err ? '<br><span style="color:var(--sev-high)">' + esc(D.err) + '</span>' : '') + '</div>';
     return;
   }
-  const kpi = (v, label, sub, cls) => '<div class="dp-tile ' + (cls||"") + '"><div class="v">' + v + '</div><div class="l">' + label + '</div><div class="kpi-sub">' + sub + '</div></div>';
+  const kpi = (key, v, label, sub, cls, opts) => { opts = opts || {}; const clk = opts.clickable !== false;
+    return '<div class="dp-tile ' + (cls||"") + (clk?" clickable":"") + (opts.on?" on":"") + '"' + (clk?' data-kpi="' + key + '"':'') + '><div class="v">' + v + '</div><div class="l">' + label + '</div><div class="kpi-sub">' + sub + '</div></div>'; };
+  const pf = STATE.pathFilter;
   const tiles = '<div class="dp-tiles">'
-    + kpi(PATHS.length, "Attack paths", "entry → critical asset", PATHS.length?"crit":"ok")
-    + kpi(toVeryHigh, "To a Very-high asset", "crown-jewel reachable", toVeryHigh?"crit":"ok")
-    + kpi(critTargets.length, "Critical assets exposed", "reachable from an entry point", critTargets.length?"high":"ok")
-    + kpi(chokes.length, "Choke points", "fix once, cut many paths", chokes.length?"high":"ok") + '</div>';
+    + kpi("all", PATHS.length, "Attack paths", pf?"show all paths":"entry → critical asset", PATHS.length?"crit":"ok", { on: pf==="", clickable: PATHS.length>0 })
+    + kpi("veryhigh", toVeryHigh, "To a Very-high asset", "crown-jewel reachable — filter", toVeryHigh?"crit":"ok", { on: pf==="veryhigh", clickable: toVeryHigh>0 })
+    + kpi("list", critTargets.length, "Critical assets exposed", "reachable from an entry point", critTargets.length?"high":"ok", { clickable: critTargets.length>0 })
+    + kpi("chokes", chokes.length, "Choke points", "fix once, cut many paths", chokes.length?"high":"ok", { clickable: chokes.length>0 }) + '</div>';
   const legend = [["internet","Internet"],["device","Device"],["user","Identity"],["guest","Guest"],["app","App / OAuth"],["cve","Vulnerability"]]
     .map(([k,l]) => '<span><i style="background:' + (AP_COLOR[k]||"#7C9CFF") + '"></i>' + l + '</span>').join("")
     + '<span><i class="crown" style="background:#FFD166"></i>Critical asset</span>';
+  const fpaths = filteredPaths();
   const act = activePath();
   const actTarget = act ? nodeOf(act.seq[act.seq.length-1]) : null;
-  const actIdx = PATHS.findIndex(p => p.id === activePathId());
-  const graphSub = PATHS.length
-    ? ('showing path to ' + (actTarget?esc(displayLabel(actTarget)):'critical asset') + ' · ' + (actIdx+1) + ' of ' + PATHS.length + ' · click a path below to switch')
+  const actIdx = fpaths.findIndex(p => p.id === activePathId());
+  const graphSub = fpaths.length
+    ? ('showing path to ' + (actTarget?esc(displayLabel(actTarget)):'critical asset') + ' · ' + (actIdx+1) + ' of ' + fpaths.length + (pf==="veryhigh"?" Very-high":"") + ' · click a path below to switch')
     : "";
   const graph = GNODES.length
     ? '<div class="ap-graph"><div class="ap-graph-h">⤳ Enterprise exposure graph <span class="sub">' + graphSub + '</span></div>'
       + '<div class="ap-cy" id="ap-cy"></div>'
       + '<div class="ap-legend">' + legend + '</div></div>'
     : '<div class="ap-panel"><div class="ap-empty">No exposure-graph nodes to draw.</div></div>';
-  const pathPanel = '<div class="ap-panel"><div class="ap-panel-h">Attack paths <span style="font-weight:400;text-transform:none;letter-spacing:0">worst-first · click to isolate</span></div>'
-    + (PATHS.length ? PATHS.map(pathRow).join("") : '<div class="ap-empty">No paths to critical assets.</div>') + '</div>';
+  const pathPanel = '<div class="ap-panel"><div class="ap-panel-h">Attack paths <span style="font-weight:400;text-transform:none;letter-spacing:0">' + (pf==="veryhigh"?"Very-high only · click to isolate":"worst-first · click to isolate") + '</span></div>'
+    + (fpaths.length ? fpaths.map(pathRow).join("") : '<div class="ap-empty">No paths match this filter.</div>') + '</div>';
   const chokePanel = '<div class="ap-panel"><div class="ap-panel-h">Choke points</div>'
     + (chokes.length ? chokes.map(c => '<div class="ap-choke"><div class="ap-choke-h"><span class="ap-choke-nm" title="' + esc((c.node||{}).label||"") + '">' + esc(displayLabel(c.node)) + '</span><span class="ap-choke-n">' + c.n + ' paths</span></div>'
         + '<div class="ap-choke-sub">On ' + c.n + ' attack paths — remediating or isolating this one node cuts them all. The highest-leverage fix.</div></div>').join("")
@@ -7510,10 +7552,18 @@ function render(D){
 }
 function wireView(){
   const root = document.getElementById("ap-root"); if (!root || _wired) return; _wired = true;
+  const scrollTo = sel => { const el = document.querySelector(sel); if (el) el.scrollIntoView({ behavior:"smooth", block:"center" }); };
   root.addEventListener("click", e => {
+    const kpiEl = e.target.closest("[data-kpi]");
+    if (kpiEl){ const k = kpiEl.getAttribute("data-kpi");
+      if (k === "veryhigh"){ STATE.pathFilter = STATE.pathFilter==="veryhigh" ? "" : "veryhigh"; STATE.focus=""; render(LAST); scrollTo(".ap-graph"); }
+      else if (k === "all"){ STATE.pathFilter=""; STATE.focus=""; render(LAST); scrollTo(".ap-graph"); }
+      else if (k === "list"){ STATE.pathFilter=""; render(LAST); scrollTo(".ap-cols"); }
+      else if (k === "chokes"){ scrollTo(".ap-cols"); }
+      return; }
     const path = e.target.closest("[data-path]");
     if (path){ const id = path.getAttribute("data-path"); STATE.focus = id; render(LAST);
-      const g = document.querySelector(".ap-graph"); if (g) g.scrollIntoView({ behavior:"smooth", block:"center" }); return; }
+      scrollTo(".ap-graph"); return; }
   });
 }
 async function analyze(){
