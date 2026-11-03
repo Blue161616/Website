@@ -4816,9 +4816,9 @@ function normName(s){ s = String(s||"").trim().toLowerCase(); const dot = s.inde
 function isSensitiveRole(r){ return /domain controller|certificat|\bca\b|exchange|\bdns\b|\bdhcp\b|\bsql\b|hyper-?v|identity|key vault/i.test(String(r||"")); }
 function parseRoles(v){ try { let a = typeof v==="string"?JSON.parse(v):v; if(!Array.isArray(a)) return []; return a.map(x=>typeof x==="string"?x:(x&&(x.Name||x.Role||x.name||x.role)||"")).filter(Boolean); } catch(e){ return (typeof v==="string"&&v)?[v]:[]; } }
 function isCriticalDev(assetValue, roles){ return assetValue==="High" || (roles||[]).some(isSensitiveRole); }
-// Crown + role badge for a device row (shared across the device-centric views).
-function critBadges(d){ return (d.critical?'<span class="cv-badge cv-crit" title="Critical asset — Defender high value or a sensitive role">👑 critical</span>':'')
-  + ((d.roles && d.roles.length)?'<span class="cv-badge cv-role" title="Device role (Defender)">' + esc(d.roles[0]) + (d.roles.length>1?' +'+(d.roles.length-1):'') + '</span>':''); }
+const CRIT_LABELS = ["Very high", "High", "Medium", "Low"];   // Exposure Management criticalityLevel 0..3
+// Crown badge for a device row — shows the criticality level, with the classification rules as the tooltip.
+function critBadges(d){ return d.critical ? '<span class="cv-badge cv-crit" title="Critical asset' + ((d.roles && d.roles.length)?' — ' + esc(d.roles.join(' · ')):'') + '">👑 ' + esc(d.assetValue || "critical") + '</span>' : ''; }
 // Platform class — mirrors Defender's own device inventory tabs (DeviceCategory): Endpoint devices split into
 // "computer" vs "mobile"; IoT / OT / network-infrastructure devices are "iot" and hidden everywhere (they are
 // absent from the Entra-anchored Devices page too). The EDR / Defender sensor is a COMPUTER control; mobile
@@ -4913,10 +4913,25 @@ async function gGetAll(path, scopes){
 }
 async function huntOnboarding(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
-  const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by DeviceId | project AadDeviceId, DeviceName, OnboardingStatus, DeviceCategory, DeviceType, OSPlatform, AssetValue, DeviceRoles";
+  const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by DeviceId | project AadDeviceId, DeviceName, OnboardingStatus, DeviceCategory, DeviceType, OSPlatform";
   const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
   if (!r.ok){ const e2 = new Error("onboarding "+r.status); e2.status=r.status; throw e2; }
   return (await r.json()).results || [];
+}
+// Real device criticality from Exposure Management (ExposureGraphNodes), keyed on rawData.deviceName. Sets each
+// device's assetValue (level label) + roles (classification rules). Optional; no crowns if unavailable.
+async function enrichExposureCrit(devices){
+  let at; try { at = await EP.tokenSilent(["ThreatHunting.Read.All"]); } catch(e){ return; }
+  let rows = [];
+  try {
+    const q = "ExposureGraphNodes | where NodeProperties has 'criticalityLevel' and NodeProperties has 'deviceName'"
+      + " | extend L=toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), DN=tostring(NodeProperties.rawData.deviceName), Rules=tostring(NodeProperties.rawData.criticalityLevel.ruleNames)"
+      + " | where isnotempty(DN) and L between (0 .. 3) | summarize L=min(L), Rules=take_any(Rules) by DN";
+    const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+    if (!r.ok) return; rows = (await r.json()).results || [];
+  } catch(e){ return; }
+  const by = {}; rows.forEach(x => { if (x.DN == null) return; by[String(x.DN).toLowerCase()] = { v: CRIT_LABELS[+x.L] || "", roles: parseRoles(x.Rules) }; });
+  devices.forEach(d => { const rec = by[String(d.name||"").toLowerCase()]; if (!rec) return; d.assetValue = rec.v; d.roles = rec.roles; });
 }
 async function collect(){
   const entra = await gGetAll("/devices?$select=id,deviceId,displayName,operatingSystem,approximateLastSignInDateTime,accountEnabled&$top=200", ["Device.Read.All"]);
@@ -4947,6 +4962,7 @@ async function collect(){
       const ak = String(m.AadDeviceId||"").toLowerCase(), nk = normName(m.DeviceName);
       if (!(ak && eIds.has(ak)) && !(nk && eNames.has(nk))) devices.push({ name: m.DeviceName || "(defender device)", os: m.OSPlatform || "—", entra:0, intune:0, mde:1, lastSyncDays:null, stale:false, category: m.DeviceCategory, deviceType: m.DeviceType, assetValue: m.AssetValue, roles: parseRoles(m.DeviceRoles) }); });
   }
+  try { await enrichExposureCrit(devices); } catch(e){}
   return { live:true, hasMde: !!machines, devices };
 }
 
@@ -5369,8 +5385,8 @@ function platformClass(category, deviceType, os){
 function isSensitiveRole(r){ return /domain controller|certificat|\bca\b|exchange|\bdns\b|\bdhcp\b|\bsql\b|hyper-?v|identity|key vault/i.test(String(r||"")); }
 function parseRoles(v){ try { let a = typeof v==="string"?JSON.parse(v):v; if(!Array.isArray(a)) return []; return a.map(x=>typeof x==="string"?x:(x&&(x.Name||x.Role||x.name||x.role)||"")).filter(Boolean); } catch(e){ return (typeof v==="string"&&v)?[v]:[]; } }
 function isCriticalDev(assetValue, roles){ return assetValue==="High" || (roles||[]).some(isSensitiveRole); }
-function critBadges(d){ return (d.critical?'<span class="cv-badge cv-crit" title="Critical asset — Defender high value or a sensitive role">👑 critical</span>':'')
-  + ((d.roles && d.roles.length)?'<span class="cv-badge cv-role" title="Device role (Defender)">' + esc(d.roles[0]) + (d.roles.length>1?' +'+(d.roles.length-1):'') + '</span>':''); }
+const CRIT_LABELS = ["Very high", "High", "Medium", "Low"];   // Exposure Management criticalityLevel 0..3
+function critBadges(d){ return d.critical ? '<span class="cv-badge cv-crit" title="Critical asset' + ((d.roles && d.roles.length)?' — ' + esc(d.roles.join(' · ')):'') + '">👑 ' + esc(d.assetValue || "critical") + '</span>' : ''; }
 // Four risk-ordered KPI filters (replace the old two strips). Each is a clickable predicate into the list.
 const KPI_TEST = {
   noncompliant: d => ["noncompliant","error","conflict"].includes(d.state),   // actively failing a policy
@@ -5468,12 +5484,14 @@ async function enrichCriticality(devices){
   let at; try { at = await EP.tokenSilent(["ThreatHunting.Read.All"]); } catch(e){ return; }
   let rows = [];
   try {
-    const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, AssetValue, DeviceRoles) by DeviceName";
+    const q = "ExposureGraphNodes | where NodeProperties has 'criticalityLevel' and NodeProperties has 'deviceName'"
+      + " | extend L=toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), DN=tostring(NodeProperties.rawData.deviceName), Rules=tostring(NodeProperties.rawData.criticalityLevel.ruleNames)"
+      + " | where isnotempty(DN) and L between (0 .. 3) | summarize L=min(L), Rules=take_any(Rules) by DN";
     const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
     if (!r.ok) return; rows = (await r.json()).results || [];
   } catch(e){ return; }
-  const byName = {}; rows.forEach(x => { if (x.DeviceName) byName[String(x.DeviceName).toLowerCase()] = x; });
-  devices.forEach(d => { const x = byName[String(d.name||"").toLowerCase()]; if (!x) return; d.assetValue = x.AssetValue; d.roles = parseRoles(x.DeviceRoles); });
+  const byName = {}; rows.forEach(x => { if (x.DN != null) byName[String(x.DN).toLowerCase()] = { v: CRIT_LABELS[+x.L] || "", roles: parseRoles(x.Rules) }; });
+  devices.forEach(d => { const rec = byName[String(d.name||"").toLowerCase()]; if (!rec) return; d.assetValue = rec.v; d.roles = rec.roles; });
 }
 async function collect(){
   const sel = "id,deviceName,operatingSystem,osVersion,complianceState,isEncrypted,jailBroken,lastSyncDateTime,userPrincipalName";
@@ -5850,8 +5868,8 @@ const GROUP_KEYS = GROUP_META.map(g => g.key);
 function isSensitiveRole(r){ return /domain controller|certificat|\bca\b|exchange|\bdns\b|\bdhcp\b|\bsql\b|hyper-?v|identity|key vault/i.test(String(r||"")); }
 function parseRoles(v){ try { let a = typeof v==="string"?JSON.parse(v):v; if(!Array.isArray(a)) return []; return a.map(x=>typeof x==="string"?x:(x&&(x.Name||x.Role||x.name||x.role)||"")).filter(Boolean); } catch(e){ return (typeof v==="string"&&v)?[v]:[]; } }
 function isCriticalDev(assetValue, roles){ return assetValue==="High" || (roles||[]).some(isSensitiveRole); }
-function critBadges(d){ return (d.critical?'<span class="cv-badge cv-crit" title="Critical asset — Defender high value or a sensitive role">👑 critical</span>':'')
-  + ((d.roles && d.roles.length)?'<span class="cv-badge cv-role" title="Device role (Defender)">' + esc(d.roles[0]) + (d.roles.length>1?' +'+(d.roles.length-1):'') + '</span>':''); }
+const CRIT_LABELS = ["Very high", "High", "Medium", "Low"];   // Exposure Management criticalityLevel 0..3
+function critBadges(d){ return d.critical ? '<span class="cv-badge cv-crit" title="Critical asset' + ((d.roles && d.roles.length)?' — ' + esc(d.roles.join(' · ')):'') + '">👑 ' + esc(d.assetValue || "critical") + '</span>' : ''; }
 function ctrlGroup(c){
   if (c.group) return c.group;
   const s = ((c.sub||"") + " " + (c.name||"") + " " + (c.cat||"")).toLowerCase();
@@ -5962,8 +5980,11 @@ function normOSPlat(s){ s = String(s||"").toLowerCase();
 // assessment rows use. Each sub-query degrades independently so one failure never blanks the rest.
 async function huntDeviceMeta(){
   const meta = {}, put = n => (meta[n] = meta[n] || {});
-  try { (await hunt("DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, OSPlatform, AssetValue, DeviceRoles) by DeviceName"))
-    .forEach(r => { if (!r.DeviceName) return; const m = put(r.DeviceName); m.os = normOSPlat(r.OSPlatform); if (r.AssetValue) m.assetValue = r.AssetValue; const rl = parseRoles(r.DeviceRoles); if (rl.length) m.roles = rl; }); } catch(e){}
+  try { (await hunt("DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, OSPlatform) by DeviceName"))
+    .forEach(r => { if (r.DeviceName) put(r.DeviceName).os = normOSPlat(r.OSPlatform); }); } catch(e){}
+  // Real criticality from Exposure Management (ExposureGraphNodes), keyed on rawData.deviceName (level label + rules).
+  try { (await hunt("ExposureGraphNodes | where NodeProperties has 'criticalityLevel' and NodeProperties has 'deviceName' | extend L=toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), DN=tostring(NodeProperties.rawData.deviceName), Rules=tostring(NodeProperties.rawData.criticalityLevel.ruleNames) | where isnotempty(DN) and L between (0 .. 3) | summarize L=min(L), Rules=take_any(Rules) by DN"))
+    .forEach(r => { if (r.DN == null) return; const m = put(r.DN); m.assetValue = CRIT_LABELS[+r.L] || ""; const rl = parseRoles(r.Rules); if (rl.length) m.roles = rl; }); } catch(e){}
   // Internet-facing: the dedicated filtered query (IsInternetFacing is set only on specific rows — same 7-day
   // rule as the Devices page; the tag is dropped after 48h without external-facing events).
   try { (await hunt("DeviceInfo | where Timestamp > ago(7d) | where IsInternetFacing | summarize by DeviceName"))
@@ -6425,8 +6446,8 @@ function platformClass(category, deviceType, os){
 function isSensitiveRole(r){ return /domain controller|certificat|\bca\b|exchange|\bdns\b|\bdhcp\b|\bsql\b|hyper-?v|identity|key vault/i.test(String(r||"")); }
 function parseRoles(v){ try { let a = typeof v==="string"?JSON.parse(v):v; if(!Array.isArray(a)) return []; return a.map(x=>typeof x==="string"?x:(x&&(x.Name||x.Role||x.name||x.role)||"")).filter(Boolean); } catch(e){ return (typeof v==="string"&&v)?[v]:[]; } }
 function isCriticalDev(assetValue, roles){ return assetValue==="High" || (roles||[]).some(isSensitiveRole); }
-function critBadges(d){ return (d.critical?'<span class="cv-badge cv-crit" title="Critical asset — Defender high value or a sensitive role">👑 critical</span>':'')
-  + ((d.roles && d.roles.length)?'<span class="cv-badge cv-role" title="Device role (Defender)">' + esc(d.roles[0]) + (d.roles.length>1?' +'+(d.roles.length-1):'') + '</span>':''); }
+const CRIT_LABELS = ["Very high", "High", "Medium", "Low"];   // Exposure Management criticalityLevel 0..3
+function critBadges(d){ return d.critical ? '<span class="cv-badge cv-crit" title="Critical asset' + ((d.roles && d.roles.length)?' — ' + esc(d.roles.join(' · ')):'') + '">👑 ' + esc(d.assetValue || "critical") + '</span>' : ''; }
 let CRIT = {};       // lowercased device name → { v:AssetValue, roles:[...] }
 function critOf(n){ return CRIT[String(n||"").toLowerCase()] || null; }
 let PLATFORM = {};   // lowercased device name → "computer" | "mobile" | "iot"
@@ -6686,6 +6707,19 @@ async function huntDeviceClass(){
   if (!r.ok) throw new Error("device class " + r.status);
   return (await r.json()).results || [];
 }
+// Real device criticality from Exposure Management (ExposureGraphNodes) — keyed on rawData.deviceName. Returns
+// name(lower) → { v:level-label, roles:ruleNames }. Optional (no crowns if Exposure Management isn't available).
+async function huntExposureCrit(){
+  const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
+  const q = "ExposureGraphNodes | where NodeProperties has 'criticalityLevel' and NodeProperties has 'deviceName'"
+    + " | extend L=toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), DN=tostring(NodeProperties.rawData.deviceName), Rules=tostring(NodeProperties.rawData.criticalityLevel.ruleNames)"
+    + " | where isnotempty(DN) and L between (0 .. 3) | summarize L=min(L), Rules=take_any(Rules) by DN";
+  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  if (!r.ok) throw new Error("exposure crit " + r.status);
+  const by = {};
+  ((await r.json()).results || []).forEach(x => { if (x.DN == null) return; by[String(x.DN).toLowerCase()] = { v: CRIT_LABELS[+x.L] || "", roles: parseRoles(x.Rules) }; });
+  return by;
+}
 // End-of-support software (DeviceTvmSoftwareInventory) — products past (or nearing) their EOS/EOL date, rolled up
 // per product-version with the affected devices. One row per product-version + status. Optional (no regression).
 async function huntEol(){
@@ -6701,12 +6735,11 @@ async function huntEol(){
     devices: x.Devices || 0, deviceNames: Array.isArray(x.DeviceNames) ? x.DeviceNames : [] }));
 }
 async function collect(){
-  const [tvm, cves, netNames, devClass, eol] = await Promise.all([ huntTvm(), huntCves(), huntInternetFacing().catch(() => []), huntDeviceClass().catch(() => []), huntEol().catch(() => []) ]);
-  // device name → platform + criticality, from DeviceInfo (DeviceCategory / DeviceType / OSPlatform / AssetValue / DeviceRoles)
-  const platformByName = {}, critByName = {};
-  devClass.forEach(x => { if (!x.DeviceName) return; const k = String(x.DeviceName).toLowerCase();
-    platformByName[k] = platformClass(x.DeviceCategory, x.DeviceType, x.OSPlatform);
-    const roles = parseRoles(x.DeviceRoles); if (x.AssetValue || roles.length) critByName[k] = { v:x.AssetValue, roles }; });
+  const [tvm, cves, netNames, devClass, eol, critByName] = await Promise.all([ huntTvm(), huntCves(), huntInternetFacing().catch(() => []), huntDeviceClass().catch(() => []), huntEol().catch(() => []), huntExposureCrit().catch(() => ({})) ]);
+  // device name → platform, from DeviceInfo (DeviceCategory / DeviceType / OSPlatform). Criticality comes separately
+  // from Exposure Management (ExposureGraphNodes) via huntExposureCrit → critByName.
+  const platformByName = {};
+  devClass.forEach(x => { if (!x.DeviceName) return; platformByName[String(x.DeviceName).toLowerCase()] = platformClass(x.DeviceCategory, x.DeviceType, x.OSPlatform); });
   const totalDev = tvm.length;
   const critDev = tvm.filter(x => (x.Critical||0) > 0).length;
   const highDev = tvm.filter(x => (x.High||0) > 0).length;
@@ -7174,6 +7207,7 @@ function isInet(n){ return NET.has(String(n||"").toLowerCase()); }
 function assetOf(n){ return ASSETBY[n] || ASSETBY[String(n||"").toLowerCase()] || ""; }
 function rolesOf(n){ return ROLESBY[n] || ROLESBY[String(n||"").toLowerCase()] || []; }
 // A device is "critical" when Defender marks it High value or it holds a sensitive role (DC / CA / Exchange / DNS / SQL).
+const CRIT_LABELS = ["Very high", "High", "Medium", "Low"];   // Exposure Management criticalityLevel 0..3
 function isSensitiveRole(r){ return /domain controller|certificat|\bca\b|exchange|\bdns\b|\bdhcp\b|\bsql\b|hyper-?v|identity|key vault/i.test(String(r||"")); }
 function isCriticalDev(assetValue, roles){ return assetValue === "High" || (roles||[]).some(isSensitiveRole); }
 // DeviceRoles is a JSON array (objects with a name field, or plain strings); parse defensively to role-name strings.
@@ -7316,8 +7350,13 @@ async function huntAlerts(){
 // Real OS per device (DeviceInfo) + internet-facing set (the filtered query — same rule as the Devices page).
 async function huntMeta(){
   const osBy = {}, assetBy = {}, rolesBy = {}, net = [];
-  try { (await hunt("DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, OSPlatform, AssetValue, DeviceRoles) by DeviceName"))
-    .forEach(r => { if (!r.DeviceName) return; osBy[r.DeviceName] = r.OSPlatform || ""; if (r.AssetValue) assetBy[r.DeviceName] = r.AssetValue; const rl = parseRoles(r.DeviceRoles); if (rl.length) rolesBy[r.DeviceName] = rl; }); } catch(e){}
+  try { (await hunt("DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, OSPlatform) by DeviceName"))
+    .forEach(r => { if (r.DeviceName) osBy[r.DeviceName] = r.OSPlatform || ""; }); } catch(e){}
+  // Real criticality from Exposure Management (ExposureGraphNodes), keyed on rawData.deviceName (device nodes are
+  // labelled by resource type, not 'device'). criticalityLevel 0=Very high..3=Low; ruleNames = why. assetValue holds
+  // the level label so the shared isCriticalDev (/high/) crowns Very high + High.
+  try { (await hunt("ExposureGraphNodes | where NodeProperties has 'criticalityLevel' and NodeProperties has 'deviceName' | extend L=toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), DN=tostring(NodeProperties.rawData.deviceName), Rules=tostring(NodeProperties.rawData.criticalityLevel.ruleNames) | where isnotempty(DN) and L between (0 .. 3) | summarize L=min(L), Rules=take_any(Rules) by DN"))
+    .forEach(r => { const k = String(r.DN).toLowerCase(); assetBy[k] = CRIT_LABELS[+r.L] || ""; const rl = parseRoles(r.Rules); if (rl.length) rolesBy[k] = rl; }); } catch(e){}
   try { (await hunt("DeviceInfo | where Timestamp > ago(7d) | where IsInternetFacing | distinct DeviceName"))
     .forEach(r => { if (r.DeviceName) net.push(r.DeviceName); }); } catch(e){}
   return { osByName:osBy, assetByName:assetBy, rolesByName:rolesBy, internetNames:net };
@@ -7385,8 +7424,7 @@ function deviceRow(d){
   const main = '<tr class="cv-trow" data-dev-row="' + esc(d.name) + '">'
     + '<td><span class="cv-chev">' + (open?'▾':'▸') + '</span></td>'
     + '<td class="cv-dev"><span class="nm">' + esc(d.name) + '</span>'
-      + (d.critical?'<span class="cv-badge cv-crit" title="Critical asset — Defender high value or a sensitive role">👑 critical</span>':'')
-      + ((d.roles && d.roles.length)?'<span class="cv-badge cv-role" title="Device role (Defender)">' + esc(d.roles[0]) + (d.roles.length>1?' +'+(d.roles.length-1):'') + '</span>':'')
+      + (d.critical?'<span class="cv-badge cv-crit" title="Critical asset' + ((d.roles && d.roles.length)?' — ' + esc(d.roles.join(' · ')):'') + '">👑 ' + esc(d.assetValue || "critical") + '</span>':'')
       + (d.internet?'<span class="cv-badge cv-inet" title="Reachable from the internet (Defender)">🌐 internet-facing</span>':'') + ' <a class="cv-graphlink" data-graph="' + esc(d.name) + '" title="Open the attack graph for this device">⤳ graph</a>' + (d.os?'<br><span class="os">' + esc(d.os) + '</span>':'') + '</td>'
     + '<td><span class="cv-sev sev-' + (SEV_CLS[d.worstSev]||"low") + '">' + d.worstSev.toUpperCase() + '</span></td>'
     + '<td class="cv-num">' + d.activeCount + '</td>'
