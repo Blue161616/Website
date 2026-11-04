@@ -151,6 +151,20 @@
   .xai .xai-t { font-size: 13px; line-height: 1.6; color: var(--text); background: rgba(90,209,230,.05); border: 1px solid rgba(90,209,230,.22); border-left: 3px solid var(--accent); border-radius: 8px; padding: 11px 14px; }
   .xai .xai-c { font-size: 10px; color: var(--muted); margin-top: 6px; }
   .xai .muted { font-size: 11.5px; color: var(--muted); }
+  .xchoke { margin: 0 18px 12px; padding: 10px 13px; border: 1px solid rgba(255,90,110,.3); background: rgba(255,90,110,.06); border-radius: 9px; }
+  .xchoke .xch-h { font-family: var(--label); font-size: 11px; font-weight: 700; letter-spacing: .04em; color: #FF8A9B; margin-bottom: 6px; }
+  .xchoke .xch-row { font-size: 12px; color: var(--text); line-height: 1.5; }
+  .xchoke .xch-row + .xch-row { margin-top: 4px; }
+  .xchoke .xch-row .k { color: var(--muted); font-size: 10.5px; }
+  .xpaths { margin: 0 18px 12px; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; }
+  .xpaths .xph { font-family: var(--label); font-size: 11px; font-weight: 700; letter-spacing: .04em; color: var(--muted); padding: 8px 12px; background: rgba(143,172,211,.05); border-bottom: 1px solid var(--border); }
+  .xprow { display: grid; grid-template-columns: minmax(70px,auto) 14px minmax(0,1fr) auto auto; gap: 8px; align-items: center; padding: 7px 12px; font-size: 11.5px; border-top: 1px solid rgba(28,55,102,.4); }
+  .xprow:first-of-type { border-top: 0; }
+  .xprow .xpr-h { font-family: var(--mono,monospace); color: #5AD1E6; white-space: nowrap; }
+  .xprow .xpr-arrow { color: var(--dim); }
+  .xprow .xpr-mid { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .xprow .xpr-reach { font-weight: 700; white-space: nowrap; }
+  .xprow .xpr-conf { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
   .xchips { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 18px 14px; }
   .xchip { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 20px; padding: 3px 10px; }
   .xchip b { color: var(--text); }
@@ -475,6 +489,49 @@
     return { nodes, edges, demo: false, correlated, aiUsed, aiGap, pathConf: correlated ? pathConf : null, vias, hint,
       enough: correlated || nodes.length >= 2 };
   }
+
+  // ── Multi-path ranking + choke points ────────────────────────────────────────
+  // Correlate EVERY reachable Sightline host (not just the foothold) into its own path, so the suite
+  // shows all the routes from the internet to an endpoint/identity, ranked worst-first — and the choke
+  // points where several routes converge (fix once, cut many). Deterministic joins for all hosts; the
+  // AI-suggested link only enriches the one host the agent was run on.
+  const REACH_RANK = { tier0: 3, privileged: 2, endpoint: 1, exposure: 0 };
+  // Summarise one host's correlation (no graph nodes — just the facts the list + choke logic need).
+  function _correlateHost(host) {
+    const d = STATE.apps.device, e = STATE.apps.entra, hostLabel = host.fqdn || host.host;
+    let conf = "high", acct = null, deviceLabel = null, identityLabel = null, reachesTier0 = false, ai = false;
+    if (_realApp("device") && d.entities && d.entities.devices) { const jA = _joinHostDevice(host, d.entities.devices);
+      if (jA) { conf = _minConf(conf, jA.conf); deviceLabel = jA.device.name || jA.device.fqdn; const lo = jA.device.loggedOn || []; acct = lo.find(u => u.privileged) || lo[0] || null; } }
+    if (!deviceLabel && _aiLinks && _aiLinks.forHost === hostLabel && _aiLinks.device) { const L = _aiLinks.device; deviceLabel = L.label; acct = L.account; conf = _minConf(conf, L.conf); ai = true; }
+    if (acct && _realApp("entra") && e.entities && e.entities.identities) { const jC = _joinAccountIdentity(acct, e.entities.identities);
+      if (jC) { conf = _minConf(conf, jC.conf); const id = jC.identity; identityLabel = (id.roles && id.roles[0]) || (id.tier0Reach ? "Tier-0 role" : "privileged role"); reachesTier0 = !!id.tier0Reach; } }
+    if (deviceLabel && !identityLabel && _aiLinks && _aiLinks.forHost === hostLabel && _aiLinks.identity) { const L = _aiLinks.identity; identityLabel = L.label; reachesTier0 = /Tier-0/.test(L.label); conf = _minConf(conf, L.conf); ai = true; }
+    const reaches = identityLabel ? (reachesTier0 ? "tier0" : "privileged") : (deviceLabel ? "endpoint" : "exposure");
+    return { hostLabel, host: _short(hostLabel), account: acct ? acct.sam : null, deviceLabel, identityLabel, reaches, conf, ai };
+  }
+  // All reachable hosts → ranked paths (worst reach first, then confidence, then exposure severity).
+  function allPaths() {
+    const s = STATE.apps.sightline;
+    if (!_realApp("sightline") || !(s.entities && s.entities.hosts && s.entities.hosts.length)) {
+      const h = _footholdHost(); return h ? [_correlateHost(h)] : [];
+    }
+    const seen = new Set(), out = [];
+    s.entities.hosts.forEach(h => { if (!h.reachable && h.reachable !== undefined) return; const k = (h.fqdn || h.host || "").toLowerCase();
+      if (!k || seen.has(k)) return; seen.add(k); out.push(_correlateHost(h)); });
+    out.sort((a, b) => (REACH_RANK[b.reaches] - REACH_RANK[a.reaches]) || ((CONF_RANK[b.conf] || 0) - (CONF_RANK[a.conf] || 0)));
+    return out;
+  }
+  // Choke points: an identity (or device) that several paths converge on — securing it cuts them all.
+  function chokePoints(paths) {
+    const byId = {}, byDev = {};
+    paths.forEach(p => { if (p.identityLabel) (byId[p.identityLabel] = byId[p.identityLabel] || []).push(p);
+      if (p.deviceLabel) (byDev[p.deviceLabel] = byDev[p.deviceLabel] || []).push(p); });
+    const chokes = [];
+    Object.keys(byId).forEach(k => { if (byId[k].length >= 2) chokes.push({ kind: "identity", label: k, n: byId[k].length, hosts: byId[k].map(p => p.host) }); });
+    Object.keys(byDev).forEach(k => { if (byDev[k].length >= 2) chokes.push({ kind: "device", label: k, n: byDev[k].length, hosts: byDev[k].map(p => p.host) }); });
+    return chokes.sort((a, b) => b.n - a.n);
+  }
+
   // Dynamic narrative for the cross-app card — states only the hops actually drawn.
   function _crossNarr(cp) {
     if (cp.demo) {
@@ -676,6 +733,24 @@
     // The agent button appears only when a hop is still missing AND a model is configured (not in demo).
     const corrBtn = (!cp.demo && cp.aiGap && llm.ready())
       ? '<button class="xai-btn corr" id="aiCorrBtn" title="Let the AI agent resolve the missing hop by reasoning over the entities (shown as AI-suggested · verify, never asserted)">✦ AI correlate</button>' : '';
+    // Multi-path ranking + choke points (real exports only; the graph above shows the worst single path).
+    const REACH_LBL = { tier0: "→ Tier-0", privileged: "→ privileged identity", endpoint: "→ endpoint only", exposure: "foothold only" };
+    const REACH_COL = { tier0: "#FF5A6E", privileged: "#FF9A6B", endpoint: "#FFC15E", exposure: "#8FE3FF" };
+    const paths = cp.demo ? [] : allPaths().filter(p => p.reaches !== "exposure");
+    const chokes = cp.demo ? [] : chokePoints(paths);
+    let pathsHtml = "";
+    if (paths.length > 1) {
+      pathsHtml = '<div class="xpaths"><div class="xph">' + paths.length + ' correlated path' + (paths.length === 1 ? "" : "s") + ' to an endpoint or identity — worst first</div>'
+        + paths.map(p => '<div class="xprow"><span class="xpr-h">' + esc(p.host) + '</span>'
+          + '<span class="xpr-arrow">→</span><span class="xpr-mid">' + (p.deviceLabel ? esc(_short(p.deviceLabel)) : "—") + (p.account ? ' · ' + esc(p.account) : "") + '</span>'
+          + '<span class="xpr-reach" style="color:' + (REACH_COL[p.reaches] || "#8FE3FF") + '">' + (p.identityLabel ? esc(p.identityLabel) + " " : "") + (REACH_LBL[p.reaches] || "") + '</span>'
+          + '<span class="xpr-conf">' + (p.ai ? '✦ ' : '') + esc(p.conf) + '</span></div>').join("") + '</div>';
+    }
+    let chokeHtml = "";
+    if (chokes.length) {
+      chokeHtml = '<div class="xchoke"><div class="xch-h">◆ Choke points — fix once, cut many</div>'
+        + chokes.slice(0, 4).map(c => '<div class="xch-row"><b>' + esc(c.label) + '</b> <span class="k">(' + c.kind + ')</span> — on <b>' + c.n + '</b> paths, reached from ' + c.hosts.slice(0, 4).map(esc).join(", ") + (c.hosts.length > 4 ? " +" + (c.hosts.length - 4) : "") + '. Securing it cuts all ' + c.n + '.</div>').join("") + '</div>';
+    }
     host.innerHTML = '<div class="xcard-h"><span class="t">Internet → exposed host → endpoint → identity → Tier-0</span>'
       + '<span class="sub">' + sub + '</span>'
       + corrBtn
@@ -683,7 +758,7 @@
       + '<div id="xcy"></div>'
       + '<div class="xnarr">' + narr + '</div>'
       + '<div class="xai" id="xai"></div>'
-      + legend + '<div class="xchips">' + chips + '</div>';
+      + legend + chokeHtml + pathsHtml + '<div class="xchips">' + chips + '</div>';
     drawXGraph(cp);
     const cb = $("aiCorrBtn"); if (cb) cb.addEventListener("click", aiCorrelate);
     const b = $("aiBriefBtn"); if (b) b.addEventListener("click", () => aiBrief(true));
