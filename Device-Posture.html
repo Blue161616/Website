@@ -4087,10 +4087,16 @@ window.EP = (function () {
         return { name: v.name, label: v.label, score: s.score != null ? s.score : null, grade: s.grade || "",
           sev: s.sev || { crit: 0, high: 0, med: 0, low: 0 }, top: (s.top || []).slice(0, 5).map(t => ({ title: t.title, sev: t.sev, impact: t.impact || "" })) }; }).filter(Boolean);
       const ap = data.attackpaths;
+      // recommendations — merge each view's ranked fixes for the suite's cross-estate Fix-first
+      const _SEVW = { critical: 3, high: 2, medium: 1, low: 0 };
+      const recommendations = [];
+      REPORT_VIEWS.forEach(v => { const s = data[v.name]; if (s && Array.isArray(s.recs)) s.recs.forEach(r => { if (r && r.title) recommendations.push(r); }); });
+      recommendations.sort((a, b) => (_SEVW[b.sev] || 0) - (_SEVW[a.sev] || 0) || (b.count || 0) - (a.count || 0));
       const out = { app: "device", label: "Endpoint posture", tenant: String(tenant), demo: !!DEMO,
         generatedAt: new Date().toISOString(), score: overall ? overall.score : null, grade: overall ? overall.grade : "–",
         domains, attackpaths: ap ? { crit: (ap.sev && ap.sev.crit) || 0, high: (ap.sev && ap.sev.high) || 0, lead: ap.lead || "" } : null };
       if (entities && entities.devices && entities.devices.length) out.entities = entities;
+      if (recommendations.length) out.recommendations = recommendations.slice(0, 8);
       const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([JSON.stringify(out, null, 2)], { type: "application/json" }));
       a.download = "device-suite-summary.json"; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
       if (btn) btn.textContent = "Exported ✓";
@@ -5742,9 +5748,15 @@ function __dpCovSummary(){
   const grade = score>=70?"D":score>=50?"C":score>=30?"B":"A";
   const gaps = buildGaps(all, HASMDE);
   const sev = { crit:0, high:0, med:0, low:0 }; gaps.forEach(g => { if (sev[g.sev]!=null) sev[g.sev]++; });
+  // whole-estate recommendations for the suite's cross-estate Fix-first
+  const wholeAgg = { managedNoSensor: all.filter(d=>d.entra&&d.intune===1&&d.mde===0&&d.platform==="computer").length,
+    entraOnly: all.filter(d=>d.entra&&d.intune===0).length, unprot: all.filter(KPI_TEST.unprot).length,
+    sensorBad: all.filter(KPI_TEST.sensorbad).length, stale: all.filter(KPI_TEST.stale).length,
+    excluded: all.filter(KPI_TEST.excluded).length, notInEntra: all.filter(d=>d.entra===0).length };
+  const recs = covRecs(wholeAgg).slice(0,4).map(r => ({ title:r[1], detail:r[2], count:r[0], sev:/EDR|Defender|sensor|unprotected/i.test(r[1]+" "+r[2])?"critical":"high" }));
   return { label:"Coverage", score, grade,
     lead: gaps.reduce((a,g)=>a+g.count,0) + " coverage gaps across " + entra.length + " devices.",
-    sev,
+    sev, recs,
     top: gaps.filter(g => g.sev==="crit" || g.sev==="high").sort((a,b)=>(SEV_RANK[b.sev]-SEV_RANK[a.sev])||(b.count-a.count)).slice(0,6)
       .map(g => ({ title: g.title + " (" + g.count + " device" + (g.count===1?"":"s") + ")", sev: g.sev, impact:"", search: g.key })) };
 }
@@ -6902,6 +6914,7 @@ function __dpHardSummary(){
   if (!LAST) return null;
   if (LAST.needsDefender) return { label:"Hardening", score:null, grade:"–", lead:"Not assessed — connect Defender (MDE).", sev:{crit:0,high:0,med:0,low:0}, top:[] };
   return { label:"Hardening", score:LAST.score, grade:LAST.grade, lead:LAST.lede, sev:sevCounts(),
+    recs: hwRecs().slice(0,4).map(r => ({ title:r[1], detail:r[2], count:r[0], sev:/impact (8|9|10)\//.test(r[1])?"critical":"high" })),
     // Full control list (+ pillar group, fail/assessed counts) so the Framework scorecard can map device
     // secure-config controls to a benchmark honestly — pass/fail per control with real device ratios.
     devicesAssessed: (LAST && LAST.devicesAssessed) || null,
@@ -7539,7 +7552,7 @@ function ledeFor(cves, seg, devCount){
 // updating one product beats chasing individual CVEs. Grounded in the software rollup; deterministic list
 // always shows, optional AI brief rewrites it.
 let _vAgg = null, _vAiState = { sig:"", html:"", busy:false };
-function vRecs(){ const sw = (typeof buildSoftware === "function") ? buildSoftware(SEGCVES||[]) : [];
+function vRecs(cves){ const sw = (typeof buildSoftware === "function") ? buildSoftware(cves||SEGCVES||[]) : [];
   return sw.filter(s => (s.devices||0) > 0 || (s.cveCount||0) > 0)
     .sort((a,b) => ((b.devices||0)*1000 + (b.cveCount||0)) - ((a.devices||0)*1000 + (a.cveCount||0))).slice(0,6)
     .map(s => [s.devices||0, "Update " + s.label,
@@ -7690,7 +7703,8 @@ function __dpVulnSummary(){
   const top = visibleCves(CVES).filter(c => c.sev==="Critical" || c.exploit || c.zeroday).slice(0, 5).map(c => ({
     title: c.cve + (c.exploit?" (public exploit)":c.zeroday?" (zero-day)":"") + " — " + c.devices + " device" + (c.devices===1?"":"s"),
     sev: c.sev==="Critical"?"crit":c.sev==="High"?"high":"med", impact: c.software[0]||"", search: "critical" }));
-  return { label:"Vulnerabilities", score:LAST.score, grade:LAST.grade, lead:LAST.lede, sev:sevCounts(), top };
+  const recs = vRecs(CVES).slice(0,4).map(r => ({ title:r[1], detail:r[2], count:r[0], sev:/critical/i.test(r[2])?"critical":"high" }));
+  return { label:"Vulnerabilities", score:LAST.score, grade:LAST.grade, lead:LAST.lede, sev:sevCounts(), top, recs };
 }
 function __dpVulnFocus(f){
   try {
