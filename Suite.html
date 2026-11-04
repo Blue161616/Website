@@ -328,14 +328,14 @@
 
   // ---- state: one summary per layer, each flagged real|demo ----
   const STATE = { apps: {} };   // key -> summary (with ._real boolean)
-  function loadDemo() { const d = demoData(); STATE.apps = {}; ORDER.forEach(k => { d[k]._real = false; STATE.apps[k] = d[k]; }); _aiLinks = null; render(); }
+  function loadDemo() { const d = demoData(); STATE.apps = {}; ORDER.forEach(k => { d[k]._real = false; STATE.apps[k] = d[k]; }); _aiLinks = null; _aiBriefText = _fixText = ""; render(); }
   // Accept a real export. It must name a known app and carry domains; otherwise it is rejected.
   function ingest(obj, fname) {
     if (!obj || typeof obj !== "object") throw new Error("not a JSON object");
     const key = String(obj.app || "").toLowerCase();
     if (!APP_META[key]) throw new Error("unknown app \"" + (obj.app || "?") + "\" (expected entra / device / sightline)");
     if (!Array.isArray(obj.domains)) throw new Error("no domains[] in " + (fname || "export"));
-    obj._real = true; STATE.apps[key] = obj; _aiLinks = null; render();
+    obj._real = true; STATE.apps[key] = obj; _aiLinks = null; _aiBriefText = _fixText = ""; render();
     return key;
   }
 
@@ -651,6 +651,7 @@
   // ingest), and a response is dropped if a newer signature superseded it — so rapid multi-file loads
   // can't leave a stale or orphaned brief. A short debounce coalesces the 3 renders of a 3-file load.
   let _aiState = { sig: "", text: "", busy: false };
+  let _aiBriefText = "", _fixText = "";   // plain text of the last brief / fix-first plan, for the board report
   let _aiTimer = null;
   const _aiShow = html => { const el = $("xai"); if (el) { el.innerHTML = html; el.classList.add("show"); } };
   function aiBriefAuto() { clearTimeout(_aiTimer); _aiTimer = setTimeout(() => aiBrief(false), 450); }
@@ -666,6 +667,7 @@
       const raw = await suiteLlm(AI_SYSTEM, facts, { temperature: 0.2, max_tokens: 400 });
       if (_aiState.sig !== sig) return;                                                               // a newer render superseded this
       const txt = String(raw || "").trim(); if (!txt) throw new Error("empty response");
+      _aiBriefText = txt;
       _aiState.text = '<div class="xai-t">' + esc(txt) + '</div><div class="xai-c">✦ ' + esc(llm.provider) + " · " + esc(llm.model) + ' — grounded in the loaded exports; nothing invented.</div>';
       _aiState.busy = false; _aiShow(_aiState.text);
     } catch (e) {
@@ -773,6 +775,7 @@
     try {
       const raw = await suiteLlm(FIX_SYS, facts, { temperature: 0.2, max_tokens: 320 });
       const txt = String(raw || "").trim(); if (!txt) throw new Error("empty response");
+      _fixText = txt;
       el.innerHTML = '<div class="xfix-t">' + esc(txt).replace(/\n+/g, "<br>") + '</div><div class="xai-c">✦ ' + esc(llm.provider) + " · " + esc(llm.model) + ' — grounded in the choke points above; verify before acting.</div>';
     } catch (e) {
       el.innerHTML = '<span class="muted">✦ Fix-first plan unavailable — ' + esc(String(e.message || e).slice(0, 110)) + '. The per-choke fixes above still apply.</span>';
@@ -970,10 +973,29 @@
 
     // cross-app attack path
     if (cp.enough) {
-      h += '<h2>Cross-app attack path <span class="mu" style="font-size:12px;font-weight:400">· ' + (cp.demo ? "illustrative · demo correlation" : "correlated from the loaded exports") + '</span></h2>';
+      const subh = 'font-weight:700;margin:14px 0 4px;color:#102040';
+      const REACH_LBL_R = { tier0: "→ Tier-0", privileged: "→ privileged identity", endpoint: "→ endpoint only", exposure: "foothold only" };
+      h += '<h2>Cross-app attack path <span class="mu" style="font-size:12px;font-weight:400">· ' + (cp.demo ? "illustrative · demo correlation" : cp.correlated ? ("correlated · confidence " + (cp.pathConf || "–")) : "exposure foothold · not yet correlated") + '</span></h2>';
       h += '<div class="chain">' + cp.nodes.map(n => esc(n.label.replace(/\\\\/g, "\\"))).join("  →  ") + '</div>';
-      h += '<p><b>Sightline</b> finds an internet-reachable host with <b>no Defender sensor</b> behind it — a foothold EDR would never see. <b>Device Posture</b> shows a privileged account (<b>BLUE16\\Administrator</b>) signed in on that host, so compromising it inherits that <b>identity</b> — whose role, per <b>Entra Posture</b>, reaches <b>Domain Admin (Tier-0)</b>. Exposure → endpoint → identity → takeover, correlated across all three from collected facts.</p>';
-      if (cp.demo) h += '<p class="mu">This correlation is illustrative in demo mode. With live exports it is assembled only where both ends are collected facts (device↔host↔identity), each carrying a confidence — see the unified-suite-view plan, Phase 2.</p>';
+      h += '<p>' + _crossNarr(cp) + '</p>';
+      // all correlated routes, worst first
+      const bpaths = cp.demo ? [] : allPaths().filter(p => p.reaches !== "exposure");
+      if (bpaths.length > 1) {
+        h += '<p style="' + subh + '">All correlated routes (worst first)</p>';
+        h += '<table><tr><th>Exposed host</th><th>Endpoint · account</th><th>Reaches</th><th>Confidence</th></tr>'
+          + bpaths.map(p => '<tr><td>' + esc(p.host) + '</td><td>' + (p.deviceLabel ? esc(_short(p.deviceLabel)) : "—") + (p.account ? ' · ' + esc(p.account) : "") + '</td><td>' + (p.identityLabel ? esc(p.identityLabel) + " " : "") + esc(REACH_LBL_R[p.reaches] || p.reaches) + '</td><td>' + esc(p.conf) + (p.ai ? " (AI)" : "") + '</td></tr>').join("") + '</table>';
+      }
+      // choke points — fix once, cut many
+      const bchokes = cp.demo ? [] : chokePoints(bpaths);
+      if (bchokes.length) {
+        h += '<p style="' + subh + '">Choke points — fix once, cut many</p><ul style="margin:4px 0 0;padding-left:20px;line-height:1.6">'
+          + bchokes.slice(0, 6).map(c => '<li><b>' + esc(c.label) + '</b> (' + esc(c.kind) + ') — on <b>' + c.n + '</b> paths (' + c.hosts.slice(0, 5).map(esc).join(", ") + '). ' + esc(_chokeFixHint(c)) + '</li>').join("") + '</ul>';
+      }
+      // AI narration, only when it was generated for this data
+      if (_aiBriefText) h += '<p style="' + subh + '">✦ AI estate brief</p><p>' + esc(_aiBriefText) + '</p>';
+      if (_fixText) h += '<p style="' + subh + '">✦ AI fix-first plan</p><p>' + esc(_fixText).replace(/\n+/g, "<br>") + '</p>';
+      if (cp.demo) h += '<p class="mu">This correlation is illustrative in demo mode. With live exports it is assembled only where both ends are collected facts (device↔host↔identity), each carrying a confidence.</p>';
+      else if (_aiBriefText || _fixText) h += '<p class="mu">AI narration is grounded in the facts above; verify before acting.</p>';
     }
 
     // prioritised across the estate
