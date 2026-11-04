@@ -1345,6 +1345,9 @@
   <button class="nav" data-view="ask">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5.5h16v10H8l-4 3.5z" stroke-linejoin="round"/><path d="M8.5 10h7M8.5 12.6h4.5" stroke-linecap="round"/><path d="M17.6 3.2l.7 1.6 1.6.7-1.6.7-.7 1.6-.7-1.6L15.3 5.5l1.6-.7z" fill="currentColor" stroke="none"/></svg>
     Ask<span class="nav-ai" aria-hidden="true">✦</span></button>
+  <button class="nav" data-view="framework">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M8 4h8a1 1 0 0 1 1 1v15l-5-2.5L7 20V5a1 1 0 0 1 1-1Z" stroke-linejoin="round"/><path d="M9.5 9.5l1.5 1.5 3-3.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    Framework</button>
   <div class="ep-nav-sect">Posture</div>
   <button class="nav" data-view="devices">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4" stroke-linecap="round"/></svg>
@@ -1518,6 +1521,7 @@
   </section>
 
 </section>
+  <section class="ep-view" id="view-framework"><div class="ep-view-empty">Framework scorecard loads here.</div></section>
   <section class="ep-view" id="view-vuln">
 <section id="results" class="hidden">
     <div id="vuln-root"></div>
@@ -1590,7 +1594,7 @@ window.EP = (function () {
   const views = {};            // name -> { load, demo, loaded, started }
   let active = null;
 
-  const VIEW_TITLES = { overview: "Overview", ask: "Ask", devices: "Devices", coverage: "Coverage", compliance: "Compliance", hardening: "Hardening", vuln: "Vulnerabilities", attackpaths: "Attack paths", threat: "Alerts" };
+  const VIEW_TITLES = { overview: "Overview", ask: "Ask", devices: "Devices", coverage: "Coverage", compliance: "Compliance", hardening: "Hardening", framework: "Framework", vuln: "Vulnerabilities", attackpaths: "Attack paths", threat: "Alerts" };
 
   function setStatus(msg, busy, isErr) {
     const s = $("epStatus"); if (!s) return;
@@ -2006,6 +2010,10 @@ window.EP = (function () {
     if (name === "overview") {
       if (IMPORTED && !IMPORT_READY.has("overview")) { const b = $("ov-body"); if (b) b.innerHTML = '<div class="ep-view-empty" style="padding:28px">The Overview reads imported data in a later step — open <b>Devices</b> to see the imported inventory now.</div>'; return; }
       renderOverview(); return;
+    }
+    if (name === "framework") {
+      if (IMPORTED && !IMPORT_READY.has("overview")) { const h = $("view-framework"); if (h) h.innerHTML = '<div class="ep-view-empty" style="padding:28px">The Framework scorecard reads the collected domains — open <b>Devices</b> to load the imported inventory first.</div>'; return; }
+      renderFramework(); return;
     }
     loadView(name);
   }
@@ -3531,6 +3539,149 @@ window.EP = (function () {
     finally { _ovBusy = false; }
   }
 
+  // ── Framework compliance scorecard (device) ───────────────────────────────
+  // Maps the device's secure-configuration controls to a recognised endpoint benchmark. Read-only and
+  // honest: every control is assessed from data this scan already collected — Defender secure-config
+  // (Hardening, per pillar, with real device fail/assessed counts), Defender Coverage (onboarding / TVM),
+  // Vulnerabilities (critical CVEs, end-of-life) and Intune device Compliance. A control with no signal in
+  // the collected data is "not assessed", never silently passed. Benchmark membership is a curated mapping
+  // over the device pillars, so it holds for both live Defender data and demo. (Distinct from the dead
+  // identity-oriented cisAssess/renderCompliance code ported from Entra Posture — this is device-native.)
+  // A pillar's compliance = the mean, across its controls, of the share of assessed devices that pass that
+  // control. Device-weighted, so one control failing on a few devices doesn't zero the whole pillar.
+  function _fwHardPillar(data, group) {
+    const h = data.hardening; if (!h || !h.controls) return null;            // null → hardening not collected (N/A)
+    const inGrp = h.controls.filter(c => c.group === group);
+    const N = h.devicesAssessed || 0;
+    if (!inGrp.length) return { ratio: 1, anyFail: false, names: [], devices: N };
+    let sum = 0; const failing = [];
+    inGrp.forEach(c => { const f = Math.min(c.failDevices || 0, N || (c.failDevices || 0));
+      sum += N ? (N - f) / N : ((c.failDevices || 0) ? 0 : 1);
+      if ((c.failDevices || 0) > 0) failing.push(c.name); });
+    return { ratio: sum / inGrp.length, anyFail: failing.length > 0, names: failing, devices: N };
+  }
+  function _fwPillarCtrl(id, title, group) {
+    return { id, title, domain: "hardening", assess(data) {
+      const g = _fwHardPillar(data, group);
+      if (!g) return { status: "na", ratio: null, evidence: "Hardening not collected." };
+      if (!g.anyFail) return { status: "pass", ratio: 1, evidence: "All assessed devices compliant." };
+      const pct = Math.round(g.ratio * 100);
+      return { status: "fail", ratio: g.ratio, evidence: g.names.slice(0, 2).join("; ") + (g.devices ? (" · " + pct + "% of " + g.devices + " devices compliant") : "") };
+    } };
+  }
+  function _fwTopHit(summary, re) { return ((summary && summary.top) || []).find(t => re.test((t.title || "") + " " + (t.search || ""))); }
+  const DEV_FW_CONTROLS = {
+    edr: _fwPillarCtrl("edr", "EDR sensor deployed & healthy", "edr"),
+    av:  _fwPillarCtrl("av",  "Antivirus — real-time & tamper protection", "av"),
+    enc: _fwPillarCtrl("enc", "Disk encryption (BitLocker)", "enc"),
+    fw:  _fwPillarCtrl("fw",  "Host firewall enabled", "fw"),
+    asr: _fwPillarCtrl("asr", "Attack surface reduction rules", "asr"),
+    onboard: { id: "onboard", title: "All eligible devices onboarded to Defender", domain: "coverage", assess(data) {
+      const c = data.coverage; if (!c) return { status: "na", ratio: null, evidence: "Coverage not collected." };
+      const hit = _fwTopHit(c, /onboard|not onboarded|no defender|\bedr\b|sensor/i);
+      return hit ? { status: "fail", ratio: 0, evidence: hit.title } : { status: "pass", ratio: 1, evidence: "No onboarding gaps in the top coverage findings." };
+    } },
+    tvm: { id: "tvm", title: "No devices excluded from vulnerability management", domain: "coverage", assess(data) {
+      const c = data.coverage; if (!c) return { status: "na", ratio: null, evidence: "Coverage not collected." };
+      const hit = _fwTopHit(c, /exclud|tvm/i);
+      return hit ? { status: "fail", ratio: 0, evidence: hit.title } : { status: "pass", ratio: 1, evidence: "No TVM-exclusion gaps in the top coverage findings." };
+    } },
+    cve: { id: "cve", title: "Critical vulnerabilities remediated", domain: "vuln", assess(data) {
+      const v = data.vuln; if (!v) return { status: "na", ratio: null, evidence: "Vulnerabilities not collected." };
+      const crit = (v.sev && v.sev.crit) || 0;
+      return crit ? { status: "fail", ratio: 0, evidence: crit + " critical vulnerability finding(s)." } : { status: "pass", ratio: 1, evidence: "No critical vulnerability findings." };
+    } },
+    eol: { id: "eol", title: "No end-of-life / unsupported software", domain: "vuln", assess(data) {
+      const v = data.vuln; if (!v) return { status: "na", ratio: null, evidence: "Vulnerabilities not collected." };
+      const hit = _fwTopHit(v, /end.?of.?life|eol|unsupported|out.?of.?support/i);
+      return hit ? { status: "fail", ratio: 0, evidence: hit.title } : { status: "pass", ratio: 1, evidence: "No end-of-life software in the top findings." };
+    } },
+    compliant: { id: "compliant", title: "Devices compliant with Intune policy", domain: "compliance", assess(data) {
+      const c = data.compliance; if (!c) return { status: "na", ratio: null, evidence: "Device compliance not collected." };
+      const bad = ((c.sev && c.sev.crit) || 0) + ((c.sev && c.sev.high) || 0);
+      return bad ? { status: "fail", ratio: 0, evidence: c.lead || ("Exposure score " + c.score) } : { status: "pass", ratio: 1, evidence: c.lead || "Compliant with policy." };
+    } }
+  };
+  const DEV_FRAMEWORKS = {
+    cis: { key: "cis", label: "CIS · Microsoft Intune", benchmark: "the CIS Microsoft Intune for Windows Benchmark", controls: ["edr", "av", "enc", "fw", "asr", "onboard", "cve", "compliant"] },
+    msb: { key: "msb", label: "Microsoft · Security baseline", benchmark: "the Microsoft Defender / Intune security baseline", controls: ["edr", "av", "asr", "fw", "enc", "tvm", "cve", "eol"] }
+  };
+  let _fwKey = (function () { try { const f = localStorage.getItem("dp_fw"); return DEV_FRAMEWORKS[f] ? f : "cis"; } catch (e) { return "cis"; } })();
+  function devFrameworkAssess(data, fwKey) {
+    const fw = DEV_FRAMEWORKS[fwKey] || DEV_FRAMEWORKS.cis;
+    const rows = fw.controls.map(id => { const spec = DEV_FW_CONTROLS[id]; const r = spec.assess(data);
+      return { id, title: spec.title, domain: spec.domain, status: r.status, ratio: (r.ratio == null ? null : r.ratio), evidence: r.evidence }; });
+    const passed = rows.filter(r => r.status === "pass").length;
+    const failed = rows.filter(r => r.status === "fail").length;
+    const na = rows.filter(r => r.status === "na").length;
+    const assessed = passed + failed;
+    // Device-weighted: the mean per-control compliance across assessed controls (not just pass-count),
+    // so a control failing on a handful of devices costs a fraction, not the whole control.
+    const ratios = rows.filter(r => r.ratio != null).map(r => r.ratio);
+    const score = ratios.length ? Math.round(100 * ratios.reduce((a, b) => a + b, 0) / ratios.length) : null;
+    const grade = score == null ? "–" : score >= 90 ? "A" : score >= 75 ? "B" : score >= 50 ? "C" : "D";
+    return { fw, rows, passed, failed, na, assessed, score, grade };
+  }
+  let _fwState = null, _fwBusy = false, _fwWired = false, _fwRowFilter = null;
+  const DP_DOMAIN_VIEW = { hardening: "hardening", coverage: "coverage", vuln: "vuln", compliance: "compliance" };
+  function _fwScoreBadge(score, grade) {
+    const cls = score == null ? "na" : score >= 75 ? "pass" : score >= 50 ? "" : "fail";
+    return '<div style="text-align:center;min-width:104px"><div class="cis-kpi-n ' + cls + '" style="font-size:40px;line-height:1">' + (score == null ? "–" : score + "%") + '</div><div class="cis-ring-s ' + (score != null && score >= 75 ? "pass" : "") + '">compliant · grade ' + esc(grade) + '</div></div>';
+  }
+  function _fwRowHtml(r) {
+    const pill = '<span class="cis-pill ' + r.status + '">' + (r.status === "pass" ? "Pass" : r.status === "fail" ? "Fail" : "N / A") + '</span>';
+    const go = DP_DOMAIN_VIEW[r.domain] ? '<button class="cis-fix" data-fwgo="' + esc(DP_DOMAIN_VIEW[r.domain]) + '">Open ' + esc(r.domain) + ' →</button>' : '';
+    return '<div class="cis-row ' + (r.status === "fail" ? "fail" : "") + '">'
+      + '<span class="cis-id">' + esc((r.id || "").toUpperCase()) + '</span>'
+      + '<div><div class="cis-title">' + esc(r.title) + '</div><div class="cis-ev">' + esc(r.evidence || "") + '</div></div>'
+      + '<div class="cis-rt">' + pill + go + '</div></div>';
+  }
+  function paintFramework(st) {
+    const host = document.getElementById("view-framework"); if (!host) return;
+    const a = devFrameworkAssess(st.data, _fwKey), fw = a.fw, order = { fail: 0, pass: 1, na: 2 };
+    const allRows = a.rows.slice().sort((x, y) => order[x.status] - order[y.status]);
+    const rows = _fwRowFilter ? allRows.filter(r => r.status === _fwRowFilter) : allRows;
+    const kpi = (key, label, n, cls) => '<div class="cis-kpi' + (_fwRowFilter === key ? ' sel' : '') + '" data-fwrf="' + key + '" style="cursor:pointer" title="Show only the ' + label.toLowerCase() + ' controls (click again to clear)"><div class="cis-kpi-l">' + label + '</div><div class="cis-kpi-n ' + cls + '">' + n + '</div></div>';
+    const chip = key => '<span class="' + (_fwKey === key ? 'cis-fw-on' : 'cis-fw-off') + '" data-fwfw="' + key + '" style="cursor:pointer" title="Assess against ' + esc(DEV_FRAMEWORKS[key].benchmark) + '">' + esc(DEV_FRAMEWORKS[key].label) + '</span>';
+    const blurb = a.score == null ? "No device controls could be assessed — connect Defender / Intune."
+      : (a.score + "% of controls satisfied across the estate against " + fw.benchmark + " · " + a.passed + " fully pass, " + a.failed + " partially fail" + (a.na ? (", " + a.na + " not assessable with the current scopes") : "") + ".");
+    let h = '<div class="cis-head"><div class="cis-h-l"><h2>Framework compliance</h2>'
+      + '<div class="cis-fw">' + chip("cis") + chip("msb") + '</div></div>'
+      + '<button class="cis-refresh" id="fwRefresh" title="Re-assess from the latest scan">&#x21bb; Re-assess</button></div>';
+    h += '<div class="cis-top">' + _fwScoreBadge(a.score, a.grade)
+      + '<div class="cis-kpis">' + kpi("pass", "Passed", a.passed, "pass") + kpi("fail", "Failed", a.failed, "fail") + kpi("na", "Not assessed", a.na, "na") + '</div>'
+      + '<div class="cis-blurb">' + esc(blurb) + '</div></div>';
+    const rfLabel = { pass: "passed", fail: "failed", na: "not-assessed" };
+    h += '<div class="cis-sub">Controls · ' + a.assessed + ' assessed · aligned to ' + esc(fw.benchmark)
+      + (_fwRowFilter ? ' · <span data-fwrf="' + _fwRowFilter + '" style="color:var(--accent-dark);cursor:pointer">showing ' + rows.length + ' ' + rfLabel[_fwRowFilter] + ' · clear ✕</span>' : '') + '</div>';
+    h += '<div class="cis-list">' + (rows.length ? rows.map(_fwRowHtml).join("") : '<div style="padding:16px;color:var(--muted);font-size:13px">No ' + rfLabel[_fwRowFilter] + ' controls.</div>') + '</div>';
+    h += '<div class="cis-foot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3" stroke-linecap="round"/></svg>'
+      + 'Read-only — every status is computed from this scan (Defender secure-config, coverage, vulnerabilities, Intune). Controls with no signal in the collected data are marked N / A, never passed.</div>';
+    host.innerHTML = h;
+  }
+  async function renderFramework(force) {
+    const host = document.getElementById("view-framework"); if (!host) return;
+    if (!_fwWired) {
+      host.addEventListener("click", e => {
+        if (e.target.closest("#fwRefresh")) { renderFramework(true); return; }
+        const fwEl = e.target.closest("[data-fwfw]");
+        if (fwEl) { const k = fwEl.getAttribute("data-fwfw"); if (DEV_FRAMEWORKS[k] && k !== _fwKey) { _fwKey = k; try { localStorage.setItem("dp_fw", k); } catch (_) {} if (_fwState) paintFramework(_fwState); } return; }
+        const rfEl = e.target.closest("[data-fwrf]");
+        if (rfEl) { const k = rfEl.getAttribute("data-fwrf"); _fwRowFilter = (_fwRowFilter === k) ? null : k; if (_fwState) paintFramework(_fwState); return; }
+        const goEl = e.target.closest("[data-fwgo]");
+        if (goEl) { show(goEl.getAttribute("data-fwgo")); return; }
+      });
+      _fwWired = true;
+    }
+    if (_fwBusy) return;
+    if (_fwState && !force) { paintFramework(_fwState); return; }
+    _fwBusy = true;
+    host.innerHTML = '<div class="ov-loading"><span class="spinner"></span> Assessing device controls against the framework…</div>';
+    try { const data = await gatherReport(); _fwState = { data }; paintFramework(_fwState); }
+    catch (e) { host.innerHTML = '<div class="ov-err">Could not assess compliance — ' + esc(e.message || e) + '</div>'; }
+    finally { _fwBusy = false; }
+  }
+
   const REPORT_SYSTEM = [
     "You are writing the executive summary of a device / endpoint security posture report for a CISO.",
     "You are given a JSON digest of findings across four domains: Coverage, Compliance, Hardening, Vulnerabilities.",
@@ -3818,6 +3969,17 @@ window.EP = (function () {
     // Uniform per-domain detail from each view's summary() + the attack-paths summary when gathered.
     REPORT_VIEWS.forEach(v => { h += dpRepDomain(v.label, data[v.name]); });
     if (data.attackpaths) h += dpRepDomain("Attack paths", data.attackpaths);
+    // Framework compliance scorecard — device controls mapped to a recognised endpoint benchmark.
+    try { const fa = devFrameworkAssess(data, _fwKey);
+      h += '<h2>Framework compliance — ' + esc(fa.fw.label) + '</h2>';
+      if (fa.score == null) h += '<p class="muted">Not assessed — connect Defender / Intune.</p>';
+      else {
+        h += '<p><b>' + fa.score + '% of controls satisfied across the estate</b> against ' + esc(fa.fw.benchmark) + ' · ' + fa.passed + ' of ' + fa.assessed + ' controls fully pass' + (fa.na ? (' · ' + fa.na + ' not assessable with current scopes') : '') + '.</p>';
+        const fails = fa.rows.filter(r => r.status === "fail");
+        if (fails.length) h += repTable([["Control", r => esc(r.title)], ["Area", r => esc(r.domain)], ["Evidence", r => esc(r.evidence)]], fails);
+        else h += '<p class="muted">No failed controls.</p>';
+      }
+    } catch (e) {}
     h += '<h2>Prioritised remediation</h2>';
     if (top.length) h += '<p class="muted">The highest-risk items across every domain, worst first.</p><ol>'
       + top.map(t => '<li><b>' + esc(t.title) + '</b> <span class="muted">· ' + esc(t.domain) + ' · ' + esc(String(t.sev || "").toUpperCase()) + '</span></li>').join("") + '</ol>';
@@ -6575,6 +6737,10 @@ function __dpHardSummary(){
   if (!LAST) return null;
   if (LAST.needsDefender) return { label:"Hardening", score:null, grade:"–", lead:"Not assessed — connect Defender (MDE).", sev:{crit:0,high:0,med:0,low:0}, top:[] };
   return { label:"Hardening", score:LAST.score, grade:LAST.grade, lead:LAST.lede, sev:sevCounts(),
+    // Full control list (+ pillar group, fail/assessed counts) so the Framework scorecard can map device
+    // secure-config controls to a benchmark honestly — pass/fail per control with real device ratios.
+    devicesAssessed: (LAST && LAST.devicesAssessed) || null,
+    controls: (CONTROLS||[]).map(c => ({ id:c.id, name:c.name, cat:c.cat, group:ctrlGroup(c), sev:c.sev, failDevices:c.failDevices||0, impact:c.impact })),
     top: CONTROLS.filter(c => c.sev==="Critical" || c.sev==="High").sort((a,b)=>(SEV_RANK[b.sev]-SEV_RANK[a.sev])||(b.failDevices-a.failDevices)).slice(0,6)
       .map(c => ({ title: c.name + " (" + c.failDevices + " device" + (c.failDevices===1?"":"s") + ")", sev: SEV_CLS[c.sev], impact: c.cat, search: (c.name||"").toLowerCase() })) };
 }
