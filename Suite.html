@@ -131,6 +131,14 @@
     background-image: radial-gradient(rgba(127,160,210,.13) 1px, transparent 1px); background-size: 18px 18px; }
   .xnarr { padding: 12px 18px; font-size: 13px; line-height: 1.6; color: var(--text); border-top: 1px solid var(--border); }
   .xnarr b { color: var(--accent-dark); }
+  .xlegend { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; padding: 0 18px 12px; font-size: 10.5px; color: var(--muted); }
+  .xlegend .lt { font-weight: 700; color: var(--text); letter-spacing: .04em; }
+  .xlegend .le { display: inline-flex; align-items: center; gap: 6px; }
+  .xlegend .le i { width: 22px; height: 0; display: inline-block; border-top: 2px solid #8FE3FF; }
+  .xlegend .le i.hi { border-top-style: solid; border-top-color: #5EE6B0; }
+  .xlegend .le i.me { border-top-style: dashed; border-top-color: #8FE3FF; }
+  .xlegend .le i.lo { border-top-style: dotted; border-top-color: #FFC15E; }
+  .xlegend .lx { margin-left: auto; font-style: italic; opacity: .8; }
   .xchips { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 18px 14px; }
   .xchip { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 20px; padding: 3px 10px; }
   .xchip b { color: var(--text); }
@@ -324,24 +332,102 @@
     }).join("");
   }
 
-  // Cross-app attack path — correlated across the loaded layers. Sightline supplies the entry: an
-  // internet-reachable host with no Defender sensor behind it (a real collected fact, not inferred).
-  // Device Posture adds the privileged account signed in on that host; Entra Posture adds its Tier-0 reach.
-  function crossPath() {
+  // ── Entity correlation (Phase 2 · the matcher) ──────────────────────────────
+  // Join the SAME real-world entity across the loaded exports' entities{} blocks:
+  //   Sightline host ↔ Device device ↔ its signed-in account ↔ Entra role reach.
+  // Every hop is drawn only when both ends are collected facts (entities carried in
+  // the exports). Confidence reflects which key matched — FQDN > IP > hostname for the
+  // host join; UPN > sAM-likely for the identity join — and the path's confidence is
+  // its weakest hop. Demo exports are never correlated against live ones.
+  const _norm  = s => String(s || "").trim().toLowerCase().replace(/\.$/, "");
+  const _isIp  = s => /^(\d{1,3}\.){3}\d{1,3}$/.test(String(s || "").trim());
+  const _short = s => { const t = _norm(s); return _isIp(t) ? t : t.split(".")[0]; };
+  const _local = s => { s = String(s || ""); if (s.indexOf("@") >= 0) return _norm(s.split("@")[0]);
+    if (s.indexOf("\\") >= 0) return _norm(s.split("\\").pop()); return _norm(s); };
+  const CONF_RANK = { high: 3, medium: 2, low: 1 };
+  const _minConf = (a, b) => CONF_RANK[a] <= CONF_RANK[b] ? a : b;
+  const _realApp = k => !!(STATE.apps[k] && STATE.apps[k]._real);
+
+  // Join A — Sightline host ↔ Device device. Device entities carry a name (FQDN or NetBIOS);
+  // Sightline carries fqdn/ip/host. Prefer a full FQDN match, then IP, then short hostname.
+  function _joinHostDevice(host, devices) {
+    if (!host || !devices || !devices.length) return null;
+    const hf = _norm(host.fqdn), hs = _short(host.fqdn || host.host), hi = host.ip || (_isIp(host.host) ? host.host : "");
+    for (const dv of devices) { const df = _norm(dv.fqdn || dv.name); if (hf && df.indexOf(".") >= 0 && hf === df) return { device: dv, conf: "high", via: "FQDN" }; }
+    for (const dv of devices) { const di = _norm(dv.ip || ""); if (hi && di && _norm(hi) === di) return { device: dv, conf: "medium", via: "IP" }; }
+    for (const dv of devices) { if (hs && _short(dv.fqdn || dv.name) === hs) return { device: dv, conf: "low", via: "hostname" }; }
+    return null;
+  }
+  // Join C — a signed-in account (Device side: DOMAIN\sam, sometimes a UPN) ↔ an Entra identity (UPN).
+  // UPN equality is asserted (high); a sAM / local-part match is "likely" (medium), never upgraded.
+  function _joinAccountIdentity(acct, identities) {
+    if (!acct || !identities || !identities.length) return null;
+    const aUpn = acct.upn ? _norm(acct.upn) : "", aLocal = _local(acct.upn || acct.sam);
+    for (const id of identities) { if (aUpn && id.upn && _norm(id.upn) === aUpn) return { identity: id, conf: "high", via: "UPN" }; }
+    for (const id of identities) { if (aLocal && _local(id.upn) === aLocal) return { identity: id, conf: "medium", via: "sAM (likely)" }; }
+    return null;
+  }
+
+  // The illustrative demo chain — shown when Sightline isn't a real export (nothing to correlate from).
+  function _demoCrossPath() {
     const s = STATE.apps.sightline, d = STATE.apps.device, e = STATE.apps.entra;
-    const demo = anyDemo();
     const host = (s && s.surface && s.surface.foothold) || "blue16-i9";
-    // nodes left→right; each tagged with the layer it comes from
-    const nodes = [{ id: "net", kind: "internet", label: "Internet" }];
-    const edges = [];
-    let prev = "net";
+    const nodes = [{ id: "net", kind: "internet", label: "Internet" }]; const edges = []; let prev = "net";
     if (s) { nodes.push({ id: "edge", kind: "surface", label: host + " · internet-reachable · no EDR", layer: "Exposure (Sightline)" });
       edges.push({ s: prev, t: "edge", l: "reachable · unmonitored" }); prev = "edge"; }
     if (d) { nodes.push({ id: "idn", kind: "idkey", label: "🔑 BLUE16\\\\Administrator on " + host, layer: "Endpoint" });
       edges.push({ s: prev, t: "idn", l: "privileged user signed in" }); prev = "idn"; }
     if (e) { nodes.push({ id: "da", kind: "crit", label: "Domain Admin · Tier-0", layer: "Identity" });
       edges.push({ s: prev, t: "da", l: "role reach" }); prev = "da"; }
-    return { nodes, edges, demo, enough: nodes.length >= 3 };
+    return { nodes, edges, demo: true, correlated: false, pathConf: null, vias: [], enough: nodes.length >= 3 };
+  }
+
+  // Cross-app attack path — correlated from the loaded exports' entities, worst-first from Sightline's
+  // foothold. Falls back to the illustrative demo chain when there's no real Sightline export to anchor it.
+  function crossPath() {
+    const s = STATE.apps.sightline, d = STATE.apps.device, e = STATE.apps.entra;
+    const canCorrelate = _realApp("sightline") && s.entities && s.entities.hosts && s.entities.hosts.length;
+    if (!canCorrelate) return _demoCrossPath();
+
+    const host = s.entities.hosts.find(h => h.foothold) || s.entities.hosts[0];
+    const hostLabel = host.fqdn || host.host;
+    const nodes = [{ id: "net", kind: "internet", label: "Internet" }]; const edges = []; let prev = "net";
+    let pathConf = "high"; const vias = [];
+    nodes.push({ id: "edge", kind: "surface", label: hostLabel + (host.edr === "unmanaged" ? " · internet-reachable · no EDR" : " · internet-reachable"), layer: "Exposure (Sightline)" });
+    edges.push({ s: prev, t: "edge", l: "reachable" + (host.edr === "unmanaged" ? " · unmonitored" : ""), conf: "high" }); prev = "edge";
+
+    // Join A → device, then Join B → the signed-in account on it (prefer a privileged one)
+    let acct = null;
+    if (_realApp("device") && d.entities && d.entities.devices) {
+      const jA = _joinHostDevice(host, d.entities.devices);
+      if (jA) { pathConf = _minConf(pathConf, jA.conf); vias.push("host↔device via " + jA.via);
+        const lo = jA.device.loggedOn || []; acct = lo.find(u => u.privileged) || lo[0] || null;
+        nodes.push({ id: "idn", kind: "idkey", label: "🔑 " + (acct ? acct.sam : "account") + " on " + _short(hostLabel), layer: "Endpoint" });
+        edges.push({ s: prev, t: "idn", l: (acct && acct.privileged ? "privileged user" : "user") + " signed in", conf: jA.conf, via: jA.via }); prev = "idn"; }
+    }
+    // Join C → the Entra identity that account resolves to
+    if (acct && _realApp("entra") && e.entities && e.entities.identities) {
+      const jC = _joinAccountIdentity(acct, e.entities.identities);
+      if (jC) { pathConf = _minConf(pathConf, jC.conf); vias.push("account↔identity via " + jC.via);
+        const id = jC.identity, roleLbl = (id.roles && id.roles[0]) || (id.tier0Reach ? "Tier-0 role" : "privileged role");
+        nodes.push({ id: "da", kind: "crit", label: roleLbl + (id.tier0Reach ? " · Tier-0" : ""), layer: "Identity" });
+        edges.push({ s: prev, t: "da", l: "role reach" + (jC.conf === "medium" ? " (likely)" : ""), conf: jC.conf, via: jC.via }); prev = "da"; }
+    }
+    const correlated = edges.some(x => x.via);   // at least Join A resolved
+    return { nodes, edges, demo: false, correlated, pathConf: correlated ? pathConf : null, vias, enough: nodes.length >= 3 };
+  }
+  // Dynamic narrative for the cross-app card — states only the hops actually drawn.
+  function _crossNarr(cp) {
+    if (cp.demo || !cp.correlated) {
+      return '<b>Sightline</b> finds <b>blue16-i9</b> reachable from the internet with <b>no Defender sensor</b> behind it — a foothold EDR would never see. <b>Device Posture</b> shows a privileged account (<b>BLUE16\\Administrator</b>) signed in on that host, so compromising it inherits that <b>identity</b> — whose role, per <b>Entra Posture</b>, reaches <b>Domain Admin (Tier-0)</b>. Exposure → endpoint → identity → takeover, correlated across all three from collected facts.';
+    }
+    const by = {}; cp.nodes.forEach(n => { if (n.layer) by[n.kind] = n; });
+    let out = '<b>Sightline</b> finds <b>' + esc((by.surface ? by.surface.label : "the host").replace(/ · .*$/, "")) + '</b> internet-reachable' + (by.surface && /no EDR/.test(by.surface.label) ? ' with <b>no Defender sensor</b>' : '') + '.';
+    if (by.idkey) out += ' <b>Device Posture</b> shows <b>' + esc(by.idkey.label.replace("🔑 ", "").replace(/ on .*$/, "")) + '</b> signed in there — compromising the host inherits that identity.';
+    if (by.crit)  out += ' <b>Entra Posture</b> puts that account at <b>' + esc(by.crit.label) + '</b>.';
+    else if (by.idkey) out += ' Load an <b>Entra</b> export to extend the chain to its role reach.';
+    out += ' <span style="color:var(--muted)">Correlated from your exports · path confidence <b>' + esc(cp.pathConf || "–") + '</b>' + (cp.vias.length ? ' · ' + esc(cp.vias.join(" · ")) : '') + '.</span>';
+    return out;
   }
   const XCOLOR = { internet: "#FF9A6B", surface: "#5AD1E6", device: "#93ACD3", idkey: "#FFD166", crit: "#FFD166" };
   let _xcy = null;
@@ -349,12 +435,22 @@
     const cp = crossPath();
     const host = $("xcard");
     if (!cp.enough) { host.innerHTML = '<div class="xcard-h"><span class="t">Cross-app attack path</span></div><div class="xnarr" style="color:var(--muted)">Load at least two layers (e.g. Endpoint + Identity) to correlate a cross-app path.</div>'; return; }
-    const narr = '<b>Sightline</b> finds <b>blue16-i9</b> reachable from the internet with <b>no Defender sensor</b> behind it — a foothold EDR would never see. <b>Device Posture</b> shows a privileged account (<b>BLUE16\\Administrator</b>) signed in on that host, so compromising it inherits that <b>identity</b> — whose role, per <b>Entra Posture</b>, reaches <b>Domain Admin (Tier-0)</b>. Exposure → endpoint → identity → takeover, correlated across all three from collected facts.';
+    const narr = _crossNarr(cp);
     const chips = cp.nodes.filter(n => n.layer).map(n => '<span class="xchip"><b>' + esc(n.layer) + '</b> · ' + esc(n.label.replace("🔑 ", "")) + '</span>').join("");
+    const sub = cp.demo ? "illustrative · demo correlation"
+      : cp.correlated ? ("correlated from your exports · confidence: " + esc(cp.pathConf || "–"))
+      : "from your exports";
+    const legend = cp.correlated
+      ? '<div class="xlegend"><span class="lt">Edge confidence</span>'
+        + '<span class="le"><i class="hi"></i>high · FQDN / UPN</span>'
+        + '<span class="le"><i class="me"></i>medium · IP / sAM</span>'
+        + '<span class="le"><i class="lo"></i>low · hostname</span>'
+        + '<span class="lx">hover an edge for the join key</span></div>'
+      : '';
     host.innerHTML = '<div class="xcard-h"><span class="t">Internet → exposed host → endpoint → identity → Tier-0</span>'
-      + '<span class="sub">' + (cp.demo ? "illustrative · demo correlation" : "correlated from your exports") + '</span></div>'
+      + '<span class="sub">' + sub + '</span></div>'
       + '<div id="xcy"></div>'
-      + '<div class="xnarr">' + narr + '</div><div class="xchips">' + chips + '</div>';
+      + '<div class="xnarr">' + narr + '</div>' + legend + '<div class="xchips">' + chips + '</div>';
     drawXGraph(cp);
   }
   function xGlyph(c) { return "data:image/svg+xml;utf8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><rect x="2.6" y="2.6" width="6.8" height="6.8" rx="1.3" transform="rotate(45 6 6)" fill="' + c + '"/></svg>'); }
@@ -363,7 +459,7 @@
     if (_xcy) { try { _xcy.destroy(); } catch (e) {} _xcy = null; }
     const els = [];
     cp.nodes.forEach(n => els.push({ data: { id: n.id, label: n.label.replace(/\\\\/g, "\\"), kind: n.kind, crit: (n.kind === "crit" || n.kind === "idkey") ? "1" : "0" } }));
-    cp.edges.forEach((e, i) => els.push({ data: { id: "xe" + i, source: e.s, target: e.t, label: e.l } }));
+    cp.edges.forEach((e, i) => els.push({ data: { id: "xe" + i, source: e.s, target: e.t, label: e.l, conf: e.conf || "", via: e.via || "" } }));
     _xcy = cytoscape({ container: host, elements: els,
       layout: { name: "breadthfirst", directed: true, roots: "#net", padding: 20, spacingFactor: 1.25, nodeDimensionsIncludeLabels: true },
       minZoom: 0.4, maxZoom: 2, userZoomingEnabled: false, pixelRatio: 2,
@@ -373,11 +469,25 @@
           "background-image": ele => xGlyph(XCOLOR[ele.data("kind")] || "#7C9CFF"), "background-width": 9, "background-height": 9, "background-position-x": "8px", "background-position-y": "50%", "background-clip": "none" } },
         { selector: 'node[kind="internet"]', style: { "border-color": "#FF7A45", "color": "#FFD8C2" } },
         { selector: 'node[crit="1"]', style: { "border-color": "#FFD166", "border-width": 2, "color": "#FFE6A3", "shadow-blur": 16, "shadow-color": "#FFD166", "shadow-opacity": .45 } },
-        { selector: "edge", style: { "width": 1.6, "line-color": "rgba(143,227,255,.5)", "line-style": "dashed", "target-arrow-color": "#FF5C7A", "target-arrow-shape": "triangle", "arrow-scale": .9, "curve-style": "bezier", "label": "data(label)", "font-size": 6.5, "font-weight": 600, "color": "#8FE3FF", "text-rotation": "autorotate", "text-background-color": "#0A1C42", "text-background-opacity": .85, "text-background-padding": 2 } }
+        { selector: "edge", style: { "width": 1.6, "line-color": "rgba(143,227,255,.5)", "line-style": "dashed", "target-arrow-color": "#FF5C7A", "target-arrow-shape": "triangle", "arrow-scale": .9, "curve-style": "bezier", "label": "data(label)", "font-size": 6.5, "font-weight": 600, "color": "#8FE3FF", "text-rotation": "autorotate", "text-background-color": "#0A1C42", "text-background-opacity": .85, "text-background-padding": 2 } },
+        // confidence → line style: high solid, medium dashed, low dotted (demo edges carry no conf → the dashed default above)
+        { selector: 'edge[conf="high"]',   style: { "line-style": "solid", "line-color": "rgba(94,230,176,.75)", "width": 2 } },
+        { selector: 'edge[conf="medium"]', style: { "line-style": "dashed", "line-color": "rgba(143,227,255,.7)" } },
+        { selector: 'edge[conf="low"]',    style: { "line-style": "dotted", "line-color": "rgba(255,193,94,.75)", "width": 2 } }
       ] });
     _xcy.nodes().forEach(n => { const p = n.position(); n.position({ x: p.y, y: p.x }); });   // horizontal flow
     const fit = () => { if (!_xcy || !host.clientHeight) return; try { _xcy.resize(); _xcy.fit(undefined, 24); if (_xcy.zoom() > 1.5) _xcy.zoom(1.5); _xcy.center(); } catch (e) {} };
     fit(); if (window.ResizeObserver) { try { new ResizeObserver(fit).observe(host); } catch (e) {} } else setTimeout(fit, 200);
+    // Edge tooltip — the join key + confidence behind each correlated hop (why these two were called the same).
+    host.style.position = "relative";
+    let tip = host.querySelector(".xtip");
+    if (!tip) { tip = document.createElement("div"); tip.className = "xtip"; tip.style.cssText = "position:absolute;z-index:20;pointer-events:none;display:none;background:#0A1C42;border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:11px;color:#EAF2FF;white-space:nowrap;box-shadow:0 4px 14px rgba(0,0,0,.45)"; host.appendChild(tip); }
+    const showTip = ev => { const c = ev.target.data("conf"), v = ev.target.data("via"); if (!c && !v) { tip.style.display = "none"; return; }
+      tip.innerHTML = (c ? '<b style="color:' + (c === "high" ? "#5EE6B0" : c === "low" ? "#FFC15E" : "#8FE3FF") + '">' + esc(c) + '</b> confidence' : "") + (v ? (c ? " · " : "") + "via " + esc(v) : "");
+      tip.style.display = "block"; };
+    _xcy.on("mouseover", "edge", showTip);
+    _xcy.on("mousemove", "edge", ev => { const r = ev.renderedPosition; if (r) { tip.style.left = (r.x + 12) + "px"; tip.style.top = (r.y + 12) + "px"; } });
+    _xcy.on("mouseout", "edge", () => { tip.style.display = "none"; });
   }
 
   function renderActions() {
