@@ -7228,9 +7228,9 @@ window.EP = (function () {
   // ── Cross-pillar graph (Cytoscape) + compact pillar strip ─────────────────────
   let _sxCy = null;
   function sxDestroyGraph() { if (_sxCy) { try { _sxCy.destroy(); } catch (_) {} _sxCy = null; } }
-  // Compact per-pillar score chips (worst first) shown under the estate gauge — replaces the big Pillars panel.
+  // Compact per-pillar score chips in canonical order (Identity · Endpoint · Apps & Data) under the estate gauge — replaces the big Pillars panel.
   function suitePillarStrip(pills) {
-    const items = SUITE_PILLARS.slice().sort((a, b) => ((pills[b.key] && pills[b.key].overall && pills[b.key].overall.score) || 0) - ((pills[a.key] && pills[a.key].overall && pills[a.key].overall.score) || 0));
+    const items = SUITE_PILLARS.slice();   // canonical order: Identity · Endpoint · Apps & Data (Identity first)
     return '<div class="sx-strip">' + items.map(p => {
       const o = pills[p.key] && pills[p.key].overall, sc = o ? o.score : null;
       const cls = sc == null ? "" : sc >= 60 ? "crit" : sc >= 35 ? "high" : "low";
@@ -7262,11 +7262,39 @@ window.EP = (function () {
     });
     return els;
   }
-  function suiteMountGraph(links) {
+  // Pillar-level blast-radius graph — the honest fallback when no single account matched across the
+  // pillars' collected entities (e.g. a tenant without the Defender exposure graph populated, so there
+  // are no device→user logons to join). Still a real cross-domain graph: Identity → Endpoint → Apps &
+  // Data, each node sized by its critical/high count, each with its weakest domain's top finding as a
+  // leaf. Upgrades to the exact identity→device→mailbox chains (suiteGraphEls) the moment that data lands.
+  function suitePillarGraphEls(pills) {
+    pills = pills || {};
+    const els = [], order = ["identity", "endpoint", "data"], X = { identity: 70, endpoint: 250, data: 430 };
+    const topTitle = t => { if (!t) return null; const s = t.title || t.name || t.fix || (typeof t === "string" ? t : null); return s ? String(s).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() : null; };
+    let prev = null;
+    order.forEach(key => {
+      const p = SUITE_PILLARS.find(x => x.key === key); if (!p) return;
+      const pd = pills[key], o = pd && pd.overall, n = o ? (o.crit || 0) + (o.high || 0) : 0;
+      const pid = "p:" + key;
+      els.push({ data: { id: pid, label: p.label + " · " + n, type: "pillar", crit: o && o.crit ? 1 : 0 }, position: { x: X[key], y: 58 } });
+      if (prev) els.push({ data: { id: prev + ">" + pid, source: prev, target: pid, label: key === "endpoint" ? "privileged user" : "reaches data" } });
+      prev = pid;
+      const wd = (pd ? suiteWorstDomains(pd, 1) : [])[0];
+      const title = wd && wd.s && wd.s.top ? topTitle(wd.s.top[0]) : null;
+      if (title) {
+        const lid = "l:" + key;
+        els.push({ data: { id: lid, label: title.slice(0, 46), type: "finding", crit: 0 }, position: { x: X[key], y: 148 } });
+        els.push({ data: { id: pid + ">" + lid, source: pid, target: lid, label: wd.v.label } });
+      }
+    });
+    return els;
+  }
+  function suiteMountGraph(links, pills) {
     sxDestroyGraph();
     const host = document.getElementById("sxGraph"); if (!host) return;
-    const els = suiteGraphEls(links || []);
-    if (!els.length || typeof cytoscape === "undefined") { host.innerHTML = '<div class="sx-gempty" style="height:100%;display:grid;place-content:center;text-align:center">' + (typeof cytoscape === "undefined" ? "Graph library unavailable." : "No correlated path to graph yet.") + '</div>'; return; }
+    let els = suiteGraphEls(links || []);
+    if (!els.length) els = suitePillarGraphEls(pills);   // no entity match → pillar-level blast-radius graph (never an empty void)
+    if (!els.length || typeof cytoscape === "undefined") { host.innerHTML = '<div class="sx-gempty" style="height:100%;display:grid;place-content:center;text-align:center">' + (typeof cytoscape === "undefined" ? "Graph library unavailable." : "No pillar data to graph yet.") + '</div>'; return; }
     _sxCy = cytoscape({
       container: host, elements: els, layout: { name: "preset" },
       minZoom: 0.3, maxZoom: 2.5, wheelSensitivity: 0.25, pixelRatio: 2,
@@ -7287,7 +7315,7 @@ window.EP = (function () {
   }
   function suiteSignalNote(pills) {
     const n = k => { const o = pills[k] && pills[k].overall; return o ? (o.crit || 0) + (o.high || 0) : 0; };
-    return '<div class="sx-gempty"><b>No account matched across pillars yet.</b> Open <b>Attack Paths</b> (Identity) and <b>Attack paths</b> (Endpoint) so their entities are collected — then the exact identity → device → mailbox path graphs here.'
+    return '<div class="sx-gempty"><b>Pillar-level blast radius.</b> The graph shows the identity-axis chain across the estate — no single account has matched across the pillars yet. Open <b>Attack Paths</b> (Identity) and <b>Attack paths</b> (Endpoint), and run the consultant M365 collection, to resolve the exact identity → device → mailbox path here.'
       + '<div class="sx-sig">Signal level now · Identity <b>' + n("identity") + '</b> · Endpoint <b>' + n("endpoint") + '</b> · Apps &amp; Data <b>' + n("data") + '</b> critical/high</div></div>';
   }
   function paintSuite(st) {
@@ -7323,7 +7351,7 @@ window.EP = (function () {
     ovAnimate(host);
     host.querySelectorAll("[data-suitego]").forEach(el => el.addEventListener("click", () => setPillar(el.getAttribute("data-suitego"))));
     const ab = host.querySelector("#suiteAiBtn"); if (ab) ab.addEventListener("click", runSuiteAi);
-    suiteMountGraph(links);
+    suiteMountGraph(links, pills);
   }
   async function renderSuite(force) {
     const host = document.getElementById("view-suite"); if (!host) return;
@@ -7540,7 +7568,7 @@ window.EP = (function () {
   }
 
   // ---- composition (print-ready HTML, generalised from EntraHound's report()) ----
-  function sevCls(t) { return ({ critical: "Critical", high: "High", medium: "Medium", low: "Low", act: "Critical", sprint: "High", healthy: "Low", info: "Informational", informational: "Informational" })[String(t).toLowerCase()] || "Informational"; }
+  function sevCls(t) { return ({ critical: "Critical", crit: "Critical", high: "High", medium: "Medium", med: "Medium", low: "Low", act: "Critical", sprint: "High", healthy: "Low", info: "Informational", informational: "Informational" })[String(t).toLowerCase()] || "Informational"; }
   function repCounts(c) {
     if (!c) return "";
     return ["critical", "high", "medium", "low", "healthy"].filter(k => c[k]).map(k =>
