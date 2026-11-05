@@ -3862,6 +3862,79 @@ document.addEventListener("DOMContentLoaded", () => window.EP._boot());
 </script>
 
 <script>
+/* ===== M365 live collection helpers — shared by the four workload views =====
+   One read-only Microsoft Graph pass, cached on window so the views don't each refetch.
+   Backbone: Microsoft Secure Score (SecurityEvents.Read.All) — its control catalog +
+   the tenant's current control state. Each view selects its slice with a predicate and
+   maps every control to the same row shape the demo uses {id,title,status,sev,detail,fix,src}.
+   Direct Graph settings (SharePoint /admin/sharepoint/settings, Teams /teamwork, sensitivity
+   labels) are added by the views on top. Everything here is read-only and grounded — a value
+   is shown only when the API returned it; nothing is invented. Deep policy detail that is not
+   in Graph (full Exchange/Teams/DLP policies) is imported from the consultant PowerShell module. */
+window.M365LIVE = (function () {
+  "use strict";
+  function stripHtml(s) { return String(s == null ? "" : s).replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim(); }
+
+  let _ssPromise = null;
+  async function _fetchSecureScore() {
+    let at; try { at = await EP.tokenSilent(["SecurityEvents.Read.All"]); } catch (e) { at = await EP.token(["SecurityEvents.Read.All"]); }
+    const base = EP.graphBase(), H = { Authorization: "Bearer " + at };
+    const sR = await fetch(base + "/security/secureScores?$top=1", { headers: H });
+    if (!sR.ok) throw new Error("secureScores HTTP " + sR.status);
+    const latest = ((await sR.json()).value || [])[0] || {};
+    // Control profiles can page — follow nextLink a few times (catalog is a few hundred rows).
+    const byName = {}; let next = base + "/security/secureScoreControlProfiles?$top=200", guard = 0;
+    while (next && guard++ < 10) {
+      const pR = await fetch(next, { headers: H });
+      if (!pR.ok) throw new Error("secureScoreControlProfiles HTTP " + pR.status);
+      const j = await pR.json();
+      (j.value || []).forEach(p => { byName[String(p.id || p.controlName || "").toLowerCase()] = p; });
+      next = j["@odata.nextLink"] || null;
+    }
+    return { controlScores: latest.controlScores || [], profiles: byName };
+  }
+  function secureScore() { return _ssPromise || (_ssPromise = _fetchSecureScore()); }
+
+  // Map the Secure Score controls a predicate selects into row objects. pred(name, title, category, profile).
+  async function fromSecureScore(pred) {
+    const ss = await secureScore(), rows = [];
+    (ss.controlScores || []).forEach(cs => {
+      const name = String(cs.controlName || "").toLowerCase();
+      const prof = ss.profiles[name] || {};
+      const cat = String(cs.controlCategory || prof.controlCategory || "").toLowerCase();
+      const title = prof.title || cs.controlName || name;
+      if (!pred(name, String(title).toLowerCase(), cat, prof)) return;
+      if (prof.deprecated) return;
+      let pct = (typeof cs.scoreInPercentage === "number") ? cs.scoreInPercentage
+        : (typeof cs.score === "number" && cs.total) ? Math.round(100 * cs.score / cs.total) : null;
+      const status = pct == null ? "warn" : pct >= 100 ? "pass" : pct <= 0 ? "fail" : "warn";
+      const maxS = Number(prof.maxScore) || 0;
+      const sev = status === "pass" ? "ok"
+        : (status === "fail" && maxS >= 8) ? "crit"
+        : status === "fail" ? "high" : "med";
+      rows.push({ id: (name.replace(/[^a-z0-9]+/g, "-").slice(0, 44) || "ctl-" + rows.length),
+        title: title, status: status, sev: sev,
+        detail: stripHtml(cs.description || prof.remediation || prof.actionUrl || ""),
+        fix: status === "pass" ? "" : stripHtml(prof.remediation || ""),
+        src: "Microsoft Secure Score" + (cat ? " · " + cat : "") });
+    });
+    return rows;
+  }
+
+  // One read-only Graph GET with the given scopes (silent, falling back to interactive consent).
+  async function graphGet(path, scopes) {
+    let at; try { at = await EP.tokenSilent(scopes); } catch (e) { at = await EP.token(scopes); }
+    const r = await fetch(EP.graphBase() + path, { headers: { Authorization: "Bearer " + at } });
+    if (r.status === 403 || r.status === 401) { const e = new Error("not consented"); e.code = r.status; throw e; }
+    if (!r.ok) throw new Error(path.split("?")[0] + " HTTP " + r.status);
+    return r.json();
+  }
+
+  return { secureScore, fromSecureScore, graphGet, stripHtml, reset() { _ssPromise = null; } };
+})();
+</script>
+
+<script>
 EP.registerView("email", (function () {
   const __root = window.document.getElementById("view-email");
   const document = EP.scopedDoc(__root);
@@ -3940,9 +4013,15 @@ EP.registerView("email", (function () {
     c.innerHTML = h;
   }
 
-  function analyze() {
-    _state = EP.DEMO ? DEMO : null;
-    render(dataset());
+  async function analyze() {
+    if (EP.DEMO) { _state = DEMO; render(DEMO); return; }
+    render(null);
+    try {
+      var rows = await M365LIVE.fromSecureScore(function (n, t, c) { return c === "apps" && /exchange|mail|phish|spam|forward|dkim|dmarc|spf|safe.?link|safe.?attach|\batp\b|mdo|outlook|office.?365|defender.*office/.test(n + " " + t); });
+      _state = rows; render(rows.length ? rows : null);
+    } catch (e) {
+      var c2 = document.getElementById("content"); if (c2) c2.innerHTML = '<div class="m-note">Couldn’t load live Email posture — ' + esc((e && e.message) || e) + '. Secure Score needs <b>SecurityEvents.Read.All</b> (admin consent). Deep policy detail comes from the consultant Exchange PowerShell module. Try <code>?demo=1</code> for the worked example.</div>';
+    }
   }
 
   function __m365EmailSummary() {
@@ -4048,7 +4127,25 @@ EP.registerView("sharepoint", (function () {
     c.innerHTML = h;
   }
 
-  function analyze() { _state = EP.DEMO ? DEMO : null; render(dataset()); }
+  async function analyze() {
+    if (EP.DEMO) { _state = DEMO; render(DEMO); return; }
+    render(null);
+    try {
+      var rows = await M365LIVE.fromSecureScore(function (n, t, c) { return (c === "apps" || c === "data") && /sharepoint|onedrive|\bspo\b|sharing|external.?shar/.test(n + " " + t); });
+      try {
+        var sp = await M365LIVE.graphGet("/admin/sharepoint/settings", ["SharePointTenantSettings.Read.All"]);
+        var lvl = sp.sharingCapability || "unknown";
+        var anon = lvl === "externalUserAndGuestSharing";
+        rows.unshift({ id: "spo-external-sharing", title: "Tenant external sharing level", status: anon ? "fail" : (lvl === "disabled" ? "pass" : "warn"), sev: anon ? "high" : (lvl === "disabled" ? "ok" : "med"),
+          detail: "External sharing capability is set to '" + lvl + "'" + (anon ? " — anonymous 'Anyone' links can be created." : "."),
+          fix: anon ? "Lower external sharing to 'New and existing guests' so recipients must authenticate." : "",
+          src: "Graph /admin/sharepoint/settings" });
+      } catch (se) { /* scope not granted / beta-only field — Secure Score still covers sharing */ }
+      _state = rows; render(rows.length ? rows : null);
+    } catch (e) {
+      var c2 = document.getElementById("content"); if (c2) c2.innerHTML = '<div class="m-note">Couldn’t load live SharePoint posture — ' + esc((e && e.message) || e) + '. Try <code>?demo=1</code> for the worked example.</div>';
+    }
+  }
 
   function __m365SpoSummary() {
     var list = dataset(); if (!list) return null;
@@ -4149,7 +4246,16 @@ EP.registerView("teams", (function () {
     c.innerHTML = h;
   }
 
-  function analyze() { _state = EP.DEMO ? DEMO : null; render(dataset()); }
+  async function analyze() {
+    if (EP.DEMO) { _state = DEMO; render(DEMO); return; }
+    render(null);
+    try {
+      var rows = await M365LIVE.fromSecureScore(function (n, t, c) { return c === "apps" && /teams|skype|meeting|federation|lobby|anonymous|external.?access/.test(n + " " + t); });
+      _state = rows; render(rows.length ? rows : null);
+    } catch (e) {
+      var c2 = document.getElementById("content"); if (c2) c2.innerHTML = '<div class="m-note">Couldn’t load live Teams posture — ' + esc((e && e.message) || e) + '. Meeting / messaging / external-access policy detail comes from the consultant Teams PowerShell module. Try <code>?demo=1</code>.</div>';
+    }
+  }
 
   function __m365TeamsSummary() {
     var list = dataset(); if (!list) return null;
@@ -4250,7 +4356,16 @@ EP.registerView("data", (function () {
     c.innerHTML = h;
   }
 
-  function analyze() { _state = EP.DEMO ? DEMO : null; render(dataset()); }
+  async function analyze() {
+    if (EP.DEMO) { _state = DEMO; render(DEMO); return; }
+    render(null);
+    try {
+      var rows = await M365LIVE.fromSecureScore(function (n, t, c) { return c === "data" || /\bdlp\b|sensitivity label|auto.?label|information protection|purview|retention/.test(t); });
+      _state = rows; render(rows.length ? rows : null);
+    } catch (e) {
+      var c2 = document.getElementById("content"); if (c2) c2.innerHTML = '<div class="m-note">Couldn’t load live Data posture — ' + esc((e && e.message) || e) + '. DLP &amp; retention policy detail comes from the consultant Purview PowerShell module. Try <code>?demo=1</code>.</div>';
+    }
+  }
 
   function __m365DataSummary() {
     var list = dataset(); if (!list) return null;
