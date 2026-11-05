@@ -6916,17 +6916,20 @@ window.EP = (function () {
     }
     await pull("entrahound", "identities");
     await pull("attackpaths", "devices");
+    await pull("email", "mailboxes");   // Apps & Data entity hop (per-mailbox, from the consultant collection)
     return out;
   }
   const _entLocal = s => String(s || "").toLowerCase().replace(/.*[\\/]/, "").replace(/@.*/, "");
   function correlateEntities(ents) {
     const idByLocal = {};
     (ents.identities || []).forEach(i => { const k = _entLocal(i.upn); if (k) idByLocal[k] = i; });
+    const mailByLocal = {};
+    (ents.mailboxes || []).forEach(m => { const k = _entLocal(m.upn); if (k && !mailByLocal[k]) mailByLocal[k] = m; });
     const links = [];
     (ents.devices || []).forEach(dev => {
       (dev.loggedOn || []).forEach(acct => {
         const id = idByLocal[_entLocal(acct.sam)];
-        if (id) links.push({ device: dev, account: acct, identity: id, tier0: !!id.tier0Reach, privileged: !!(id.privileged || acct.privileged) });
+        if (id) links.push({ device: dev, account: acct, identity: id, tier0: !!id.tier0Reach, privileged: !!(id.privileged || acct.privileged), data: mailByLocal[_entLocal(id.upn)] || null });
       });
     });
     const critRank = { "Very high": 0, "High": 1, "Medium": 2, "Low": 3 };
@@ -6980,12 +6983,16 @@ window.EP = (function () {
         const roles = (id.roles || []).slice(0, 2).join(", ") || (id.privileged ? "privileged" : "standard user");
         const t0 = l.tier0 ? '<span class="sx-t0">Tier-0</span>' : (l.privileged ? '<span class="sx-t0 priv">privileged</span>' : '');
         const ehop = (cls, ic, go, t, d) => '<div class="sx-ehop ' + cls + '" data-suitego="' + go + '"><div class="sx-eh-ic">' + ic + '</div><div class="sx-eh-x"><div class="sx-eh-t">' + t + '</div><div class="sx-eh-d">' + d + '</div></div></div>';
+        // Data hop: entity-level when the same UPN has a flagged mailbox (consultant collection); else signal-level.
+        const dh = l.data ? ('<b>' + esc(l.data.upn) + '</b> · ' + esc(l.data.issue)) : dataHop;
+        const dataTitle = l.data ? "Mailbox exposed" : "Apps &amp; Data";
+        const dataCls = "data" + ((l.data || dataN) ? "" : " off");
         return '<div class="sx-echain">'
           + ehop("id", "🔑", "identity", esc(id.displayName || id.upn) + " " + t0, esc(roles) + " · " + esc(id.upn))
           + '<div class="sx-earrow">signed in on →</div>'
           + ehop("dev", "💻", "endpoint", esc(dev.name), esc(dev.criticality || "device") + (dev.ip ? " · " + esc(dev.ip) : ""))
           + '<div class="sx-earrow">reaches →</div>'
-          + ehop("data" + (dataN ? "" : " off"), "📩", "data", "Apps &amp; Data", dataHop)
+          + ehop(dataCls, "📩", "data", dataTitle, dh)
           + '</div>';
       }).join("");
       body = '<div class="sx-lede">A privileged identity signed in on a weak endpoint is a <b>live cross-estate path</b> — compromise the endpoint, inherit the identity, reach the data. '
@@ -7033,7 +7040,7 @@ window.EP = (function () {
     const btn = document.getElementById("suiteAiBtn"); if (btn) { btn.disabled = true; btn.textContent = "✦ thinking…"; }
     try {
       const pills = _suiteState.pillars;
-      const correlations = (_suiteState.links || []).slice(0, 3).map(l => ({ identity: l.identity.upn, roles: l.identity.roles || [], tier0: l.tier0, privileged: l.privileged, device: l.device.name, deviceCriticality: l.device.criticality || null }));
+      const correlations = (_suiteState.links || []).slice(0, 3).map(l => ({ identity: l.identity.upn, roles: l.identity.roles || [], tier0: l.tier0, privileged: l.privileged, device: l.device.name, deviceCriticality: l.device.criticality || null, mailbox: l.data ? l.data.issue : null }));
       const digest = JSON.stringify({
         pillars: SUITE_PILLARS.map(p => { const pd = pills[p.key]; const o = pd && pd.overall;
           return { pillar: p.label, score: o ? o.score : null, grade: o ? o.grade : null, critical: o ? o.crit : 0, high: o ? o.high : 0,
@@ -25636,6 +25643,14 @@ EP.registerView("email", (function () {
 
   var SEV_RANK = { crit:0, high:1, med:2, low:3, ok:9 };
   var _state = null;
+  // Entity-level findings (per mailbox, keyed by UPN) from the consultant collection — the data
+  // the Suite's cross-pillar correlation joins to an identity/device. Live: m365-collection.json
+  // entities.mailboxes (Get-Mailbox / Get-InboxRule, not in Graph). Demo: a worked example.
+  var _mbx = [];
+  var DEMO_MBX = [
+    { upn: "ava.devries0@contoso.com", display: "Ava de Vries", issue: "external forwarding", detail: "Mailbox auto-forwards to ava.personal@proton.me (outside the tenant).", sev: "high" },
+    { upn: "svc_reports@contoso.com", display: "Reporting service", issue: "inbox rule forwards externally", detail: "Inbox rule 'archive' redirects to an external Gmail address.", sev: "high" }
+  ];
 
   function dataset() { return EP.DEMO ? DEMO : _state; }
 
@@ -25651,11 +25666,12 @@ EP.registerView("email", (function () {
   }
 
   async function analyze() {
-    if (EP.DEMO) { _state = DEMO; render(DEMO); return; }
+    if (EP.DEMO) { _state = DEMO; _mbx = DEMO_MBX; render(DEMO); return; }
     render(null);
     try {
       var rows = await M365LIVE.fromSecureScore(function (n, t, c) { return c === "apps" && /exchange|mail|phish|spam|forward|dkim|dmarc|spf|safe.?link|safe.?attach|\batp\b|mdo|outlook|office.?365|defender.*office/.test(n + " " + t); });
       rows = rows.concat(await M365LIVE.collect("email"));   // deep policy detail from the consultant PowerShell collection, if present
+      try { var _coll = await M365LIVE.collection(); _mbx = (_coll && _coll.entities && _coll.entities.mailboxes) || []; } catch (e) { _mbx = []; }   // per-mailbox entities for cross-pillar correlation
       _state = rows; render(rows.length ? rows : null);
     } catch (e) {
       var c2 = document.getElementById("content"); if (c2) c2.innerHTML = '<div class="m-note">Couldn’t load live Email posture — ' + esc((e && e.message) || e) + '. Secure Score needs <b>SecurityEvents.Read.All</b> (admin consent). Deep policy detail comes from the consultant Exchange PowerShell module. Try <code>?demo=1</code> for the worked example.</div>';
@@ -25681,6 +25697,8 @@ EP.registerView("email", (function () {
     };
   }
 
+  function __m365EmailEntities() { return { mailboxes: _mbx || [] }; }
+
   function __m365EmailFocus(f) {
     if (!f || !f.id) return;
     var el = document.getElementById("ctl-" + f.id); if (!el) return;
@@ -25690,7 +25708,7 @@ EP.registerView("email", (function () {
 
   if (EP.DEMO) analyze();   // demo self-renders at registration (loadView skips load() in demo)
 
-;return { load: (typeof analyze === "function") ? analyze : null, summary: (typeof __m365EmailSummary === 'function' ? __m365EmailSummary : null), focus: (typeof __m365EmailFocus === 'function' ? __m365EmailFocus : null) };
+;return { load: (typeof analyze === "function") ? analyze : null, summary: (typeof __m365EmailSummary === 'function' ? __m365EmailSummary : null), focus: (typeof __m365EmailFocus === 'function' ? __m365EmailFocus : null), entities: (typeof __m365EmailEntities === 'function' ? __m365EmailEntities : null) };
 })());
 </script>
 <script>
