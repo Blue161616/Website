@@ -25036,13 +25036,22 @@ EP.registerView("asropt", (function () {
     return '<span class="ca-opt-btn" id="asr-opt-run" role="button" tabindex="0" title="Sequences the rollout into a priority order. Runs on ' + model + ', grounded in your fleet\'s ASR modes; nothing leaves the machine. Advisory, not a control."><span class="spk">✦</span> Optimise with AI</span><span id="asr-opt-status" style="font-size:11.5px;margin-left:8px"></span>';
   }
 
-  // ── Per-rule recommendation card ──
-  function psSnippet(rule, kind) {
-    const action = (kind === "pilot" || kind === "review-block") ? "AuditMode" : "Enabled";   // Enabled = Block
-    return "# " + rule.name + "\n"
-      + "# " + rule.guid + "  →  " + (action === "AuditMode" ? "Audit (pilot first)" : "Block")
-      + "\nAdd-MpPreference -AttackSurfaceReductionRules_Ids " + rule.guid
-      + " `\n  -AttackSurfaceReductionRules_Actions " + action;
+  // ── Shared "How to apply" expander — used by both the rollout cards and the all-rules list, so there is one
+  //    consistent way to apply a rule. targetAction is "Enabled" (Block) or "AuditMode" (Audit first). ──
+  function applySnippet(rule, targetAction) {
+    const audit = targetAction === "AuditMode";
+    return "# " + rule.name + "  (" + rule.guid + ")\n"
+      + "# Recommended: " + (audit ? "Audit first (higher false-positive), then Block" : "Block") + "\n"
+      + "Add-MpPreference -AttackSurfaceReductionRules_Ids " + rule.guid
+      + " `\n  -AttackSurfaceReductionRules_Actions " + targetAction;
+  }
+  function applyExpander(rule, targetAction, domId) {
+    const audit = targetAction === "AuditMode";
+    return '<details class="opt-det"><summary>How to apply ▸</summary>'
+      + '<div class="opt-rem"><div class="opt-rem-h">SightLine is read-only — apply it yourself in the Intune <b>Endpoint security &rsaquo; Attack surface reduction</b> policy (recommended: <b>' + (audit ? "Audit first, then Block" : "Block") + '</b>), or with the Defender PowerShell below:</div>'
+      + '<a href="' + PORTAL + '" target="_blank" rel="noopener">Open the ASR blade in the Defender portal &#8599;</a>'
+      + '<div class="opt-ps-wrap"><button type="button" class="btn js-apply-copy" data-target="' + domId + '" style="padding:4px 10px;font-size:11px">Copy</button>'
+      + '<pre class="opt-ps" id="' + domId + '">' + esc(applySnippet(rule, targetAction)) + '</pre></div></div></details>';
   }
   // Colored "current → target" transition for a rec's right-side label (rule-level). Current mode is shown in
   // its status colour (Audit amber, Block/Warn green, Not configured red) so the live state reads at a glance.
@@ -25057,11 +25066,7 @@ EP.registerView("asropt", (function () {
   }
   function recCard(r, i, rankLabel) {
     const rule = r.rule;
-    const apply = '<details class="opt-det"><summary>How to apply ▸</summary>'
-      + '<div class="opt-rem"><div class="opt-rem-h">SightLine is read-only, so apply it yourself — set this rule via the Intune <b>Endpoint security &rsaquo; Attack surface reduction</b> policy, or with Defender PowerShell below:</div>'
-      + '<a href="' + PORTAL + '" target="_blank" rel="noopener">Open the ASR blade in the Defender portal &#8599;</a>'
-      + '<div class="opt-ps-wrap"><button type="button" class="btn js-opt-copy" data-i="' + i + '" style="padding:4px 10px;font-size:11px">Copy</button>'
-      + '<pre class="opt-ps" id="opt-ps-' + i + '">' + esc(psSnippet(rule, r.kind)) + '</pre></div></div></details>';
+    const apply = applyExpander(rule, (r.kind === "pilot" || r.kind === "review-block") ? "AuditMode" : "Enabled", "ap-" + i);
     const MODE_WORD = { block: "Block", warn: "Warn (enforces)", audit: "Audit", off: "Not configured" };
     const dist = (LAST && LAST.ruleLevel)
       ? '<div class="opt-dist"><span class="' + (r.rs.block ? "d-block" : r.rs.audit ? "d-audit" : "d-off") + '"><i></i>Currently: ' + esc(MODE_WORD[r.rs.mode] || "Not configured") + '</span>'
@@ -25094,7 +25099,6 @@ EP.registerView("asropt", (function () {
     block: { label: "Block", cls: "ok" }, warn: { label: "Warn (enforces)", cls: "ok" },
     audit: { label: "Audit", cls: "warn" }, off: { label: "Not configured", cls: "crit" }
   };
-  const targetFor = rule => rule.tier === "safe" ? "Block" : "Audit first, then Block";
   function ruleStatus(state, rule, rs) {
     if (rule.os === "server" && !(state.servers)) return { label: "N/A · no servers", cls: "na" };
     if (state.unknown) return { label: "Not read", cls: "na" };
@@ -25104,24 +25108,14 @@ EP.registerView("asropt", (function () {
     if (b > 0 || a > 0) return { label: b + " blk · " + a + " aud · " + o + " off", cls: "warn" };
     return { label: "Off", cls: "crit" };
   }
-  function cfgSnippet(rule) {
-    const audit = rule.tier !== "safe";
-    return "# " + rule.name + "  (" + rule.guid + ")\n"
-      + "# Recommended: " + (audit ? "Audit first (higher false-positive), then Block" : "Block") + "\n"
-      + "Add-MpPreference -AttackSurfaceReductionRules_Ids " + rule.guid + " `\n  -AttackSurfaceReductionRules_Actions " + (audit ? "AuditMode" : "Enabled");
-  }
   function allRulesSection(state) {
     const byslug = {}; (state.rules || []).forEach(rs => byslug[rs.slug] = rs);
     const rows = ASR_RULES.map((rule, i) => {
       const st = ruleStatus(state, rule, byslug[rule.slug]);
       const badges = (rule.standard ? '<span class="asr-badge asr-std">Standard</span>' : '')
         + (rule.os === "server" ? '<span class="asr-badge asr-srv">Server</span>' : '');
-      const showHow = st.cls !== "ok";   // enforcing rules need no "how to configure"
-      const how = showHow ? ('<details class="opt-det asr-how"><summary>How to configure ▸</summary>'
-        + '<div class="opt-rem"><div class="opt-rem-h">Set in Intune › <b>Endpoint security › Attack surface reduction</b> (create or edit an ASR policy, Windows). Recommended mode: <b>' + esc(targetFor(rule)) + '</b>. SightLine is read-only — apply it yourself.</div>'
-        + '<a href="' + PORTAL + '" target="_blank" rel="noopener">Open the ASR report in the Defender portal &#8599;</a>'
-        + '<div class="opt-ps-wrap"><button type="button" class="btn js-asr-copy" data-ci="' + i + '" style="padding:4px 10px;font-size:11px">Copy</button>'
-        + '<pre class="opt-ps" id="asr-cfg-' + i + '">' + esc(cfgSnippet(rule)) + '</pre></div></div></details>') : '';
+      const showHow = st.cls !== "ok";   // enforcing rules need no "how to apply"
+      const how = showHow ? ('<div class="asr-how">' + applyExpander(rule, rule.tier === "safe" ? "Enabled" : "AuditMode", "cf-" + i) + '</div>') : '';
       return '<div class="asr-rule">'
         + '<div class="asr-rule-h"><span class="asr-st asr-st-' + st.cls + '">' + esc(st.label) + '</span>'
         + '<span class="asr-name">' + esc(rule.name) + '</span>' + badges
@@ -25202,12 +25196,8 @@ EP.registerView("asropt", (function () {
   function wire(root) {
     const btn = root.querySelector("#asr-opt-run");
     if (btn) { btn.onclick = () => runAiOptimize(); btn.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); runAiOptimize(); } }; }
-    [].forEach.call(root.querySelectorAll(".js-opt-copy"), b => {
-      b.onclick = () => { const pre = root.querySelector("#opt-ps-" + b.getAttribute("data-i")); if (!pre) return;
-        try { navigator.clipboard.writeText(pre.textContent); const t = b.textContent; b.textContent = "Copied"; setTimeout(() => { b.textContent = t; }, 1400); } catch (e) {} };
-    });
-    [].forEach.call(root.querySelectorAll(".js-asr-copy"), b => {
-      b.onclick = () => { const pre = root.querySelector("#asr-cfg-" + b.getAttribute("data-ci")); if (!pre) return;
+    [].forEach.call(root.querySelectorAll(".js-apply-copy"), b => {
+      b.onclick = () => { const pre = root.querySelector("#" + b.getAttribute("data-target")); if (!pre) return;
         try { navigator.clipboard.writeText(pre.textContent); const t = b.textContent; b.textContent = "Copied"; setTimeout(() => { b.textContent = t; }, 1400); } catch (e) {} };
     });
   }
