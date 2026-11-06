@@ -25252,11 +25252,25 @@ EP.registerView("asropt", (function () {
     if (v.indexOf("block") >= 0 || v.indexOf("enable") >= 0) return "block";
     return "off";
   }
-  function flattenChoice(inst) {   // settingInstance → the choice value id/string, across the shapes v1.0 returns
-    if (!inst) return null;
-    const cv = inst.choiceSettingValue || inst.simpleSettingValue
-      || (inst.groupSettingCollectionValue || []).reduce((a, g) => a || (g.children || []).map(c => c.choiceSettingValue).find(Boolean), null);
-    return cv ? (cv.value != null ? cv.value : null) : null;
+  // Flatten a Settings-Catalog settingInstance into every concrete { defId, value } leaf. ASR rules live as
+  // CHILDREN of one group-collection setting (parent id "..._attacksurfacereductionrules"), each child a choice
+  // whose own definitionId + value carry the rule and its mode — so we must recurse, not just read the top.
+  function asrLeaves(inst, out) {
+    out = out || [];
+    if (!inst) return out;
+    const did = inst.settingDefinitionId || "";
+    if (inst.choiceSettingValue) {
+      if (inst.choiceSettingValue.value != null) out.push({ defId: did, value: inst.choiceSettingValue.value });
+      (inst.choiceSettingValue.children || []).forEach(c => asrLeaves(c, out));
+    }
+    if (inst.simpleSettingValue && inst.simpleSettingValue.value != null) out.push({ defId: did, value: inst.simpleSettingValue.value });
+    (inst.choiceSettingCollectionValue || []).forEach(cv => {
+      if (cv.value != null) out.push({ defId: did, value: cv.value });
+      (cv.children || []).forEach(c => asrLeaves(c, out));
+    });
+    (inst.groupSettingCollectionValue || []).forEach(g => (g.children || []).forEach(c => asrLeaves(c, out)));
+    (inst.groupSettingValue && inst.groupSettingValue.children || []).forEach(c => asrLeaves(c, out));
+    return out;
   }
 
   async function gpaged(path, scopes) {
@@ -25319,17 +25333,22 @@ EP.registerView("asropt", (function () {
       }
       let hit = false;
       (settings || []).forEach(s => {
-        const inst = s.settingInstance || {};
-        const defId = inst.settingDefinitionId || "";
-        const defN = asrNorm(defId);
-        const looksAsr = isAsrFamily || defN.indexOf("attacksurfacereduction") >= 0 || defN.indexOf("asrrule") >= 0;
-        if (!looksAsr) return;
-        if (defN.indexOf("exclusions") >= 0) return;               // exclusions, not a rule mode
-        const val = flattenChoice(inst);
-        if (val == null) return;
-        const slug = ruleForSetting(defId);
-        if (!slug) { unmapped.push(defId + " = " + val); return; }
-        hit = true; keepMode(byRule, slug, asrModeOf(val));
+        asrLeaves(s.settingInstance || {}).forEach(leaf => {
+          const dn = asrNorm(leaf.defId), vn = asrNorm(leaf.value);
+          // a rule leaf sits under the "...attacksurfacereductionrules_<rule>_<mode>" id/value; everything else
+          // in an ASR policy (Controlled Folder Access, Network Protection, exclusions, …) is not one of the rules
+          const isRuleLeaf = dn.indexOf("attacksurfacereductionrules") >= 0 || vn.indexOf("attacksurfacereductionrules") >= 0;
+          if (!isRuleLeaf || dn.indexOf("exclusions") >= 0 || vn.indexOf("exclusions") >= 0) return;
+          const slug = ruleForSetting(leaf.defId) || ruleForSetting(leaf.value);   // rule keyword is in the child id and its value
+          if (!slug) {
+            // the group's own enable-toggle (parent id, value just Enabled/Disabled/number) is not a rule — skip quietly
+            if (dn.replace(/.*attacksurfacereductionrules/, "") === "") return;
+            const vtail = vn.slice(vn.lastIndexOf("attacksurfacereductionrules") + 27).replace(/^_?/, "");
+            if (/^(\d+|enabled?|disabled?)$/.test(vtail)) return;
+            unmapped.push(leaf.defId + " = " + leaf.value); return;
+          }
+          hit = true; keepMode(byRule, slug, asrModeOf(leaf.value));
+        });
       });
       if (hit || isAsrFamily) policyCount++;
     }
