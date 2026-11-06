@@ -25261,7 +25261,7 @@ EP.registerView("asropt", (function () {
 
   async function gpaged(path, scopes) {
     let at; try { at = await EP.tokenSilent(scopes); } catch (e) { at = await EP.token(scopes); }
-    const out = []; let next = EP.graphBase() + path, guard = 0;
+    const out = []; let next = /^https?:\/\//.test(path) ? path : EP.graphBase() + path, guard = 0;
     while (next && guard++ < 25) {
       const r = await fetch(next, { headers: { Authorization: "Bearer " + at } });
       if (!r.ok) throw new Error(path.split("?")[0] + " HTTP " + r.status);
@@ -25285,16 +25285,40 @@ EP.registerView("asropt", (function () {
     if (!(slug in byRule) || MODE_RANK[mode] > MODE_RANK[byRule[slug]]) byRule[slug] = mode;
   }
 
-  // Source 1 — Settings Catalog ASR policies (deviceManagement/configurationPolicies). Mutates byRule/unmapped,
-  // returns the number of ASR policies seen.
-  async function readConfigPolicies(byRule, unmapped) {
-    const pols = await gpaged("/deviceManagement/configurationPolicies?$expand=settings&$top=100", SCOPES_INTUNE);
-    let policyCount = 0;
-    pols.forEach(p => {
+  // Source 1 — Settings Catalog ASR policies (deviceManagement/configurationPolicies). Lists policies, then
+  // reads settings PER POLICY ($expand=settings on the collection returns HTTP 400 on v1.0). Only ASR-template
+  // and custom (no-template) policies are fetched, so firewall / AV / other templates don't cost calls.
+  // Non-fatal: any failure is recorded in `errs` and we return what we found so the intents source still runs.
+  async function readConfigPolicies(byRule, unmapped, errs) {
+    // Prefer beta with inline settings — one call, and it accepts $expand=settings (v1.0's collection returns
+    // HTTP 400 for that expand). Fall back to a v1.0 list + per-policy settings reads if beta is unavailable.
+    let pols = null, inlineSettings = false;
+    try { pols = await gpaged("https://graph.microsoft.com/beta/deviceManagement/configurationPolicies?$expand=settings", SCOPES_INTUNE); inlineSettings = true; }
+    catch (e1) {
+      errs.push("configurationPolicies (beta): " + (e1.message || e1));
+      try { pols = await gpaged("/deviceManagement/configurationPolicies", SCOPES_INTUNE); }
+      catch (e2) { errs.push("configurationPolicies (v1.0): " + (e2.message || e2)); return 0; }
+    }
+    // ASR-family first, then custom Settings-Catalog policies (which may still carry ASR settings)
+    const ranked = pols.slice().sort((a, b) => {
+      const fa = asrNorm((a.templateReference && a.templateReference.templateFamily) || "").indexOf("attacksurfacereduction") >= 0 ? 0 : 1;
+      const fb = asrNorm((b.templateReference && b.templateReference.templateFamily) || "").indexOf("attacksurfacereduction") >= 0 ? 0 : 1;
+      return fa - fb;
+    });
+    let policyCount = 0, fetched = 0;
+    for (const p of ranked) {
       const fam = asrNorm((p.templateReference && p.templateReference.templateFamily) || "");
       const isAsrFamily = fam.indexOf("attacksurfacereduction") >= 0;
+      const tid = (p.templateReference && p.templateReference.templateId) || "";
+      if (!isAsrFamily && tid) continue;                           // a non-ASR template (firewall, AV, …) → skip
+      let settings = p.settings;
+      if (!settings && !inlineSettings) {   // v1.0 fallback: fetch this policy's settings (v1.0 relative path)
+        if (fetched++ > 50) continue;
+        try { settings = await gpaged("/deviceManagement/configurationPolicies/" + p.id + "/settings", SCOPES_INTUNE); }
+        catch (e) { errs.push("policy '" + (p.name || p.id) + "' settings: " + (e.message || e)); continue; }
+      }
       let hit = false;
-      (p.settings || []).forEach(s => {
+      (settings || []).forEach(s => {
         const inst = s.settingInstance || {};
         const defId = inst.settingDefinitionId || "";
         const defN = asrNorm(defId);
@@ -25308,24 +25332,24 @@ EP.registerView("asropt", (function () {
         hit = true; keepMode(byRule, slug, asrModeOf(val));
       });
       if (hit || isAsrFamily) policyCount++;
-    });
+    }
     return policyCount;
   }
 
   // Source 2 — legacy Endpoint Security "Attack surface reduction rules" template (deviceManagement/intents).
   // Its settings use the windows10EndpointProtectionConfiguration definition ids + enum / valueJson values.
   // Non-fatal: if the intents endpoint or a setting read fails, we keep whatever Source 1 found.
-  async function readIntents(byRule, unmapped) {
+  async function readIntents(byRule, unmapped, errs) {
     let intents;
-    try { intents = await gpaged("/deviceManagement/intents?$top=200", SCOPES_INTUNE); }
-    catch (e) { return 0; }
+    try { intents = await gpaged("/deviceManagement/intents", SCOPES_INTUNE); }
+    catch (e) { errs.push("intents: " + (e.message || e)); return 0; }
     let policyCount = 0, scanned = 0;
     for (const it of intents) {
       if (scanned++ > 60) break;                                   // bound the per-intent settings reads
       const intentIsAsr = /asr|attacksurface/.test(asrNorm(it.displayName || "") + asrNorm(it.description || ""));
       let settings;
       try { settings = await gpaged("/deviceManagement/intents/" + it.id + "/settings", SCOPES_INTUNE); }
-      catch (e) { continue; }
+      catch (e) { if (intentIsAsr) errs.push("intent '" + (it.displayName || it.id) + "' settings: " + (e.message || e)); continue; }
       let hit = false;
       settings.forEach(s => {
         const defId = s.definitionId || s.settingDefinitionId || "";
@@ -25347,18 +25371,20 @@ EP.registerView("asropt", (function () {
   async function collectIntune() {
     const byRule = {};          // slug → most-protective configured mode seen across all sources
     const unmapped = [];        // ASR settings we couldn't map to a known rule (surfaced for live validation)
+    const errs = [];            // per-source read failures (surfaced in diagnostics; non-fatal individually)
     const sources = [];
-    let policyCount = await readConfigPolicies(byRule, unmapped);
+    let policyCount = await readConfigPolicies(byRule, unmapped, errs);
     if (Object.keys(byRule).length) sources.push("Settings Catalog policy");
     if (!Object.keys(byRule).length) {                             // nothing in Settings Catalog → try legacy template/intents
-      const ic = await readIntents(byRule, unmapped);
+      const ic = await readIntents(byRule, unmapped, errs);
       if (Object.keys(byRule).length) { policyCount += ic; sources.push("Endpoint Security template"); }
     }
     if (!Object.keys(byRule).length) {
+      const why = unmapped.length
+        ? unmapped.length + " ASR setting(s) were found in your Intune policies but not recognised — the diagnostics below show the raw ids so the mapping can be confirmed."
+        : "No ASR-rule settings found in your Intune Attack surface reduction policies (Settings Catalog or Endpoint Security template). If you have an ASR policy assigned, grant DeviceManagementConfiguration.Read.All and reload.";
       return { needsDefender: true, intune: true, unmapped: unmapped,
-        err: unmapped.length
-          ? unmapped.length + " ASR setting(s) were found in your Intune policies but not recognised — the diagnostics below show the raw ids so the mapping can be confirmed."
-          : "No ASR-rule settings found in your Intune Attack surface reduction policies (Settings Catalog or Endpoint Security template). If you have an ASR policy assigned, grant DeviceManagementConfiguration.Read.All and reload." };
+        err: why + (errs.length ? " [" + errs.join("; ") + "]" : "") };
     }
     const webshellCfg = ("webshell" in byRule);
     const warnRules = [];
