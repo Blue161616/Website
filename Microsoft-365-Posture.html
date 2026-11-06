@@ -2873,6 +2873,29 @@
 #view-devices .di-note { margin-top:14px; font-size:11.5px; color:var(--muted); border-left:2px solid var(--border); padding:4px 0 4px 12px; line-height:1.55; }
 #view-devices .di-load { padding:28px 4px; color:var(--muted); font-size:13px; }
 #view-devices .di-err { margin:8px 0; padding:12px 15px; border:1px solid var(--amber,#E0A64B); border-radius:10px; background:rgba(224,166,75,.09); font-size:12.5px; color:var(--text); line-height:1.5; }
+#view-devices .di-chain { margin:0 0 14px; padding:12px 15px; border-radius:11px; border:1px solid var(--border); background:var(--card); }
+#view-devices .di-chain.gap { border-color:rgba(255,90,110,.45); background:rgba(255,90,110,.06); }
+#view-devices .di-chain.ok { border-color:rgba(94,230,176,.4); background:rgba(94,230,176,.06); }
+#view-devices .di-chain.mute { border-style:dashed; }
+#view-devices .di-chain .ch-h { font-size:13px; font-weight:800; color:var(--text); display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+#view-devices .di-chain .ch-sub { font-size:11.5px; color:var(--muted); margin-top:4px; line-height:1.5; }
+#view-devices .di-chain .ch-sub a, #view-devices .di-chain .ch-cta { color:var(--accent); cursor:pointer; text-decoration:none; font-weight:700; }
+#view-devices .di-chain .ch-flow { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:10px 0 2px; }
+#view-devices .ch-step { font-size:9.5px; font-weight:800; letter-spacing:.02em; padding:3px 8px; border-radius:6px; border:1px solid var(--border); background:var(--card); color:var(--muted); white-space:nowrap; text-align:center; }
+#view-devices .ch-step .cv { display:block; font-size:10.5px; font-weight:700; color:var(--text); margin-top:1px; letter-spacing:0; }
+#view-devices .ch-step.bad { border-color:rgba(255,90,110,.5); }
+#view-devices .ch-step.bad .cv { color:var(--sev-crit); }
+#view-devices .ch-step.warnx { border-color:rgba(255,154,107,.5); }
+#view-devices .ch-step.warnx .cv { color:var(--sev-high); }
+#view-devices .ch-step.good { border-color:rgba(94,230,176,.45); }
+#view-devices .ch-step.good .cv { color:var(--sev-low); }
+#view-devices .ch-arrow { color:var(--muted); font-size:12px; }
+#view-devices .di-dim.access { border-left-color:#9FB8DA; }
+#view-devices .di-dim .av { font-weight:700; }
+#view-devices .av-bad { color:var(--sev-crit); }
+#view-devices .av-warn { color:var(--sev-high); }
+#view-devices .av-ok { color:var(--sev-low); }
+#view-devices .av-mute { color:var(--muted); }
 @media (max-width:860px) {
 #view-devices .di-kpis { grid-template-columns:repeat(2,1fr); }
 }
@@ -22420,7 +22443,7 @@ function riskCompose(sig){
 // Demo-only active alerts. Exposure is NOT an alert, so most high-exposure assets carry no active threat
 // (they read "Defender exposure · …"); only these two have a real Defender alert. ATOMMAN is the headline
 // case: an active High alert on a Medium-exposure asset, which the model must surface as High.
-const DEMO_THREAT = { "blue16-i9-64gb-2tbssd":"High", "blue16-atomman":"High" };
+const DEMO_THREAT = { "blue16-i9-64gb-2tbssd":"High", "blue16-atomman":"High", "blue16-mstlpt02":"High" };   // mstlpt02 is compliant → a chain "blind spot" in the showcase
 const DEMO_ROLES = { "srv000":["Domain Controller"], "win-i3oa1c8bv5i":["SQL Server"] };
 // Demo business-unit tags (what Defender Manual/Dynamic tags look like) — drives the Tag filter in the showcase.
 const DEMO_TAGS = { "blue16-i9-64gb-2tbssd":["Executive","Finance"], "win-i3oa1c8bv5i":["Critical-Server","Finance"], "srv000":["Critical-Server","Datacenter"], "blue16-atomman":["Executive"], "kiosk-recep-3":["Kiosk","Reception"], "hr-laptop-22":["HR","BYOD"], "eden-inuc":["Engineering","BYOD"], "miranda-medion":["Finance"], "derk_iphone 13":["Executive","BYOD"] };
@@ -22580,6 +22603,55 @@ async function enrichExposureCrit(devices){
   devices.forEach(d => { const rec = by[String(d.name||"").toLowerCase()] || by[normName(d.name)]; if (!rec) return;
     d.criticality = rec.label; d.critWhy = rec.why; d.critical = rec.level <= 1; });   // crown Very high + High; why = classification rules
 }
+// ── Conditional Access: the enforcement layer at the end of the compliance chain. We read only the grant
+//    controls + state (Policy.Read.All, read-only) and keep the policies that require a compliant / hybrid
+//    device. The chain only actually BLOCKS a drifted device when such a grant is ENABLED (not report-only
+//    / disabled / absent). CA targets users & apps, not devices, so this is the enforcement BACKBONE, not a
+//    per-user applicability verdict (said so in the UI). Degrades silently if CA can't be read. ──
+function summarizeCa(pols){
+  const req = [];
+  (pols||[]).forEach(p => {
+    const gc = p.grantControls || {}; const bic = (gc.builtInControls || []).map(x => String(x).toLowerCase());
+    const wantsCompliant = bic.includes("compliantdevice"), wantsHybrid = bic.includes("domainjoineddevice");
+    if (!wantsCompliant && !wantsHybrid) return;
+    const st = String(p.state||"").toLowerCase();
+    const state = st === "enabled" ? "on" : (st === "enabledforreportingbutnotenforced" ? "reportonly" : "off");
+    const users = (p.conditions||{}).users || {}; const incl = (users.includeUsers||[]).map(x => String(x).toLowerCase());
+    req.push({ name: p.displayName || "(policy)", state, wantsCompliant, wantsHybrid, broad: incl.includes("all") });
+  });
+  const enforced = req.some(p => p.state === "on");
+  const reportOnly = !enforced && req.some(p => p.state === "reportonly");
+  return { policies: req, present: req.length > 0, enforced, reportOnly,
+    posture: enforced ? "enforced" : (reportOnly ? "reportonly" : (req.length ? "off" : "nopolicy")) };
+}
+async function collectCa(){
+  const at = await EP.tokenSilent(["Policy.Read.All"]);
+  const r = await fetch(EP.graphBase() + "/identity/conditionalAccess/policies?$select=displayName,state,conditions,grantControls", { headers:{ Authorization:"Bearer "+at } });
+  if (!r.ok){ const e2 = new Error("Conditional Access " + r.status); e2.status = r.status; throw e2; }
+  return summarizeCa((await r.json()).value || []);
+}
+function demoCa(){
+  // Mirrors the screenshot: a "Require Device Compliance" grant that is report-only (evaluated, not enforced).
+  return summarizeCa([
+    { displayName:"Require Device Compliance on Windows", state:"enabledForReportingButNotEnforced", conditions:{ users:{ includeUsers:["All"] } }, grantControls:{ builtInControls:["compliantDevice"], operator:"OR" } },
+    { displayName:"Require Device Compliance on macOS",   state:"enabledForReportingButNotEnforced", conditions:{ users:{ includeUsers:["All"] } }, grantControls:{ builtInControls:["compliantDevice"], operator:"OR" } }
+  ]);
+}
+// chainNeedsGating = enforcement SHOULD stop this device (non-compliant / unevaluated / a High active alert).
+// chainBlindspot = Intune says compliant yet Defender has a High active alert — the compliance policy isn't
+// turning Defender risk into non-compliance. gateOf() resolves the fleet CA posture to this device's verdict.
+function chainBlindspot(d){ return d.compliance === "compliant" && d.threat === "High"; }
+// Needs gating = enforcement should stop it. A blind spot (compliant but high-threat) is NOT here: it's
+// compliant, so a require-compliant grant would let it through regardless — the gap is in compliance, not CA.
+function chainNeedsGating(d){ return !chainBlindspot(d) && (d.compliance === "noncompliant" || d.compliance === "unevaluated" || d.threat === "High"); }
+function gateOf(d, ca){
+  if (chainBlindspot(d)) return "blindspot";
+  if (!chainNeedsGating(d)) return "ok";
+  if (!ca) return "unknown";
+  return ca.posture;   // enforced | reportonly | off | nopolicy
+}
+const CA_POSTURE_TXT = { enforced:"require-compliant — enforced", reportonly:"require-compliant — report-only", off:"require-compliant — disabled", nopolicy:"no require-compliant policy" };
+function caStateLabel(ca){ return ca ? (CA_POSTURE_TXT[ca.posture] || "—") : "not read"; }
 async function collect(){
   const entra = await gGetAll("/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,approximateLastSignInDateTime,accountEnabled&$top=200", ["Device.Read.All"]);
   let intune = [];
@@ -22676,7 +22748,9 @@ async function collect(){
     };
   });
   try { await enrichExposureCrit(devs); } catch(e){}
-  return { devices: devs, live: true, hasMde: !!machines, mdeErr, threatErr };
+  let ca = null, caErr = null;
+  try { ca = await collectCa(); } catch(e){ caErr = e; }   // Conditional Access enforcement backbone — read-only, optional
+  return { devices: devs, live: true, hasMde: !!machines, mdeErr, threatErr, ca, caErr };
 }
 
 // ── filtering + rendering ──
@@ -22716,6 +22790,8 @@ function applyFilters(list){
     if (S.quick === "ei-no-d" && !(d.intune === 1 && d.defender === 0)) return false;
     if (S.quick === "ed-no-i" && !(d.intune === 0 && d.defender === 1)) return false;
     if (S.quick === "e-only" && !(d.intune === 0 && d.defender !== 1)) return false;
+    if (S.quick === "exposed" && !(chainNeedsGating(d) && !(DALL && DALL.ca && DALL.ca.enforced))) return false;   // should be gated, but CA posture doesn't block
+    if (S.quick === "blindspot" && !chainBlindspot(d)) return false;
     return true;
   });
 }
@@ -22731,6 +22807,63 @@ function threatBadge(t){ if (t == null) return '<span class="di-pill p-mute">—
 function srcChips(d){
   const chip = (lbl, on) => '<span class="di-chip ' + (on==null?"":on?"on":"off") + '" title="' + lbl + '">' + lbl[0] + '</span>';
   return '<span class="di-src">' + chip("Entra", d.entra) + chip("Intune", d.intune) + chip("Defender", d.defender) + '</span>';
+}
+// ── The headline cross-domain finding: does the enforcement chain actually block the devices that need it? ──
+function chainBanner(D){
+  const ca = D.ca, ds = D.devices;
+  const need = ds.filter(chainNeedsGating).length;
+  const blind = ds.filter(chainBlindspot).length;
+  if (!need && !blind && (!ca || ca.posture === "enforced")) return "";   // nothing to flag
+  const flow = (caCls, caVal, verdict, vCls) => '<div class="ch-flow">'
+    + '<span class="ch-step">Defender<span class="cv">risk / alert</span></span><span class="ch-arrow">→</span>'
+    + '<span class="ch-step">Intune<span class="cv">compliance</span></span><span class="ch-arrow">→</span>'
+    + '<span class="ch-step">Entra<span class="cv">isCompliant</span></span><span class="ch-arrow">→</span>'
+    + '<span class="ch-step ' + caCls + '">Conditional Access<span class="cv">' + caVal + '</span></span><span class="ch-arrow">→</span>'
+    + '<span class="ch-step ' + vCls + '">Access<span class="cv">' + verdict + '</span></span></div>';
+  const seeBlind = blind ? ' <span class="ch-cta" data-quick="blindspot">see the ' + blind + ' blind spot' + (blind===1?'':'s') + ' →</span>' : '';
+  const blindLine = blind ? '<div class="ch-sub">🕳 <b>' + blind + ' blind spot' + (blind===1?'':'s') + ':</b> Intune reports <b>compliant</b> but Defender has a <b>High active alert</b> — the compliance policy isn’t turning Defender risk into non-compliance (add a “require the device to be at or under machine-risk-score” rule and confirm the Defender↔Intune connector).' + seeBlind + '</div>' : '';
+  if (!ca){
+    if (!need) return "";
+    return '<div class="di-chain mute"><div class="ch-h">🔗 Compliance chain · Conditional Access not read</div>'
+      + '<div class="ch-sub">' + need + ' device' + (need===1?'':'s') + ' are non-compliant or carry a high-severity Defender alert. Grant <b>Policy.Read.All</b> to see whether a require-compliant Conditional Access policy actually blocks them.</div>' + blindLine + '</div>';
+  }
+  if (ca.posture === "enforced"){
+    return '<div class="di-chain ok"><div class="ch-h">✓ Compliance chain enforced — require-compliant Conditional Access is on</div>'
+      + '<div class="ch-sub">' + (need ? need + ' non-compliant / high-threat device' + (need===1?'':'s') + ' are blocked by a require-compliant grant.' : 'No device currently needs gating.') + ' CA applies per user &amp; app, so coverage depends on the policy’s assignments.</div>'
+      + flow("good", "enforced", "blocked", "good") + blindLine + '</div>';
+  }
+  const seeExposed = need ? ' <span class="ch-cta" data-quick="exposed">see the ' + need + ' device' + (need===1?'':'s') + ' →</span>' : '';
+  const headline = ca.posture === "reportonly" ? '⚠ Compliance chain broken — require-compliant Conditional Access is REPORT-ONLY'
+    : ca.posture === "off" ? '⚠ Compliance chain broken — your require-compliant Conditional Access policy is disabled'
+    : '⚠ Compliance chain open — no Conditional Access policy requires a compliant device';
+  const explain = ca.posture === "reportonly" ? 'The policy is evaluated and logged but not enforced, so '
+    : ca.posture === "off" ? 'The policy exists but is turned off, so '
+    : 'Compliance is advisory — nothing blocks a device that drifts, so ';
+  const caCls = (ca.posture === "reportonly" || ca.posture === "off") ? "warnx" : "bad";
+  const caVal = ca.posture === "reportonly" ? "report-only" : ca.posture === "off" ? "disabled" : "none";
+  return '<div class="di-chain gap"><div class="ch-h">' + headline + '</div>'
+    + '<div class="ch-sub">' + explain + '<b>' + need + ' non-compliant or high-threat device' + (need===1?'':'s') + '</b> that the chain should stop still ha' + (need===1?'s':'ve') + ' access.' + seeExposed + ' <span style="color:var(--muted)">CA applies per user &amp; app.</span></div>'
+    + flow(caCls, caVal, "not blocked", "bad") + blindLine + '</div>';
+}
+// Per-device access-enforcement dimension — the chain, resolved for one device.
+function accessPanel(d, ca){
+  const g = gateOf(d, ca);
+  const line = (k, v, cls) => '<div class="drow"><span class="dk">' + k + '</span><span class="av ' + (cls||'') + '">' + v + '</span></div>';
+  const def = (d.threat === "High") ? ["High active alert","av-bad"] : (d.exposure === "High") ? ["High exposure","av-warn"] : (d.threat && d.threat !== "None" ? [d.threat + " alert","av-warn"] : ["no active alert","av-mute"]);
+  const comp = d.compliance === "noncompliant" ? ["non-compliant","av-bad"] : d.compliance === "unevaluated" ? ["unevaluated","av-warn"] : d.compliance === "grace" ? ["grace","av-warn"] : d.compliance === "compliant" ? ["compliant","av-ok"] : ["—","av-mute"];
+  let verdict, vcls;
+  if (g === "ok"){ verdict = "Nothing to gate — compliant, no active alert"; vcls = "av-ok"; }
+  else if (g === "blindspot"){ verdict = "⚠ Blind spot — compliant in Intune, but Defender sees a High alert"; vcls = "av-warn"; }
+  else if (g === "enforced"){ verdict = "✓ Blocked — require-compliant CA is enforced"; vcls = "av-ok"; }
+  else if (g === "reportonly"){ verdict = "⚠ Not blocked — require-compliant CA is report-only"; vcls = "av-bad"; }
+  else if (g === "off"){ verdict = "⚠ Not blocked — require-compliant CA is disabled"; vcls = "av-bad"; }
+  else if (g === "nopolicy"){ verdict = "⚠ Not blocked — no require-compliant CA policy"; vcls = "av-bad"; }
+  else { verdict = "Conditional Access not read"; vcls = "av-mute"; }
+  return '<div class="di-dim access"><div class="dh">Access enforcement</div>'
+    + line("Defender", def[0], def[1])
+    + line("Intune", comp[0], comp[1])
+    + line("Conditional Access", caStateLabel(ca), ca ? (ca.posture === "enforced" ? "av-ok" : "av-warn") : "av-mute")
+    + '<div class="drow" style="margin-top:6px"><span class="av ' + vcls + '" style="font-size:11px">' + verdict + '</span></div></div>';
 }
 // The row-expand is a per-asset POSTURE CARD: the four posture dimensions (Coverage · Compliance ·
 // Hardening · Vulnerabilities) that the issue-centric workspaces each own, converged here on ONE device,
@@ -22804,7 +22937,7 @@ function detailRow(d, cols){
     else aiBlock = '<div style="margin-top:10px"><span class="di-why-link" data-fixai="' + esc(d.id) + '" role="button" tabindex="0" style="cursor:pointer" title="Ask your local model to prioritise this device’s fixes — grounded in its signals, nothing leaves the machine.">' + (busy ? '<span class="spinner"></span> thinking…' : '✦ What to fix first') + '</span></div>';
   }
   return '<tr class="di-detrow"><td colspan="' + cols + '"><div class="di-card">' + idrow
-    + '<div class="di-dims">' + covPanel + compPanel + hardPanel + vulnPanel + '</div>' + riskFoot + aiBlock + '</div></td></tr>';
+    + '<div class="di-dims">' + covPanel + compPanel + accessPanel(d, DALL && DALL.ca) + hardPanel + vulnPanel + '</div>' + riskFoot + aiBlock + '</div></td></tr>';
 }
 
 function fixaiDigest(d){
@@ -22832,10 +22965,15 @@ function paint(){
   const unm = D.devices.filter(d => d.intune===0).length;
   const nc = D.devices.filter(d => d.compliance==="noncompliant").length;
   const st = D.devices.filter(d => d.stale).length;
+  // Cross-domain chain: devices that enforcement should gate but the CA posture doesn't block, and blind spots.
+  const exposed = (D.ca && !D.ca.enforced) ? D.devices.filter(chainNeedsGating).length : 0;
+  const blind = D.devices.filter(chainBlindspot).length;
   const kpi = (id, v, l, cls) => '<div class="di-kpi ' + (cls||"") + (STATE.quick===id?" on":"") + '" data-quick="' + id + '"><div class="v">' + (v==null?"–":v) + '</div><div class="l">' + l + '</div></div>';
   const kpis = '<div class="di-kpis">'
     + kpi("critical", crit, "critical assets", "crit")
     + kpi("high", hi, "high risk", "crit")
+    + (exposed ? kpi("exposed", exposed, "risky · not gated by CA", "crit") : "")
+    + (blind ? kpi("blindspot", blind, "compliant but risky", "high") : "")
     + kpi("notonb", notOnb, "not onboarded to Defender", "crit")
     + kpi("unmanaged", unm, "unmanaged (Intune)", "high")
     + kpi("noncompliant", nc, "non-compliant", "high")
@@ -22925,7 +23063,7 @@ function paint(){
     + '<button data-connect style="flex:none;background:var(--accent);color:#06101f;font-weight:700;border:none;border-radius:7px;padding:7px 14px;cursor:pointer;font-size:12px">Connect Defender →</button></div>' : "";
   const note = '<div class="di-note"><b>Read-only. ' + src + '</b> One row per device, merged across Entra, Intune and Defender — click a row for the full per-asset posture card (Coverage · Compliance · Hardening · Vulnerabilities on one machine). <b>Risk</b> is a composite of compliance / management raised by the live Defender exposure level (staleness is a hygiene flag, not a risk escalator). <b>Threat</b> is the highest severity of the device’s active Defender alerts (the signal behind the portal’s Risk level). Last seen is the most recent of Defender telemetry, Intune sync or Entra sign-in.'
     + (D.threatErr ? ' <span style="color:var(--sev-high)">Threat unavailable — the advanced-hunting alert query failed: ' + esc(D.threatErr) + '</span>' : '') + '</div>';
-  root.innerHTML = band + mdeBanner + kpis + seg + filters + '<table class="di-tbl"><thead>' + head + '</thead><tbody>' + body + '</tbody></table>' + note;
+  root.innerHTML = band + mdeBanner + chainBanner(D) + kpis + seg + filters + '<table class="di-tbl"><thead>' + head + '</thead><tbody>' + body + '</tbody></table>' + note;
 }
 
 function render(D){ DALL = D; paint(); wire(); }
@@ -22948,7 +23086,7 @@ function wire(){
 async function analyze(){
   const root = document.getElementById("dev-root");
   if (window.EP && EP.IMPORT && EP.IMPORT.devices){ render({ devices: EP.IMPORT.devices, live:false, imported:true, hasMde: EP.IMPORT.hasMde }); return; }
-  if (window.EP && EP.DEMO){ render({ devices: demoDevices(), live:false, hasMde:true }); return; }
+  if (window.EP && EP.DEMO){ render({ devices: demoDevices(), live:false, hasMde:true, ca: demoCa() }); return; }
   if (root) root.innerHTML = '<div class="di-load"><b>Reading devices across Entra, Intune and Defender…</b></div>';
   try { render(await collect()); }
   catch(e){ if (root) root.innerHTML = '<div class="di-err"><b>Device inventory not available.</b> ' + esc(e.message || String(e)) + '</div>'; DALL = null; }
