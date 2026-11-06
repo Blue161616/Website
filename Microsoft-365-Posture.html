@@ -2271,6 +2271,11 @@
 #view-ca .ccscope .out b {color:var(--med)}
 #view-ca .ccscope .k {color:var(--dim)}
 #view-ca .cccard .covpols {margin-top:9px}
+#view-ca .covother {margin-top:12px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:11px 14px}
+#view-ca .covother-h {font-size:12.5px;font-weight:700;color:var(--text)}
+#view-ca .covother-s {font-size:11.5px;color:var(--muted);margin-left:8px}
+#view-ca .covother .covpols {margin-top:8px}
+#view-ca .covother .pollink .k {color:var(--muted);font-weight:500;margin-left:5px}
 #view-ca .pscrim {position:fixed;inset:0;background:rgba(3,8,20,.55);backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px);
     z-index:55;opacity:0;pointer-events:none;transition:opacity .18s}
 #view-ca .pscrim.open {opacity:1;pointer-events:auto}
@@ -19754,13 +19759,23 @@ function coverageMatrix(ctx) {
   const pol = ctx.policies || [];
   const enabled = pol.filter(isEnabled);
   const ro = pol.filter(isReportOnly);
+  // m: does a policy belong to this control.   full: does an ENABLED policy fully cover the control's
+  // intended population (→ ENFORCED, green) vs only part of it (→ SCOPED). "Full" is per control: an
+  // all-users control needs All users; the admins control needs admin roles (or All users) — a role-scoped
+  // admin policy IS fully enforced for admins, so it shouldn't read amber. fullLabel names the covered set.
   const CONTROLS = [
-    { label: 'MFA — all users',           m: p => requiresMfa(p) && includesAllUsers(p) && coversAllApps(p) && !blocksAccess(p) },
-    { label: 'MFA — administrators',       m: p => requiresMfa(p) && targetsAdmins(p) && coversAllApps(p) && !blocksAccess(p) },
-    { label: 'Block legacy authentication',m: p => blocksAccess(p) && coversLegacyClients(p) && includesAllUsers(p) },
-    { label: 'Sign-in risk (risk-based)',  m: p => (conds(p).signInRiskLevels || []).length > 0 },
-    { label: 'User risk (risk-based)',     m: p => (conds(p).userRiskLevels || []).length > 0 },
-    { label: 'Compliant / managed device', m: p => requiresCompliantDevice(p) }
+    { label: 'MFA — all users',           m: p => requiresMfa(p) && includesAllUsers(p) && coversAllApps(p) && !blocksAccess(p),
+      full: includesAllUsers, fullLabel: 'All users' },
+    { label: 'MFA — administrators',       m: p => requiresMfa(p) && targetsAdmins(p) && coversAllApps(p) && !blocksAccess(p),
+      full: targetsAdmins,    fullLabel: 'All privileged roles' },
+    { label: 'Block legacy authentication',m: p => blocksAccess(p) && coversLegacyClients(p) && includesAllUsers(p),
+      full: includesAllUsers, fullLabel: 'All users' },
+    { label: 'Sign-in risk (risk-based)',  m: p => (conds(p).signInRiskLevels || []).length > 0,
+      full: includesAllUsers, fullLabel: 'All users at sign-in risk' },
+    { label: 'User risk (risk-based)',     m: p => (conds(p).userRiskLevels || []).length > 0,
+      full: includesAllUsers, fullLabel: 'All users at risk' },
+    { label: 'Compliant / managed device', m: p => requiresCompliantDevice(p),
+      full: includesAllUsers, fullLabel: 'All users' }
   ];
   const scopeOf = list => {
     if (list.some(includesAllUsers)) return 'All users';
@@ -19779,11 +19794,11 @@ function coverageMatrix(ctx) {
   const cards = CONTROLS.map(c => {
     const en = enabled.filter(c.m), r = ro.filter(c.m);
     const basis = en.length ? en : r;
-    const allUsers = basis.some(includesAllUsers);
+    const fullyCovered = en.some(c.full);   // an ENABLED policy covers the control's whole intended population
     const exMax = basis.reduce((n, p) => Math.max(n, exclusionCount(p)), 0);
     let band, label, frac, inScope, outScope;
-    if (en.length && allUsers) { band = 'b-ok'; label = 'ENFORCED'; frac = 1;
-      inScope = '<b>All users</b>'; outScope = exMax ? '<b>' + exMax + '</b> excluded' : 'none'; }
+    if (en.length && fullyCovered) { band = 'b-ok'; label = 'ENFORCED'; frac = 1;
+      inScope = '<b>' + esc(c.fullLabel) + '</b>'; outScope = exMax ? '<b>' + exMax + '</b> excluded' : 'none'; }
     else if (en.length) { band = 'b-warn'; label = 'SCOPED'; frac = 0.62;
       inScope = '<b>' + esc(scopeOf(basis)) + '</b>'; outScope = (exMax ? '<b>' + exMax + '</b> excluded · ' : '') + 'all other users'; }
     else if (r.length) { band = 'b-warn'; label = 'REPORT-ONLY'; frac = 0.42;
@@ -19802,6 +19817,18 @@ function coverageMatrix(ctx) {
       '<div class="ccscope"><div class="in">In scope: ' + inScope + '</div><div class="out">Out of scope: ' + outScope + '</div></div></div>' +
       links + '</div>';
   }).join('');
+  // Surface ENABLED MFA policies that don't land in any baseline control (e.g. the legacy "per-user MFA
+  // users" bridge, or a group-scoped MFA policy). They're real, enforcing coverage — don't leave them invisible.
+  const matchedIds = new Set();
+  CONTROLS.forEach(c => { enabled.filter(c.m).forEach(p => matchedIds.add(p.id)); ro.filter(c.m).forEach(p => matchedIds.add(p.id)); });
+  const otherMfa = enabled.filter(p => requiresMfa(p) && !blocksAccess(p) && !matchedIds.has(p.id));
+  const otherMfaNote = otherMfa.length
+    ? '<div class="covother"><span class="covother-h">Also enforcing MFA — narrower scope</span>' +
+      '<span class="covother-s">enabled, but not an all-users / all-admins baseline</span>' +
+      '<div class="covpols">' + otherMfa.map(p =>
+        '<span class="pollink" data-pol="' + esc(p.id) + '" role="button" tabindex="0" title="' + esc(p.displayName || p.id) + ' — open details &amp; score">' +
+          esc(p.displayName || p.id) + ' <span class="k">' + esc(scopeOf([p])) + '</span></span>').join('') + '</div></div>'
+    : '';
   return '<div class="band" id="ca-coverage"><span class="band-t">Coverage</span>' +
       '<span class="band-s">Is each control actually enforced, and who is in scope</span></div>' +
     '<div class="note note-info">This reads policy <b>scope</b>, not your user directory — it answers “is there an ' +
@@ -19810,7 +19837,7 @@ function coverageMatrix(ctx) {
       '<span class="ep-xlink" role="button" tabindex="0" title="Open the Ask page and list the accounts out of scope of enforced MFA"' +
       'onclick="if(window.EP&&EP.goto)EP.goto(\'ask\',{ask:\'users admin notenforced\'})" ' +
       'onkeydown="if((event.key===\'Enter\'||event.key===\' \')&&window.EP&&EP.goto){event.preventDefault();EP.goto(\'ask\',{ask:\'users admin notenforced\'})}">→ list the accounts out of scope</span></div>' +
-    '<div class="ccgrid">' + cards + '</div>';
+    '<div class="ccgrid">' + cards + '</div>' + otherMfaNote;
 }
 
 // ═════════════════════════ AI assist (optional, local) ═════════════════════════
