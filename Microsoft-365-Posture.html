@@ -7040,15 +7040,19 @@ window.EP = (function () {
     const counts = ovCounts(s);
     if (typeof cytoscape !== "undefined") ovRefreshPaths();
     let body;
-    if (_ovPathList.length && typeof cytoscape !== "undefined") {
+    // Flow-list style (consistent with the Endpoint overview): the top paths as entry → critical-asset chains,
+    // each deep-linking into the full Attack Paths graph. Built from the live graph paths when available, else
+    // from the summary's topPaths.
+    if (_ovPathList.length && _ovPathG) {
       const g = _ovPathG, N = id => g.nodes.get(id);
-      const pl = n => n.label + " (" + ovTypeWord(n) + ")";
-      const opts = _ovPathList.map((p, i) => '<option value="' + i + '"' + (i === _ovPathSel ? " selected" : "") + '>' + esc(pl(N(p.source)) + " → " + pl(N(p.target)) + " · " + p.edges.length + " hop" + (p.edges.length === 1 ? "" : "s")) + '</option>').join("");
-      const cur = _ovPathList[_ovPathSel], q = "paths from id:" + cur.source + " to id:" + cur.target;
-      body = '<div class="ov-mini-head"><select class="ov-mini-select" id="ovMiniSel" title="Choose an attack path to show">' + opts + '</select>'
-        + '<button class="ov-mini-open" id="ovMiniOpen" data-ovgo="entrahound" data-ovfocus="' + esc(JSON.stringify({ query: q })) + '" title="Open this path in the full Attack Paths graph">Open full graph &rarr;</button></div>'
-        + '<div class="ov-minigraph" id="ovMiniCy"></div>'
-        + '<div class="ov-mini-foot" id="ovMiniFoot">Drag nodes to explore · ' + cur.nodes.length + '-node path · ' + _ovPathList.length + ' paths · scroll to zoom</div>';
+      body = '<div class="ov-paths">' + _ovPathList.slice(0, OV_MAX).map(p => {
+        const t = N(p.target), sev = (t && (t.critical || t.tier === 0)) ? "crit" : "high";
+        let flow = ""; p.nodes.forEach((id, i) => { const n = N(id); if (!n) return; const last = i === p.nodes.length - 1;
+          flow += '<span class="ov-node' + (last ? " crit" : (i === 0 ? " src" : "")) + '" title="' + esc(n.label) + '">' + esc(n.label) + '</span>';
+          if (!last) flow += '<span class="ov-edge">&rsaquo;</span>'; });
+        const q = "paths from id:" + p.source + " to id:" + p.target;
+        return '<div class="ov-path ' + sev + '" data-ovgo="entrahound" data-ovfocus="' + esc(JSON.stringify({ query: q })) + '" title="Open this path in the full Attack Paths graph">' + flow + '<span class="ov-flowdot"></span></div>';
+      }).join("") + '</div>';
     } else {
       body = ovPathGraph(s);
     }
@@ -7521,7 +7525,7 @@ window.EP = (function () {
       lv.innerHTML = '<span class="ov-live-dot"></span>Live · refreshed ' + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + (n ? ' · ' + n + ' domains' : "");
     }
     ovAnimate();
-    if (PILLAR === "identity") { ovInitMiniGraph(); ovInitExtMap(); }   // the mini attack-graph + External map are identity-only
+    if (PILLAR === "identity") { ovInitExtMap(); }   // External map is identity-only (attack paths now render as a flow list, like Endpoint)
     else if (PILLAR === "endpoint") { ovInitEndpointRow(); }            // internet-facing surface + device attack paths
   }
   // ══════════════════════ Endpoint · device-native Framework scorecard ══════════════════════
@@ -22967,8 +22971,9 @@ const DEMO_ROLES = { "srv000":["Domain Controller"], "win-i3oa1c8bv5i":["SQL Ser
 // Demo privileged users: Derk is a Global Admin (tier 0), Miranda a scoped write admin (tier 1) — so their
 // high-risk devices showcase the "privileged access from a risky device" correlation.
 const DEMO_ADMINS = { "derk@blue16.nl":{ roles:["Global Administrator"], tier:0, write:true }, "miranda@in2cats.nl":{ roles:["Intune Administrator"], tier:1, write:true } };
-// Demo listening (open) ports per onboarded device — the exposed service surface for the internet-facing panel.
-const DEMO_PORTS = { "srv000":[80,135,139,443,445,3389], "blue16-i9-64gb-2tbssd":[443,3389], "win-i3oa1c8bv5i":[1433,3389] };
+// Demo internet-facing exposed ports per onboarded device (Defender InternetFacingPublicScannedPort) — the real
+// externally-reachable services, not every listening socket.
+const DEMO_PORTS = { "srv000":[22,3389], "blue16-i9-64gb-2tbssd":[22,3306], "win-i3oa1c8bv5i":[22,80,3306] };
 // Demo business-unit tags (what Defender Manual/Dynamic tags look like) — drives the Tag filter in the showcase.
 const DEMO_TAGS = { "blue16-i9-64gb-2tbssd":["Executive","Finance"], "win-i3oa1c8bv5i":["Critical-Server","Finance"], "srv000":["Critical-Server","Datacenter"], "blue16-atomman":["Executive"], "kiosk-recep-3":["Kiosk","Reception"], "hr-laptop-22":["HR","BYOD"], "eden-inuc":["Engineering","BYOD"], "miranda-medion":["Finance"], "derk_iphone 13":["Executive","BYOD"] };
 function esc(s){ return window.EP ? EP.esc(s) : String(s==null?"":s); }
@@ -23085,19 +23090,17 @@ async function huntConfig(){
 // Returns one row per flagged DeviceId with the detection reason. Optional: failure → internet stays unknown.
 async function huntInternetFacing(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
-  const q = "DeviceInfo | where Timestamp > ago(7d) | where IsInternetFacing | extend IFR = tostring(parse_json(AdditionalFields)['InternetFacingReason']) | summarize arg_max(Timestamp, IFR) by DeviceId";
+  // Each internet-facing DeviceInfo row carries the actually-EXPOSED port in AdditionalFields
+  // (InternetFacingPublicScannedPort — the port reached from outside, or the local port behind it). That is the
+  // real open-port surface; listening sockets (DeviceNetworkEvents) are mostly internal noise. Aggregate the
+  // exposed ports + the detection reason per device. 7-day window: Defender drops the tag after 48h without events.
+  const q = "DeviceInfo | where Timestamp > ago(7d) | where IsInternetFacing"
+    + " | extend AF = parse_json(AdditionalFields)"
+    + " | extend PP = tostring(AF.InternetFacingPublicScannedPort), LP = tostring(AF.InternetFacingLocalPort), IFR = tostring(AF.InternetFacingReason)"
+    + " | extend Port = toint(iif(isnotempty(PP), PP, LP))"
+    + " | summarize Ports = make_set_if(Port, isnotempty(Port) and Port > 0, 40), IFR = take_any(IFR) by DeviceId";
   const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
   if (!r.ok){ const e2 = new Error("internet-facing " + r.status); e2.status = r.status; throw e2; }
-  return (await r.json()).results || [];
-}
-// Listening (open) TCP ports per device — the exposed service surface, strongest signal on internet-facing
-// hosts. Read via advanced hunting (DeviceNetworkEvents · ListeningConnectionCreated), registered ports only
-// (1..49151, excludes ephemeral), keyed by MDE DeviceId. Optional: failure leaves ports unset.
-async function huntListeningPorts(){
-  const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
-  const q = "DeviceNetworkEvents | where Timestamp > ago(7d) | where ActionType == 'ListeningConnectionCreated' and isnotempty(LocalPort) | extend P = toint(LocalPort) | where P between (1 .. 49151) | summarize Ports = make_set(P, 40) by DeviceId";
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
-  if (!r.ok){ const e2 = new Error("ports " + r.status); e2.status = r.status; throw e2; }
   return (await r.json()).results || [];
 }
 // Normalise a device name for matching: lowercase + strip any DNS/domain suffix (host.domain → host).
@@ -23240,19 +23243,19 @@ async function collect(){
   try { intune = await gGetAll("/deviceManagement/managedDevices?$select=id,deviceName,azureADDeviceId,operatingSystem,osVersion,complianceState,isEncrypted,lastSyncDateTime,managedDeviceOwnerType,userPrincipalName,managementAgent&$top=200", ["DeviceManagementManagedDevices.Read.All"]); } catch(e){ intune = []; }
   let machines = null, mdeErr = null;
   try { machines = await huntDevices(); } catch(e){ mdeErr = e; machines = null; }
-  let threatRows = null, cveRows = null, cfgRows = null, netRows = null, portRows = null, threatErr = null;
+  let threatRows = null, cveRows = null, cfgRows = null, netRows = null, threatErr = null;
   if (machines){
-    const [t, c, g, n, p] = await Promise.allSettled([ huntThreat(), huntCves(), huntConfig(), huntInternetFacing(), huntListeningPorts() ]);
+    const [t, c, g, n] = await Promise.allSettled([ huntThreat(), huntCves(), huntConfig(), huntInternetFacing() ]);
     threatRows = t.status === "fulfilled" ? t.value : (threatErr = (t.reason && t.reason.message) || String(t.reason), null);
     cveRows = c.status === "fulfilled" ? c.value : null;
     cfgRows = g.status === "fulfilled" ? g.value : null;
     netRows = n.status === "fulfilled" ? n.value : null;
-    portRows = p.status === "fulfilled" ? p.value : null;
   }
   const threatBy = {}; if (threatRows) threatRows.forEach(x => { const id = String(x.DeviceId||"").toLowerCase(); if (id) threatBy[id] = x.Sev||0; });
   const cveBy = {}; if (cveRows) cveRows.forEach(x => { const id = String(x.DeviceId||"").toLowerCase(); if (id) cveBy[id] = { sev: x.Sev||0, crit: x.Crit||0, high: x.High||0, med: x.Med||0, n: x.Cves||0 }; });
   const cfgBy = {}; if (cfgRows) cfgRows.forEach(x => { const id = String(x.DeviceId||"").toLowerCase(); if (id) cfgBy[id] = x.Fails||0; });
-  const portsBy = {}; if (portRows) portRows.forEach(x => { const id = String(x.DeviceId||"").toLowerCase(); if (id) portsBy[id] = (x.Ports||[]).map(Number).filter(p => p > 0).sort((a,b) => a-b); });
+  // Open ports = the internet-facing exposed ports from the same DeviceInfo rows (keyed by MDE DeviceId).
+  const portsBy = {}; if (netRows) netRows.forEach(x => { const id = String(x.DeviceId||"").toLowerCase(); if (id) portsBy[id] = (x.Ports||[]).map(Number).filter(p => p > 0).sort((a,b) => a-b); });
   // Internet-facing set, keyed by MDE DeviceId → detection reason (external scan / incoming communication).
   const netBy = {}; if (netRows) netRows.forEach(x => { const id = String(x.DeviceId||"").toLowerCase(); if (id) netBy[id] = String(x.IFR||x.InternetFacingReason||"").trim(); });
   const inBy = {}; intune.forEach(d => { const k = String(d.azureADDeviceId||"").toLowerCase(); if (k) inBy[k] = d; });
@@ -23280,7 +23283,7 @@ async function collect(){
     const cve = _cve == null ? null : _cve.sev >= 4 ? "Critical" : _cve.sev >= 3 ? "High" : _cve.sev >= 2 ? "Medium" : _cve.sev >= 1 ? "Low" : "None";
     const cveCount = _cve ? _cve.n : null, cveCrit = _cve ? _cve.crit : null, cveHigh = _cve ? _cve.high : null, cveMed = _cve ? _cve.med : null;
     const configFail = m ? (cfgBy[_mid] != null ? cfgBy[_mid] : 0) : null;
-    const openPorts = m ? (portsBy[_mid] || null) : null;   // listening (open) registered ports — the exposed service surface
+    const openPorts = m ? (portsBy[_mid] || null) : null;   // internet-facing exposed ports (Defender InternetFacingPublicScannedPort)
     // Internet-facing: from the dedicated (filtered) query — in-set → true, Defender device not in set → internal,
     // no Defender device → unknown. If that query failed, fall back to the latest-row read (legacy mNet).
     const _netReason = m ? (netBy[_mid] != null ? netBy[_mid] : null) : null;
