@@ -25067,10 +25067,11 @@ EP.registerView("asropt", (function () {
   function recCard(r, i, rankLabel) {
     const rule = r.rule;
     const apply = applyExpander(rule, (r.kind === "pilot" || r.kind === "review-block") ? "AuditMode" : "Enabled", "ap-" + i);
-    const MODE_WORD = { block: "Block", warn: "Warn (enforces)", audit: "Audit", off: "Not configured" };
+    const st = ruleStatus(LAST || {}, rule, r.rs);
+    const stChip = '<span class="asr-st asr-st-' + st.cls + '">' + esc(st.label) + '</span>';
+    // device-level demo keeps the block/audit/off spread; rule-level shows only an exclusions note (status is on the chip)
     const dist = (LAST && LAST.ruleLevel)
-      ? '<div class="opt-dist"><span class="' + (r.rs.block ? "d-block" : r.rs.audit ? "d-audit" : "d-off") + '"><i></i>Currently: ' + esc(MODE_WORD[r.rs.mode] || "Not configured") + '</span>'
-        + (r.rs.excl ? '<span style="color:var(--med)">· ' + r.rs.excl + ' with exclusions</span>' : '') + '</div>'
+      ? (r.rs && r.rs.excl ? '<div class="opt-dist"><span style="color:var(--med)">' + r.rs.excl + ' with exclusions</span></div>' : '')
       : '<div class="opt-dist"><span class="d-block"><i></i>' + (r.rs.block || 0) + ' block</span>'
         + '<span class="d-audit"><i></i>' + (r.rs.audit || 0) + ' audit</span>'
         + '<span class="d-off"><i></i>' + (r.rs.off || 0) + ' off</span>'
@@ -25083,13 +25084,28 @@ EP.registerView("asropt", (function () {
       : esc(KIND_CAT[r.kind] || r.kind) + ' · ' + esc(r.impact);
     return '<div class="finding" style="--fc:' + SEV_COL[r.sev] + '">'
       + '<div class="fh">' + (rankLabel ? '<span class="fr">' + rankLabel + '</span>' : '')
-      + '<span class="sev sev-' + r.sev + '">' + r.sev + '</span>'
+      + stChip
       + phaseChip
       + '<span class="ft">' + esc(r.title) + '</span>'
       + '<span class="opt-cat">' + catRight + '</span></div>'
       + '<div class="fw">' + r.why + '</div>'
       + '<div class="opt-mitre">' + esc(rule.mitre) + '</div>'
       + impact + dist + apply + '</div>';
+  }
+  // Compact row for a rule that needs no action (already enforcing, or not applicable / not read).
+  function compactRuleRow(state, rule) {
+    const rs = (state.rules || []).filter(x => x.slug === rule.slug)[0];
+    const st = ruleStatus(state, rule, rs);
+    const badges = (rule.standard ? '<span class="asr-badge asr-std">Standard</span>' : '')
+      + (rule.os === "server" ? '<span class="asr-badge asr-srv">Server</span>' : '');
+    const note = st.cls === "ok" ? "Enforcing — no action needed"
+      : (rule.os === "server" && !state.servers) ? "Not applicable — no servers"
+      : state.unknown ? "Not read" : "";
+    return '<div class="finding asr-compact" style="--fc:' + (st.cls === "ok" ? "var(--low)" : "var(--border)") + '">'
+      + '<div class="fh"><span class="asr-st asr-st-' + st.cls + '">' + esc(st.label) + '</span>'
+      + '<span class="ft">' + esc(rule.name) + '</span>' + badges
+      + '<span class="opt-cat">' + esc(note) + '</span></div>'
+      + '<div class="opt-mitre">' + esc(rule.mitre) + '</div></div>';
   }
 
   // ── All ASR rules — full status + how-to-configure, so the admin sees every Microsoft ASR rule (configured
@@ -25171,25 +25187,24 @@ EP.registerView("asropt", (function () {
     }
     const src = (window.EP && EP.DEMO) ? "Demo data." : (D.source === "intune" ? "Live — Intune " + (D.sourceLabel || "ASR policy") + " (configured modes)." : "Live.");
     const planBox = (ASR_AI && ASR_AI.plan) ? '<div class="opt-plan"><b>✦ AI rollout plan.</b> ' + esc(ASR_AI.plan) + '<span class="opt-plan-c">Grounded in your fleet\'s ASR modes; advisory — verify before you enforce.</span></div>' : '';
-    const head = '<div class="band" id="asr-optimize"><span class="band-t" style="color:var(--accent-2)">✦ Recommended rollout</span>'
-      + '<span class="band-s">Safe, sequenced ASR changes — grounded in your fleet, read-only</span>'
+    const head = '<div class="band" id="asr-optimize"><span class="band-t" style="color:var(--accent-2)">✦ ASR rollout &amp; rule status</span>'
+      + '<span class="band-s">Actions first, in safe sequence — then every rule\'s current state. Grounded in your fleet, read-only</span>'
       + '<span class="band-right">' + (window.EP ? aiLink() : '') + '<span class="band-x">' + recs.length + ' ' + plural(recs.length, "action") + '</span></span></div>';
-    const emptyMsg = slots(D).all
-      ? 'Every applicable ASR rule is already configured to Block — nothing to optimise.'
-      : 'No ASR rule modes to score.';
     // Diagnostic: ASR settings found in the tenant but not mapped to a known rule — shown so the mapping
     // can be confirmed against the live tenant (honest-data: never silently drop a configured rule).
     const diag = (D.unmapped && D.unmapped.length)
       ? '<div class="note" style="border-left-color:var(--med)"><b>' + D.unmapped.length + ' ASR setting(s) not recognised</b> — please confirm these map to the right rule:<br>'
         + D.unmapped.slice(0, 20).map(u => '<code style="font-size:10.5px">' + esc(u) + '</code>').join('<br>') + '</div>'
       : '';
-    const cards = recs.length
-      ? '<div class="card">' + ordered.map((r, i) => recCard(r, i, (ASR_AI && ASR_AI.order && ASR_AI.order.length) ? String(i + 1) : "")).join("") + '</div>'
-      : '<div class="card"><div class="empty">' + emptyMsg + '</div></div>';
+    // One unified list: actionable rules first (rollout/AI order), then every remaining rule (enforcing / N-A) compact.
+    const recSlugs = {}; recs.forEach(r => { recSlugs[r.slug] = true; });
+    const recCards = ordered.map((r, i) => recCard(r, i, (ASR_AI && ASR_AI.order && ASR_AI.order.length) ? String(i + 1) : "")).join("");
+    const restRows = ASR_RULES.filter(rule => !recSlugs[rule.slug]).map(rule => compactRuleRow(D, rule)).join("");
+    const noAction = recs.length ? "" : '<div class="opt-rem-h" style="padding:13px 15px;border-bottom:1px solid rgba(48,54,61,.5)">Every applicable ASR rule is already enforcing — nothing to promote.</div>';
+    const cards = '<div class="card">' + noAction + recCards + restRows + '</div>';
     root.innerHTML = '<div class="opt-hero"><h2>ASR-rule Optimization</h2>' + headerLine(D, recs) + '</div>'
       + covGauges(D)
       + head + planBox + cards + diag
-      + allRulesSection(D)
       + '<div class="note note-info"><b>Read-only. ' + src + '</b> Attack-surface-reduction rules sit between your AV and your apps — in <b>Block</b> they stop the technique, in <b>Audit</b> they only log it. This page sequences the safest way to move rules toward Block in phases — <b>Phase 1</b>: Microsoft\'s 3 Standard protection rules (Block first); <b>Phase 2</b>: low-false-positive rules proven in Audit (promote); <b>Phase 3</b>: the noisy rules (admin tooling, LOB apps, USB) piloted through Audit. Server-only rules (Webshell) are scored against your servers, not your endpoints. Apply changes in Intune or Defender — SightLine never writes to the tenant.</div>';
     wire(root);
   }
