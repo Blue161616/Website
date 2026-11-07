@@ -7877,6 +7877,18 @@ window.EP = (function () {
       return hit ? { status: "fail", ratio: 0, evidence: hit.title } : { status: "pass", ratio: 1, evidence: "No gap in the " + AD_WL_LABEL[workload] + " Secure Score findings." };
     } };
   }
+  // Collected-aware control (review #10/#11/#13 wiring): Secure Score / Graph don't cover these, so the control is
+  // N/A until the consultant collection for its workload is present (summary.collected) — then it's finding-based
+  // (a matching gap row ⇒ fail, none ⇒ pass). Never "no finding ⇒ pass" while the topic is uncollected.
+  function _adCtrlColl(id, title, workload, re, refs, needs) {
+    return { id, title, domain: workload, refs: refs || null, assess(data) {
+      const s = data[workload]; if (!s) return { status: "na", ratio: null, evidence: AD_WL_LABEL[workload] + " not collected." };
+      if (!s.collected) return { status: "na", ratio: null, evidence: "Not assessed — needs " + (needs || "the consultant " + (AD_WL_LABEL[workload] || workload) + " collection") + "." };
+      const hit = _adHit(s, re);
+      return hit ? { status: "fail", ratio: 0, evidence: hit.title }
+                 : { status: "pass", ratio: 1, evidence: "No gap in the collected " + AD_WL_LABEL[workload] + " policy." };
+    } };
+  }
   // Each control carries the real benchmark recommendation IDs it maps to, verified against the published catalogs:
   // CIS Microsoft 365 Foundations Benchmark v7.0.0 (cis) and the CISA ScubaGear (SCuBA) M365 secure-configuration
   // baseline as implemented by Maester (maester — MDO lives under MS.EXO.8–17 in that baseline, not the newer
@@ -7894,7 +7906,7 @@ window.EP = (function () {
       return ea.pass ? { status: "pass", ratio: 1, evidence: ea.summary || "All accepted domains publish enforcing SPF, DKIM and DMARC." }
                      : { status: "fail", ratio: 0, evidence: ea.summary || "One or more accepted domains lack enforcing SPF / DKIM / DMARC." };
     } },
-    mbxaudit:  _adCtrl("mbxaudit",  "Mailbox / unified audit enabled", "email", null, "an Exchange / audit-config collection", { cis: "3.1.1", maester: "MS.EXO.17.1" }),
+    mbxaudit:  _adCtrlColl("mbxaudit", "Mailbox / unified audit enabled", "email", /audit/, { cis: "3.1.1", maester: "MS.EXO.17.1" }, "an Exchange / audit-config collection (Get-OrganizationConfig / Get-AdminAuditLogConfig)"),
     // Safe Links / Safe Attachments only — NOT every mdo_ control. The old regex also matched mdo-autoforwardingmode,
     // so the forwarding finding wrongly failed this control while the Email page showed both protections as Pass.
     safe:      _adCtrl("safe",      "Safe Links & Safe Attachments", "email", /safe.?link|safe.?attach/, null, { cis: "2.1.1 / 2.1.4", maester: "MS.EXO.9.1 / 15.1" }),
@@ -7902,14 +7914,14 @@ window.EP = (function () {
     // Unmanaged-device access is a Conditional Access / app-enforced-restriction theme — no single CIS/SCuBA SharePoint
     // recommendation maps to it, so it carries no id (renders "custom").
     spodev:    _adCtrl("spodev",    "Access from unmanaged devices limited", "sharepoint", /unmanaged|device/),
-    teamsext:  _adCtrl("teamsext",  "Teams external access (federation) restricted", "teams", null, "a Teams federation collection (Get-CsTenantFederationConfiguration)", { cis: "8.2.1", maester: "MS.TEAMS.2.1" }),
-    teamsapp:  _adCtrl("teamsapp",  "Teams third-party / custom apps governed", "teams", null, "a Teams app-policy collection (teamwork/teamsAppSettings)", { cis: "8.4.1", maester: "MS.TEAMS.5.2" }),
+    teamsext:  _adCtrlColl("teamsext", "Teams external access (federation) restricted", "teams", /federation|external.?access/, { cis: "8.2.1", maester: "MS.TEAMS.2.1" }, "a Teams federation collection (Get-CsTenantFederationConfiguration)"),
+    teamsapp:  _adCtrlColl("teamsapp", "Teams third-party / custom apps governed", "teams", /third.?party|custom.?app|apps?\b[^.]*(govern|polic|permission|sideload)/i, { cis: "8.4.1", maester: "MS.TEAMS.5.2" }, "a Teams app-policy collection (Get-CsTeamsAppPermissionPolicy)"),
     teamsmeet: _adCtrl("teamsmeet", "Teams anonymous meeting join controlled", "teams", /anonymous|lobby|meeting/, null, { cis: "8.5.1", maester: "MS.TEAMS.1.2" }),
     dlp:       _adCtrl("dlp",       "DLP policy protects PII / financial data", "data", /\bdlp\b|data loss/, null, { cis: "3.2.1", maester: "MS.EXO.8.1" }),
     // Sensitivity labels have a CIS recommendation (3.3.1) but no dedicated EXO/SharePoint/Teams SCuBA policy — custom on Maester.
     labels:    _adCtrl("labels",    "Sensitivity labels published & applied", "data", /label|sensitivity|classif|auto.?label/, null, { cis: "3.3.1" }),
     // Retention has no dedicated CIS M365 or SCuBA recommendation in these workloads — custom on both.
-    retention: _adCtrl("retention", "Retention policy configured", "data", null, "a Purview retention collection")
+    retention: _adCtrlColl("retention", "Retention policy configured", "data", /retention/, null, "a Purview retention collection (Get-RetentionCompliancePolicy)")
   };
   // The two tabs carry real, verified recommendation IDs per control (see AD_FW_CONTROLS). Controls with no published
   // recommendation render as "custom" rather than claiming a number.
@@ -29720,6 +29732,7 @@ EP.registerView("email", (function () {
       },
       top: fails.map(function (x) { return { title: x.title, sev: x.sev, focus: { id: x.id } }; }),
       recs: fails.filter(function (x) { return x.title; }).map(function (x) { return { title: x.title, sev: x.sev, fix: x.fix }; }),
+      collected: !!_m365Collected,   // consultant collection present? (Framework's mbxaudit control reads this)
       emailAuth: eaV
     };
   }
@@ -29863,6 +29876,7 @@ EP.registerView("teams", (function () {
 
   var SEV_RANK = { crit:0, high:1, med:2, low:3, ok:9 };
   var _state = null;
+  var _collected = false;   // consultant Teams collection present? (Framework's teamsext / teamsapp controls read this)
   function dataset() { return EP.DEMO ? DEMO : _state; }
 
   function render(list) {
@@ -29878,12 +29892,14 @@ EP.registerView("teams", (function () {
   }
 
   async function analyze() {
-    if (EP.DEMO) { _state = DEMO; render(DEMO); return; }
+    if (EP.DEMO) { _state = DEMO; _collected = true; render(DEMO); return; }
     render(null);
     try {
       // Keep the MDO "Defender for Office 365 in SPO/OneDrive/Teams" control on Email, not here — it just mentions Teams.
       var rows = await M365LIVE.fromSecureScore(function (n, t, c) { var h = n + " " + t; return c === "apps" && /teams|skype|meeting|federation|lobby|anonymous|external.?access/.test(h) && !/defender for office|safe.?attach|safe.?link|\batp\b/.test(h); });
-      rows = rows.concat(await M365LIVE.collect("teams"));   // deep policy detail from the consultant PowerShell collection, if present
+      var cr = await M365LIVE.collect("teams");   // deep policy detail from the consultant PowerShell collection, if present
+      _collected = cr.length > 0;                 // Teams module connected ⇒ federation/app rows present; drives the Framework's teamsext/teamsapp verdict
+      rows = rows.concat(cr);
       _state = rows; render(rows.length ? rows : null);
     } catch (e) {
       var c2 = document.getElementById("content"); if (c2) c2.innerHTML = '<div class="m-note">Couldn’t load live Teams posture — ' + esc((e && e.message) || e) + '. Meeting / messaging / external-access policy detail comes from the consultant Teams PowerShell module. Try <code>?demo=1</code>.</div>';
@@ -29902,7 +29918,8 @@ EP.registerView("teams", (function () {
              high: list.filter(function (x){return x.sev==="high";}).length,
              med: list.filter(function (x){return x.sev==="med";}).length, low: 0 },
       top: fails.map(function (x) { return { title: x.title, sev: x.sev, focus: { id: x.id } }; }),
-      recs: fails.filter(function (x) { return x.title; }).map(function (x) { return { title: x.title, sev: x.sev, fix: x.fix }; })
+      recs: fails.filter(function (x) { return x.title; }).map(function (x) { return { title: x.title, sev: x.sev, fix: x.fix }; }),
+      collected: !!_collected
     };
   }
 
@@ -29940,13 +29957,14 @@ EP.registerView("data", (function () {
       detail:"A sensitivity-label taxonomy (Public → Confidential) is published to all users.", fix:"" },
     { id:"encrypt", title:"Encryption on Confidential label", status:"pass", sev:"ok",
       detail:"The Confidential label applies encryption + access restriction to protected content.", fix:"" },
-    { id:"retention", title:"Retention policy configured", status:"na", sev:"na",
-      detail:"Retention policy state isn't readable web-only — assessed via the consultant Purview collection.",
-      fix:"" }
+    { id:"retention", title:"Retention policy configured", status:"warn", sev:"med",
+      detail:"No retention policy is configured in the demo estate — mail and site content has no enforced retention or deletion schedule.",
+      fix:"Configure retention policies for mail and sites per your compliance requirements (Get-RetentionCompliancePolicy via the consultant Purview collection)." }
   ];
 
   var SEV_RANK = { crit:0, high:1, med:2, low:3, ok:9, na:8 };
   var _state = null;
+  var _collected = false;   // consultant Purview collection present? (Framework's retention control reads this)
   function dataset() { return EP.DEMO ? DEMO : _state; }
 
   function render(list) {
@@ -29958,15 +29976,17 @@ EP.registerView("data", (function () {
         + 'to see the worked example.</div>';
       return;
     }
-    M365UI.render(c, list, "data", "Data & Purview — DLP, sensitivity labels and auto-labeling. Labels read web-only; DLP & retention policy detail via the consultant Purview collection. Not assessed here yet: the unified audit log and retention policies (need a Purview collection) — shown as N/A in the Framework, not passed.");
+    M365UI.render(c, list, "data", "Data & Purview — DLP, sensitivity labels and auto-labeling. Labels read web-only; DLP, retention and the unified audit log come from the consultant Purview collection — assessed in the Framework when that collection is present, shown N/A until then (never passed blind).");
   }
 
   async function analyze() {
-    if (EP.DEMO) { _state = DEMO; render(DEMO); return; }
+    if (EP.DEMO) { _state = DEMO; _collected = true; render(DEMO); return; }
     render(null);
     try {
       var rows = await M365LIVE.fromSecureScore(function (n, t, c) { return c === "data" || /\bdlp\b|sensitivity label|auto.?label|information protection|purview|retention/.test(t); });
-      rows = rows.concat(await M365LIVE.collect("data"));   // deep policy detail from the consultant PowerShell collection, if present
+      var cr = await M365LIVE.collect("data");   // deep policy detail from the consultant PowerShell collection, if present
+      _collected = cr.length > 0;                // Purview module connected ⇒ DLP/label/retention rows present; drives the Framework's retention verdict
+      rows = rows.concat(cr);
       _state = rows; render(rows.length ? rows : null);
     } catch (e) {
       var c2 = document.getElementById("content"); if (c2) c2.innerHTML = '<div class="m-note">Couldn’t load live Data posture — ' + esc((e && e.message) || e) + '. DLP &amp; retention policy detail comes from the consultant Purview PowerShell module. Try <code>?demo=1</code>.</div>';
@@ -29984,6 +30004,7 @@ EP.registerView("data", (function () {
       sev: { crit: list.filter(function (x){return x.sev==="crit";}).length,
              high: list.filter(function (x){return x.sev==="high";}).length,
              med: list.filter(function (x){return x.sev==="med";}).length, low: 0 },
+      collected: !!_collected,
       top: fails.map(function (x) { return { title: x.title, sev: x.sev, focus: { id: x.id } }; }),
       recs: fails.filter(function (x) { return x.title; }).map(function (x) { return { title: x.title, sev: x.sev, fix: x.fix }; })
     };
