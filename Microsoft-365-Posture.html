@@ -7861,31 +7861,41 @@ window.EP = (function () {
   // view-adframework (distinct from the identity CIS M365 and the device framework).
   const AD_WL_LABEL = { email: "Email & Exchange", sharepoint: "SharePoint & OneDrive", teams: "Teams", data: "Data & Purview" };
   function _adHit(s, re) { return ((s && s.top) || []).find(t => re.test(((t.title || "") + " " + ((t.focus && t.focus.id) || t.id || "")).toLowerCase())); }
-  function _adCtrl(id, title, workload, re) {
+  // A control passes only on a POSITIVE check. A finding-based control reads the workload's Secure Score findings: a
+  // matching finding = fail, none = pass. But a topic that is NOT collected (no DNS/Exchange/Teams/Purview source
+  // behind it) must be N/A, never a silent pass — otherwise "no finding" on a topic Secure Score doesn't cover reads
+  // as compliant. Such controls pass `uncollected` with the source they would need.
+  function _adCtrl(id, title, workload, re, uncollected) {
     return { id, title, domain: workload, assess(data) {
       const s = data[workload]; if (!s) return { status: "na", ratio: null, evidence: AD_WL_LABEL[workload] + " not collected." };
+      if (uncollected) return { status: "na", ratio: null, evidence: "Not assessed — needs " + uncollected + "." };
       const hit = _adHit(s, re);
-      return hit ? { status: "fail", ratio: 0, evidence: hit.title } : { status: "pass", ratio: 1, evidence: "No gap in the " + AD_WL_LABEL[workload] + " findings." };
+      return hit ? { status: "fail", ratio: 0, evidence: hit.title } : { status: "pass", ratio: 1, evidence: "No gap in the " + AD_WL_LABEL[workload] + " Secure Score findings." };
     } };
   }
   const AD_FW_CONTROLS = {
     fwd:       _adCtrl("fwd",       "Block external auto-forwarding", "email", /forward/),
     phish:     _adCtrl("phish",     "Anti-phishing & impersonation protection", "email", /phish|impersonat|spoof/),
-    dkim:      _adCtrl("dkim",      "Email authentication (SPF / DKIM / DMARC)", "email", /dkim|dmarc|\bspf\b/),
-    mbxaudit:  _adCtrl("mbxaudit",  "Mailbox / unified audit enabled", "email", /audit/),
-    safe:      _adCtrl("safe",      "Safe Links & Safe Attachments", "email", /safe.?link|safe.?attach|\batp\b|\bmdo\b/),
+    // No DNS read behind SPF/DKIM/DMARC, no audit-config read — so these are N/A, not a free pass (see review P1 #1).
+    dkim:      _adCtrl("dkim",      "Email authentication (SPF / DKIM / DMARC)", "email", null, "a DNS check of each accepted domain (SPF / DKIM / DMARC)"),
+    mbxaudit:  _adCtrl("mbxaudit",  "Mailbox / unified audit enabled", "email", null, "an Exchange / audit-config collection"),
+    // Safe Links / Safe Attachments only — NOT every mdo_ control. The old regex also matched mdo-autoforwardingmode,
+    // so the forwarding finding wrongly failed this control while the Email page showed both protections as Pass.
+    safe:      _adCtrl("safe",      "Safe Links & Safe Attachments", "email", /safe.?link|safe.?attach/),
     spoext:    _adCtrl("spoext",    "SharePoint external sharing restricted", "sharepoint", /anonymous|external shar|anyone|\bshar/),
     spodev:    _adCtrl("spodev",    "Access from unmanaged devices limited", "sharepoint", /unmanaged|device/),
-    teamsext:  _adCtrl("teamsext",  "Teams external access (federation) restricted", "teams", /external access|federation|external domain/),
-    teamsapp:  _adCtrl("teamsapp",  "Teams third-party / custom apps governed", "teams", /\bapp|sideload/),
+    teamsext:  _adCtrl("teamsext",  "Teams external access (federation) restricted", "teams", null, "a Teams federation collection (Get-CsTenantFederationConfiguration)"),
+    teamsapp:  _adCtrl("teamsapp",  "Teams third-party / custom apps governed", "teams", null, "a Teams app-policy collection (teamwork/teamsAppSettings)"),
     teamsmeet: _adCtrl("teamsmeet", "Teams anonymous meeting join controlled", "teams", /anonymous|lobby|meeting/),
     dlp:       _adCtrl("dlp",       "DLP policy protects PII / financial data", "data", /\bdlp\b|data loss/),
     labels:    _adCtrl("labels",    "Sensitivity labels published & applied", "data", /label|sensitivity|classif|auto.?label/),
-    retention: _adCtrl("retention", "Retention policy configured", "data", /retention/)
+    retention: _adCtrl("retention", "Retention policy configured", "data", null, "a Purview retention collection")
   };
+  // Labelled as pillar-level THEME mappings (not enumerated benchmark IDs) — the row codes are internal themes, not CIS
+  // recommendation numbers, so the tabs don't claim IDs they don't carry. (Matches the Endpoint framework treatment.)
   const AD_FRAMEWORKS = {
-    cis:     { key: "cis",     label: "CIS · Microsoft 365", benchmark: "the CIS Microsoft 365 Foundations Benchmark", controls: ["fwd", "phish", "dkim", "mbxaudit", "safe", "spoext", "spodev", "teamsext", "teamsapp", "dlp", "labels", "retention"] },
-    maester: { key: "maester", label: "Maester · M365", benchmark: "the Maester Microsoft 365 test set", controls: ["fwd", "phish", "dkim", "safe", "spoext", "teamsext", "teamsapp", "teamsmeet", "dlp", "labels"] }
+    cis:     { key: "cis",     label: "CIS-aligned · M365", benchmark: "the CIS Microsoft 365 Foundations Benchmark themes (pillar-level)", controls: ["fwd", "phish", "dkim", "mbxaudit", "safe", "spoext", "spodev", "teamsext", "teamsapp", "dlp", "labels", "retention"] },
+    maester: { key: "maester", label: "Maester-aligned · M365", benchmark: "the Maester / CISA ScubaGear M365 test themes (pillar-level)", controls: ["fwd", "phish", "dkim", "safe", "spoext", "teamsext", "teamsapp", "teamsmeet", "dlp", "labels"] }
   };
   let _adFwKey = (function () { try { const f = localStorage.getItem("ad_fw"); return AD_FRAMEWORKS[f] ? f : "cis"; } catch (e) { return "cis"; } })();
   const AD_DOMAIN_VIEW = { email: "email", sharepoint: "sharepoint", teams: "teams", data: "data" };
@@ -29806,7 +29816,7 @@ function demoAlerts(){
 const DEMO = { live:false, alerts:demoAlerts() };
 const NEEDS_DEFENDER = { needsDefender:true };
 
-let LAST = null, ENTITIES = [], ACTIVE = [], RESOLVED = 0, _wired = false;
+let LAST = null, ENTITIES = [], ACTIVE = [], RESOLVED = 0, _statusKnown = false, _wired = false;
 const STATE = { kpi:"", q:"", sev:"all", expanded:{} };
 const KPI_TEST = {
   highcrit: e => SEV_RANK[e.worstSev] >= 3,
@@ -29842,13 +29852,15 @@ async function hunt(q){
 // Apps & Data alerts (last 30d): Defender for Office 365 + Defender for Cloud Apps, joined to a mailbox / app / file
 // entity. One row per alert×entity, newest first. All columns are valid AlertInfo / AlertEvidence fields.
 async function huntAlerts(){
-  // Categorise by the populated AlertEvidence column (AccountUpn → mailbox, Application → app, else file/url →
-  // data). Only valid AlertEvidence columns are referenced (AccountUpn, Application, FileName, RemoteUrl) — the
-  // URL value lives in RemoteUrl, not 'Url'. ServiceSource keeps this to Apps & Data alerts (MDO + Cloud Apps).
-  const q = "AlertInfo | where Timestamp > ago(30d) and ServiceSource in ('Microsoft Defender for Office 365','Office 365 Advanced Threat Protection','Microsoft Defender for Cloud Apps','Microsoft Cloud App Security')"
+  // Categorise by the evidence EntityType, not by which column happens to be populated. A Cloud Apps alert also
+  // carries an AccountUpn, so "AccountUpn → mailbox under MDO attack" was wrong; and a CloudApplication is the app
+  // WHERE the activity happened (e.g. "Microsoft 365"), NOT a compromised OAuth app — only an OauthApplication is.
+  // ServiceSource includes Purview (DLP / Insider Risk) so the data/files bucket actually fills.
+  const q = "AlertInfo | where Timestamp > ago(30d) and ServiceSource in ('Microsoft Defender for Office 365','Office 365 Advanced Threat Protection','Microsoft Defender for Cloud Apps','Microsoft Cloud App Security','Microsoft Data Loss Prevention','Microsoft Insider Risk Management')"
     + " | join kind=inner (AlertEvidence | where Timestamp > ago(30d)"
-    + "   | extend Ent = coalesce(AccountUpn, Application, FileName, RemoteUrl), Kind = case(isnotempty(AccountUpn),'mailbox', isnotempty(Application),'app','data')"
-    + "   | where isnotempty(Ent) | distinct AlertId, Ent, Kind) on AlertId"
+    + "   | extend ET = tostring(EntityType), Kind = case(EntityType =~ 'Mailbox','mailbox', EntityType =~ 'OauthApplication','app', EntityType in~ ('File','Url','CloudApplication'),'data', EntityType =~ 'User','user','data'),"
+    + "            Ent = case(EntityType =~ 'OauthApplication', Application, EntityType in~ ('File'), FileName, EntityType =~ 'Url', RemoteUrl, coalesce(AccountUpn, Application, FileName, RemoteUrl))"
+    + "   | where Kind != 'user' and isnotempty(Ent) | distinct AlertId, Ent, Kind) on AlertId"
     + " | summarize Title=any(Title), Severity=any(Severity), Category=any(Category), ServiceSource=any(ServiceSource), Techniques=any(AttackTechniques), LastSeen=max(Timestamp) by AlertId, Ent, Kind"
     + " | top 500 by LastSeen desc";
   const now = Date.now();
@@ -29866,16 +29878,21 @@ function render(D){
   LAST = D;
   const root = document.getElementById("m365alerts-root"); if (!root) return;
   const all = D.alerts || [];
-  ACTIVE = all.filter(a => String(a.status||"").toLowerCase() !== "resolved");
+  // Advanced hunting (AlertInfo) carries no resolution status, so live alerts arrive with status "" and active can't
+  // be told from resolved — then the page says "last 30 days", not "active". When status IS known (incidents API /
+  // demo) active = not resolved and the wording follows.
+  const STATUS_KNOWN = all.some(a => String(a.status||"").trim()); _statusKnown = STATUS_KNOWN;
+  ACTIVE = STATUS_KNOWN ? all.filter(a => String(a.status||"").toLowerCase() !== "resolved") : all.slice();
   RESOLVED = all.length - ACTIVE.length;
   ENTITIES = buildEntities(ACTIVE);
   const score = pageScore(ENTITIES);
   const highCrit = ENTITIES.filter(KPI_TEST.highcrit).length;
+  const alertWord = STATUS_KNOWN ? "active alert" : "alert";
   const lede = ENTITIES.length
-    ? ENTITIES.length + " " + (ENTITIES.length===1?"entity":"entities") + " under active attack · " + ACTIVE.length + " active alert" + (ACTIVE.length===1?"":"s") + " · " + highCrit + " high/critical" + (RESOLVED?(" · " + RESOLVED + " resolved in 30d"):"") + "."
-    : ("No active Apps & Data threats in the last 30 days" + (RESOLVED?(" · " + RESOLVED + " resolved"):"") + ".");
-  const band = '<div class="dp-band">' + (EP.scoreGauge ? EP.scoreGauge(score) : "")
-    + '<div><div class="h1">Alerts · active on your mailboxes, apps &amp; data</div><div class="lede">' + esc(lede) + '</div></div></div>';
+    ? ENTITIES.length + " " + (ENTITIES.length===1?"entity":"entities") + (STATUS_KNOWN ? " under active attack" : " with alerts in the last 30 days") + " · " + ACTIVE.length + " " + alertWord + (ACTIVE.length===1?"":"s") + " · " + highCrit + " high/critical" + (STATUS_KNOWN && RESOLVED?(" · " + RESOLVED + " resolved in 30d"):"") + "."
+    : ((STATUS_KNOWN ? "No active Apps & Data threats in the last 30 days" : "No Apps & Data alerts in the last 30 days") + (STATUS_KNOWN && RESOLVED?(" · " + RESOLVED + " resolved"):"") + ".");
+  const band = '<div class="dp-band">' + (EP.scoreGauge ? EP.scoreGauge(score, { caption: "risk" }) : "")
+    + '<div><div class="h1">' + (STATUS_KNOWN ? "Alerts · active on your mailboxes, apps &amp; data" : "Alerts · mailboxes, apps &amp; data · last 30 days") + '</div><div class="lede">' + esc(lede) + '</div></div></div>';
   if (D.needsDefender){
     root.innerHTML = band + '<div style="margin-top:10px;padding:16px 18px;border:1px dashed var(--accent);border-radius:12px;background:rgba(63,169,255,.06);font-size:13px;line-height:1.6;color:var(--text)">'
       + '<b>Connect Defender to populate this view.</b><br>Active alerts read from <b>Defender for Office 365</b> + <b>Defender for Cloud Apps</b> via Graph advanced hunting — grant <b>ThreatHunting.Read.All</b>.'
@@ -29884,16 +29901,17 @@ function render(D){
   }
   const mailboxN = ENTITIES.filter(KPI_TEST.mailbox).length, appN = ENTITIES.filter(KPI_TEST.app).length, dataN = ENTITIES.filter(KPI_TEST.data).length, multiN = ENTITIES.filter(KPI_TEST.multi).length;
   const kpiCard = (key, v, label, sub, cls) => '<div class="dp-tile ' + (cls||"") + ' clickable' + (STATE.kpi===key?" on":"") + '" data-kpi="' + key + '"><div class="v">' + v + '</div><div class="l">' + label + ' <span class="dp-hint">see them →</span></div><div class="kpi-sub">' + sub + '</div></div>';
+  const attackedWord = STATUS_KNOWN ? "attacked" : "with alerts";
   const tiles = '<div class="dp-tiles">'
-    + kpiCard("highcrit", highCrit, "High / Critical", "a high-severity active alert", highCrit?"crit":"ok")
-    + kpiCard("mailbox", mailboxN, "Mailboxes", "mailbox under active attack (MDO)", mailboxN?"crit":"ok")
-    + kpiCard("app", appN, "Apps / OAuth", "a risky or compromised app (MDA)", appN?"high":"ok")
+    + kpiCard("highcrit", highCrit, "High / Critical", "a high-severity " + alertWord, highCrit?"crit":"ok")
+    + kpiCard("mailbox", mailboxN, "Mailboxes", "mailbox " + alertWord + " (MDO)", mailboxN?"crit":"ok")
+    + kpiCard("app", appN, "Apps / OAuth", "a risky OAuth-app " + alertWord + " (MDA)", appN?"high":"ok")
     + kpiCard("data", dataN, "Data / files", "SharePoint / OneDrive / file alert", dataN?"high":"ok")
-    + kpiCard("multi", multiN, "Multiple alerts", "2+ active alerts — sustained", multiN?"high":"ok")
-    + kpiCard("active", ENTITIES.length, "Entities attacked", "any active alert (clear filter)", ENTITIES.length?"high":"ok") + '</div>';
+    + kpiCard("multi", multiN, "Multiple alerts", "2+ " + alertWord + "s — sustained", multiN?"high":"ok")
+    + kpiCard("active", ENTITIES.length, STATUS_KNOWN ? "Entities attacked" : "Entities with alerts", "any " + alertWord + " (clear filter)", ENTITIES.length?"high":"ok") + '</div>';
   const src = (window.EP && EP.DEMO) ? "Demo data." : "Live — Defender for Office 365 + Cloud Apps alerts via advanced hunting.";
   const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> The Apps &amp; Data counterpart of Endpoint &amp; Identity Alerts — Defender alerts mapped to a <b>mailbox, app or file</b>, not a device or user. The config pages (Email / SharePoint / Teams / Data) are what <i>could</i> be exploited; this is what Defender sees happening now. Every alert links out to Defender to investigate; Microsoft 365 Posture never resolves. Active threats are <b>live-only</b> (alerts aren’t in any portal export, so demo / import mode show a sample).</div>';
-  const block = ENTITIES.length ? (tiles + '<div class="dp-h2">Active alerts across Apps &amp; Data</div>' + toolbar() + entityTable())
+  const block = ENTITIES.length ? (tiles + '<div class="dp-h2">' + (STATUS_KNOWN ? "Active alerts across Apps &amp; Data" : "Alerts across Apps &amp; Data · last 30 days") + '</div>' + toolbar() + entityTable())
     : '<div class="dp-note" style="margin:2px 0 6px"><b>No Apps &amp; Data alerts in the last 30 days.</b> Nothing Defender attributes to a mailbox, app or file is active right now.</div>';
   root.innerHTML = band + block + note;
   wireView();
@@ -29939,7 +29957,7 @@ function entityTable(){
           + (tech ? ('<span>·</span>' + tech) : "")
           + '<span>·</span><a class="th-defender" href="https://security.microsoft.com/alerts" target="_blank" rel="noopener">Open in Defender →</a></div></div>';
       }).join("");
-      html += '<tr class="cv-detail"><td colspan="6"><div style="font-size:11px;color:var(--muted);margin-bottom:4px">' + e.activeCount + ' active alert' + (e.activeCount===1?"":"s") + ' on <b style="color:var(--text)">' + esc(e.name) + '</b></div>' + alerts + '</td></tr>';
+      html += '<tr class="cv-detail"><td colspan="6"><div style="font-size:11px;color:var(--muted);margin-bottom:4px">' + e.activeCount + (_statusKnown ? " active" : "") + ' alert' + (e.activeCount===1?"":"s") + ' on <b style="color:var(--text)">' + esc(e.name) + '</b></div>' + alerts + '</td></tr>';
     }
     return html;
   }).join("");
@@ -29971,12 +29989,13 @@ function __m365AlertsSummary(){
   const sev = { crit:0, high:0, med:0, low:0 };
   ENTITIES.forEach(e => { sev[SEV_CLS[e.worstSev]]++; });
   const kic = { mailbox:"📩", app:"🧩", data:"📄" };
+  const aWord = _statusKnown ? "active alert" : "alert";
   const top = ENTITIES.slice().sort((a,b)=>b.score-a.score).slice(0,5).map(e => ({
-    title: (kic[e.kind]||"") + " " + e.name + " — " + e.activeCount + " active alert" + (e.activeCount===1?"":"s"),
+    title: (kic[e.kind]||"") + " " + e.name + " — " + e.activeCount + " " + aWord + (e.activeCount===1?"":"s"),
     sev: SEV_CLS[e.worstSev], impact: e.cats.map(catLabel)[0] || "", search:"" }));
   // computeOverall reads this score as POSTURE (higher = better; exposure = 100 − score), so return the
   // inverse of the in-view exposure gauge — no alerts → posture 100 → exposure 0, many alerts → high exposure.
-  return { label:"Alerts", score: Math.max(0, 100 - pageScore(ENTITIES)), grade:"", lead:(ENTITIES.length + " entity/entities under active attack · " + ACTIVE.length + " alert(s)"), sev, top };
+  return { label:"Alerts", score: Math.max(0, 100 - pageScore(ENTITIES)), grade:"", lead:(ENTITIES.length + " entity/entities " + (_statusKnown ? "under active attack" : "with alerts in the last 30 days") + " · " + ACTIVE.length + " " + aWord + "(s)"), sev, top };
 }
 function __m365AlertsFocus(f){
   try { const r = document.getElementById("m365alerts-root"); if (r) r.scrollIntoView({ behavior:"smooth", block:"start" });
