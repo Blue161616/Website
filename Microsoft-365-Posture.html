@@ -8635,10 +8635,15 @@ window.EP = (function () {
     const chain = st && st.chain; if (!chain) return "";
     const posture = chain.caPosture, need = chain.needsGating || 0, blind = chain.blindspot || 0, adminR = chain.adminRisk || 0;
     const items = [];
-    if (posture && posture !== "enforced" && need) {
+    // The require-compliant control: flag ANY state that isn't actually enforced — even with no device currently
+    // exposed, an absent/report-only policy means nothing blocks a device that drifts (matches the CA view).
+    if (posture && posture !== "enforced") {
       const lbl = posture === "reportonly" ? "report-only" : posture === "off" ? "disabled" : "not configured";
-      items.push({ sev: posture === "nopolicy" ? "high" : "crit", quick: "exposed",
-        title: "Require-compliant Conditional Access is " + lbl + " — " + need + " non-compliant / high-threat device" + (need === 1 ? "" : "s") + " not blocked" });
+      items.push(need
+        ? { sev: posture === "nopolicy" ? "high" : "crit", quick: "exposed",
+            title: "Require-compliant Conditional Access is " + lbl + " — " + need + " non-compliant / high-threat device" + (need === 1 ? "" : "s") + " not blocked" }
+        : { sev: "high", quick: "exposed",
+            title: "Require-compliant Conditional Access is " + lbl + " — compliance is advisory; nothing blocks a device that drifts or carries a Defender alert" });
     }
     if (adminR) items.push({ sev: "crit", quick: "adminrisk",
       title: adminR + " high-risk device" + (adminR === 1 ? "" : "s") + " used by an administrator — a compromised endpoint becomes privileged-account takeover" });
@@ -8646,8 +8651,12 @@ window.EP = (function () {
       title: blind + " compliant device" + (blind === 1 ? "" : "s") + " with a High Defender alert — compliance isn't turning Defender risk into non-compliance" });
     const head = '<div class="ov-panel-h">Cross-domain enforcement<span class="ov-chg-cap">compliance chain · live</span></div>';
     if (!items.length) {
-      return '<div class="ov-panel sx-corr">' + head + '<div class="sx-corr-body"><div class="sx-lede">'
-        + '✓ The compliance chain holds — risky and non-compliant devices are gated by an enforced require-compliant policy, and no admin device is high-risk.</div></div></div>';
+      // Only a genuinely enforced require-compliant policy counts as "holds". If the Endpoint scan hasn't assessed
+      // CA posture (null), don't claim either way.
+      const msg = posture === "enforced"
+        ? '✓ The compliance chain holds — risky and non-compliant devices are gated by an enforced require-compliant policy, and no admin device is high-risk.'
+        : 'Compliance-chain enforcement not assessed yet — open the Endpoint pillar to evaluate the require-compliant Conditional Access chain.';
+      return '<div class="ov-panel sx-corr">' + head + '<div class="sx-corr-body"><div class="sx-lede">' + msg + '</div></div></div>';
     }
     const rows = items.map((c, i) => '<div class="ov-fix-row" data-suitego="endpoint" data-fixview="devices" data-fixfocus=\''
       + esc(JSON.stringify({ quick: c.quick })) + '\'><span class="ov-fix-n">' + (i + 1) + '</span>' + ovSevBadge(c.sev)
@@ -8660,8 +8669,26 @@ window.EP = (function () {
     const pills = st.pillars, links = st.links || [], ents = st.ents || {};
     const nm = links.length ? null : suiteNearMiss(ents);
     const overalls = SUITE_PILLARS.map(p => pills[p.key] && pills[p.key].overall).filter(Boolean);
-    let worst = null; overalls.forEach(o => { if (!worst || (o.score || 0) > (worst.score || 0)) worst = o; });
-    const worstP = SUITE_PILLARS.find(p => pills[p.key] && pills[p.key].overall === worst);
+    // Weakest domain (sets the estate grade) = the most MATERIAL exposure, not the highest ratio. Each domain's
+    // exposure is weighted by how much real estate sits behind it (assessed population), so a tiny domain — e.g.
+    // 2 devices all unmanaged, which reads 100% → a top score — can't crown the estate over a large, genuinely
+    // risky one. Config-only domains with no asset population (Apps & Data = tenant-wide settings) are fully
+    // material. The grade shown is then the weakest material domain's OWN raw score; per-domain tiles are unchanged.
+    const MAT_K = 8;   // ~assets for half-confidence; below this a domain can't dominate on ratio alone
+    const pillarVolume = key => {
+      try {
+        if (key === "endpoint") { const a = viewApi("devices"), s = a && a.summary && a.summary(); return s ? (s.total || 0) : null; }
+        if (key === "identity") { const a = viewApi("user"), s = a && a.summary && a.summary(); return s && s.totals ? (s.totals.accounts || 0) : null; }
+        return null;   // Apps & Data is config-based (no population) → fully material
+      } catch (e) { return null; }
+    };
+    let worst = null, worstP = null, worstEff = -1;
+    SUITE_PILLARS.forEach(p => {
+      const o = pills[p.key] && pills[p.key].overall; if (!o) return;
+      const vol = pillarVolume(p.key), conf = (vol == null) ? 1 : vol / (vol + MAT_K);
+      const eff = (o.score || 0) * conf;
+      if (eff > worstEff) { worstEff = eff; worst = o; worstP = p; }
+    });
     const estScore = worst ? worst.score : null;
     let totCrit = 0, totHigh = 0; overalls.forEach(o => { totCrit += o.crit || 0; totHigh += o.high || 0; });
     suiteSnapSave(suiteCurScores(pills, estScore));   // persist this scan's per-pillar scores (live) so the trend becomes real over time
@@ -15103,6 +15130,7 @@ const CA_SCOPES           = ["Policy.Read.All"];                          // Con
 let signInAvailable = null;   // null = not attempted, true = loaded, false = scope not consented
 let riskAvailable   = null;
 let caAvailable     = null;
+let caPolicies      = [];       // agent/workload-targeting CA policies (with grant controls) — for the agent-risk card
 let workloadIdPremium = null;   // inferred: risk data returned as "hidden" => no Workload ID Premium
 let pendingScopes   = [];       // optional scopes the "grant access" link should request
 
@@ -15220,7 +15248,7 @@ async function loadCaCoverage(blueprints, agents) {
   let policies = [];
   try {
     policies = await graphGetAll("https://graph.microsoft.com/beta"
-      + "/identity/conditionalAccess/policies?$select=id,displayName,state,conditions", at);
+      + "/identity/conditionalAccess/policies?$select=id,displayName,state,conditions,grantControls", at);
   } catch { caAvailable = false; return; }
   caAvailable = true;
   // Keep only policies that scope to agents or workload identities at all.
@@ -15231,6 +15259,7 @@ async function loadCaCoverage(blueprints, agents) {
       || (ca.includeAgentIdServicePrincipals || []).length || (ca.excludeAgentIdServicePrincipals || []).length
       || !!ca.agentIdServicePrincipalFilter;
   });
+  caPolicies = wl;   // retained (with grant controls) so the CA Coverage matrix can assess agent risk-blocking
   agents.forEach(a => { a._ca = caEvaluate(wl, a.id, "agent"); });
   // The blueprint principal itself: CA never governs a blueprint acquiring a token to create agents,
   // so this only reports an explicit workload-identity targeting, not "coverage" of the blueprint.
@@ -16624,6 +16653,35 @@ function __epAgentSummary() {
   };
 }
 
+// Exposed to the shell (EP.viewApi("agent").caRisk): the AGENT-identity CA risk-blocking posture, for the CA
+// Coverage matrix's "Agent risk" card. Agents have their OWN CA policies (includeAgentIdServicePrincipals), so a
+// "block risky agents" policy = enabled + block grant + servicePrincipalRiskLevels, targeting agent identities.
+function __epAgentCaRisk() {
+  try {
+    if (caAvailable == null && !(loaded && loaded.byBlueprint)) return null;
+    const pols = caPolicies || [];
+    const clientApps = p => (p.conditions && p.conditions.clientApplications) || {};
+    const targetsAgents = p => (clientApps(p).includeAgentIdServicePrincipals || []).length > 0;
+    const isBlock = p => ((((p.grantControls || {}).builtInControls) || []).indexOf('block') >= 0);
+    const hasRisk = p => ((p.conditions || {}).servicePrincipalRiskLevels || []).length > 0;
+    const riskBlock = p => targetsAgents(p) && isBlock(p) && hasRisk(p);
+    const en = pols.filter(p => String(p.state) === 'enabled' && riskBlock(p));
+    const ro = pols.filter(p => String(p.state) === 'enabledForReportingButNotEnforced' && riskBlock(p));
+    let caTotal = 0, caCovered = 0, riskyTotal = 0;
+    if (loaded && loaded.byBlueprint) Object.keys(loaded.byBlueprint).forEach(k => (loaded.byBlueprint[k] || []).forEach(a => {
+      if (a._ca) { caTotal++; if (a._ca.covered) caCovered++; }
+      if (agStateRisk(a)) riskyTotal++;
+    }));
+    const allAgents = en.concat(ro).some(p => (clientApps(p).includeAgentIdServicePrincipals || []).map(x => String(x).toLowerCase()).indexOf('all') >= 0);
+    return {
+      available: caAvailable === true,
+      enforced: en.length > 0, reportOnly: en.length === 0 && ro.length > 0, allAgents,
+      policies: en.concat(ro).map(p => ({ id: p.id, name: p.displayName || p.id, reportOnly: String(p.state) === 'enabledForReportingButNotEnforced' })),
+      agentTotal: caTotal, agentCovered: caCovered, riskyTotal
+    };
+  } catch (e) { return null; }
+}
+
 function download(filename, text, mime) {
   const blob = new Blob([text], { type: mime });
   const url = URL.createObjectURL(blob);
@@ -17216,6 +17274,16 @@ function startDemo() {
   $("demoBar").classList.remove("hidden");
   $("who").innerHTML = "Demo tenant \u2014 <b>contoso.demo</b>";
   riskAvailable = true; signInAvailable = true; caAvailable = true;
+  // Agent-targeting CA policies \u2014 a risk-based block on high-risk agents (On), plus report-only baselines.
+  caPolicies = [
+    { id: 'ca-a90', displayName: 'CA-A90-Agents-Risk-AllResources-BlockHighRisk', state: 'enabled',
+      conditions: { clientApplications: { includeAgentIdServicePrincipals: ['All'] }, servicePrincipalRiskLevels: ['high'] },
+      grantControls: { builtInControls: ['block'] } },
+    { id: 'ca-a00', displayName: 'CA-A00-Agents-Baseline-AllResources-BlockUnlessApproved', state: 'enabledForReportingButNotEnforced',
+      conditions: { clientApplications: { includeAgentIdServicePrincipals: ['All'] } }, grantControls: { builtInControls: ['block'] } },
+    { id: 'ca-a10', displayName: 'CA-A10-Agents-HR-HRAPI-BlockUnlessHRApproved', state: 'enabledForReportingButNotEnforced',
+      conditions: { clientApplications: { includeAgentIdServicePrincipals: ['ag-hr'] } }, grantControls: { builtInControls: ['block'] } }
+  ];
   const d = demoTenant();
   render(d.bps, d.byBlueprint, Object.values(d.byBlueprint).reduce((a, x) => a + x.length, 0));
   $("configCard").classList.add("hidden");
@@ -17294,7 +17362,7 @@ function __epAgentFocus(f){ if(!f||!f.search) return; try { var s=$("fltSearch")
 function ehPathCount(objId){ try { if(window.EP && window.EP.DEMO) return null; var S=window.EH&&window.EH.ui&&window.EH.ui.S; if(!S||!S.paths||!S.paths.length) return null; var n=0; for(var i=0;i<S.paths.length;i++) if(S.paths[i].source===objId) n++; return n; } catch(e){ return null; } }
 try { window.addEventListener("ep:graphready", function(){ try { renderTable(); } catch(e){} }); } catch(e){}
 
-;return { load: (typeof loadBlueprints === "function") ? loadBlueprints : null, focus: (typeof __epAgentFocus === 'function' ? __epAgentFocus : null), summary: (typeof __epAgentSummary === 'function' ? __epAgentSummary : null), ask: (typeof __epAgentAsk === 'function' ? __epAgentAsk : null) };
+;return { load: (typeof loadBlueprints === "function") ? loadBlueprints : null, focus: (typeof __epAgentFocus === 'function' ? __epAgentFocus : null), summary: (typeof __epAgentSummary === 'function' ? __epAgentSummary : null), ask: (typeof __epAgentAsk === 'function' ? __epAgentAsk : null), caRisk: (typeof __epAgentCaRisk === 'function' ? __epAgentCaRisk : null) };
 })());
 </script>
 <script>
@@ -20074,14 +20142,19 @@ function coverageMatrix(ctx) {
       devLine + links + '</div>';
   }).join('');
   // Workload risk — block risky workloads. Reads workload-identity CA (a separate policy set living in the
-  // Workload scan), so it's a placeholder here that fillChainImpact fills async from EP.viewApi('workload').caRisk().
-  // Agent identities ride the same workload-identity CA, so they're folded into this card, not a separate one.
+  // Workload scan); a placeholder here that fillChainImpact fills async from EP.viewApi('workload').caRisk().
   const wlRiskCard = '<div class="cccard b-bad" id="ca-cc-wlrisk">'
     + '<div class="cctop"><span class="ccname">Workload risk — block risky workloads</span><span class="ccbadge" id="ca-cc-wlrisk-badge">…</span></div>'
     + '<div class="ccmid"><div class="ccgauge" id="ca-cc-wlrisk-gauge" title="Enforcement level"></div>'
     + '<div class="ccscope"><div class="in" id="ca-cc-wlrisk-in">In scope: <span class="k">reading the Workload scan…</span></div><div class="out" id="ca-cc-wlrisk-out"></div></div></div>'
-    + '<div class="ccdev" id="ca-cc-wlrisk-agent" hidden></div>'
     + '<div class="covpols" id="ca-cc-wlrisk-pols"></div></div>';
+  // Agent risk — block risky agents. Agents have their OWN Conditional Access policies
+  // (includeAgentIdServicePrincipals), so this is a distinct card filled from EP.viewApi('agent').caRisk().
+  const agRiskCard = '<div class="cccard b-bad" id="ca-cc-agrisk">'
+    + '<div class="cctop"><span class="ccname">Agent risk — block risky agents</span><span class="ccbadge" id="ca-cc-agrisk-badge">…</span></div>'
+    + '<div class="ccmid"><div class="ccgauge" id="ca-cc-agrisk-gauge" title="Enforcement level"></div>'
+    + '<div class="ccscope"><div class="in" id="ca-cc-agrisk-in">In scope: <span class="k">reading the Agent scan…</span></div><div class="out" id="ca-cc-agrisk-out"></div></div></div>'
+    + '<div class="covpols" id="ca-cc-agrisk-pols"></div></div>';
   return '<div class="band" id="ca-coverage"><span class="band-t">Coverage</span>' +
       '<span class="band-s">Is each control actually enforced, and who is in scope</span></div>' +
     '<div class="note note-info">This reads policy <b>scope</b>, not your user directory — it answers “is there an ' +
@@ -20090,29 +20163,34 @@ function coverageMatrix(ctx) {
       '<span class="ep-xlink" role="button" tabindex="0" title="Open the Ask page and list the accounts out of scope of enforced MFA"' +
       'onclick="if(window.EP&&EP.goto)EP.goto(\'ask\',{ask:\'users admin notenforced\'})" ' +
       'onkeydown="if((event.key===\'Enter\'||event.key===\' \')&&window.EP&&EP.goto){event.preventDefault();EP.goto(\'ask\',{ask:\'users admin notenforced\'})}">→ list the accounts out of scope</span></div>' +
-    '<div class="ccgrid">' + cards + wlRiskCard + '</div>';
+    '<div class="ccgrid">' + cards + wlRiskCard + agRiskCard + '</div>';
 }
-// Fill the "Workload risk — block risky workloads" card from the Workload scan (workload-identity CA), with agent
-// identities folded in from the Agent scan. Grounded; shows NOT SCANNED until the workload data is available.
-function fillWlRiskCard(wl, ag) {
-  const card = $('ca-cc-wlrisk'); if (!card) return;
-  const badge = $('ca-cc-wlrisk-badge'), gauge = $('ca-cc-wlrisk-gauge'), inEl = $('ca-cc-wlrisk-in'),
-        outEl = $('ca-cc-wlrisk-out'), agEl = $('ca-cc-wlrisk-agent'), polsEl = $('ca-cc-wlrisk-pols');
+// Shared renderer for the two risk-blocking cards (workload / agent). `d` is the caRisk() shape; `o` names the
+// asset ("workload" / "agent"), the id prefix, and the "no CA at all" message. Grounded; NOT SCANNED until data.
+function fillRiskBlockCard(d, o) {
+  const card = $(o.id); if (!card) return;
+  const badge = $(o.id + '-badge'), gauge = $(o.id + '-gauge'), inEl = $(o.id + '-in'), outEl = $(o.id + '-out'), polsEl = $(o.id + '-pols');
   const setGauge = pct => { if (gauge) gauge.innerHTML = (window.EP && EP.scoreGauge) ? EP.scoreGauge(pct, { size: 52, goodHigh: true }) : ''; };
-  if (!wl) { card.className = 'cccard b-bad'; if (badge) badge.textContent = 'NOT SCANNED'; setGauge(0);
-    if (inEl) inEl.innerHTML = 'In scope: <span class="k">—</span>'; if (outEl) outEl.innerHTML = '<span class="k">open Workloads to scan workload-identity CA</span>'; return; }
-  if (!wl.available) { card.className = 'cccard b-bad'; if (badge) badge.textContent = 'NOT CONFIGURED'; setGauge(0);
-    if (inEl) inEl.innerHTML = 'In scope: <span class="k">—</span>'; if (outEl) outEl.innerHTML = '<b>every workload identity</b> — no Conditional Access for workload identities'; return; }
+  if (!d) { card.className = 'cccard b-bad'; if (badge) badge.textContent = 'NOT SCANNED'; setGauge(0);
+    if (inEl) inEl.innerHTML = 'In scope: <span class="k">—</span>'; if (outEl) outEl.innerHTML = '<span class="k">open ' + o.scanLabel + ' to scan ' + o.noun + ' CA</span>'; if (polsEl) polsEl.innerHTML = ''; return; }
+  if (!d.available) { card.className = 'cccard b-bad'; if (badge) badge.textContent = 'NOT CONFIGURED'; setGauge(0);
+    if (inEl) inEl.innerHTML = 'In scope: <span class="k">—</span>'; if (outEl) outEl.innerHTML = '<b>every ' + o.noun + '</b> — ' + o.noCa; if (polsEl) polsEl.innerHTML = ''; return; }
   let band, label, frac;
-  if (wl.enforced) { band = 'b-ok'; label = 'ENFORCED'; frac = 1; }
-  else if (wl.reportOnly) { band = 'b-warn'; label = 'REPORT-ONLY'; frac = 0.4; }
+  if (d.enforced) { band = 'b-ok'; label = 'ENFORCED'; frac = 1; }
+  else if (d.reportOnly) { band = 'b-warn'; label = 'REPORT-ONLY'; frac = 0.4; }
   else { band = 'b-bad'; label = 'NOT CONFIGURED'; frac = 0; }
   card.className = 'cccard ' + band; if (badge) badge.textContent = label; setGauge(Math.round(frac * 100));
-  if (inEl) inEl.innerHTML = 'In scope: <b>' + (wl.allTenant ? 'All workload identities' : (frac ? 'scoped service principals' : '—')) + '</b>' + (label === 'REPORT-ONLY' ? ' <span class="k">— evaluated, not enforced</span>' : '');
-  if (outEl) outEl.innerHTML = wl.riskyTotal ? '<b>' + wl.riskyTotal + '</b> at-risk workload' + (wl.riskyTotal === 1 ? '' : 's') + ' flagged by ID Protection' + (frac ? '' : ' — unblocked') : (frac ? 'no at-risk workloads flagged' : '<b>everyone</b> — no risk-based block policy');
-  if (agEl) { const t = ag && ag.totals; if (t && typeof t.caTotal === 'number' && t.caTotal) {
-      agEl.innerHTML = 'Agent identities ride the same workload-identity CA — <b>' + (t.caCovered || 0) + '</b> / ' + t.caTotal + ' in scope of an enforced policy'; agEl.hidden = false; } else agEl.hidden = true; }
-  if (polsEl) polsEl.innerHTML = (wl.policies || []).map(p => '<span class="pollink" style="cursor:default" title="' + esc(p.name) + ' — workload-identity CA (open the Workloads view for detail)">' + esc(p.name) + (p.reportOnly ? ' <span class="covro">report-only</span>' : '') + '</span>').join('');
+  if (inEl) inEl.innerHTML = 'In scope: <b>' + (d.allScope ? o.allLabel : (frac ? o.scopedLabel : '—')) + '</b>' + (label === 'REPORT-ONLY' ? ' <span class="k">— evaluated, not enforced</span>' : '');
+  if (outEl) outEl.innerHTML = d.riskyTotal ? '<b>' + d.riskyTotal + '</b> at-risk ' + o.riskNoun + (d.riskyTotal === 1 ? '' : 's') + ' flagged by ID Protection' + (frac ? '' : ' — unblocked') : (frac ? 'none flagged at risk by ID Protection' : '<b>everyone</b> — no risk-based block policy');
+  if (polsEl) polsEl.innerHTML = (d.policies || []).map(p => '<span class="pollink" style="cursor:default" title="' + esc(p.name) + ' — ' + o.noun + ' CA (open the ' + o.scanLabel + ' view for detail)">' + esc(p.name) + (p.reportOnly ? ' <span class="covro">report-only</span>' : '') + '</span>').join('');
+}
+function fillWlRiskCard(wl) {
+  fillRiskBlockCard(wl && { available: wl.available, enforced: wl.enforced, reportOnly: wl.reportOnly, allScope: wl.allTenant, policies: wl.policies, riskyTotal: wl.riskyTotal },
+    { id: 'ca-cc-wlrisk', noun: 'workload identity', riskNoun: 'workload', allLabel: 'All workload identities', scopedLabel: 'scoped service principals', scanLabel: 'Workloads', noCa: 'no Conditional Access for workload identities' });
+}
+function fillAgentRiskCard(ag) {
+  fillRiskBlockCard(ag && { available: ag.available, enforced: ag.enforced, reportOnly: ag.reportOnly, allScope: ag.allAgents, policies: ag.policies, riskyTotal: ag.riskyTotal },
+    { id: 'ca-cc-agrisk', noun: 'agent', riskNoun: 'agent', allLabel: 'All agent identities', scopedLabel: 'scoped agent identities', scanLabel: 'Agents', noCa: 'no Conditional Access for agent identities' });
 }
 
 // ═════════════════════════ AI assist (optional, local) ═════════════════════════
@@ -20754,21 +20832,21 @@ async function fillChainImpact(ctx) {
       await new Promise(r => setTimeout(r, 100));
     }
   } catch (e) {}
-  // Fill the "Workload risk" coverage card from the Workload scan (+ agents from the Agent scan), cross-pillar.
-  try {
+  // Fill the "Workload risk" and "Agent risk" coverage cards from their own scans' CA (cross-pillar, risk-blocking).
+  async function pollCaRisk(view) {
     const signedIn = !!(window.EP && EP.ACCOUNT);
-    if (window.EP && !EP.DEMO && signedIn && EP.ensureLoaded) { try { await EP.ensureLoaded('workload'); } catch (e) {} }
-    let wl = null;
+    if (window.EP && !EP.DEMO && signedIn && EP.ensureLoaded) { try { await EP.ensureLoaded(view); } catch (e) {} }
     for (let i = 0; i < 20; i++) {
-      const wv = window.EP && EP.viewApi ? EP.viewApi('workload') : null;
-      wl = wv && typeof wv.caRisk === 'function' ? wv.caRisk() : null;
-      if (wl) break;
-      if (window.EP && !EP.DEMO && !signedIn) break;
+      const v = window.EP && EP.viewApi ? EP.viewApi(view) : null;
+      const d = v && typeof v.caRisk === 'function' ? v.caRisk() : null;
+      if (d) return d;
+      if (window.EP && !EP.DEMO && !signedIn) return null;
       await new Promise(r => setTimeout(r, 100));
     }
-    let ag = null; try { const av = window.EP && EP.viewApi ? EP.viewApi('agent') : null; ag = av && av.summary ? av.summary() : null; } catch (e) {}
-    fillWlRiskCard(wl, ag);
-  } catch (e) {}
+    return null;
+  }
+  try { fillWlRiskCard(await pollCaRisk('workload')); } catch (e) {}
+  try { fillAgentRiskCard(await pollCaRisk('agent')); } catch (e) {}
   // Fill the Compliant/managed-device coverage card's device line with REAL Endpoint counts (grounded, cross-pillar).
   const dl = $('ca-cc-devline');
   if (dl && devSum) {
@@ -21919,7 +21997,15 @@ EH.findings = (function(){
         if(t0.length) add(n.type === 'agent' ? 'AgentPrivilege' : 'AppDangerousPerms', 'Critical', (n.type === 'agent' ? 'Agent identity' : 'Workload identity') + ' holds Tier-0 Graph permissions', n.id, t0.map(function(p){ return p.label; }).join(', '));
         else if(t1.length) add(n.type === 'agent' ? 'AgentPrivilege' : 'AppDangerousPerms', 'High', (n.type === 'agent' ? 'Agent identity' : 'Workload identity') + ' holds high-impact Graph permissions', n.id, t1.map(function(p){ return p.label; }).join(', '));
         var dl = (g.out.get(n.id) || []).filter(function(e){ return e.k === 'HasDelegatedPermission'; });
-        dl.forEach(function(e){ var p = g.nodes.get(e.t); if(p.tier === 0 && /AllPrincipals|all users/.test(e.via)) add('DangerousDelegated', 'Critical', 'Tenant-wide delegated consent for ' + p.label, n.id, 'any user signing in to this app lends it their privileges'); else if(p.tier <= 1) add('RiskyOAuthConsent', /all users/.test(e.via) ? 'High' : 'Medium', (/all users/.test(e.via) ? 'Tenant-wide' : 'User-consented') + ' delegated ' + p.label, n.id, e.via); });
+        // "Any user signing in lends it their privileges" only holds when the app accepts ANY user. When
+        // appRoleAssignmentRequired = true, only assigned users/groups can sign in, so the blast radius is the
+        // assignment list, not the tenant — downgrade Critical → High and say so. (Graph Explorer is the classic
+        // case: tenant-wide delegated Application.ReadWrite.All, but assignment required with one admin assigned.)
+        var gated = n.props && n.props.appRoleAssignmentRequired === true;
+        dl.forEach(function(e){ var p = g.nodes.get(e.t); var allUsers = /AllPrincipals|all users/.test(e.via);
+          if(p.tier === 0 && allUsers && !gated) add('DangerousDelegated', 'Critical', 'Tenant-wide delegated consent for ' + p.label, n.id, 'any user signing in to this app lends it their privileges');
+          else if(p.tier === 0 && allUsers && gated) add('DangerousDelegated', 'High', 'Assignment-gated delegated consent for ' + p.label, n.id, 'assignment required is on — only assigned users/groups can sign in, so the blast radius is the assignment list, not the tenant. Keep that list tight (ideally admins only) and protect them with phishing-resistant MFA.');
+          else if(p.tier <= 1) add('RiskyOAuthConsent', (allUsers && !gated) ? 'High' : 'Medium', ((allUsers && !gated) ? 'Tenant-wide' : (gated ? 'Assignment-gated' : 'User-consented')) + ' delegated ' + p.label, n.id, gated ? (e.via + ' · assignment required (limited to assigned users/groups)') : e.via); });
         if(n.flags.privileged){
           var owners2 = (g.inn.get(n.id) || []).filter(function(e){ return e.k === 'OwnerOf'; });
           var low2 = owners2.filter(function(e){ return !g.nodes.get(e.s).flags.tier0; }); if(low2.length) add('SPOwnedByLowPriv', n.flags.permTier === 0 ? 'Critical' : 'High', 'Privileged service principal owned by non-Tier-0 identity', n.id, low2.map(function(e){ return g.nodes.get(e.s).label; }).join(', '));
@@ -22885,6 +22971,10 @@ EH.ui = (function(){
     var ext = { id: guid(), appId: guid(), displayName: 'Contoso Partner Backup SaaS', servicePrincipalType: 'Application', accountEnabled: true, appOwnerOrganizationId: guid(), owners: [], publisherName: 'BackupVendor Ltd' }; sps.push(ext); grant(ext, 'Sites.ReadWrite.All'); grant(ext, 'Directory.ReadWrite.All');
     var consent = { id: guid(), appId: guid(), displayName: 'Quick PDF Converter', servicePrincipalType: 'Application', accountEnabled: true, appOwnerOrganizationId: guid(), owners: [] }; sps.push(consent);
     grants.push({ id: guid(), clientId: consent.id, consentType: 'AllPrincipals', resourceId: graphSp.id, scope: 'User.Read Directory.AccessAsUser.All Mail.ReadWrite' }); grants.push({ id: guid(), clientId: a3.s.id, consentType: 'Principal', principalId: users[50].id, resourceId: graphSp.id, scope: 'User.Read Files.ReadWrite.All' });
+    // Same tenant-wide tier-0 delegated consent, but assignment required is ON (only assigned users can sign in) —
+    // the Graph-Explorer case: the finding should read "Assignment-gated" (High), not "any user" (Critical).
+    var gatedApp = { id: guid(), appId: guid(), displayName: 'Graph Explorer', servicePrincipalType: 'Application', accountEnabled: true, appOwnerOrganizationId: tenantId, appRoleAssignmentRequired: true, owners: [] }; sps.push(gatedApp);
+    grants.push({ id: guid(), clientId: gatedApp.id, consentType: 'AllPrincipals', resourceId: graphSp.id, scope: 'User.Read Directory.AccessAsUser.All' });
     // agents
     var bp = { id: guid(), appId: guid(), displayName: 'Customer Support Agent Blueprint', createdDateTime: d(60), signInAudience: 'AzureADMyOrg', passwordCredentials: [secret(2, 50)], keyCredentials: [], federatedIdentityCredentials: [], owners: [{ id: users[31].id }] };
     var agents = [{ id: guid(), appId: guid(), displayName: 'Support Triage Agent', accountEnabled: true, agentIdentityBlueprintId: bp.appId, createdDateTime: d(40), passwordCredentials: [], keyCredentials: [] }, { id: guid(), appId: guid(), displayName: 'Directory Cleanup Agent', accountEnabled: true, agentIdentityBlueprintId: bp.appId, createdDateTime: d(20), passwordCredentials: [], keyCredentials: [] }];
