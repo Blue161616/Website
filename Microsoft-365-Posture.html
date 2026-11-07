@@ -227,6 +227,20 @@
   .sx-ask-out { margin-top:12px; }
   .sx-ask-answer { font-size:13px; color:var(--text); line-height:1.6; border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:10px; background:color-mix(in srgb,var(--accent) 6%,transparent); padding:12px 15px; }
   .sx-ask-note { margin-top:8px; font-size:11.5px; color:var(--muted); line-height:1.5; } .sx-ask-note b { color:var(--text); }
+  /* cross-domain "stale assets" roll-up (deterministic list, self-contained styling so it renders in the dock too) */
+  .sx-stale-grp { margin-top:13px; }
+  .sx-stale-h { display:flex; align-items:center; gap:8px; font-size:12px; font-weight:700; color:var(--text); margin:0 0 5px; }
+  .sx-stale-n { font-variant-numeric:tabular-nums; background:color-mix(in srgb,var(--accent) 15%,transparent); color:var(--accent); border-radius:999px; padding:0 8px; font-size:11px; font-weight:800; }
+  .sx-stale-kind { font-weight:400; font-size:11px; color:var(--muted); }
+  .sx-stale-all { margin-left:auto; font-weight:600; font-size:11px; color:var(--accent); cursor:pointer; white-space:nowrap; }
+  .sx-stale-all:hover { text-decoration:underline; }
+  .sx-stale-row { display:flex; align-items:center; gap:8px; padding:7px 10px; border:1px solid var(--border); border-radius:8px; margin-top:4px; cursor:pointer; }
+  .sx-stale-row:hover { border-color:var(--accent); background:color-mix(in srgb,var(--accent) 5%,transparent); }
+  .sx-stale-row .nm { font-size:12.5px; color:var(--text); font-weight:600; }
+  .sx-stale-row .up { font-size:10.5px; color:var(--muted); margin-top:1px; }
+  .sx-stale-row .chev { margin-left:auto; color:var(--muted); flex:0 0 auto; }
+  .sx-stale-row .badge { display:inline-block; font-size:10px; font-weight:700; padding:1px 7px; border-radius:999px; border:1px solid var(--border); color:var(--muted); vertical-align:middle; white-space:nowrap; }
+  .sx-stale-row .badge.b-crit { color:var(--sev-crit); border-color:color-mix(in srgb,var(--sev-crit) 40%,transparent); }
   /* what-if line under the gauge */
   .sx-whatif { margin:10px 16px 2px; padding:7px 11px; border:1px dashed var(--border); border-radius:9px; font-size:12px; color:var(--muted); line-height:1.5; transition:border-color .15s,background .15s; }
   .sx-whatif.on { border-color:var(--accent); border-style:solid; background:color-mix(in srgb,var(--accent) 8%,transparent); }
@@ -2894,6 +2908,7 @@
 #view-devices .di-role { font-size:8.5px; font-weight:800; letter-spacing:.03em; padding:1px 6px; border-radius:5px; background:rgba(127,160,210,.16); color:#9FB8DA; margin-left:7px; white-space:nowrap; vertical-align:middle; }
 #view-devices .di-admin { font-size:8.5px; font-weight:800; letter-spacing:.03em; padding:1px 6px; border-radius:5px; background:rgba(255,90,110,.16); color:var(--sev-crit); margin-left:7px; white-space:nowrap; vertical-align:middle; }
 #view-devices .di-tag { font-size:8.5px; font-weight:800; letter-spacing:.03em; padding:1px 6px; border-radius:5px; background:rgba(90,209,230,.16); color:#5AD1E6; margin-left:7px; white-space:nowrap; vertical-align:middle; }
+#view-devices .di-stale { font-size:8.5px; font-weight:800; letter-spacing:.03em; padding:1px 6px; border-radius:5px; background:rgba(255,193,94,.18); color:var(--sev-med); margin-left:7px; white-space:nowrap; vertical-align:middle; }
 #view-devices .di-sub { font-size:11px; color:var(--muted); }
 #view-devices .di-os .v2 { display:block; font-size:10px; color:var(--muted); }
 #view-devices .di-src { display:inline-flex; gap:4px; }
@@ -8106,11 +8121,15 @@ window.EP = (function () {
   //    composes an answer from ONLY those facts and returns the ids it used — grounded, never invents. ──
   let _suiteAskBusy = false;
   const SUITE_ASK_SAMPLES = [
+    "Show me all stale assets",
     "What should I fix first across the estate, and why?",
     "Which risks chain together across identities, endpoints and data?",
     "What's my exposure to a Midnight-Blizzard-style attack?",
     "Summarise my estate's security posture for a board update."
   ];
+  // "Stale assets" is answered deterministically across the three pillars (no model needed) — each pillar
+  // exposes its stale entities (EP.viewApi(view).stale()); this just rolls them up and lists them.
+  const SUITE_STALE_RE = /\bstale\b|\bdormant\b|\bunused\b|\binactive\b|not seen|never (signed|used|logged|authenticat)/i;
   const SUITE_ASK_SYSTEM = [
     "You are a cross-estate Microsoft 365 security copilot for one tenant, spanning three pillars: Identity, Endpoint and Apps & Data.",
     "Answer the user's question using ONLY the FACTS provided — each has an id, a domain and a statement, together the tenant's real current posture from live scans across all three pillars.",
@@ -8134,10 +8153,57 @@ window.EP = (function () {
       text: (l.identity.displayName || l.identity.upn) + (l.tier0 ? " (Tier-0)" : l.privileged ? " (privileged)" : "") + " is signed in on " + l.device.name + (l.device.criticality ? (" (" + l.device.criticality + ")") : "") + (l.data ? (" and reaches mailbox " + l.data.upn + " — " + (l.data.issue || "exposed")) : "") + " — one account spanning the estate." }));
     return facts;
   }
+  // Deterministic cross-domain "stale assets" roll-up — stale users (never signed in / idle, break-glass
+  // excluded), workload identities not seen authenticating, and devices not seen in 30+ days. Grounded in each
+  // pillar's own scan, works with no AI model, and every row opens the real entity in its view.
+  async function suiteStale(out) {
+    if (_suiteAskBusy) return;
+    _suiteAskBusy = true;
+    out.innerHTML = '<div class="sx-ask-note"><span class="spinner"></span> Gathering stale assets across Identity, Endpoint and Apps &amp; Data…</div>';
+    try {
+      const groups = [];
+      for (const view of ["user", "workload", "devices"]) {
+        try {
+          const v = views[view];
+          if (!DEMO && account && v && v.load && !v.loaded) { try { await ensureLoaded(view); } catch (e) {} }
+          const api = viewApi(view);
+          const g = (api && typeof api.stale === "function") ? api.stale() : null;
+          if (g) groups.push(g);
+        } catch (e) {}
+      }
+      if (!groups.length) { out.innerHTML = '<div class="sx-ask-note"><b>No data yet.</b> Open the pillars (or the Cross-domain View) first, then ask again.</div>'; return; }
+      const totalStale = groups.reduce((a, g) => a + (g.count || 0), 0), PER = 8;
+      let h = '<div class="sx-ask-note"><b>' + totalStale + '</b> stale asset' + (totalStale === 1 ? "" : "s") + ' across the estate — identities that <b>never signed in or went idle</b>, workload identities <b>not seen</b> authenticating, and devices <b>not seen in 30+ days</b>. Read straight from each domain’s scan — deterministic, no AI.</div>';
+      groups.forEach((g, gi) => {
+        h += '<div class="sx-stale-grp"><div class="sx-stale-h"><span class="sx-stale-ttl">' + esc(g.label) + '</span><span class="sx-stale-n">' + (g.count || 0) + '</span>'
+          + (g.kind ? '<span class="sx-stale-kind">' + esc(g.kind) + '</span>' : '')
+          + (g.count ? '<span class="sx-stale-all" data-sg="' + gi + '">open all →</span>' : '') + '</div>';
+        if (g.unavailable) h += '<div class="sx-ask-note" style="margin:2px 0 0">Usage detection is off — grant <code>AuditLog.Read.All</code> to tell which workloads are dormant.</div>';
+        else if (!g.count) h += '<div class="sx-ask-note" style="margin:2px 0 0">None.</div>';
+        else {
+          h += (g.rows || []).slice(0, PER).map((r, i) => '<div class="sx-stale-row" data-g="' + gi + '" data-i="' + i + '"><div style="flex:1;min-width:0"><span class="nm">' + esc(r.name) + '</span> ' + (r.badgesHtml || "") + (r.sub ? '<div class="up mono">' + esc(r.sub) + '</div>' : "") + '</div><span class="chev">▸</span></div>').join("");
+          if (g.count > PER) h += '<div class="sx-ask-note" style="margin:2px 0 0">+' + (g.count - PER) + ' more — <span class="sx-stale-all" data-sg="' + gi + '">open all →</span></div>';
+        }
+        h += '</div>';
+      });
+      out.innerHTML = h;
+      out.querySelectorAll(".sx-stale-row").forEach(el => el.addEventListener("click", () => {
+        const g = groups[+el.getAttribute("data-g")], r = g && g.rows[+el.getAttribute("data-i")];
+        if (r && typeof r.open === "function") r.open();
+      }));
+      out.querySelectorAll(".sx-stale-all").forEach(el => el.addEventListener("click", () => {
+        const g = groups[+el.getAttribute("data-sg")]; if (!g) return;
+        if (g.view === "devices") goto("devices", { quick: "stale" });
+        else goto("ask", { scope: g.scope, ask: g.cmd });
+      }));
+    } catch (e) { out.innerHTML = '<div class="sx-ask-note">Couldn’t gather stale assets — ' + esc(e.message || e) + '</div>'; }
+    finally { _suiteAskBusy = false; }
+  }
   async function suiteAsk(q, outEl) {
     const out = outEl || document.getElementById("sxAskOut"); if (!out) return;
     q = (q || "").trim(); if (!q || _suiteAskBusy) return;
-    if (!(llm && llm.ready() && llmComplete)) { out.innerHTML = '<div class="sx-ask-note">The estate copilot needs a local AI model — set one in <b>Configuration</b>. (Each domain’s own Ask works without one.)</div>'; return; }
+    if (SUITE_STALE_RE.test(q)) { return suiteStale(out); }   // deterministic cross-domain list — no model required
+    if (!(llm && llm.ready() && llmComplete)) { out.innerHTML = '<div class="sx-ask-note">The estate copilot needs a local AI model for free-form questions — set one in <b>Configuration</b>. (Try “show me all stale assets”, which works without one; each domain’s own Ask works too.)</div>'; return; }
     const facts = suiteAskFacts();
     if (!facts.length) { out.innerHTML = '<div class="sx-ask-note"><b>No estate data yet.</b> The Cross-domain View is still rolling up the three pillars.</div>'; return; }
     _suiteAskBusy = true; out.innerHTML = '<div class="sx-ask-note">✦ Composing across Identity, Endpoint and Apps &amp; Data…</div>';
@@ -8159,9 +8225,9 @@ window.EP = (function () {
     const askReady = !!(llm && llm.ready());
     return '<div class="ov-panel sx-askpanel"><div class="ov-panel-h">Ask across the estate<span class="ov-chg-cap">cross-domain · cites the findings</span></div>'
       + '<div class="sx-ask-body">'
-      + '<div class="sx-ask-lede">One question that spans all three domains — the copilot composes an answer from your real scans across Identity, Endpoint and Apps &amp; Data, and <b>cites the findings it used</b>. It never invents numbers.' + (askReady ? '' : ' <span style="color:var(--muted)">Set a local model in Configuration to enable it.</span>') + '</div>'
-      + '<div class="sx-ask-row"><input id="sxAskInput" type="text" placeholder="Ask a question that spans identities, endpoints and data…"' + (askReady ? '' : ' disabled') + '><button id="sxAskRun" class="ov-fix-ai"' + (askReady ? '' : ' disabled') + '>&#10022; Ask</button></div>'
-      + '<div class="sx-ask-chips">' + SUITE_ASK_SAMPLES.map(s => '<button type="button" class="sx-ask-chip" data-saq="' + esc(s) + '"' + (askReady ? '' : ' disabled') + '>' + esc(s) + '</button>').join("") + '</div>'
+      + '<div class="sx-ask-lede">One question that spans all three domains — the copilot composes an answer from your real scans across Identity, Endpoint and Apps &amp; Data, and <b>cites the findings it used</b>. It never invents numbers.' + (askReady ? '' : ' <span style="color:var(--muted)">Free-form questions need a local model (Configuration); “show me all stale assets” works without one.</span>') + '</div>'
+      + '<div class="sx-ask-row"><input id="sxAskInput" type="text" placeholder="Ask a question that spans identities, endpoints and data…"><button id="sxAskRun" class="ov-fix-ai">&#10022; Ask</button></div>'
+      + '<div class="sx-ask-chips">' + SUITE_ASK_SAMPLES.map(s => '<button type="button" class="sx-ask-chip" data-saq="' + esc(s) + '"' + (askReady || SUITE_STALE_RE.test(s) ? '' : ' disabled') + '>' + esc(s) + '</button>').join("") + '</div>'
       + '<div class="sx-ask-out" id="sxAskOut"></div></div></div>';
   }
   function wireSuiteAsk(host) {
@@ -10021,17 +10087,23 @@ EP.registerView("ask", (function () {
       return;
     }
     if (!f.ask) return;
-    const sel = $("askScope"); if (sel) sel.value = "user";
-    const ico = $("askScopeIco"); if (ico) ico.innerHTML = _ICO.user;
-    const d = $("askScopeDesc"); if (d) d.textContent = "— " + _DESC.user;
-    const api = window.EP && EP.viewApi && EP.viewApi("user");
+    // Run a handed-in grammar query against the scope it belongs to. The three identity engines share the
+    // makeAsk grammar + a host-relative runner; default to accounts (user) when the scope isn't one of them.
+    const GRAMMAR = { user: "user", workload: "workload", agent: "agent" };
+    const scope = (f.scope && GRAMMAR[f.scope]) ? f.scope : "user";
+    const view = GRAMMAR[scope];
+    const sel = $("askScope"); if (sel) sel.value = scope;
+    const ico = $("askScopeIco"); if (ico) ico.innerHTML = _ICO[scope] || "";
+    const d = $("askScopeDesc"); if (d) d.textContent = _DESC[scope] ? "— " + _DESC[scope] : "";
+    const api = window.EP && EP.viewApi && EP.viewApi(view);
     if (!api || typeof api.ask !== "function") { setTimeout(() => __epAskFocus(f), 100); return; }
     const runIt = () => {
-      _accountsRun = api.ask($("askHost"));
-      if (_accountsRun) { _accountsRun(f.ask); const h = $("askHost"); if (h) setTimeout(() => h.scrollIntoView({ behavior: "smooth", block: "center" }), 120); }
+      const runner = api.ask($("askHost"));
+      if (view === "user") _accountsRun = runner;
+      if (runner) { runner(f.ask); const h = $("askHost"); if (h) setTimeout(() => h.scrollIntoView({ behavior: "smooth", block: "center" }), 120); }
     };
     if ((window.EP && EP.DEMO) || api.loaded) runIt();
-    else Promise.resolve(EP.ensureLoaded("user")).then(runIt).catch(e => console.error("[ask focus]", e));
+    else Promise.resolve(EP.ensureLoaded(view)).then(runIt).catch(e => console.error("[ask focus]", e));
   }
 
   // Demo mode doesn't call load() (the shell self-renders demo views). Defer one tick so every view's
@@ -10709,7 +10781,9 @@ function computeUserFlags(u) {
   // Approval-gated: the account's most-privileged WRITE role is PIM-eligible AND activating it requires approval (not
   // standing). Only meaningful when the PIM policy was read; a self-activatable eligible role is NOT gated.
   u.approvalGated = !u.standingWrite && u.hasWriteRole && u.writeRoles.some((r) => r.tier === u.topTier && r.kind === "eligible" && r.approval);
-  if (!u.enabled) { u.stale = false; u.staleDays = null; }
+  // Break-glass accounts are MEANT to sit unused (used only when CA/MFA breaks), so "never signed in" is by design
+  // for them, not a dormancy finding — exclude them from stale (they carry their own Break-glass badge + guidance).
+  if (!u.enabled || u.breakGlass) { u.stale = false; u.staleDays = u.lastSignIn ? Math.floor((Date.now() - new Date(u.lastSignIn).getTime()) / 86400000) : null; }
   else if (!u.lastSignIn) { u.stale = true; u.staleDays = null; }       // never signed in
   else { u.staleDays = Math.floor((Date.now() - new Date(u.lastSignIn).getTime()) / 86400000); u.stale = u.staleDays > STALE_DAYS; }
   u.notCovered = u.isAdmin && !u.breakGlass && (u.caCovered === false || u.caCovered === "excluded" || u.caCovered === "reportonly");
@@ -11553,6 +11627,22 @@ function __epUserAsk(root) {
   }).mount(root);
 }
 
+// Exposed to the shell (build.py extra_return → EP.viewApi("user").stale): the stale accounts, for the
+// cross-estate "show me all stale assets" roll-up. Stale = enabled, NON-break-glass accounts that never
+// signed in or have gone quiet past the idle window. Rows carry the same badges + open() as the Ask.
+function __epUserStale() {
+  try {
+    const all = (MODEL && MODEL.users) || [];
+    const rows = all.filter(u => u.stale).map(u => ({
+      name: u.name, sub: u.upn, badgesHtml: flagBadges(u) || "",
+      open: () => { try { EP.goto("user", { search: u.upn || u.name }); } catch (e) {} }
+    }));
+    return { label: "Identity · users", view: "user", scope: "user", cmd: "users stale",
+      kind: "never signed in or " + STALE_DAYS + "d+ idle (break-glass excluded)",
+      total: all.length, count: rows.length, rows: rows };
+  } catch (e) { return null; }
+}
+
 function userDetailHtml(u) {
   const risk = (u.reasons || []).map((r) => '<li><span class="badge ' + (POSTURE_CLS[r.sev] || "b-med") + '" style="margin-right:6px">' + r.sev.toUpperCase() + '</span>' + escapeHtml(r.t) + '</li>').join("");
   const dimBars = DIM_META.map((dm) => {
@@ -11683,7 +11773,7 @@ function __epUserFocus(f){ if(!f) return; try { if(!f.search) return; var s=$("f
 function ehPathCount(objId){ try { if(window.EP && window.EP.DEMO) return null; var S=window.EH&&window.EH.ui&&window.EH.ui.S; if(!S||!S.paths||!S.paths.length) return null; var n=0; for(var i=0;i<S.paths.length;i++) if(S.paths[i].source===objId) n++; return n; } catch(e){ return null; } }
 try { window.addEventListener("ep:graphready", function(){ try { renderTable(); } catch(e){} }); } catch(e){}
 
-;return { load: (typeof analyze === "function") ? analyze : null, focus: (typeof __epUserFocus === 'function' ? __epUserFocus : null), summary: (typeof __epUserSummary === 'function' ? __epUserSummary : null), ask: (typeof __epUserAsk === 'function' ? __epUserAsk : null) };
+;return { load: (typeof analyze === "function") ? analyze : null, focus: (typeof __epUserFocus === 'function' ? __epUserFocus : null), summary: (typeof __epUserSummary === 'function' ? __epUserSummary : null), ask: (typeof __epUserAsk === 'function' ? __epUserAsk : null), stale: (typeof __epUserStale === 'function' ? __epUserStale : null) };
 })());
 </script>
 <script>
@@ -12826,7 +12916,17 @@ EP.registerView("workload", (function () {
         delegatedDetail: (o.deleg || []).map(function(v){
           return { resourceName: 'Microsoft Graph', resourceAppId: GRAPH_ID, retired: false, scopes: v, consentType: o.allPrincipals === false ? 'Principal' : 'AllPrincipals', principalCount: o.allPrincipals === false ? 3 : null };
         }),
-        portalUrl: 'https://entra.microsoft.com/'
+        portalUrl: 'https://entra.microsoft.com/',
+        // servicePrincipalSignInActivities shape: most apps have authenticated recently (app-only if they hold
+        // app perms, delegated otherwise); o.seen===false leaves it empty → "not seen" (dormant) in the window.
+        signInActivity: (function(){
+          if(o.seen === false || o.off) return null;
+          var sa = {}, d = o.seenDays != null ? o.seenDays : 9;
+          if(o.app && o.app.length) sa.applicationAuthenticationClientSignInActivity = { lastSignInDateTime: days(d) };
+          if(o.deleg && o.deleg.length) sa.delegatedClientSignInActivity = { lastSignInDateTime: days(d + 3) };
+          if(!sa.applicationAuthenticationClientSignInActivity && !sa.delegatedClientSignInActivity) sa.delegatedClientSignInActivity = { lastSignInDateTime: days(d) };
+          return sa;
+        })()
       };
       r.allScopes = (o.app || []).concat((o.deleg || []).join(', ').split(', ').filter(Boolean));
       r.liveScopes = o.retiredApi ? [] : r.allScopes.slice();
@@ -12840,12 +12940,12 @@ EP.registerView("workload", (function () {
     app({ name:'Acme Analytics Connector', ext:true, aud:'AzureADMultipleOrgs', verified:true, app:['User.Read.All'], deleg:['User.Read'] });
     app({ name:'Mailbox Copilot Connector', app:['Mail.ReadWrite'], deleg:['Mail.Read, offline_access'], publicClient:true, secret:true, owners:false });
     app({ name:'Internal_AccessScope', ext:true, aud:'AzureADMultipleOrgs', msDisabled:true, off:true, owners:false, age:3600 });
-    app({ name:'Legacy Reporting Job', app:['Directory.ReadWrite.All'], secret:true, secretExpired:true, owners:false });
+    app({ name:'Legacy Reporting Job', app:['Directory.ReadWrite.All'], secret:true, secretExpired:true, owners:false, seen:false });
     app({ name:'Tenant Admin Automation', app:['User.Read.All'], secret:true, roles:[{ name:'Global Administrator', tier:0, scoped:false }], wiRisk:'atRisk', wiLevel:'high' });
     app({ name:'Mail Archive Service', app:['Exchange.ManageAsApp'], cert:true, roles:[{ name:'Exchange Administrator', tier:1, scoped:false }] });
     app({ name:'Field Service Mobile', publicClient:true, deleg:['Mail.Read, Files.Read.All, offline_access'], uris:['https://fieldsvc.demo.local/auth'] });
     app({ name:'Partner Portal SSO', ext:true, aud:'AzureADMultipleOrgs', implicit:true, uris:['https://*.partner-demo.local/cb','http://portal.partner-demo.local/cb'], deleg:['User.Read, email'] });
-    app({ name:'Payroll Export (legacy)', app:['Directory.Read.All'], retiredApi:true, secret:true, secretExpired:true, owners:false, wiRisk:'atRisk', wiLevel:'medium' });
+    app({ name:'Payroll Export (legacy)', app:['Directory.Read.All'], retiredApi:true, secret:true, secretExpired:true, owners:false, wiRisk:'atRisk', wiLevel:'medium', seen:false });
     app({ name:'Deployment Pipeline', app:['Application.ReadWrite.OwnedBy'], fic:true, assign:true });
     app({ name:'Consumer Feedback Widget', ext:true, aud:'AzureADandPersonalMicrosoftAccount', deleg:['User.Read'], owners:false });
     // ---- filler: the long tail every tenant actually has ----
@@ -12860,6 +12960,7 @@ EP.registerView("workload", (function () {
             secret: i % 4 === 0, secretExpired: i % 12 === 0, cert: i % 9 === 0, fic: i % 13 === 0,
             publicClient: i % 31 === 0, implicit: i % 29 === 0,
             uris: i % 23 === 0 ? ['http://legacy.demo.local/cb'] : [],
+            seen: i % 8 === 0 ? false : undefined,
             age: 60 + (i * 13) % 1200 });
     }
     // ---- Microsoft first-party, so the publisher filter has something to do ----
@@ -13480,6 +13581,14 @@ EP.registerView("workload", (function () {
       { k:'notreq', label:'Open to all users', sev:'high',
         tip:'<b>No assignment gate.</b> Any user in the tenant can obtain a token for this app \u2014 including a compromised low-privilege account, which is exactly the account an attacker starts with. Turn assignment on unless the app genuinely serves everyone.',
         test:function(r){ return r.appRoleAssignmentRequired === false; } } ]},
+    { id:'act', label:'Activity', gate:function(){ return cache.auditAvailable === true; },
+      tip:'Whether the app has authenticated in your tenant lately — from <code>servicePrincipalSignInActivities</code>. Needs usage detection (<code>AuditLog.Read.All</code> + Entra ID P1/P2); with it off, this filter is hidden.', opts:[
+      { k:'notseen', label:'Not seen', sev:'med',
+        tip:'<b>No app-only or delegated authentication</b> recorded for this app in the retained window (~30 days) — the workload analogue of an account that never signed in. Dormant, or last used before the window; absence is not proof it never ran. A standing credential nobody is watching is exactly what gets abused quietly — review whether the registration is still needed.',
+        test:function(r){ return wlNotSeen(r); } },
+      { k:'seen', label:'Recently seen',
+        tip:'Authenticated in your tenant within the retained window — app-only (client credentials) or delegated.',
+        test:function(r){ return cache.auditAvailable === true && !wlNotSeen(r); } } ]},
     { id:'fac', label:'Posture factors', bars:true, opts: EXPO.map(function(e){
       return { k:e.key, label:e.label, test:function(r){ return !!r.factors[e.key]; } }; }) }
   ];
@@ -13561,7 +13670,7 @@ EP.registerView("workload", (function () {
   // watching Application permissions fall from 16 to 3 answers the overlap question without a click-through.
   function renderFacets(){
     var rows = filtered();
-    el('facets').innerHTML = FACETS.filter(function(g){ return !g.bars && !g.chips; }).map(function(g){
+    el('facets').innerHTML = FACETS.filter(function(g){ return !g.bars && !g.chips && (!g.gate || g.gate()); }).map(function(g){
       var st = facet[g.id];
       return '<div class="facet' + (facetActive(g) ? ' on' : '') + '">'
         + '<div class="facet-head"><span class="facet-title"' + (g.tip ? ' title="' + escHtml(g.tip) + '"' : '') + '>' + escHtml(g.label) + '</span>' + modesHtml(g.id) + '</div>'
@@ -14004,6 +14113,7 @@ EP.registerView("workload", (function () {
     if(r.factors.riskyRedirect) add('<span class="badge b-auth" title="Wildcard or cleartext redirect URI">Risky URI</span>', "Risky URI");
     if(r.factors.inertHighGrant) add('<span class="badge b-retired" title="Its high/critical permission targets a RETIRED API (e.g. Azure AD Graph) — inert / non-exercisable.">Retired API · inert</span>', "Retired API · inert");
     if(r.appRoleAssignmentRequired === true) add('<span class="badge b-single" title="Only assigned users/groups can obtain a token — safer">Assignment required</span>', "Assignment required");
+    if(wlNotSeen(r)) add('<span class="badge b-retired" title="Usage detection is on, but no app-only or delegated authentication was recorded for this app in the retained window — dormant, or last used before the window. Absence is not proof it never ran; review whether the registration is still needed.">Not seen</span>', "Not seen");
     if(r.factors.disabled) add('<span class="badge b-disabled" title="Service principal disabled">Disabled</span>', "Disabled");
     if(r.isFirstPartyMicrosoft) add('<span class="badge b-ms">Microsoft</span>', "Microsoft");
     if(!a.length) return '';
@@ -14455,6 +14565,9 @@ EP.registerView("workload", (function () {
   // ---- management-report summary (consumed by the shell's combined Management Report) ----
   // ── Natural-language ask (mounted on the shell's Ask page via EP.makeAsk) ──────────────────────
   function wlStale(r){ try { const la = lastActive(r); return !la || daysAgo(la.when) > 120; } catch(e){ return false; } }
+  // "Not seen" = usage detection is on AND no app-only/delegated authentication is recorded in the retained
+  // window — the workload-identity analogue of a user that never signed in. Only meaningful with auditAvailable.
+  function wlNotSeen(r){ try { return cache.auditAvailable === true && !lastActive(r); } catch(e){ return false; } }
   const WL_PREDS = {
     risky:       r => r.riskScore >= 3,
     critical:    r => r.riskScore === 4,
@@ -14484,7 +14597,7 @@ EP.registerView("workload", (function () {
     disabled:    r => !r.accountEnabled || !!r.factors.msDisabled,
     noowner:     r => !!r.factors.noOwner,
     openaccess:  r => !!r.factors.assignmentNotRequired,
-    dormant:     wlStale, stale: wlStale
+    dormant:     wlStale, stale: wlNotSeen, notseen: wlNotSeen, unused: wlNotSeen
   };
   function wlToRow(r){
     const b = [], lvl = (typeof RISK_LABELS !== 'undefined' && RISK_LABELS[r.riskScore]) || '';
@@ -14498,6 +14611,7 @@ EP.registerView("workload", (function () {
     if (r.factors.dirRoleTakeover) b.push({ t: 'Dir-role takeover', cls: 'b-crit' });
     if (r.factors.wiAtRisk || r.factors.wiCompromised) b.push({ t: 'ID-Protection risk', cls: 'b-crit' });
     if (r.factors.caUncovered) b.push({ t: 'CA uncovered', cls: 'q2' });
+    if (wlNotSeen(r)) b.push({ t: 'Not seen', cls: 'q' });
     return { name: r.displayName || r.appId, sub: r.publisherName || r.appId, badges: b.slice(0, 6),
       pathId: r.appId, open: () => { try { window.EP.goto('workload', { search: r.displayName || r.appId }); } catch(e){} } };
   }
@@ -14507,7 +14621,7 @@ EP.registerView("workload", (function () {
       noun: 'apps', countNoun: 'application',
       head: 'Ask about your enterprise applications — permissions, credentials, risk and Conditional Access coverage.',
       name: r => r.displayName || '', items: () => cache.results || [], preds: WL_PREDS, toRow: wlToRow,
-      samples: ['Apps with tenant-wide consent', 'Apps with high-privilege permissions', 'Apps with secrets', 'Risky external apps', 'Dormant apps'],
+      samples: ['Apps with tenant-wide consent', 'Apps with high-privilege permissions', 'Apps with secrets', 'Risky external apps', 'Apps not seen'],
       nlMap: [
         [/tenant.?wide|all.?principal/i, 'apps allprincipals'],
         [/high.?priv|privileg/i, 'apps highpriv'],
@@ -14516,7 +14630,8 @@ EP.registerView("workload", (function () {
         [/external/i, 'apps external'],
         [/secret/i, 'apps secret'],
         [/expired/i, 'apps expired'],
-        [/dormant|stale|unused|not used/i, 'apps dormant'],
+        [/not seen|never (seen|used|authenticat)|unused|not used|inactive/i, 'apps notseen'],
+        [/dormant|stale/i, 'apps dormant'],
         [/public client/i, 'apps publicclient'],
         [/conditional access|uncovered|not covered/i, 'apps cauncovered'],
         [/risky|high.?risk/i, 'apps risky']
@@ -14526,8 +14641,25 @@ EP.registerView("workload", (function () {
         ['external apps with secrets', 'apps external secret'],
         ['risky apps that can take over the directory', 'apps risky takeover']
       ],
-      aiHint: "Workloads are enterprise applications / service principals. Flags: 'risky' = risk High or Critical; 'highpriv' = high-privilege application permissions; 'allprincipals' = tenant-wide admin consent; 'takeover' = a directory-role-takeover permission; 'wirisk' = flagged by ID Protection; 'cauncovered' = no Conditional Access for the workload; 'dormant' = not seen in 120+ days; 'unverified' = publisher not verified."
+      aiHint: "Workloads are enterprise applications / service principals. Flags: 'risky' = risk High or Critical; 'highpriv' = high-privilege application permissions; 'allprincipals' = tenant-wide admin consent; 'takeover' = a directory-role-takeover permission; 'wirisk' = flagged by ID Protection; 'cauncovered' = no Conditional Access for the workload; 'notseen'/'stale' = no app-only or delegated authentication recorded in the retained window; 'dormant' = not seen in 120+ days; 'unverified' = publisher not verified."
     }).mount(root);
+  }
+  // Exposed to the shell (build.py extra_return → EP.viewApi("workload").stale): service principals NOT SEEN
+  // authenticating in the retained window — the workload half of the cross-estate "stale assets" roll-up. Empty
+  // (unavailable:true) when usage detection is off, since absence of the log is not evidence of dormancy.
+  function __epWorkloadStale(){
+    try {
+      var all = cache.results || [];
+      if(cache.auditAvailable !== true) return { label:'Identity · workloads', view:'workload', scope:'workload', cmd:'apps notseen', kind:'not seen', total: all.length, count: 0, rows: [], unavailable:true };
+      var rows = all.filter(wlNotSeen).map(function(r){
+        var row = wlToRow(r);
+        return { name: row.name, sub: row.sub,
+          badgesHtml: (row.badges||[]).map(function(b){ return '<span class="badge '+(b.cls||'q')+'">'+EP.esc(b.t)+'</span>'; }).join(' '),
+          open: row.open };
+      });
+      return { label:'Identity · workloads', view:'workload', scope:'workload', cmd:'apps notseen',
+        kind:'not seen — no app-only/delegated auth in the retained window', total: all.length, count: rows.length, rows: rows };
+    } catch(e){ return null; }
   }
   function __epWorkloadFocus(f){
     if (!f || !f.search) return;
@@ -14707,7 +14839,7 @@ function __epWorkloadFocus(f){ if(!f||!f.search) return; try { var s=el("q"); if
 function ehPathCount(objId){ try { if(window.EP && window.EP.DEMO) return null; var S=window.EH&&window.EH.ui&&window.EH.ui.S; if(!S||!S.paths||!S.paths.length) return null; var n=0; for(var i=0;i<S.paths.length;i++) if(S.paths[i].source===objId) n++; return n; } catch(e){ return null; } }
 try { window.addEventListener("ep:graphready", function(){ try { renderTable(); } catch(e){} }); } catch(e){}
 
-;return { load: (typeof runAudit === "function") ? runAudit : null, focus: (typeof __epWorkloadFocus === 'function' ? __epWorkloadFocus : null), summary: (typeof __epWorkloadSummary === 'function' ? __epWorkloadSummary : null), ask: (typeof __epWorkloadAsk === 'function' ? __epWorkloadAsk : null), externalApps: (typeof __epWorkloadExternalApps === 'function' ? __epWorkloadExternalApps : null) };
+;return { load: (typeof runAudit === "function") ? runAudit : null, focus: (typeof __epWorkloadFocus === 'function' ? __epWorkloadFocus : null), summary: (typeof __epWorkloadSummary === 'function' ? __epWorkloadSummary : null), ask: (typeof __epWorkloadAsk === 'function' ? __epWorkloadAsk : null), externalApps: (typeof __epWorkloadExternalApps === 'function' ? __epWorkloadExternalApps : null), stale: (typeof __epWorkloadStale === 'function' ? __epWorkloadStale : null) };
 })());
 </script>
 <script>
@@ -23867,7 +23999,8 @@ function paint(){
         + ((d.roles && d.roles.length) ? '<span class="di-role" title="Device role (Defender)">' + esc(d.roles[0]) + (d.roles.length>1?' +'+(d.roles.length-1):'') + '</span>' : '')
         + (d.isAdminUser ? '<span class="di-admin" title="Primary user holds a privileged Entra role: ' + esc((d.adminRoles||[]).join(', ')) + '">🛡 ' + esc(d.adminTier===0?'Global Admin':((d.adminRoles&&d.adminRoles[0])||'admin')) + '</span>' : '')
         + ((d.tags && d.tags.length) ? d.tags.slice(0,3).map(t => '<span class="di-tag" title="Device tags: ' + esc(d.tags.join(', ')) + '">' + esc(t) + '</span>').join("") : '')
-        + (d.internet === true ? '<span class="di-inet" title="Reachable from the internet (Defender)">🌐 internet-facing</span>' : '') + '<span class="jt">' + esc(d.joinType) + '</span></td>'
+        + (d.internet === true ? '<span class="di-inet" title="Reachable from the internet (Defender)">🌐 internet-facing</span>' : '')
+        + (d.stale ? '<span class="di-stale" title="No sync or sign-in in ' + (d.lastSeenDays!=null?d.lastSeenDays+' days':'30+ days') + ' — stale device">⏻ stale</span>' : '') + '<span class="jt">' + esc(d.joinType) + '</span></td>'
       + '<td class="di-os">' + esc(d.os) + '<span class="v2">' + esc(d.osVer) + '</span></td>'
       + '<td>' + srcChips(d) + '</td><td>' + compBadge(d.compliance) + '</td><td>' + expBadge(d.exposure) + '</td><td>' + threatBadge(d.threat) + '</td>'
       + '<td class="di-sub"' + (d.stale?' style="color:var(--sev-high)"':'') + '>' + ago(d.lastSeenDays) + '</td></tr>';
@@ -23969,6 +24102,23 @@ function __dpDevCrit(){
   } catch(e){}
   return out;
 }
+// Exposed to the shell (build.py extra_return → EP.viewApi("devices").stale): devices NOT SEEN in 30+ days —
+// the endpoint half of the cross-estate "stale assets" roll-up. Rows open the device in the inventory.
+function __dpDevStale(){
+  try {
+    if (!DALL || !DALL.devices) return null;
+    const all = DALL.devices;
+    const rows = all.filter(d => d.stale).map(d => ({
+      name: d.name,
+      sub: (d.os || "") + (d.user && d.user !== "—" ? " · " + d.user : ""),
+      badgesHtml: '<span class="badge q" title="Last seen ' + esc(ago(d.lastSeenDays)) + '">⏻ ' + esc(ago(d.lastSeenDays)) + '</span>'
+        + (d.critical ? ' <span class="badge b-crit">👑 ' + esc(d.criticality || "critical") + '</span>' : ''),
+      open: () => { try { EP.goto("devices", { search: d.name }); } catch(e){} }
+    }));
+    return { label: "Endpoint · devices", view: "devices", scope: "endpoint", cmd: "devices stale",
+      kind: "no sync or sign-in in 30+ days", total: all.length, count: rows.length, rows: rows };
+  } catch(e){ return null; }
+}
 // Cross-link target: a domain view calls EP.goto("devices", {comp|exp|threat|cve|config|onb|quick|…}).
 // Clear the current filters, apply the ones handed in, and show the filtered device list.
 function __dpDevFocus(f){
@@ -23986,7 +24136,7 @@ function __dpDevFocus(f){
 
 if (window.EP && EP.DEMO){ try { analyze(); } catch(e){ console.error("[devices demo]", e); } }
 
-;return { load: (typeof analyze === "function") ? analyze : null, summary: (typeof __dpDevSummary === 'function' ? __dpDevSummary : null), focus: (typeof __dpDevFocus === 'function' ? __dpDevFocus : null), crit: (typeof __dpDevCrit === 'function' ? __dpDevCrit : null) };
+;return { load: (typeof analyze === "function") ? analyze : null, summary: (typeof __dpDevSummary === 'function' ? __dpDevSummary : null), focus: (typeof __dpDevFocus === 'function' ? __dpDevFocus : null), crit: (typeof __dpDevCrit === 'function' ? __dpDevCrit : null), stale: (typeof __dpDevStale === 'function' ? __dpDevStale : null) };
 })());
 </script>
 <script>
