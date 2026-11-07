@@ -21656,7 +21656,14 @@ EH.model = (function(){
       (g.scope || '').trim().split(/\s+/).filter(Boolean).forEach(function(sc){
         if(DELEGATED_DANGEROUS[sc] == null) return;
         var p = permNode(resAppId, sc, true);
-        if(g.consentType === 'AllPrincipals'){ if(!hasEdge(g.clientId, p.id, 'HasDelegatedPermission')) edge(g.clientId, p.id, 'HasDelegatedPermission', { m: 'CONDITIONAL', via: 'tenant-wide admin consent (all users)' }); }
+        if(g.consentType === 'AllPrincipals'){ if(!hasEdge(g.clientId, p.id, 'HasDelegatedPermission')){
+          // Assignment required limits who can sign in, so the path is narrower than a true all-users app — cost it
+          // higher (like a user-consented grant) so a gated app ranks/scores lower than an open one.
+          var gatedClient = sp.props && sp.props.appRoleAssignmentRequired === true;
+          var props = { m: 'CONDITIONAL', via: gatedClient ? 'tenant-wide admin consent, but assignment required — limited to assigned users/groups' : 'tenant-wide admin consent (all users)' };
+          if(gatedClient) props.w = 4;
+          edge(g.clientId, p.id, 'HasDelegatedPermission', props);
+        } }
         else { p.props.userConsents = (p.props.userConsents || 0) + 1; if(!hasEdge(g.clientId, p.id, 'HasDelegatedPermission')) edge(g.clientId, p.id, 'HasDelegatedPermission', { m: 'CONDITIONAL', w: 4, via: 'consented by individual users' }); }
       });
     });
@@ -21966,7 +21973,7 @@ EH.findings = (function(){
   };
   function run(g, paths){
     var F = [], raw = g.raw;
-    function add(kind, sev, title, nodeId, evidence){ F.push({ id: kind + ':' + (nodeId || '') + ':' + F.length, kind: kind, sev: sev, title: title, node: nodeId, evidence: evidence || '', remediation: R[kind] || [] }); }
+    function add(kind, sev, title, nodeId, evidence, remOverride){ F.push({ id: kind + ':' + (nodeId || '') + ':' + F.length, kind: kind, sev: sev, title: title, node: nodeId, evidence: evidence || '', remediation: remOverride || R[kind] || [] }); }
     var reachesCrit = new Map(); paths.forEach(function(p){ if(!reachesCrit.has(p.source) || EH.risk.SEV_ORDER[p.risk.severity] < EH.risk.SEV_ORDER[reachesCrit.get(p.source)]) reachesCrit.set(p.source, p.risk.severity); });
     g.nodes.forEach(function(n){
       var isUser = n.type === 'user' || n.type === 'guest';
@@ -22004,10 +22011,14 @@ EH.findings = (function(){
         // assignment list, not the tenant — downgrade Critical → High and say so. (Graph Explorer is the classic
         // case: tenant-wide delegated Application.ReadWrite.All, but assignment required with one admin assigned.)
         var gated = n.props && n.props.appRoleAssignmentRequired === true;
-        dl.forEach(function(e){ var p = g.nodes.get(e.t); var allUsers = /AllPrincipals|all users/.test(e.via);
+        // Assignment-gated apps get their own remediation: the lever is the assignment list, not revoking the grant.
+        var GATED_REMED = ['Review this app’s assignment list (Enterprise application → Users and groups) and remove anyone who doesn’t need it — keep it to admins only.',
+          'If broad access is NOT intended, treat it as tenant-wide: revoke Directory.AccessAsUser.All and similar high-impact delegated grants.',
+          'Protect the assigned users with phishing-resistant MFA and sign-in-risk Conditional Access.'];
+        dl.forEach(function(e){ var p = g.nodes.get(e.t); var allUsers = /AllPrincipals|all users|tenant-wide/i.test(e.via);
           if(p.tier === 0 && allUsers && !gated) add('DangerousDelegated', 'Critical', 'Tenant-wide delegated consent for ' + p.label, n.id, 'any user signing in to this app lends it their privileges');
-          else if(p.tier === 0 && allUsers && gated) add('DangerousDelegated', 'High', 'Assignment-gated delegated consent for ' + p.label, n.id, 'assignment required is on — only assigned users/groups can sign in, so the blast radius is the assignment list, not the tenant. Keep that list tight (ideally admins only) and protect them with phishing-resistant MFA.');
-          else if(p.tier <= 1) add('RiskyOAuthConsent', (allUsers && !gated) ? 'High' : 'Medium', ((allUsers && !gated) ? 'Tenant-wide' : (gated ? 'Assignment-gated' : 'User-consented')) + ' delegated ' + p.label, n.id, gated ? (e.via + ' · assignment required (limited to assigned users/groups)') : e.via); });
+          else if(p.tier === 0 && allUsers && gated) add('DangerousDelegated', 'High', 'Assignment-gated delegated consent for ' + p.label, n.id, 'assignment required is on — only assigned users/groups can sign in, so the blast radius is the assignment list, not the tenant. Keep that list tight (ideally admins only) and protect them with phishing-resistant MFA.', GATED_REMED);
+          else if(p.tier <= 1) add('RiskyOAuthConsent', (allUsers && !gated) ? 'High' : 'Medium', ((allUsers && !gated) ? 'Tenant-wide' : (gated ? 'Assignment-gated' : 'User-consented')) + ' delegated ' + p.label, n.id, gated ? (e.via + ' · assignment required (limited to assigned users/groups)') : e.via, gated ? GATED_REMED : null); });
         if(n.flags.privileged){
           var owners2 = (g.inn.get(n.id) || []).filter(function(e){ return e.k === 'OwnerOf'; });
           var low2 = owners2.filter(function(e){ return !g.nodes.get(e.s).flags.tier0; }); if(low2.length) add('SPOwnedByLowPriv', n.flags.permTier === 0 ? 'Critical' : 'High', 'Privileged service principal owned by non-Tier-0 identity', n.id, low2.map(function(e){ return g.nodes.get(e.s).label; }).join(', '));
