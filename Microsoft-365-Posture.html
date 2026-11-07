@@ -4262,6 +4262,10 @@
   .cis-row:last-child { border-bottom: 0; }
   .cis-row.fail { background: rgba(255,77,109,.045); }
   .cis-id { font-size: 11px; color: var(--muted); font-family: var(--mono, monospace); }
+  .cis-id-custom { font-family: var(--mono, monospace); font-style: italic; opacity: .72; }
+  /* Apps & Data rows carry real CIS / SCuBA recommendation IDs (e.g. MS.SHAREPOINT.1.1), wider than the identity codes. */
+  #view-adframework .cis-row { grid-template-columns: 124px minmax(0,1fr) auto; }
+  #view-adframework .cis-id { white-space: normal; word-break: break-word; line-height: 1.3; }
   .cis-title { font-size: 13.5px; color: var(--text); }
   .cis-ev { font-size: 12px; color: var(--muted); margin-top: 1px; }
   .cis-rt { display: flex; align-items: center; gap: 10px; }
@@ -7865,44 +7869,61 @@ window.EP = (function () {
   // matching finding = fail, none = pass. But a topic that is NOT collected (no DNS/Exchange/Teams/Purview source
   // behind it) must be N/A, never a silent pass — otherwise "no finding" on a topic Secure Score doesn't cover reads
   // as compliant. Such controls pass `uncollected` with the source they would need.
-  function _adCtrl(id, title, workload, re, uncollected) {
-    return { id, title, domain: workload, assess(data) {
+  function _adCtrl(id, title, workload, re, uncollected, refs) {
+    return { id, title, domain: workload, refs: refs || null, assess(data) {
       const s = data[workload]; if (!s) return { status: "na", ratio: null, evidence: AD_WL_LABEL[workload] + " not collected." };
       if (uncollected) return { status: "na", ratio: null, evidence: "Not assessed — needs " + uncollected + "." };
       const hit = _adHit(s, re);
       return hit ? { status: "fail", ratio: 0, evidence: hit.title } : { status: "pass", ratio: 1, evidence: "No gap in the " + AD_WL_LABEL[workload] + " Secure Score findings." };
     } };
   }
+  // Each control carries the real benchmark recommendation IDs it maps to, verified against the published catalogs:
+  // CIS Microsoft 365 Foundations Benchmark v7.0.0 (cis) and the CISA ScubaGear (SCuBA) M365 secure-configuration
+  // baseline as implemented by Maester (maester — MDO lives under MS.EXO.8–17 in that baseline, not the newer
+  // MS.SECURITYSUITE split). A control with no matching published recommendation carries no id for that framework and
+  // renders as "custom" — we never invent numbers (review P1 #3).
   const AD_FW_CONTROLS = {
-    fwd:       _adCtrl("fwd",       "Block external auto-forwarding", "email", /forward/),
-    phish:     _adCtrl("phish",     "Anti-phishing & impersonation protection", "email", /phish|impersonat|spoof/),
-    // No DNS read behind SPF/DKIM/DMARC, no audit-config read — so these are N/A, not a free pass (see review P1 #1).
-    dkim:      _adCtrl("dkim",      "Email authentication (SPF / DKIM / DMARC)", "email", null, "a DNS check of each accepted domain (SPF / DKIM / DMARC)"),
-    mbxaudit:  _adCtrl("mbxaudit",  "Mailbox / unified audit enabled", "email", null, "an Exchange / audit-config collection"),
+    fwd:       _adCtrl("fwd",       "Block external auto-forwarding", "email", /forward/, null, { cis: "6.2.1", maester: "MS.EXO.1.1" }),
+    phish:     _adCtrl("phish",     "Anti-phishing & impersonation protection", "email", /phish|impersonat|spoof/, null, { cis: "2.1.7", maester: "MS.EXO.11.1" }),
+    // #12: email auth is now DNS-checked per accepted domain. The Email view resolves SPF/DKIM/DMARC over
+    // DNS-over-HTTPS and exposes an explicit verdict (summary.emailAuth); we read that — never "no finding ⇒ pass".
+    dkim: { id: "dkim", title: "Email authentication (SPF / DKIM / DMARC)", domain: "email", refs: { cis: "2.1.8–10", maester: "MS.EXO.2–4" }, assess(data) {
+      const s = data.email; if (!s) return { status: "na", ratio: null, evidence: AD_WL_LABEL.email + " not collected." };
+      const ea = s.emailAuth;
+      if (!ea || !ea.assessed) return { status: "na", ratio: null, evidence: "Not assessed — " + ((ea && ea.reason) ? ea.reason : "needs a DNS check of each accepted domain (SPF / DKIM / DMARC)") + "." };
+      return ea.pass ? { status: "pass", ratio: 1, evidence: ea.summary || "All accepted domains publish enforcing SPF, DKIM and DMARC." }
+                     : { status: "fail", ratio: 0, evidence: ea.summary || "One or more accepted domains lack enforcing SPF / DKIM / DMARC." };
+    } },
+    mbxaudit:  _adCtrl("mbxaudit",  "Mailbox / unified audit enabled", "email", null, "an Exchange / audit-config collection", { cis: "3.1.1", maester: "MS.EXO.17.1" }),
     // Safe Links / Safe Attachments only — NOT every mdo_ control. The old regex also matched mdo-autoforwardingmode,
     // so the forwarding finding wrongly failed this control while the Email page showed both protections as Pass.
-    safe:      _adCtrl("safe",      "Safe Links & Safe Attachments", "email", /safe.?link|safe.?attach/),
-    spoext:    _adCtrl("spoext",    "SharePoint external sharing restricted", "sharepoint", /anonymous|external shar|anyone|\bshar/),
+    safe:      _adCtrl("safe",      "Safe Links & Safe Attachments", "email", /safe.?link|safe.?attach/, null, { cis: "2.1.1 / 2.1.4", maester: "MS.EXO.9.1 / 15.1" }),
+    spoext:    _adCtrl("spoext",    "SharePoint external sharing restricted", "sharepoint", /anonymous|external shar|anyone|\bshar/, null, { cis: "7.2.3", maester: "MS.SHAREPOINT.1.1" }),
+    // Unmanaged-device access is a Conditional Access / app-enforced-restriction theme — no single CIS/SCuBA SharePoint
+    // recommendation maps to it, so it carries no id (renders "custom").
     spodev:    _adCtrl("spodev",    "Access from unmanaged devices limited", "sharepoint", /unmanaged|device/),
-    teamsext:  _adCtrl("teamsext",  "Teams external access (federation) restricted", "teams", null, "a Teams federation collection (Get-CsTenantFederationConfiguration)"),
-    teamsapp:  _adCtrl("teamsapp",  "Teams third-party / custom apps governed", "teams", null, "a Teams app-policy collection (teamwork/teamsAppSettings)"),
-    teamsmeet: _adCtrl("teamsmeet", "Teams anonymous meeting join controlled", "teams", /anonymous|lobby|meeting/),
-    dlp:       _adCtrl("dlp",       "DLP policy protects PII / financial data", "data", /\bdlp\b|data loss/),
-    labels:    _adCtrl("labels",    "Sensitivity labels published & applied", "data", /label|sensitivity|classif|auto.?label/),
+    teamsext:  _adCtrl("teamsext",  "Teams external access (federation) restricted", "teams", null, "a Teams federation collection (Get-CsTenantFederationConfiguration)", { cis: "8.2.1", maester: "MS.TEAMS.2.1" }),
+    teamsapp:  _adCtrl("teamsapp",  "Teams third-party / custom apps governed", "teams", null, "a Teams app-policy collection (teamwork/teamsAppSettings)", { cis: "8.4.1", maester: "MS.TEAMS.5.2" }),
+    teamsmeet: _adCtrl("teamsmeet", "Teams anonymous meeting join controlled", "teams", /anonymous|lobby|meeting/, null, { cis: "8.5.1", maester: "MS.TEAMS.1.2" }),
+    dlp:       _adCtrl("dlp",       "DLP policy protects PII / financial data", "data", /\bdlp\b|data loss/, null, { cis: "3.2.1", maester: "MS.EXO.8.1" }),
+    // Sensitivity labels have a CIS recommendation (3.3.1) but no dedicated EXO/SharePoint/Teams SCuBA policy — custom on Maester.
+    labels:    _adCtrl("labels",    "Sensitivity labels published & applied", "data", /label|sensitivity|classif|auto.?label/, null, { cis: "3.3.1" }),
+    // Retention has no dedicated CIS M365 or SCuBA recommendation in these workloads — custom on both.
     retention: _adCtrl("retention", "Retention policy configured", "data", null, "a Purview retention collection")
   };
-  // Labelled as pillar-level THEME mappings (not enumerated benchmark IDs) — the row codes are internal themes, not CIS
-  // recommendation numbers, so the tabs don't claim IDs they don't carry. (Matches the Endpoint framework treatment.)
+  // The two tabs carry real, verified recommendation IDs per control (see AD_FW_CONTROLS). Controls with no published
+  // recommendation render as "custom" rather than claiming a number.
   const AD_FRAMEWORKS = {
-    cis:     { key: "cis",     label: "CIS-aligned · M365", benchmark: "the CIS Microsoft 365 Foundations Benchmark themes (pillar-level)", controls: ["fwd", "phish", "dkim", "mbxaudit", "safe", "spoext", "spodev", "teamsext", "teamsapp", "dlp", "labels", "retention"] },
-    maester: { key: "maester", label: "Maester-aligned · M365", benchmark: "the Maester / CISA ScubaGear M365 test themes (pillar-level)", controls: ["fwd", "phish", "dkim", "safe", "spoext", "teamsext", "teamsapp", "teamsmeet", "dlp", "labels"] }
+    cis:     { key: "cis",     label: "CIS · M365",      benchmark: "the CIS Microsoft 365 Foundations Benchmark v7.0.0", controls: ["fwd", "phish", "dkim", "mbxaudit", "safe", "spoext", "spodev", "teamsext", "teamsapp", "dlp", "labels", "retention"] },
+    maester: { key: "maester", label: "Maester · SCuBA", benchmark: "the CISA ScubaGear (SCuBA) M365 baseline, as run by Maester", controls: ["fwd", "phish", "dkim", "safe", "spoext", "teamsext", "teamsapp", "teamsmeet", "dlp", "labels"] }
   };
   let _adFwKey = (function () { try { const f = localStorage.getItem("ad_fw"); return AD_FRAMEWORKS[f] ? f : "cis"; } catch (e) { return "cis"; } })();
   const AD_DOMAIN_VIEW = { email: "email", sharepoint: "sharepoint", teams: "teams", data: "data" };
   function adFrameworkAssess(data, fwKey) {
     const fw = AD_FRAMEWORKS[fwKey] || AD_FRAMEWORKS.cis;
     const rows = fw.controls.map(id => { const spec = AD_FW_CONTROLS[id]; const r = spec.assess(data);
-      return { id, title: spec.title, domain: spec.domain, status: r.status, ratio: (r.ratio == null ? null : r.ratio), evidence: r.evidence }; });
+      const ref = (spec.refs && spec.refs[fwKey]) || null;
+      return { id, ref, title: spec.title, domain: spec.domain, status: r.status, ratio: (r.ratio == null ? null : r.ratio), evidence: r.evidence }; });
     const passed = rows.filter(r => r.status === "pass").length, failed = rows.filter(r => r.status === "fail").length, na = rows.filter(r => r.status === "na").length;
     const ratios = rows.filter(r => r.ratio != null).map(r => r.ratio);
     const score = ratios.length ? Math.round(100 * ratios.reduce((a, b) => a + b, 0) / ratios.length) : null;
@@ -7919,7 +7940,8 @@ window.EP = (function () {
   function _adRowHtml(r) {
     const pill = '<span class="cis-pill ' + r.status + '">' + (r.status === "pass" ? "Pass" : r.status === "fail" ? "Fail" : "N / A") + '</span>';
     const go = AD_DOMAIN_VIEW[r.domain] ? '<button class="cis-fix" data-adgo="' + esc(AD_DOMAIN_VIEW[r.domain]) + '" title="Open ' + esc(AD_WL_LABEL[r.domain] || r.domain) + '">Fix &rarr;</button>' : '';
-    return '<div class="cis-row ' + (r.status === "fail" ? "fail" : "") + '"><span class="cis-id">' + esc((r.id || "").toUpperCase()) + '</span>'
+    const idHtml = r.ref ? esc(r.ref) : '<span class="cis-id-custom" title="No published CIS / SCuBA recommendation maps to this control">custom</span>';
+    return '<div class="cis-row ' + (r.status === "fail" ? "fail" : "") + '"><span class="cis-id">' + idHtml + '</span>'
       + '<div><div class="cis-title">' + esc(r.title) + '</div><div class="cis-ev">' + esc(r.evidence || "") + '</div></div>'
       + '<div class="cis-rt">' + pill + go + '</div></div>';
   }
@@ -9821,7 +9843,77 @@ window.M365LIVE = (function () {
   }
   async function collect(key) { const c = await collection(); return (c && Array.isArray(c[key])) ? c[key] : []; }
 
-  return { secureScore, fromSecureScore, graphGet, stripHtml, collection, collect, reset() { _ssPromise = null; _collPromise = null; } };
+  // ── Email authentication (SPF / DKIM / DMARC) via public DNS-over-HTTPS ──────────────────
+  // Review #12: assess each accepted domain's spoofing defences from the browser. No Graph scope beyond
+  // Directory.Read.All (already used — to list the tenant's verified domains). DNS is resolved over
+  // Cloudflare JSON DoH (fallback Google) — public resolvers; only the domain name leaves the browser,
+  // never tenant data. These are the signals behind CIS M365 2.1.8–2.1.10 / SCuBA MS.EXO.2–4.
+  async function _doh(name, type) {
+    const q = encodeURIComponent(name), t = encodeURIComponent(type);
+    const urls = ["https://cloudflare-dns.com/dns-query?name=" + q + "&type=" + t,
+                  "https://dns.google/resolve?name=" + q + "&type=" + t];
+    let lastErr;
+    for (const u of urls) {
+      try {
+        const r = await fetch(u, { headers: { accept: "application/dns-json" } });
+        if (!r.ok) { lastErr = new Error("DoH HTTP " + r.status); continue; }
+        const j = await r.json();
+        // RFC 8427 JSON: Answer[].data; TXT comes quoted and long records arrive as "part1" "part2" — unquote and rejoin.
+        return (j.Answer || []).map(a => String(a.data || "").replace(/^"/, "").replace(/"$/, "").replace(/"\s+"/g, ""));
+      } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error("DoH failed");
+  }
+  // Verified tenant domains (accepted sending domains). isDefault flags the primary; onmicrosoft.com is MS-managed.
+  async function acceptedDomains() {
+    const j = await graphGet("/domains?$select=id,isVerified,isDefault,supportedServices", ["Directory.Read.All"]);
+    return (j.value || [])
+      .filter(d => d.isVerified !== false)
+      .map(d => { const name = String(d.id || "").toLowerCase(); return { name, isDefault: !!d.isDefault, managed: /\.onmicrosoft\.com$/i.test(name) }; })
+      .filter(d => d.name);
+  }
+  // Resolve SPF / DKIM / DMARC for a set of domains ({name,managed} or bare strings). ok:true/false/null (null = lookup error).
+  async function emailAuth(domains) {
+    const list = [];
+    for (const dom of (domains || [])) {
+      const d = (typeof dom === "string") ? { name: dom.toLowerCase(), managed: /\.onmicrosoft\.com$/i.test(dom) } : dom;
+      const rec = { domain: d.name, managed: !!d.managed, spf: null, dkim: null, dmarc: null };
+      try {
+        const txt = await _doh(d.name, "TXT");
+        const spf = txt.find(x => /^v=spf1/i.test(x));
+        if (!spf) rec.spf = { ok: false, state: "missing" };
+        else { const m = spf.match(/([-~?+])all\b/i), q = m ? m[1] : "+";
+          rec.spf = { ok: (q === "-" || q === "~"), state: q === "-" ? "-all (strict)" : q === "~" ? "~all (soft)" : (m ? q : "no ") + "all", record: spf }; }
+      } catch (e) { rec.spf = { ok: null, state: "lookup error" }; }
+      try {
+        const txt = await _doh("_dmarc." + d.name, "TXT");
+        const dm = txt.find(x => /^v=DMARC1/i.test(x));
+        if (!dm) rec.dmarc = { ok: false, policy: null, state: "missing" };
+        else { const p = (dm.match(/\bp\s*=\s*([a-z]+)/i) || [, "none"])[1].toLowerCase();
+          rec.dmarc = { ok: (p === "reject" || p === "quarantine"), policy: p, state: "p=" + p, record: dm }; }
+      } catch (e) { rec.dmarc = { ok: null, policy: null, state: "lookup error" }; }
+      try {
+        // A selector counts as enabled only if it resolves to a managed-key CNAME (M365: selectorN._domainkey → *.onmicrosoft.com)
+        // or an inline TXT with a NON-empty p= key. "v=DKIM1; p=" (empty key) is a revoked/unconfigured selector — not enabled.
+        let found = 0, selErr = 0;
+        for (const sel of ["selector1", "selector2"]) {
+          let cname = [], txt = [], threw = 0;
+          try { cname = await _doh(sel + "._domainkey." + d.name, "CNAME"); } catch (e) { threw++; }
+          try { txt = await _doh(sel + "._domainkey." + d.name, "TXT"); } catch (e) { threw++; }
+          if (threw >= 2) { selErr++; continue; }
+          const viaCname = cname.some(x => /\./.test(x) && !/^v=/i.test(x));
+          const viaTxt = txt.some(x => /^v=dkim1/i.test(x) && /\bp\s*=\s*[^;\s]/i.test(x));
+          if (viaCname || viaTxt) found++;
+        }
+        rec.dkim = (found === 0 && selErr >= 2) ? { ok: null, state: "lookup error", selectors: 0 }
+          : { ok: found >= 1, state: found >= 2 ? "selector1+2" : found === 1 ? "one selector" : "missing", selectors: found };
+      } catch (e) { rec.dkim = { ok: null, state: "lookup error", selectors: 0 }; }
+      list.push(rec);
+    }
+    return list;
+  }
+
+  return { secureScore, fromSecureScore, graphGet, stripHtml, collection, collect, acceptedDomains, emailAuth, reset() { _ssPromise = null; _collPromise = null; } };
 })();
 </script>
 
@@ -29513,8 +29605,57 @@ EP.registerView("email", (function () {
     { upn: "ava.devries0@contoso.com", display: "Ava de Vries", issue: "external forwarding", detail: "Mailbox auto-forwards to ava.personal@proton.me (outside the tenant).", sev: "high" },
     { upn: "svc_reports@contoso.com", display: "Reporting service", issue: "inbox rule forwards externally", detail: "Inbox rule 'archive' redirects to an external Gmail address.", sev: "high" }
   ];
+  // #12 Email authentication (SPF / DKIM / DMARC) — live via DNS-over-HTTPS per accepted domain (M365LIVE.emailAuth).
+  // Demo: a worked example matching the DEMO findings above (contoso.com weak, mail subdomain strong, MS-managed ok).
+  var _emailAuth = null;   // { assessed, domains:[{domain,managed,spf,dkim,dmarc}], reason? }
+  var DEMO_EMAILAUTH = { assessed: true, domains: [
+    { domain: "contoso.com",               managed: false, spf: { ok: true,  state: "~all (soft)" }, dkim: { ok: false, state: "missing",     selectors: 0 }, dmarc: { ok: false, policy: "none",       state: "p=none" } },
+    { domain: "mail.contoso.com",           managed: false, spf: { ok: true,  state: "-all (strict)" }, dkim: { ok: true,  state: "selector1+2", selectors: 2 }, dmarc: { ok: true,  policy: "quarantine", state: "p=quarantine" } },
+    { domain: "contoso.onmicrosoft.com",    managed: true,  spf: { ok: true,  state: "-all (strict)" }, dkim: { ok: true,  state: "selector1+2", selectors: 2 }, dmarc: { ok: true,  policy: "reject",     state: "p=reject" } }
+  ] };
 
   function dataset() { return EP.DEMO ? DEMO : _state; }
+
+  // Turn the per-domain DNS-over-HTTPS results into three aggregate findings (SPF / DKIM / DMARC), each listing
+  // the domains that fail. DMARC p=none is a warn (published but monitoring only); missing/weak is a fail.
+  function _mechRow(ea, mech, id, title, fixText) {
+    var checked = ea.filter(function (r) { return r[mech] && r[mech].ok !== null; });
+    var errored = ea.filter(function (r) { return r[mech] && r[mech].ok === null; });
+    if (!checked.length) return { id: id, title: title, status: "na", sev: "low",
+      detail: "Could not resolve " + mech.toUpperCase() + " over DNS (" + errored.length + " lookup error(s)).", fix: "", src: "DNS-over-HTTPS (Cloudflare / Google)" };
+    var bad = checked.filter(function (r) { return !r[mech].ok; });
+    var ok = !bad.length;
+    var detail = ok
+      ? "All " + checked.length + " accepted domain(s) publish a valid " + mech.toUpperCase() + " record."
+      : bad.length + " of " + checked.length + " domain(s) weak or missing: " + bad.map(function (r) { return r.domain + " (" + r[mech].state + ")"; }).join(", ") + ".";
+    return { id: id, title: title, status: ok ? "pass" : "fail", sev: ok ? "ok" : "high",
+      detail: detail + (errored.length ? " (" + errored.length + " not resolvable.)" : ""), fix: ok ? "" : fixText,
+      src: "DNS-over-HTTPS (Cloudflare / Google) · live" };
+  }
+  function _dmarcRow(ea) {
+    var checked = ea.filter(function (r) { return r.dmarc && r.dmarc.ok !== null; });
+    if (!checked.length) return { id: "dmarc", title: "DMARC enforcing (p=quarantine or p=reject)", status: "na", sev: "low", detail: "Could not resolve DMARC over DNS.", fix: "", src: "DNS-over-HTTPS (Cloudflare / Google)" };
+    var missing = checked.filter(function (r) { return r.dmarc.state === "missing"; });
+    var monitor = checked.filter(function (r) { return r.dmarc.policy === "none"; });
+    var ok = !missing.length && !monitor.length;
+    var status = missing.length ? "fail" : monitor.length ? "warn" : "pass";
+    var detail = ok ? "All " + checked.length + " accepted domain(s) enforce DMARC (p=quarantine or p=reject)."
+      : (missing.length ? missing.length + " domain(s) have no DMARC record: " + missing.map(function (r) { return r.domain; }).join(", ") + ". " : "")
+        + (monitor.length ? monitor.length + " domain(s) at p=none (monitoring only): " + monitor.map(function (r) { return r.domain; }).join(", ") + "." : "");
+    return { id: "dmarc", title: "DMARC enforcing (p=quarantine or p=reject)", status: status,
+      sev: missing.length ? "high" : monitor.length ? "med" : "ok", detail: detail.trim(),
+      fix: ok ? "" : "Publish a _dmarc TXT record and move policy to p=quarantine, then p=reject, after reviewing aggregate reports.",
+      src: "DNS-over-HTTPS (Cloudflare / Google) · live" };
+  }
+  function _emailAuthRows(ea) {
+    return [
+      _mechRow(ea, "spf", "spf", "SPF published with an enforcing qualifier (-all / ~all)",
+        "Publish an SPF TXT record ending in -all (hard) or ~all (soft) for each sending domain."),
+      _mechRow(ea, "dkim", "dkim", "DKIM signing enabled for all domains",
+        "Enable DKIM (security.microsoft.com → Email & collaboration → Policies → DKIM) and publish the selector1 / selector2 CNAMEs."),
+      _dmarcRow(ea)
+    ];
+  }
 
   function render(list) {
     var c = document.getElementById("content"); if (!c) return;
@@ -29524,15 +29665,26 @@ EP.registerView("email", (function () {
         + 'Exchange Online PowerShell module for full policy detail. Open with <code>?demo=1</code> to see the worked example.</div>';
       return;
     }
-    M365UI.render(c, list, "email", "Email & Exchange — anti-phishing, forwarding, authentication and auditing, grounded in Microsoft Secure Score. Deep per-policy detail from the consultant Exchange collection. SPF / DKIM / DMARC are not DNS-checked yet (a per-domain DNS-over-HTTPS check would make them real) — shown as N/A in the Framework, not passed.");
+    M365UI.render(c, list, "email", "Email & Exchange — anti-phishing, forwarding, authentication and auditing, grounded in Microsoft Secure Score. Deep per-policy detail from the consultant Exchange collection. SPF / DKIM / DMARC are checked live for each accepted domain via public DNS-over-HTTPS (Cloudflare / Google) — only the domain name is resolved, no tenant data leaves the browser.");
   }
 
   async function analyze() {
-    if (EP.DEMO) { _state = DEMO; _mbx = DEMO_MBX; _m365Collected = true; render(DEMO); return; }
+    if (EP.DEMO) { _state = DEMO; _mbx = DEMO_MBX; _m365Collected = true; _emailAuth = DEMO_EMAILAUTH; render(DEMO); return; }
     render(null);
     try {
       var rows = await M365LIVE.fromSecureScore(function (n, t, c) { return c === "apps" && /exchange|mail|phish|spam|forward|dkim|dmarc|spf|safe.?link|safe.?attach|\batp\b|mdo|outlook|office.?365|defender.*office|calendar/.test(n + " " + t); });
       rows = rows.concat(await M365LIVE.collect("email"));   // deep policy detail from the consultant PowerShell collection, if present
+      // #12 Email authentication: resolve SPF / DKIM / DMARC for each accepted domain over DNS-over-HTTPS, and
+      // replace Secure Score's SPF/DKIM/DMARC placeholders with the real per-domain verdicts.
+      try {
+        var domains = await M365LIVE.acceptedDomains();
+        if (domains && domains.length) {
+          var ea = await M365LIVE.emailAuth(domains);
+          _emailAuth = { assessed: true, domains: ea };
+          rows = rows.filter(function (r) { return !/\bdkim\b|\bdmarc\b|\bspf\b|sender policy framework|domainkeys/i.test((r.title || "") + " " + (r.id || "")); });
+          rows = rows.concat(_emailAuthRows(ea));
+        } else { _emailAuth = { assessed: false, reason: "no verified domains returned by Microsoft Graph" }; }
+      } catch (e2) { _emailAuth = { assessed: false, reason: (e2 && e2.code === 403) ? "needs Directory.Read.All consent" : ((e2 && e2.message) || "DNS check failed") }; }
       try { var _coll = await M365LIVE.collection(); _m365Collected = !!(_coll && _coll.entities); _mbx = (_coll && _coll.entities && _coll.entities.mailboxes) || []; } catch (e) { _mbx = []; _m365Collected = false; }   // per-mailbox entities for cross-pillar correlation + whether the collection was present
       _state = rows; render(rows.length ? rows : null);
     } catch (e) {
@@ -29546,6 +29698,18 @@ EP.registerView("email", (function () {
     var pass = scored.filter(function (x) { return x.status === "pass"; }).length;
     var fails = list.filter(function (x) { return x.status === "fail" || x.status === "warn"; })
                     .sort(function (a, b) { return SEV_RANK[a.sev] - SEV_RANK[b.sev]; });
+    // #12 Email-authentication verdict for the Framework's "Email authentication (SPF/DKIM/DMARC)" control:
+    // an explicit pass/fail/not-assessed from the DNS-over-HTTPS results — never "no finding ⇒ pass".
+    var ea = _emailAuth, eaV = { assessed: !!(ea && ea.assessed) };
+    if (eaV.assessed) {
+      var doms = ea.domains || [];
+      var ck = doms.filter(function (r) { return r.spf && r.spf.ok !== null; });
+      var bad = doms.filter(function (r) { return (r.spf && r.spf.ok === false) || (r.dkim && r.dkim.ok === false) || (r.dmarc && !r.dmarc.ok); });
+      eaV.pass = ck.length > 0 && bad.length === 0;
+      eaV.summary = bad.length === 0
+        ? "All " + ck.length + " accepted domain(s) publish enforcing SPF, DKIM and DMARC."
+        : bad.length + " of " + doms.length + " accepted domain(s) lack enforcing SPF / DKIM / DMARC: " + bad.map(function (r) { return r.domain; }).slice(0, 4).join(", ") + (bad.length > 4 ? "…" : "") + ".";
+    } else if (ea && ea.reason) { eaV.reason = ea.reason; }
     return {
       score: scored.length ? Math.round(100 * pass / scored.length) : null,
       sev: {
@@ -29555,7 +29719,8 @@ EP.registerView("email", (function () {
         low: 0
       },
       top: fails.map(function (x) { return { title: x.title, sev: x.sev, focus: { id: x.id } }; }),
-      recs: fails.filter(function (x) { return x.title; }).map(function (x) { return { title: x.title, sev: x.sev, fix: x.fix }; })
+      recs: fails.filter(function (x) { return x.title; }).map(function (x) { return { title: x.title, sev: x.sev, fix: x.fix }; }),
+      emailAuth: eaV
     };
   }
 
