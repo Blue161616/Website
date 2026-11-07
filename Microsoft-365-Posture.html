@@ -1807,6 +1807,10 @@
 #view-agentreach .ar-chip.saas { color:var(--sev-high); background:color-mix(in srgb,var(--sev-high) 14%,transparent); }
 #view-agentreach .ar-chip.noowner { color:var(--sev-high); background:color-mix(in srgb,var(--sev-high) 14%,transparent); }
 #view-agentreach .ar-chip.ok { color:var(--sev-low); background:color-mix(in srgb,var(--sev-low) 13%,transparent); }
+#view-agentreach .ar-chip.toxic { color:#fff; background:color-mix(in srgb,var(--sev-crit) 70%,transparent); }
+#view-agentreach .ar-toxic { font-size:12px; line-height:1.5; color:var(--text); background:color-mix(in srgb,var(--sev-crit) 10%,transparent); border-left:2px solid var(--sev-crit); padding:6px 9px; border-radius:0 6px 6px 0; }
+#view-agentreach .ar-toxic b { color:var(--sev-crit); font-weight:700; }
+#view-agentreach .ar-priv { font-size:9px; font-weight:800; color:var(--sev-high); background:color-mix(in srgb,var(--sev-high) 14%,transparent); padding:1px 5px; border-radius:5px; text-transform:uppercase; letter-spacing:.04em; }
 #view-agentreach .ar-agent-b { padding:11px 14px; display:grid; grid-template-columns:1fr; gap:9px; }
 #view-agentreach .ar-line { font-size:12px; color:var(--text); line-height:1.5; }
 #view-agentreach .ar-line .k { color:var(--muted); font-weight:700; text-transform:uppercase; font-size:9.5px; letter-spacing:.06em; margin-right:7px; }
@@ -17963,11 +17967,32 @@ function dName(n){
   return t + (nm ? " · " + nm.slice(0, 8) : "");
 }
 
+// ── Privileged-operator correlation (first §2 toxic combo). A privileged account that can OPERATE an agent
+// which reaches a crown jewel is a toxic combo: compromise that account and the agent drives straight into the
+// crown jewels. The privileged set is the RESOLVED admin set (objectId/UPN join via the shell), not a name
+// guess — so a flag is verified; when no resolved set is available nothing is flagged (never fabricated).
+let _arPriv = null;
+function privSet(){
+  if (_arPriv) return _arPriv;
+  try { const api = window.EP && EP.viewApi && EP.viewApi("devices"); const p = api && api.privUsers ? api.privUsers() : null;
+    _arPriv = { upns: new Set((p && p.upns) || []), sams: new Set((p && p.sams) || []) }; }
+  catch(e){ _arPriv = { upns: new Set(), sams: new Set() }; }
+  return _arPriv;
+}
+function isPrivOperator(rawName){
+  const low = String(rawName || "").trim().toLowerCase(); if (!low) return false;
+  const P = privSet(); if (!P.upns.size && !P.sams.size) return false;   // no resolved admin set → don't fabricate a toxic flag
+  const sam = low.split("@")[0].replace(/^.*\\/, "");
+  return P.upns.has(low) || P.sams.has(sam);
+}
+// Toxic = reaches a crown jewel AND a privileged account can operate it.
+function withToxic(a){ const pops = (a.operators || []).filter(o => o.privileged).map(o => o.name); a.privilegedOperators = pops; a.toxic = !!(a.reachesCritical && pops.length); return a; }
+
 // ---- demo: a small, realistic agent estate with reach into a labelled site and a crown-jewel ----
 function demoModel(){
   return { live:false, licensed:true, baseModels:3, agents:[
     { id:"a1", name:"Finance Copilot Agent", model:"GPT-4o",
-      operators:[{name:"ava.devries@contoso.com",kind:"user"}], owner:true,
+      operators:[{name:"ava.devries@contoso.com",kind:"user",privileged:true}], owner:true,
       authAsSP:["svc-finance-bot"],
       reach:[ { via:"svc-finance-bot", target:"Finance — Board Reporting (SharePoint)", targetKind:"resource", saas:false, crit:"Very high" },
               { via:"svc-finance-bot", target:"Salesforce", targetKind:"app", saas:true, crit:null } ],
@@ -17987,7 +18012,7 @@ function demoModel(){
       authAsSP:["svc-devops"],
       reach:[ { via:"svc-devops", target:"ServiceNow", targetKind:"app", saas:true, crit:null } ],
       reachesCritical:false, reachesSaaS:true }
-  ] };
+  ].map(withToxic) };
 }
 
 // ---- live: build the agent-reach model from the shared Exposure Management graph (Phase 1 adapter) ----
@@ -17998,7 +18023,7 @@ async function buildModel(){
   const baseModels = g.nodes.filter(n => n.kind === "baseModel").length;
   const out = agents.map(a => {
     const inb = E.filter(e => e.to === a.id), outb = E.filter(e => e.from === a.id);
-    const operators = inb.filter(e => (nm[e.from] || {}).kind === "user").map(e => ({ name: dName(nm[e.from]), kind: "user" }));
+    const operators = inb.filter(e => (nm[e.from] || {}).kind === "user").map(e => ({ name: dName(nm[e.from]), kind: "user", privileged: isPrivOperator(nm[e.from] && nm[e.from].name) }));
     const authAs = outb.filter(e => /authenticate as/i.test(e.label)).map(e => nm[e.to]).filter(Boolean);
     const modelNode = outb.map(e => nm[e.to]).find(n => n && n.kind === "baseModel");
     const reach = [];
@@ -18009,9 +18034,9 @@ async function buildModel(){
       });
       if (sp.crit) reach.push({ via: dName(sp), target: dName(sp), targetKind: "sp", saas: false, crit: sp.crit });
     });
-    return { id: a.id, name: dName(a), model: modelNode ? dName(modelNode) : null,
+    return withToxic({ id: a.id, name: dName(a), model: modelNode ? dName(modelNode) : null,
       operators: operators, owner: operators.length > 0, authAsSP: authAs.map(dName),
-      reach: reach, reachesCritical: reach.some(r => r.crit) || authAs.some(s => s.crit), reachesSaaS: reach.some(r => r.saas) };
+      reach: reach, reachesCritical: reach.some(r => r.crit) || authAs.some(s => s.crit), reachesSaaS: reach.some(r => r.saas) });
   });
   return { live: true, licensed: agents.length > 0, agents: out, baseModels: baseModels };
 }
@@ -18020,7 +18045,8 @@ function arScore(m){
   if (!m || !m.agents || !m.agents.length) return null;
   let pen = 0;
   m.agents.forEach(a => {
-    if (a.reachesCritical && !a.owner) pen += 34;      // worst: an unowned agent that reaches a crown jewel
+    if (a.toxic) pen += 45;                             // worst: a privileged account can drive it into a crown jewel
+    else if (a.reachesCritical && !a.owner) pen += 34;
     else if (a.reachesCritical) pen += 18;
     else if (!a.owner) pen += 12;
     else if (a.reachesSaaS) pen += 5;
@@ -18028,7 +18054,7 @@ function arScore(m){
   return Math.max(0, 100 - Math.min(100, pen));
 }
 // Worst-first rank: an unowned agent reaching a crown jewel is the worst; then crown-jewel reach, then no owner, then SaaS reach.
-function arRank(a){ return (a.reachesCritical && !a.owner ? 100 : 0) + (a.reachesCritical ? 40 : 0) + (!a.owner ? 20 : 0) + (a.reachesSaaS ? 5 : 0); }
+function arRank(a){ return (a.toxic ? 200 : 0) + (a.reachesCritical && !a.owner ? 100 : 0) + (a.reachesCritical ? 40 : 0) + (!a.owner ? 20 : 0) + (a.reachesSaaS ? 5 : 0); }
 
 function flowHtml(a){
   const cells = [ '<span class="ar-node agent">✦ ' + esc(a.name) + '</span>' ];
@@ -18042,20 +18068,22 @@ function flowHtml(a){
 }
 
 function agentCard(a){
-  const cls = (a.reachesCritical && !a.owner) ? "critflag" : (a.reachesCritical || !a.owner) ? "flag" : "";
+  const cls = (a.toxic || (a.reachesCritical && !a.owner)) ? "critflag" : (a.reachesCritical || !a.owner) ? "flag" : "";
   const chips = [];
+  if (a.toxic) chips.push('<span class="ar-chip toxic">⚠ toxic combo</span>');
   if (a.reachesCritical) chips.push('<span class="ar-chip crit">reaches crown jewel</span>');
   if (a.reachesSaaS) chips.push('<span class="ar-chip saas">reaches SaaS</span>');
   if (!a.owner) chips.push('<span class="ar-chip noowner">⚠ no owner</span>');
   if (!chips.length) chips.push('<span class="ar-chip ok">scoped</span>');
   const ops = a.owner
-    ? a.operators.map(o => esc(o.name)).join(", ")
+    ? a.operators.map(o => esc(o.name) + (o.privileged ? ' <span class="ar-priv">privileged</span>' : '')).join(", ")
     : '<span class="ar-muted">No human operator — an orphaned agent still holds its credentials and reach.</span>';
   return '<div class="ar-agent ' + cls + '">'
     + '<div class="ar-agent-h"><span class="ar-agent-nm">✦ ' + esc(a.name) + '</span>'
     + (a.model ? '<span class="ar-agent-model">· ' + esc(a.model) + '</span>' : '')
     + '<span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">' + chips.join("") + '</span></div>'
     + '<div class="ar-agent-b">'
+    + (a.toxic ? '<div class="ar-line ar-toxic"><b>⚠ Toxic combo →</b> a privileged account (' + esc((a.privilegedOperators || []).join(", ")) + ') can operate this agent, and it reaches a crown jewel. Compromise or misuse of that account drives the agent straight into crown-jewel data — verified: the account holds a resolved admin role.</div>' : '')
     + '<div class="ar-line"><span class="k">Operated by</span>' + ops + '</div>'
     + (a.reach && a.reach.length ? ('<div class="ar-line"><span class="k">Reach</span>' + flowHtml(a) + '</div>')
         : '<div class="ar-line ar-muted">No reachable resource edges in the graph for this agent.</div>')
@@ -18082,10 +18110,11 @@ function render(m){
   const reachCrit = agents.filter(a => a.reachesCritical).length;
   const reachSaaS = agents.filter(a => a.reachesSaaS).length;
   const noOwner = agents.filter(a => !a.owner).length;
-  const authSP = agents.filter(a => (a.authAsSP || []).length).length;
+  const toxicN = agents.filter(a => a.toxic).length;
   const score = arScore(m);
   const lede = agents.length
     ? agents.length + " AI agent" + (agents.length === 1 ? "" : "s")
+      + (toxicN ? (" · " + toxicN + " toxic (privileged operator → crown jewel)") : "")
       + (reachCrit ? (" · " + reachCrit + " reach a crown-jewel asset") : "")
       + (noOwner ? (" · " + noOwner + " with no owner") : "")
       + (reachSaaS ? (" · " + reachSaaS + " reach a SaaS app") : "") + "."
@@ -18098,14 +18127,15 @@ function render(m){
     + tile(reachCrit, "Reach a crown jewel", reachCrit ? "crit" : "ok")
     + tile(noOwner, "No owner", noOwner ? "high" : "ok")
     + tile(reachSaaS, "Reach a SaaS app", reachSaaS ? "high" : "ok")
-    + tile(authSP, "Can assume a service principal", authSP ? "high" : "ok") + '</div>';
+    + tile(toxicN, "Toxic: privileged → crown jewel", toxicN ? "crit" : "ok") + '</div>';
   const sorted = agents.slice().sort((a, b) => arRank(b) - arRank(a));
   const list = agents.length ? sorted.map(agentCard).join("") : '<div class="ar-empty">No AI agents found.</div>';
   const src = (window.EP && EP.DEMO) ? "Demo data." : "Live — Microsoft Security Exposure Management graph via advanced hunting.";
   const note = '<div class="ar-note"><b>Read-only. ' + src + '</b> The first slice of the AI &amp; Agents section, built on the shared exposure-graph adapter. '
     + 'Every edge here is <b>verified</b> — Microsoft’s objectId-joined graph, not a name match. An agent’s reach flows through the '
-    + 'service principal it <b>can authenticate as</b>; an agent with <b>no owner</b> still holds those credentials. Data-at-rest reach (which '
-    + 'labelled sites / mailboxes) and runtime protection (CA for agents, agent risk, DSPM for AI) are the next slices.</div>';
+    + 'service principal it <b>can authenticate as</b>; an agent with <b>no owner</b> still holds those credentials. A <b>toxic combo</b> is the first '
+    + 'cross-signal correlation: a privileged account (resolved admin role) that can operate an agent which reaches a crown jewel — only flagged when the '
+    + 'privileged role is verified, never guessed from a name. Data-at-rest reach and runtime protection (CA for agents, agent risk, DSPM for AI) are the next slices.</div>';
   root.innerHTML = band + tiles + '<div class="ar-h2">Agents · worst-first</div>' + list + note;
 }
 
@@ -18125,13 +18155,20 @@ function __agentReachSummary(){
   const noOwner = agents.filter(a => !a.owner);
   const score = arScore(m);
   const recs = agents.slice()
-    .filter(a => a.reachesCritical || !a.owner)
+    .filter(a => a.toxic || a.reachesCritical || !a.owner)
     .sort((a, b) => arRank(b) - arRank(a))
-    .map(a => ({ title: a.name + (a.reachesCritical && !a.owner ? " — unowned agent reaches a crown jewel" : a.reachesCritical ? " — reaches a crown jewel" : " — no owner"),
-      sev: (a.reachesCritical && !a.owner) ? "crit" : a.reachesCritical ? "high" : "med", fix: a.owner ? "Scope the agent's service-principal permissions to least privilege." : "Assign a human owner and review this agent's credentials and reach." }));
+    .map(a => {
+      const reason = a.toxic ? " — a privileged account can drive it into a crown jewel (toxic combo)"
+        : (a.reachesCritical && !a.owner) ? " — unowned agent reaches a crown jewel"
+        : a.reachesCritical ? " — reaches a crown jewel" : " — no owner";
+      const sev = (a.toxic || (a.reachesCritical && !a.owner)) ? "crit" : a.reachesCritical ? "high" : "med";
+      const fix = a.toxic ? "Remove the privileged account's control of this agent (or scope the agent's permissions) — a privileged admin should not be able to operate an agent that reaches crown-jewel data."
+        : a.owner ? "Scope the agent's service-principal permissions to least privilege." : "Assign a human owner and review this agent's credentials and reach.";
+      return { title: a.name + reason, sev: sev, fix: fix };
+    });
   return { label: "Agent reach", score: score, grade: "",
-    lead: agents.length + " AI agent(s)" + (reachCrit.length ? (" · " + reachCrit.length + " reach a crown jewel") : "") + (noOwner.length ? (" · " + noOwner.length + " with no owner") : ""),
-    sev: { crit: agents.filter(a => a.reachesCritical && !a.owner).length, high: agents.filter(a => a.reachesCritical && a.owner).length, med: noOwner.filter(a => !a.reachesCritical).length, low: 0 },
+    lead: agents.length + " AI agent(s)" + (agents.filter(a => a.toxic).length ? (" · " + agents.filter(a => a.toxic).length + " toxic") : "") + (reachCrit.length ? (" · " + reachCrit.length + " reach a crown jewel") : "") + (noOwner.length ? (" · " + noOwner.length + " with no owner") : ""),
+    sev: { crit: agents.filter(a => a.toxic || (a.reachesCritical && !a.owner)).length, high: agents.filter(a => a.reachesCritical && a.owner && !a.toxic).length, med: noOwner.filter(a => !a.reachesCritical && !a.toxic).length, low: 0 },
     top: recs.slice(0, 5).map(r => ({ title: r.title, sev: r.sev, impact: "", search: "" })),
     recs: recs };
 }
