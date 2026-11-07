@@ -9710,7 +9710,27 @@ document.addEventListener("DOMContentLoaded", () => window.EP._boot());
    Deep policy detail not in Graph is imported from the consultant PowerShell module. */
 window.M365LIVE = (function () {
   "use strict";
-  function stripHtml(s) { return String(s == null ? "" : s).replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim(); }
+  // Strip tags so copied remediation runs: block boundaries → one space, inline tags removed with NO space (so a token
+  // split by a tag, e.g. -<b>SharingAllowedDomainList</b>, stays intact), and HTML entities decoded (&apos; &quot; …)
+  // via the browser parser so they don't appear literally in commands.
+  function stripHtml(s) {
+    s = String(s == null ? "" : s)
+      .replace(/<\s*(?:br|\/p|\/li|\/div|\/tr|\/h[1-6])\s*\/?>/gi, " ")
+      .replace(/<[^>]+>/g, "");
+    try { const ta = document.createElement("textarea"); ta.innerHTML = s; s = ta.value; }
+    catch (e) { s = s.replace(/&apos;/g, "'").replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " "); }
+    return s.replace(/[ \t]+/g, " ").replace(/ *\n */g, "\n").trim();
+  }
+  // Modernise Microsoft's own (sometimes years-old) remediation text: current portal hostnames + Entra naming.
+  function _modernize(s) {
+    return String(s == null ? "" : s)
+      .replace(/compliance\.microsoft\.com/gi, "purview.microsoft.com")
+      .replace(/protection\.office\.com/gi, "security.microsoft.com")
+      .replace(/\bAzure Active Directory\b/gi, "Microsoft Entra ID")
+      .replace(/\bAzure AD[ -]joined\b/gi, "Microsoft Entra joined")
+      .replace(/\bAzure Domain[ -]?Joined\b/gi, "Microsoft Entra joined")
+      .replace(/\bAzure AD\b/gi, "Microsoft Entra ID");
+  }
 
   let _ssPromise = null;
   async function _fetchSecureScore() {
@@ -9743,14 +9763,40 @@ window.M365LIVE = (function () {
       let pct = (typeof cs.scoreInPercentage === "number") ? cs.scoreInPercentage
         : (typeof cs.score === "number" && cs.total) ? Math.round(100 * cs.score / cs.total) : null;
       const status = pct == null ? "warn" : pct >= 100 ? "pass" : pct <= 0 ? "fail" : "warn";
+      // Severity from Microsoft's own signals (maxScore, rank, threat classes) + a small curated override so classic
+      // attack routes (forwarding, audit logging, anonymous/anyone sharing, legacy auth) rank above low-stakes items
+      // (MailTips, Sway). Partial (<100% but not 0%) sits a tier below a full miss.
       const maxS = Number(prof.maxScore) || 0;
-      const sev = status === "pass" ? "ok"
-        : (status === "fail" && maxS >= 8) ? "crit"
-        : status === "fail" ? "high" : "med";
+      let sev;
+      if (status === "pass") sev = "ok";
+      else {
+        const rank = Number(prof.rank) || 999;
+        const threats = (prof.threats || []).map(t => String(t).toLowerCase());
+        const highThreat = threats.some(t => /account breach|elevation of privilege|data exfiltration|data spillage|malicious insider/.test(t));
+        const hay = name + " " + String(title).toLowerCase();
+        const bumpUp = /forward|audit log|unified audit|audit data|anonymous|anyone link|legacy auth|basic auth|smtp auth|\bimap\b|\bpop\b|external shar|resharing|add-?ins|guest/.test(hay);
+        const bumpDown = /mailtip|\bsway\b/.test(hay);
+        let pr = Math.min(10, maxS) + (rank <= 15 ? 4 : rank <= 40 ? 2 : 0) + (highThreat ? 3 : 0) + (bumpUp ? 5 : 0) - (bumpDown ? 6 : 0);
+        if (status === "warn") pr -= 4;
+        sev = pr >= 12 ? "crit" : pr >= 7 ? "high" : pr >= 3 ? "med" : "low";
+      }
+      // Risk-accepted / third-party / reviewed: a non-default admin state means the control was consciously
+      // dispositioned — label it and stop ranking it as a live gap (Secure Score keeps it at 0%).
+      const upd = (prof.controlStateUpdates || []).slice().sort((a, b) => new Date(b.updatedDateTime || 0) - new Date(a.updatedDateTime || 0))[0];
+      const stRaw = upd ? String(upd.state || "").toLowerCase() : "";
+      const acceptedLabel = (stRaw && stRaw !== "default")
+        ? (({ thirdparty: "Third-party", ignored: "Risk accepted", reviewed: "Reviewed", resolved: "Resolved" }[stRaw] || upd.state)
+           + (upd.assignedTo ? " by " + upd.assignedTo : "") + (upd.updatedDateTime ? " on " + String(upd.updatedDateTime).slice(0, 10) : ""))
+        : null;
+      if (acceptedLabel && sev !== "ok") sev = "low";
+      // The OneDrive domain-joined-sync fix (Get-ADDomain GUID) is impossible on a cloud-only / Entra estate — replace it.
+      const isOneDriveSync = /onedrive/.test(name + " " + String(title).toLowerCase()) && /sync|domain.?join/.test(name + " " + String(title).toLowerCase());
+      let fixText = status === "pass" ? "" : _modernize(stripHtml(prof.remediation || ""));
+      if (isOneDriveSync && status !== "pass") fixText = "Restrict OneDrive/SharePoint access from unmanaged devices via app-enforced restrictions (SharePoint admin center → Policies → Access control → Unmanaged devices), backed by a Conditional Access 'require compliant/Entra-joined device' policy. The legacy Get-ADDomain GUID approach does not apply to a cloud-only / Microsoft Entra estate.";
       rows.push({ id: (name.replace(/[^a-z0-9]+/g, "-").slice(0, 44) || "ctl-" + rows.length),
-        title: title, status: status, sev: sev,
-        detail: stripHtml(cs.description || prof.remediation || prof.actionUrl || ""),
-        fix: status === "pass" ? "" : stripHtml(prof.remediation || ""),
+        title: title, status: status, sev: sev, accepted: acceptedLabel,
+        detail: (acceptedLabel ? "[" + acceptedLabel + "] " : "") + _modernize(stripHtml(cs.description || prof.remediation || prof.actionUrl || "")),
+        fix: fixText,
         src: "Microsoft Secure Score" + (cat ? " · " + cat : "") });
     });
     return rows;
@@ -9888,15 +9934,16 @@ window.M365UI = (function () {
     const pass = scored.filter(x => x.status === "pass").length;
     const score = scored.length ? Math.round(100 * pass / scored.length) : null;
     const crit = list.filter(x => x.sev === "crit").length, high = list.filter(x => x.sev === "high").length;
+    const toFixAll = list.filter(x => x.status === "fail" || x.status === "warn").length;   // workload-wide; the per-group "N to fix" sum to this
     const groups = {};
     list.forEach(x => { const g = groupOf(workload, x); (groups[g] = groups[g] || []).push(x); });
     const worst = g => Math.min.apply(null, groups[g].map(x => SEV_RANK[x.sev] == null ? 5 : SEV_RANK[x.sev]));
     const order = Object.keys(groups).sort((a, b) => worst(a) - worst(b) || a.localeCompare(b));
     const expo = score == null ? null : Math.max(0, Math.min(100, 100 - score));   // exposure (higher = worse) — same convention + colours as Identity / Endpoint
     let h = '<div class="mc-head">'
-      + ((window.EP && EP.scoreGauge) ? EP.scoreGauge(expo, { size: 66 }) : '<div class="mc-score">' + (expo == null ? "—" : expo) + '<small>/100</small></div>')
+      + ((window.EP && EP.scoreGauge) ? EP.scoreGauge(expo, { size: 66, caption: "risk" }) : '<div class="mc-score">' + (expo == null ? "—" : expo) + '<small>/100 · higher = worse</small></div>')
       + (sub ? '<div class="mc-sub">' + esc(sub) + '</div>' : '')
-      + '<div class="mc-counts">' + (crit ? '<span class="mc-pill crit">' + crit + ' critical</span>' : '') + (high ? '<span class="mc-pill high">' + high + ' high</span>' : '') + (!crit && !high ? '<span class="mc-pill ok">no critical/high</span>' : '') + '</div></div>';
+      + '<div class="mc-counts">' + (crit ? '<span class="mc-pill crit">' + crit + ' critical</span>' : '') + (high ? '<span class="mc-pill high">' + high + ' high</span>' : '') + (!crit && !high ? '<span class="mc-pill ok">no critical/high</span>' : '') + (toFixAll ? '<span class="mc-pill" title="Total controls to fix across all groups below — the per-group “to fix” counts sum to this.">' + toFixAll + ' to fix (all groups)</span>' : '') + '</div></div>';
     order.forEach(g => {
       const items = groups[g].slice().sort((a, b) => (SEV_RANK[a.sev] == null ? 5 : SEV_RANK[a.sev]) - (SEV_RANK[b.sev] == null ? 5 : SEV_RANK[b.sev]));
       const toFix = items.filter(x => x.status === "fail" || x.status === "warn").length;
@@ -29477,14 +29524,14 @@ EP.registerView("email", (function () {
         + 'Exchange Online PowerShell module for full policy detail. Open with <code>?demo=1</code> to see the worked example.</div>';
       return;
     }
-    M365UI.render(c, list, "email", "Email & Exchange — anti-phishing, forwarding, authentication and auditing, grounded in Microsoft Secure Score. Deep per-policy detail from the consultant Exchange collection.");
+    M365UI.render(c, list, "email", "Email & Exchange — anti-phishing, forwarding, authentication and auditing, grounded in Microsoft Secure Score. Deep per-policy detail from the consultant Exchange collection. SPF / DKIM / DMARC are not DNS-checked yet (a per-domain DNS-over-HTTPS check would make them real) — shown as N/A in the Framework, not passed.");
   }
 
   async function analyze() {
     if (EP.DEMO) { _state = DEMO; _mbx = DEMO_MBX; _m365Collected = true; render(DEMO); return; }
     render(null);
     try {
-      var rows = await M365LIVE.fromSecureScore(function (n, t, c) { return c === "apps" && /exchange|mail|phish|spam|forward|dkim|dmarc|spf|safe.?link|safe.?attach|\batp\b|mdo|outlook|office.?365|defender.*office/.test(n + " " + t); });
+      var rows = await M365LIVE.fromSecureScore(function (n, t, c) { return c === "apps" && /exchange|mail|phish|spam|forward|dkim|dmarc|spf|safe.?link|safe.?attach|\batp\b|mdo|outlook|office.?365|defender.*office|calendar/.test(n + " " + t); });
       rows = rows.concat(await M365LIVE.collect("email"));   // deep policy detail from the consultant PowerShell collection, if present
       try { var _coll = await M365LIVE.collection(); _m365Collected = !!(_coll && _coll.entities); _mbx = (_coll && _coll.entities && _coll.entities.mailboxes) || []; } catch (e) { _mbx = []; _m365Collected = false; }   // per-mailbox entities for cross-pillar correlation + whether the collection was present
       _state = rows; render(rows.length ? rows : null);
@@ -29567,14 +29614,17 @@ EP.registerView("sharepoint", (function () {
         + 'SharePoint controls. Open with <code>?demo=1</code> to see the worked example.</div>';
       return;
     }
-    M365UI.render(c, list, "sharepoint", "SharePoint & OneDrive — external sharing, anonymous links, unmanaged-device access and guest governance, from Graph tenant settings + Secure Score.");
+    M365UI.render(c, list, "sharepoint", "SharePoint & OneDrive — external sharing, anonymous links, unmanaged-device access and guest governance, from Graph tenant settings + Secure Score. Deeper /admin/sharepoint/settings fields (default link type, Anyone-link expiry, resharing by external users, idle-session sign-out, domain restriction mode) aren't assessed yet.");
   }
 
   async function analyze() {
     if (EP.DEMO) { _state = DEMO; render(DEMO); return; }
     render(null);
     try {
-      var rows = await M365LIVE.fromSecureScore(function (n, t, c) { return (c === "apps" || c === "data") && /sharepoint|onedrive|\bspo\b|sharing|external.?shar/.test(n + " " + t); });
+      // Exclude controls that belong to another workload but mention SharePoint/OneDrive/"sharing": the MDO "Defender
+      // for Office 365 in SPO/OneDrive/Teams" control is Email/MDO, calendar sharing is Exchange, and Sway is its own
+      // app — so they don't triplicate across views (de-dup by owning service).
+      var rows = await M365LIVE.fromSecureScore(function (n, t, c) { var h = n + " " + t; return (c === "apps" || c === "data") && /sharepoint|onedrive|\bspo\b|sharing|external.?shar/.test(h) && !/defender for office|safe.?attach|safe.?link|\batp\b|calendar|\bsway\b/.test(h); });
       try {
         var sp = await M365LIVE.graphGet("/admin/sharepoint/settings", ["SharePointTenantSettings.Read.All"]);
         var lvl = sp.sharingCapability || "unknown";
@@ -29659,14 +29709,15 @@ EP.registerView("teams", (function () {
         + '<code>?demo=1</code> to see the worked example.</div>';
       return;
     }
-    M365UI.render(c, list, "teams", "Teams — external access, third-party & custom apps, and meeting join controls, from Graph teamwork settings + Secure Score. Meeting/messaging policy detail from the consultant Teams collection.");
+    M365UI.render(c, list, "teams", "Teams — meeting-join and messaging controls from Secure Score. Not assessed here yet: external access / federation (needs Get-CsTenantFederationConfiguration) and third-party / custom-app governance (needs teamwork/teamsAppSettings) — shown as N/A in the Framework. Identity › External Access points here for Teams external chat, which is set separately in the Teams admin centre.");
   }
 
   async function analyze() {
     if (EP.DEMO) { _state = DEMO; render(DEMO); return; }
     render(null);
     try {
-      var rows = await M365LIVE.fromSecureScore(function (n, t, c) { return c === "apps" && /teams|skype|meeting|federation|lobby|anonymous|external.?access/.test(n + " " + t); });
+      // Keep the MDO "Defender for Office 365 in SPO/OneDrive/Teams" control on Email, not here — it just mentions Teams.
+      var rows = await M365LIVE.fromSecureScore(function (n, t, c) { var h = n + " " + t; return c === "apps" && /teams|skype|meeting|federation|lobby|anonymous|external.?access/.test(h) && !/defender for office|safe.?attach|safe.?link|\batp\b/.test(h); });
       rows = rows.concat(await M365LIVE.collect("teams"));   // deep policy detail from the consultant PowerShell collection, if present
       _state = rows; render(rows.length ? rows : null);
     } catch (e) {
@@ -29742,7 +29793,7 @@ EP.registerView("data", (function () {
         + 'to see the worked example.</div>';
       return;
     }
-    M365UI.render(c, list, "data", "Data & Purview — DLP, sensitivity labels and auto-labeling. Labels read web-only; DLP & retention policy detail via the consultant Purview collection.");
+    M365UI.render(c, list, "data", "Data & Purview — DLP, sensitivity labels and auto-labeling. Labels read web-only; DLP & retention policy detail via the consultant Purview collection. Not assessed here yet: the unified audit log and retention policies (need a Purview collection) — shown as N/A in the Framework, not passed.");
   }
 
   async function analyze() {
