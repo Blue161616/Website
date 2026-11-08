@@ -8119,7 +8119,7 @@ window.EP = (function () {
     { key: "endpoint", label: "Endpoint",   app: "Defender · devices, hardening, paths" },
     { key: "data",     label: "Apps & Data", app: "Exchange · SharePoint · Teams · Purview" }
   ];
-  let _suiteState = null, _suiteBusy = false, _suiteRetried = 0, _suiteAiText = "", _suiteAiBusy = false, _suiteGraphReadyWired = false;
+  let _suiteState = null, _suiteBusy = false, _suiteRetried = 0, _suiteAiText = "", _suiteAiBusy = false;
 
   function pillarOverallFrom(key, data) {
     if (key === "identity" && data.entrahound && data.entrahound.exposure) return data.entrahound.exposure;
@@ -8889,24 +8889,34 @@ window.EP = (function () {
   // Asset inventory across the estate — the populations behind the findings. Identity (members / guests /
   // workloads / agents) + Endpoint (computers / mobile), each read from its own pillar view's summary. Guests
   // come from EntraHound's typed graph (the User view is member-only); device class split from the inventory.
-  function suiteAssetStrip() {
+  function suiteAssetData() {
     const sum = n => { try { const a = viewApi(n); return a && a.summary ? a.summary() : null; } catch (e) { return null; } };
     const u = sum("user"), eh = sum("entrahound"), w = sum("workload"), ag = sum("agent"), d = sum("devices");
-    const users = u && u.totals ? u.totals.accounts : null;
-    const guests = eh && eh.inventory ? (eh.inventory.guest || 0) : null;
-    const workloads = w && w.totals ? (w.totals.apps != null ? w.totals.apps : w.totals.inventoryTotal) : null;
-    const agents = ag && ag.totals ? ag.totals.agents : null;
-    const comps = d ? d.computers : null, mob = d ? d.mobile : null;
-    if ([users, guests, workloads, agents, comps, mob].every(v => v == null)) return "";   // nothing collected yet
+    return {
+      users: u && u.totals ? u.totals.accounts : null,
+      guests: eh && eh.inventory ? (eh.inventory.guest || 0) : null,
+      workloads: w && w.totals ? (w.totals.apps != null ? w.totals.apps : w.totals.inventoryTotal) : null,
+      agents: ag && ag.totals ? ag.totals.agents : null,
+      comps: d && d.computers != null ? d.computers : null,
+      mob: d && d.mobile != null ? d.mobile : null
+    };
+  }
+  function suiteAssetCells(r) {
+    if ([r.users, r.guests, r.workloads, r.agents, r.comps, r.mob].every(v => v == null)) return '<span class="sx-asset-grp">Assets rolling up…</span>';
     const fmt = v => (v == null ? "—" : (typeof v === "number" ? v.toLocaleString() : esc(String(v))));
-    const cell = (v, l, go) => '<' + (go ? 'button' : 'span') + ' class="sx-asset' + (go ? ' go' : '') + '"' + (go ? ' data-suitego="' + go + '"' : '') + '><b>' + fmt(v) + '</b><span class="sx-asset-l">' + l + '</span></' + (go ? 'button' : 'span') + '>';
-    return '<div class="sx-assets">'
-      + '<span class="sx-asset-grp">Identity</span>'
-      + cell(users, "users", "identity") + cell(guests, "guests", "identity") + cell(workloads, "workloads", "identity") + cell(agents, "agents", "identity")
+    const cell = (v, l, go) => '<button class="sx-asset go" data-suitego="' + go + '"><b>' + fmt(v) + '</b><span class="sx-asset-l">' + l + '</span></button>';
+    return '<span class="sx-asset-grp">Identity</span>'
+      + cell(r.users, "users", "identity") + cell(r.guests, "guests", "identity") + cell(r.workloads, "workloads", "identity") + cell(r.agents, "agents", "identity")
       + '<span class="sx-asset-div"></span>'
       + '<span class="sx-asset-grp">Endpoint</span>'
-      + cell(comps, "computers", "endpoint") + cell(mob, "mobile", "endpoint")
-      + '</div>';
+      + cell(r.comps, "computers", "endpoint") + cell(r.mob, "mobile", "endpoint");
+  }
+  // EntraHound (the guest/agent graph) can finish loading after the first roll-up, so fill the strip now and
+  // retry briefly until the guest count resolves — guests==null means its summary isn't ready yet (0 is valid).
+  function suiteAssetFill(n) {
+    const el = document.getElementById("sxAssets"); if (!el) return;
+    const r = suiteAssetData(); el.innerHTML = suiteAssetCells(r);
+    if (r.guests == null && (n || 0) < 10) setTimeout(() => suiteAssetFill((n || 0) + 1), 500);
   }
   function paintSuite(st) {
     const host = document.getElementById("view-suite"); if (!host) return;
@@ -8954,7 +8964,7 @@ window.EP = (function () {
       + suiteKpi(OV_ICON.globe, overalls.length, "Domains assessed", "Identity · Endpoint · Apps & Data", "info")
       + '</div></div>'
       + suitePillarStrip(pills)
-      + suiteAssetStrip()
+      + '<div class="sx-assets" id="sxAssets"></div>'
       + '<div class="sx-whatif" id="sxWhatIf"></div>'
       + suiteMultiTrend(pills, estScore)
       + '</div>';
@@ -8973,6 +8983,7 @@ window.EP = (function () {
       + '<div class="sx-gwrap"><div class="sx-graph" id="sxGraph">' + suiteGraphHtml(links, pills, ents) + '</div>'
       + graphSide + '</div></div>';
     host.innerHTML = h;
+    suiteAssetFill(0);   // fill the asset-inventory strip (retries until EntraHound's guest count resolves)
     const gl = host.querySelector(".ov-gauge span"); if (gl) gl.textContent = "Estate exposure";
     ovAnimate(host);
     try { breakGlassBarSync(); } catch (e) {}   // the rollup has now loaded the User scan — the break-glass alarm can assert
@@ -9037,10 +9048,6 @@ window.EP = (function () {
   }
   async function renderSuite(force) {
     const host = document.getElementById("view-suite"); if (!host) return;
-    // EntraHound (the identity graph behind the guest/agent asset counts) finishes loading asynchronously and can
-    // land after the first roll-up. Re-paint the estate once it signals ready so the asset strip fills in.
-    if (!_suiteGraphReadyWired) { _suiteGraphReadyWired = true;
-      window.addEventListener("ep:graphready", () => { try { if (_suiteState) paintSuite(_suiteState); } catch (e) {} }); }
     if (_suiteState && !force) {   // re-correlate on revisit — picks up entities collected since (e.g. after opening Attack paths)
       try { const ents = await gatherEntities(); _suiteState.ents = ents; _suiteState.links = correlateEntities(ents); } catch (e) {}
       try { _suiteState.chain = await gatherChain(); } catch (e) {}
