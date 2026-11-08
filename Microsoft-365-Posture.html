@@ -242,6 +242,15 @@
   .sx-stale-row .badge { display:inline-block; font-size:10px; font-weight:700; padding:1px 7px; border-radius:999px; border:1px solid var(--border); color:var(--muted); vertical-align:middle; white-space:nowrap; }
   .sx-stale-row .badge.b-crit { color:var(--sev-crit); border-color:color-mix(in srgb,var(--sev-crit) 40%,transparent); }
   /* what-if line under the gauge */
+  /* Asset inventory strip — the populations behind the findings (Identity + Endpoint) */
+  .sx-assets { display:flex; flex-wrap:wrap; align-items:center; gap:7px 10px; margin:9px 16px 2px; padding:8px 11px; border:1px solid var(--border); border-radius:9px; background:color-mix(in srgb,var(--accent) 4%,transparent); }
+  .sx-asset-grp { font-family:var(--label); font-size:9px; font-weight:800; letter-spacing:.09em; text-transform:uppercase; color:var(--muted); }
+  .sx-asset { display:inline-flex; align-items:baseline; gap:5px; padding:2px 8px; border:1px solid var(--border); border-radius:7px; background:var(--card); font-size:12px; color:var(--muted); }
+  .sx-asset b { color:var(--text); font-weight:800; font-variant-numeric:tabular-nums; font-size:13.5px; }
+  .sx-asset-l { font-size:11px; color:var(--muted); }
+  .sx-asset.go { cursor:pointer; transition:border-color .15s,background .15s; }
+  .sx-asset.go:hover { border-color:var(--accent); background:color-mix(in srgb,var(--accent) 9%,transparent); }
+  .sx-asset-div { width:1px; align-self:stretch; min-height:16px; background:var(--border); margin:0 3px; }
   .sx-whatif { margin:10px 16px 2px; padding:7px 11px; border:1px dashed var(--border); border-radius:9px; font-size:12px; color:var(--muted); line-height:1.5; transition:border-color .15s,background .15s; }
   .sx-whatif.on { border-color:var(--accent); border-style:solid; background:color-mix(in srgb,var(--accent) 8%,transparent); }
   .sx-whatif b { color:var(--text); font-weight:800; font-size:13px; }
@@ -8110,7 +8119,7 @@ window.EP = (function () {
     { key: "endpoint", label: "Endpoint",   app: "Defender · devices, hardening, paths" },
     { key: "data",     label: "Apps & Data", app: "Exchange · SharePoint · Teams · Purview" }
   ];
-  let _suiteState = null, _suiteBusy = false, _suiteRetried = 0, _suiteAiText = "", _suiteAiBusy = false;
+  let _suiteState = null, _suiteBusy = false, _suiteRetried = 0, _suiteAiText = "", _suiteAiBusy = false, _suiteGraphReadyWired = false;
 
   function pillarOverallFrom(key, data) {
     if (key === "identity" && data.entrahound && data.entrahound.exposure) return data.entrahound.exposure;
@@ -8877,6 +8886,28 @@ window.EP = (function () {
     const lede = 'Compliance work only reduces risk if the chain is enforced end-to-end: <b>Defender risk &rarr; Intune compliance &rarr; Entra &rarr; Conditional Access &rarr; access</b>. Where it breaks, a risky device still gets in.';
     return '<div class="ov-panel sx-corr">' + head + '<div class="sx-corr-body"><div class="sx-lede">' + lede + '</div>' + rows + '</div></div>';
   }
+  // Asset inventory across the estate — the populations behind the findings. Identity (members / guests /
+  // workloads / agents) + Endpoint (computers / mobile), each read from its own pillar view's summary. Guests
+  // come from EntraHound's typed graph (the User view is member-only); device class split from the inventory.
+  function suiteAssetStrip() {
+    const sum = n => { try { const a = viewApi(n); return a && a.summary ? a.summary() : null; } catch (e) { return null; } };
+    const u = sum("user"), eh = sum("entrahound"), w = sum("workload"), ag = sum("agent"), d = sum("devices");
+    const users = u && u.totals ? u.totals.accounts : null;
+    const guests = eh && eh.inventory ? (eh.inventory.guest || 0) : null;
+    const workloads = w && w.totals ? (w.totals.apps != null ? w.totals.apps : w.totals.inventoryTotal) : null;
+    const agents = ag && ag.totals ? ag.totals.agents : null;
+    const comps = d ? d.computers : null, mob = d ? d.mobile : null;
+    if ([users, guests, workloads, agents, comps, mob].every(v => v == null)) return "";   // nothing collected yet
+    const fmt = v => (v == null ? "—" : (typeof v === "number" ? v.toLocaleString() : esc(String(v))));
+    const cell = (v, l, go) => '<' + (go ? 'button' : 'span') + ' class="sx-asset' + (go ? ' go' : '') + '"' + (go ? ' data-suitego="' + go + '"' : '') + '><b>' + fmt(v) + '</b><span class="sx-asset-l">' + l + '</span></' + (go ? 'button' : 'span') + '>';
+    return '<div class="sx-assets">'
+      + '<span class="sx-asset-grp">Identity</span>'
+      + cell(users, "users", "identity") + cell(guests, "guests", "identity") + cell(workloads, "workloads", "identity") + cell(agents, "agents", "identity")
+      + '<span class="sx-asset-div"></span>'
+      + '<span class="sx-asset-grp">Endpoint</span>'
+      + cell(comps, "computers", "endpoint") + cell(mob, "mobile", "endpoint")
+      + '</div>';
+  }
   function paintSuite(st) {
     const host = document.getElementById("view-suite"); if (!host) return;
     const pills = st.pillars, links = st.links || [], ents = st.ents || {};
@@ -8923,6 +8954,7 @@ window.EP = (function () {
       + suiteKpi(OV_ICON.globe, overalls.length, "Domains assessed", "Identity · Endpoint · Apps & Data", "info")
       + '</div></div>'
       + suitePillarStrip(pills)
+      + suiteAssetStrip()
       + '<div class="sx-whatif" id="sxWhatIf"></div>'
       + suiteMultiTrend(pills, estScore)
       + '</div>';
@@ -9005,6 +9037,10 @@ window.EP = (function () {
   }
   async function renderSuite(force) {
     const host = document.getElementById("view-suite"); if (!host) return;
+    // EntraHound (the identity graph behind the guest/agent asset counts) finishes loading asynchronously and can
+    // land after the first roll-up. Re-paint the estate once it signals ready so the asset strip fills in.
+    if (!_suiteGraphReadyWired) { _suiteGraphReadyWired = true;
+      window.addEventListener("ep:graphready", () => { try { if (_suiteState) paintSuite(_suiteState); } catch (e) {} }); }
     if (_suiteState && !force) {   // re-correlate on revisit — picks up entities collected since (e.g. after opening Attack paths)
       try { const ents = await gatherEntities(); _suiteState.ents = ents; _suiteState.links = correlateEntities(ents); } catch (e) {}
       try { _suiteState.chain = await gatherChain(); } catch (e) {}
@@ -25211,7 +25247,9 @@ function __dpDevSummary(){
   // overview's exposure surface; IP + reach-to-critical are enriched from the attack-paths graph there.
   const internetFacing = ds.filter(d => d.internet === true).map(d => ({ name: d.name, crit: (d.criticality && d.criticality !== "—") ? d.criticality : null, reason: d.internetReason || null, threat: d.threat || null, exposure: (d.exposure && d.exposure !== "—") ? d.exposure : null, ports: (d.openPorts && d.openPorts.length) ? d.openPorts : null }));
   const managed = ds.length - unmanaged, compliant = ds.filter(d => d.compliance === "compliant").length;
-  return { label: "Devices", total: ds.length, risk: { High: hi, Medium: med, Low: low }, highRisk: hi,
+  // Device class split (computers vs mobile) for the cross-domain asset inventory — same devClass() the segment uses.
+  const computers = ds.filter(d => devClass(d.os) === "computer").length, mobile = ds.filter(d => devClass(d.os) === "mobile").length;
+  return { label: "Devices", total: ds.length, computers, mobile, risk: { High: hi, Medium: med, Low: low }, highRisk: hi,
     unmanaged, managed, compliant, notOnb, critical, chain, internetFacing, hasMde: DALL.hasMde, live: DALL.live,
     score: null, grade: "–", lead: ds.length + " devices · " + hi + " high-risk" + (critical?(" · " + critical + " critical asset" + (critical===1?"":"s")):"") + " · " + unmanaged + " unmanaged", sev: { crit:0, high:0, med:0, low:0 }, top: [] };
 }
