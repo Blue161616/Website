@@ -31497,6 +31497,30 @@ EP.registerView("email", (function () {
     { upn: "ava.devries0@contoso.com", display: "Ava de Vries", issue: "external forwarding", detail: "Mailbox auto-forwards to ava.personal@proton.me (outside the tenant).", sev: "high" },
     { upn: "svc_reports@contoso.com", display: "Reporting service", issue: "inbox rule forwards externally", detail: "Inbox rule 'archive' redirects to an external Gmail address.", sev: "high" }
   ];
+  // §4 Apps & Data — org-level mail-flow exfil + delegation, from the consultant Exchange collection (not in Graph):
+  // transport rules that redirect/BCC externally (Get-TransportRule) and Full Access / Send As on sensitive mailboxes
+  // (Get-MailboxPermission). Each builds a first-class finding below; empty arrays ⇒ no finding (not fabricated).
+  var _transportRules = [], _delegations = [];
+  var DEMO_TRANSPORT = [
+    { name: "Archive all to partner", action: "BlindCopyTo", target: "archive@external-partner.example", scope: "all messages", external: true }
+  ];
+  var DEMO_DELEGATION = [
+    { mailbox: "ceo@contoso.com", display: "CEO mailbox", delegate: "svc_assistant@contoso.com", access: "FullAccess", sensitive: true },
+    { mailbox: "finance@contoso.com", display: "Finance (shared)", delegate: "jordan@fabrikam.com", access: "SendAs", sensitive: true }
+  ];
+  // Build the transport-rule + mailbox-delegation findings from whatever the collection provided (live or demo).
+  function _exchGovFindings() {
+    var out = [];
+    var tr = (_transportRules || []).filter(function (r) { return r && r.external; });
+    if (tr.length) out.push({ id: "transport-ext", title: "Mail-flow rules redirect or copy mail outside the tenant", status: "fail", sev: "crit",
+      detail: tr.length + " transport rule" + (tr.length === 1 ? "" : "s") + " redirect / BCC externally — e.g. “" + tr[0].name + "” " + (tr[0].action || "forwards") + " to " + tr[0].target + (tr[0].scope ? " (" + tr[0].scope + ")" : "") + ". A single mail-flow rule can exfiltrate mail org-wide, invisibly to the mailbox owner.",
+      fix: "Review every mail-flow rule with a redirect / BlindCopyTo / forward to an external recipient; remove or tightly scope any not deliberately required.", src: "Consultant Exchange collection (Get-TransportRule)" });
+    var dl = (_delegations || []).filter(function (d) { return d && d.sensitive; });
+    if (dl.length) out.push({ id: "mbx-deleg", title: "Full Access / Send As on sensitive mailboxes", status: "fail", sev: "high",
+      detail: dl.length + " sensitive mailbox" + (dl.length === 1 ? "" : "es") + " carry delegates — e.g. " + dl[0].delegate + " holds " + dl[0].access + " on " + (dl[0].display || dl[0].mailbox) + ". Delegation is standing access to that mailbox's mail, often on a delegate without phishing-resistant MFA.",
+      fix: "Review Full Access / Send As / Send on Behalf on exec, finance and shared mailboxes; remove stale grants and prefer scoped, audited access.", src: "Consultant Exchange collection (Get-MailboxPermission)" });
+    return out;
+  }
   // #12 Email authentication (SPF / DKIM / DMARC) — live via DNS-over-HTTPS per accepted domain (M365LIVE.emailAuth).
   // Demo: a worked example matching the DEMO findings above (contoso.com weak, mail subdomain strong, MS-managed ok).
   var _emailAuth = null;   // { assessed, domains:[{domain,managed,spf,dkim,dmarc}], reason? }
@@ -31506,7 +31530,7 @@ EP.registerView("email", (function () {
     { domain: "contoso.onmicrosoft.com",    managed: true,  spf: { ok: true,  state: "-all (strict)" }, dkim: { ok: true,  state: "selector1+2", selectors: 2 }, dmarc: { ok: true,  policy: "reject",     state: "p=reject" } }
   ] };
 
-  function dataset() { return EP.DEMO ? DEMO : _state; }
+  function dataset() { return EP.DEMO ? (_state || DEMO) : _state; }   // _state carries DEMO + the collection-derived findings (transport rules / delegation)
 
   // Turn the per-domain DNS-over-HTTPS results into three aggregate findings (SPF / DKIM / DMARC), each listing
   // the domains that fail. DMARC p=none is a warn (published but monitoring only); missing/weak is a fail.
@@ -31561,7 +31585,9 @@ EP.registerView("email", (function () {
   }
 
   async function analyze() {
-    if (EP.DEMO) { _state = DEMO; _mbx = DEMO_MBX; _m365Collected = true; _emailAuth = DEMO_EMAILAUTH; render(DEMO); return; }
+    if (EP.DEMO) { _mbx = DEMO_MBX; _m365Collected = true; _emailAuth = DEMO_EMAILAUTH;
+      _transportRules = DEMO_TRANSPORT; _delegations = DEMO_DELEGATION;
+      _state = DEMO.concat(_exchGovFindings()); render(_state); return; }
     render(null);
     try {
       var rows = await M365LIVE.fromSecureScore(function (n, t, c) { return c === "apps" && /exchange|mail|phish|spam|forward|dkim|dmarc|spf|safe.?link|safe.?attach|\batp\b|mdo|outlook|office.?365|defender.*office|calendar/.test(n + " " + t); });
@@ -31577,7 +31603,13 @@ EP.registerView("email", (function () {
           rows = rows.concat(_emailAuthRows(ea));
         } else { _emailAuth = { assessed: false, reason: "no verified domains returned by Microsoft Graph" }; }
       } catch (e2) { _emailAuth = { assessed: false, reason: (e2 && e2.code === 403) ? "needs Directory.Read.All consent" : ((e2 && e2.message) || "DNS check failed") }; }
-      try { var _coll = await M365LIVE.collection(); _m365Collected = !!(_coll && _coll.entities); _mbx = (_coll && _coll.entities && _coll.entities.mailboxes) || []; } catch (e) { _mbx = []; _m365Collected = false; }   // per-mailbox entities for cross-pillar correlation + whether the collection was present
+      try { var _coll = await M365LIVE.collection(); _m365Collected = !!(_coll && _coll.entities);
+        var _ce = (_coll && _coll.entities) || {};
+        _mbx = _ce.mailboxes || [];
+        _transportRules = _ce.transportRules || [];      // Get-TransportRule export (external redirect/BCC rules)
+        _delegations = _ce.mailboxDelegations || [];      // Get-MailboxPermission export (Full Access / Send As)
+      } catch (e) { _mbx = []; _transportRules = []; _delegations = []; _m365Collected = false; }   // per-mailbox entities + mail-flow/delegation for cross-pillar correlation + whether the collection was present
+      rows = rows.concat(_exchGovFindings());   // §4: external transport rules + sensitive-mailbox delegation (from the collection)
       _state = rows; render(rows.length ? rows : null);
     } catch (e) {
       var c2 = document.getElementById("content"); if (c2) c2.innerHTML = '<div class="m-note">Couldn’t load live Email posture — ' + esc((e && e.message) || e) + '. Secure Score needs <b>SecurityEvents.Read.All</b> (admin consent). Deep policy detail comes from the consultant Exchange PowerShell module. Try <code>?demo=1</code> for the worked example.</div>';
@@ -31668,7 +31700,40 @@ EP.registerView("sharepoint", (function () {
 
   var SEV_RANK = { crit:0, high:1, med:2, low:3, ok:9 };
   var _state = null;
-  function dataset() { return EP.DEMO ? DEMO : _state; }
+  function dataset() { return EP.DEMO ? (_state || DEMO) : _state; }   // _state carries DEMO + the collection-derived findings
+
+  // §4 Apps & Data — data-exposure governance from SharePoint Advanced Management / Purview (not in /admin/sharepoint
+  // tenant settings): sites shared to an 'Everyone' / EEEU scope (Data Access Governance oversharing report) and
+  // sensitivity-label coverage on sensitive sites. Built into first-class findings below; empty ⇒ no finding.
+  var _overshared = [], _labelCov = null;
+  var DEMO_OVERSHARED = [
+    { site:"Finance — Board Reporting", access:"Everyone except external users", sensitivity:"Highly confidential", items:1240 },
+    { site:"HR — Compensation", access:"All Company", sensitivity:"Confidential", items:860 }
+  ];
+  var DEMO_LABELCOV = { sensitive:9, labelled:5, unlabelled:4, examples:["Legal — Contracts","Finance — Forecasts"] };
+  function _spoGovFindings() {
+    var out = [];
+    var ov = _overshared || [];
+    if (ov.length) {
+      var sens = ov.filter(function (s) { return s && s.sensitivity; });
+      out.push({ id: "spo-oversharing", title: "Sites broadly accessible across the whole org (oversharing)", status: "fail", sev: sens.length ? "crit" : "high",
+        detail: ov.length + " site" + (ov.length === 1 ? "" : "s") + " grant access to an ‘Everyone’ / ‘Everyone except external users’ / all-company scope"
+          + (sens.length ? ", " + sens.length + " of them labelled sensitive — e.g. " + sens[0].site + " (" + sens[0].sensitivity + ", " + sens[0].access + ")" : "")
+          + ". With Microsoft 365 Copilot on, anyone who can open these can have Copilot surface their content.",
+        fix: "Remove the broad ‘Everyone’ / EEEU grants on these sites, apply the right sensitivity label, and turn on Restricted SharePoint Search + a DLP policy for the Microsoft 365 Copilot location.",
+        src: "SharePoint Advanced Management — Data Access Governance (oversharing / EEEU report)" });
+    }
+    var lc = _labelCov;
+    if (lc && lc.unlabelled) {
+      out.push({ id: "spo-labelcov", title: "Sensitivity labels missing on sensitive sites", status: "fail", sev: (lc.unlabelled >= (lc.sensitive || 0) / 2) ? "high" : "med",
+        detail: lc.unlabelled + " of " + (lc.sensitive || lc.unlabelled) + " sensitive site" + ((lc.sensitive || 0) === 1 ? "" : "s") + " have no container sensitivity label"
+          + (lc.examples && lc.examples.length ? " — e.g. " + lc.examples.slice(0, 2).join(", ") : "")
+          + ", so the access, encryption and Copilot / DLP controls that key off the label do not apply to them.",
+        fix: "Apply container sensitivity labels to sensitive sites (auto-label where possible); labels drive access, default sharing and DLP / Copilot enforcement.",
+        src: "Purview / SharePoint Advanced Management — label coverage" });
+    }
+    return out;
+  }
 
   function render(list) {
     var c = document.getElementById("content"); if (!c) return;
@@ -31682,7 +31747,7 @@ EP.registerView("sharepoint", (function () {
   }
 
   async function analyze() {
-    if (EP.DEMO) { _state = DEMO; render(DEMO); return; }
+    if (EP.DEMO) { _overshared = DEMO_OVERSHARED; _labelCov = DEMO_LABELCOV; _state = DEMO.concat(_spoGovFindings()); render(_state); return; }
     render(null);
     try {
       // Exclude controls that belong to another workload but mention SharePoint/OneDrive/"sharing": the MDO "Defender
@@ -31699,6 +31764,11 @@ EP.registerView("sharepoint", (function () {
           src: "Graph /admin/sharepoint/settings" });
       } catch (se) { /* scope not granted / beta-only field — Secure Score still covers sharing */ }
       rows = rows.concat(await M365LIVE.collect("sharepoint"));   // deep policy detail from the consultant PowerShell collection, if present
+      try { var _coll = await M365LIVE.collection(); var _ce = (_coll && _coll.entities) || {};
+        _overshared = _ce.oversharedSites || [];     // SharePoint Advanced Management DAG oversharing / EEEU report
+        _labelCov = _ce.labelCoverage || null;        // sensitivity-label coverage on sensitive sites
+      } catch (e) { _overshared = []; _labelCov = null; }
+      rows = rows.concat(_spoGovFindings());   // §4: oversharing + label coverage (from the collection / SAM report)
       _state = rows; render(rows.length ? rows : null);
     } catch (e) {
       var c2 = document.getElementById("content"); if (c2) c2.innerHTML = '<div class="m-note">Couldn’t load live SharePoint posture — ' + esc((e && e.message) || e) + '. Try <code>?demo=1</code> for the worked example.</div>';
@@ -31853,7 +31923,39 @@ EP.registerView("data", (function () {
   var SEV_RANK = { crit:0, high:1, med:2, low:3, ok:9, na:8 };
   var _state = null;
   var _collected = false;   // consultant Purview collection present? (Framework's retention control reads this)
-  function dataset() { return EP.DEMO ? DEMO : _state; }
+  function dataset() { return EP.DEMO ? (_state || DEMO) : _state; }   // _state carries DEMO + the collection-derived findings
+
+  // §4 Apps & Data — Purview governance not in Graph's label read: a DLP policy for the Microsoft 365 Copilot
+  // location, unified audit-log retention, and Insider Risk Management. Built from the consultant Purview collection
+  // entities; empty ⇒ no finding (honest N/A).
+  var _dataGov = null;
+  var DEMO_DATAGOV = {
+    dlpCopilot: { covered: false },                               // no DLP policy scoped to the M365 Copilot location
+    auditRetention: { enabled: true, days: 90, recommended: 365 }, // audit on, but short retention
+    insiderRisk: { policies: 0 }                                  // no Insider Risk policies
+  };
+  function _dataGovFindings() {
+    var g = _dataGov; if (!g) return [];
+    var out = [];
+    if (g.dlpCopilot && g.dlpCopilot.covered === false)
+      out.push({ id: "dlp-copilot", title: "DLP policy for the Microsoft 365 Copilot location", status: "fail", sev: "high",
+        detail: "No Data Loss Prevention policy is scoped to the Microsoft 365 Copilot location, so Copilot can surface and summarise labelled / sensitive content in its responses with no DLP control holding it back.",
+        fix: "Add a DLP policy for the ‘Microsoft 365 Copilot’ location that excludes items carrying your sensitive labels from Copilot processing.", src: "Consultant Purview collection (Get-DlpCompliancePolicy)" });
+    var ar = g.auditRetention;
+    if (ar && !ar.enabled)
+      out.push({ id: "audit-ret", title: "Unified audit log retention", status: "fail", sev: "high",
+        detail: "Unified audit logging is off or has no retention configured — an investigation has no activity history to go back to.",
+        fix: "Turn on unified audit logging and set an audit-log retention policy (keep privileged / sensitive activity at least a year).", src: "Consultant Purview collection (audit config)" });
+    else if (ar && ar.days && ar.days < (ar.recommended || 365))
+      out.push({ id: "audit-ret", title: "Unified audit log retention", status: "warn", sev: "med",
+        detail: "Audit logging is on but retention is " + ar.days + " days — short for incident investigation; a breach discovered months later has no trail.",
+        fix: "Add an audit-log retention policy keeping privileged / sensitive activity for at least a year (E5 supports up to 10 years with the add-on).", src: "Consultant Purview collection (audit config)" });
+    if (g.insiderRisk && (g.insiderRisk.policies | 0) === 0)
+      out.push({ id: "insider-risk", title: "Insider Risk Management policies", status: "warn", sev: "med",
+        detail: "No Insider Risk Management policies are configured, so risky data activity — a departing employee hoarding files, exfiltration to personal storage — isn't being detected.",
+        fix: "Configure Insider Risk Management policies (data leaks, departing-user data theft) in Microsoft Purview.", src: "Consultant Purview collection (Insider Risk Management)" });
+    return out;
+  }
 
   function render(list) {
     var c = document.getElementById("content"); if (!c) return;
@@ -31868,13 +31970,17 @@ EP.registerView("data", (function () {
   }
 
   async function analyze() {
-    if (EP.DEMO) { _state = DEMO; _collected = true; render(DEMO); return; }
+    if (EP.DEMO) { _collected = true; _dataGov = DEMO_DATAGOV; _state = DEMO.concat(_dataGovFindings()); render(_state); return; }
     render(null);
     try {
       var rows = await M365LIVE.fromSecureScore(function (n, t, c) { return c === "data" || /\bdlp\b|sensitivity label|auto.?label|information protection|purview|retention/.test(t); });
       var cr = await M365LIVE.collect("data");   // deep policy detail from the consultant PowerShell collection, if present
       _collected = cr.length > 0;                // Purview module connected ⇒ DLP/label/retention rows present; drives the Framework's retention verdict
       rows = rows.concat(cr);
+      try { var _coll = await M365LIVE.collection(); var _ce = (_coll && _coll.entities) || {};
+        _dataGov = _ce.purviewGov || null;   // { dlpCopilot, auditRetention, insiderRisk } from the consultant Purview collection
+      } catch (e) { _dataGov = null; }
+      rows = rows.concat(_dataGovFindings());   // §4: DLP-for-Copilot + audit retention + Insider Risk
       _state = rows; render(rows.length ? rows : null);
     } catch (e) {
       var c2 = document.getElementById("content"); if (c2) c2.innerHTML = '<div class="m-note">Couldn’t load live Data posture — ' + esc((e && e.message) || e) + '. DLP &amp; retention policy detail comes from the consultant Purview PowerShell module. Try <code>?demo=1</code>.</div>';
