@@ -1838,6 +1838,11 @@
 #view-agentreach .ar-chip.managed { color:var(--sev-low); background:color-mix(in srgb,var(--sev-low) 13%,transparent); }
 #view-agentreach .ar-chip.risk { color:var(--sev-crit); background:color-mix(in srgb,var(--sev-crit) 14%,transparent); }
 #view-agentreach .ar-chip.ext { color:var(--sev-high); background:color-mix(in srgb,var(--sev-high) 13%,transparent); }
+#view-agentreach .ar-chip.toxic { color:#fff; background:color-mix(in srgb,var(--sev-crit) 72%,transparent); }
+#view-agentreach .ar-chip.reach { color:var(--sev-crit); background:color-mix(in srgb,var(--sev-crit) 14%,transparent); }
+#view-agentreach .ar-priv { font-size:9.5px; font-weight:800; letter-spacing:.03em; text-transform:uppercase; color:var(--sev-crit); background:color-mix(in srgb,var(--sev-crit) 15%,transparent); border-radius:5px; padding:1px 5px; margin-left:4px; }
+#view-agentreach .ar-toxic { margin-top:8px; font-size:11.5px; line-height:1.55; color:var(--text); background:color-mix(in srgb,var(--sev-crit) 10%,transparent); border-left:2px solid var(--sev-crit); padding:6px 10px; border-radius:0 7px 7px 0; }
+#view-agentreach .ar-toxic b { color:var(--sev-crit); font-weight:700; }
 #view-agentreach .ar-agent-meta { margin-top:7px; display:flex; flex-wrap:wrap; gap:5px 14px; font-size:11.5px; color:var(--muted); }
 #view-agentreach .ar-agent-meta b { color:var(--text); font-weight:700; }
 #view-agentreach .ar-risks { margin-top:7px; display:flex; flex-wrap:wrap; gap:5px; }
@@ -18072,10 +18077,12 @@ function normAgent(r){
   return {
     id: r.AgentId, name: r.Name || r.AgentName || "(unnamed agent)", platform: platform, local: local,
     model: r.Model || null, version: r.Version || null,
-    managed: !!(r.EntraAgentID), blueprint: r.EntraBlueprintID || null,
+    managed: !!(r.EntraAgentID), entraAgentId: r.EntraAgentID || null, blueprint: r.EntraBlueprintID || null,
     owner: owners.length > 0, ownerCount: owners.length, ownerIds: owners, ownerNames: null,
     risks: risks, tools: tools, mcp: mcp, connected: connected,
-    externalEndpoint: endpointExternal(r.Endpoints), published: /^publish/i.test(r.PublishedStatus || "")
+    externalEndpoint: endpointExternal(r.Endpoints), published: /^publish/i.test(r.PublishedStatus || ""),
+    // exposure-graph enrichment (filled for managed agents by joinExposureToxic; honest defaults otherwise)
+    exposureMatched: false, operators: [], privilegedOperators: [], reach: [], reachesCritical: false, toxic: false
   };
 }
 
@@ -18089,7 +18096,8 @@ async function buildModel(){
     + " | project AgentId, Name, Platform, Version, Model, EntraAgentID, EntraBlueprintID, Owners, RiskIndicators, DeclaredTools, McpServers, Endpoints, ConnectedAgents, PublishedStatus";
   const rows = await EP.exposureGraph.hunt(q);
   const agents = rows.map(normAgent);
-  await resolveOwnerNames(agents);   // turn owner objectId GUIDs into display names (best-effort)
+  await resolveOwnerNames(agents);    // turn owner objectId GUIDs into display names (best-effort)
+  await joinExposureToxic(agents);    // re-join operators + reach + toxic combo for the managed subset
   return { live: true, licensed: rows.length > 0, agents: agents };
 }
 // Resolve owner objectId GUIDs → display names via Graph directoryObjects/getByIds (any principal type).
@@ -18109,12 +18117,73 @@ async function resolveOwnerNames(agents){
   agents.forEach(a => { a.ownerNames = (a.ownerIds || []).map(id => map[id] || ("id " + String(id).slice(0, 8))); });
 }
 
+// ── Privileged-operator toxic combo — re-joined for the MANAGED subset (agents registered with Entra Agent ID,
+// the only ones with an identity in the exposure graph). A verified privileged account that can OPERATE a
+// managed agent which reaches a crown jewel is a toxic combo: compromise that account and the agent drives
+// straight into the crown jewels. Verified-only: the privileged set is the RESOLVED admin set (objectId/UPN
+// join via the devices view), never a name guess — no resolved set, graph unavailable, or no node match → nothing
+// is flagged (never fabricated). Per-agent reach is blueprint-mediated and sparse live, so this is honestly 0 on
+// most tenants; the demo carries an explicit combo so the slice is visible.
+function arIsGuid(s){ return (window.EP && EP.exposureGraph && EP.exposureGraph.isGuid) ? EP.exposureGraph.isGuid(s) : /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(String(s || "")); }
+function dName(n){ if (!n) return ""; const nm = String(n.name || "").trim(); if (nm && !arIsGuid(nm)) return nm; const t = { agent:"AI agent", baseModel:"Base model", sp:"Service principal", app:"App", saas:"SaaS app", user:"User" }[n.kind] || "Asset"; return t + (nm ? " · " + nm.slice(0, 8) : ""); }
+let _arPriv = null;
+function privSet(){
+  if (_arPriv) return _arPriv;
+  try { const api = window.EP && EP.viewApi && EP.viewApi("devices"); const p = api && api.privUsers ? api.privUsers() : null;
+    _arPriv = { upns: new Set((p && p.upns) || []), sams: new Set((p && p.sams) || []) }; }
+  catch(e){ _arPriv = { upns: new Set(), sams: new Set() }; }
+  return _arPriv;
+}
+function isPrivOperator(rawName){
+  const low = String(rawName || "").trim().toLowerCase(); if (!low) return false;
+  const P = privSet(); if (!P.upns.size && !P.sams.size) return false;   // no resolved admin set → don't fabricate a flag
+  const sam = low.split("@")[0].replace(/^.*\\/, "");
+  return P.upns.has(low) || P.sams.has(sam);
+}
+// Join each managed agent to its exposure-graph node (by EntraAgentID in the node props, else by name), then read
+// operators (inbound users, flagged against the admin set) and reach (agent → authenticate-as SP → permissions /
+// role on a crown jewel). Sets a.toxic when a privileged operator meets crown-jewel reach. Best-effort throughout.
+async function joinExposureToxic(agents){
+  const managed = (agents || []).filter(a => a.managed);
+  if (!managed.length || !(window.EP && EP.exposureGraph)) return;
+  let g; try { g = await EP.exposureGraph.load(); } catch(e){ return; }
+  const nm = g.nmap, E = g.edges;
+  const nodes = g.nodes.filter(n => n.kind === "agent");
+  if (!nodes.length) return;
+  const norm = s => String(s || "").trim().toLowerCase();
+  managed.forEach(a => {
+    const node = (a.entraAgentId && nodes.find(n => n.props && JSON.stringify(n.props).toLowerCase().includes(norm(a.entraAgentId))))
+      || nodes.find(n => norm(dName(n)) === norm(a.name))
+      || (a.id && nodes.find(n => norm(n.id) === norm(a.id)));
+    if (!node) return;
+    const inb = E.filter(e => e.to === node.id), outb = E.filter(e => e.from === node.id);
+    const operators = inb.filter(e => (nm[e.from] || {}).kind === "user")
+      .map(e => ({ name: dName(nm[e.from]), privileged: isPrivOperator(nm[e.from] && nm[e.from].name) }));
+    const authAs = outb.filter(e => /authenticate as/i.test(e.label)).map(e => nm[e.to]).filter(Boolean);
+    const reach = [];
+    authAs.forEach(sp => {
+      E.filter(e => e.from === sp.id && /permissions to|has role on/i.test(e.label)).forEach(e => {
+        const t = nm[e.to]; if (!t) return;
+        reach.push({ via: dName(sp), target: dName(t), crit: t.crit || null, saas: t.rawLabel === "SaaS Application" });
+      });
+      if (sp.crit) reach.push({ via: dName(sp), target: dName(sp), crit: sp.crit, saas: false });
+    });
+    a.exposureMatched = true;
+    a.operators = operators;
+    a.reach = reach;
+    a.reachesCritical = reach.some(r => r.crit) || authAs.some(s => s.crit);
+    a.privilegedOperators = operators.filter(o => o.privileged).map(o => o.name);
+    a.toxic = !!(a.reachesCritical && a.privilegedOperators.length);
+  });
+}
+
 // ---- demo: a realistic fleet — cloud (Copilot Studio + third-party, mostly unowned, Defender-flagged) + local ----
 function demoModel(){
-  const A = (o) => Object.assign({ platform:"Copilot Studio", local:false, model:null, version:null, managed:false, blueprint:null, owner:false, ownerCount:0, risks:[], tools:0, mcp:0, connected:0, externalEndpoint:false, published:true }, o);
+  const A = (o) => Object.assign({ platform:"Copilot Studio", local:false, model:null, version:null, managed:false, blueprint:null, owner:false, ownerCount:0, risks:[], tools:0, mcp:0, connected:0, externalEndpoint:false, published:true, exposureMatched:false, operators:[], privilegedOperators:[], reach:[], reachesCritical:false, toxic:false }, o);
   return { live:false, licensed:true, agents:[
     A({ id:"c1", name:"Message Center Adoption Agent", platform:"Other", risks:["Published Agent","Weak Instructions"], tools:3, published:true }),
-    A({ id:"c2", name:"Finance Copilot Agent", platform:"Copilot Studio", managed:true, owner:true, ownerCount:1, ownerNames:["ava.devries@contoso.com"], model:"GPT-4o", risks:["Privileged Business-system Access"], tools:5, mcp:1, externalEndpoint:true }),
+    A({ id:"c2", name:"Finance Copilot Agent", platform:"Copilot Studio", managed:true, owner:true, ownerCount:1, ownerNames:["ava.devries@contoso.com"], model:"GPT-4o", risks:["Privileged Business-system Access"], tools:5, mcp:1, externalEndpoint:true,
+       exposureMatched:true, operators:[{name:"ava.devries@contoso.com",privileged:true}], privilegedOperators:["ava.devries@contoso.com"], reach:[{via:"svc-finance-bot",target:"Finance — Board Reporting (SharePoint)",crit:"Very high",saas:false}], reachesCritical:true, toxic:true }),
     A({ id:"c3", name:"Seaworthy Insurance Bot", platform:"Other", risks:["Published Agent"], tools:1 }),
     A({ id:"c4", name:"HR Onboarding Agent", platform:"Copilot Studio", managed:true, owner:false, model:"GPT-4o-mini", risks:["Weak Instructions"], tools:2 }),
     A({ id:"c5", name:"Nexoya", platform:"Other", risks:["Published Agent","Indirect Prompt Injection Exposure"], tools:4, externalEndpoint:true }),
@@ -18124,18 +18193,20 @@ function demoModel(){
   ] };
 }
 
-function agRank(a){ return (a.risks.length ? 40 + a.risks.length * 8 : 0) + (!a.owner ? 20 : 0) + (a.externalEndpoint ? 8 : 0) + (!a.managed ? 4 : 0) + (a.mcp ? 3 : 0); }
+function agRank(a){ return (a.toxic ? 120 : 0) + (a.reachesCritical ? 30 : 0) + (a.risks.length ? 40 + a.risks.length * 8 : 0) + (!a.owner ? 20 : 0) + (a.externalEndpoint ? 8 : 0) + (!a.managed ? 4 : 0) + (a.mcp ? 3 : 0); }
 function arScore(list){
   if (!list || !list.length) return null;
-  let pen = 0; list.forEach(a => { if (!a.owner) pen += 4; if (a.risks.length) pen += 6 + a.risks.length * 2; if (a.externalEndpoint) pen += 2; });
+  let pen = 0; list.forEach(a => { if (!a.owner) pen += 4; if (a.risks.length) pen += 6 + a.risks.length * 2; if (a.externalEndpoint) pen += 2; if (a.toxic) pen += 12; else if (a.reachesCritical) pen += 5; });
   return Math.max(0, 100 - Math.min(100, Math.round(pen / Math.max(1, list.length) * 6)));
 }
 
 function agentCard(a){
-  const cls = (a.risks.length && !a.owner) ? "critflag" : (a.risks.length || !a.owner) ? "flag" : "";
+  const cls = (a.toxic || (a.risks.length && !a.owner)) ? "critflag" : (a.risks.length || !a.owner || a.reachesCritical) ? "flag" : "";
   const chips = [];
+  if (a.toxic) chips.push('<span class="ar-chip toxic">⚠ toxic combo</span>');
   if (!a.owner) chips.push('<span class="ar-chip noowner">⚠ no owner</span>');
   chips.push(a.managed ? '<span class="ar-chip managed">managed</span>' : '<span class="ar-chip shadow">no Entra ID</span>');
+  if (a.reachesCritical && !a.toxic) chips.push('<span class="ar-chip reach">reaches crown jewel</span>');
   if (a.externalEndpoint) chips.push('<span class="ar-chip ext">external endpoint</span>');
   if (a.risks.length) chips.push('<span class="ar-chip risk">' + a.risks.length + ' risk</span>');
   const meta = [];
@@ -18146,13 +18217,16 @@ function agentCard(a){
   meta.push(a.owner
     ? ('<span><b>Owner' + (a.ownerCount === 1 ? "" : "s") + ':</b> ' + esc((a.ownerNames && a.ownerNames.length) ? a.ownerNames.join(", ") : String(a.ownerCount)) + '</span>')
     : '<span class="ar-owner-note">no owner / sponsor — accountability gap</span>');
+  if (a.privilegedOperators && a.privilegedOperators.length) meta.push('<span><b>Privileged operator' + (a.privilegedOperators.length === 1 ? "" : "s") + ':</b> ' + esc(a.privilegedOperators.join(", ")) + '<span class="ar-priv">privileged</span></span>');
   const risks = a.risks.length ? ('<div class="ar-risks">' + a.risks.slice(0, 6).map(r => '<span class="ar-risk">' + esc(r) + '</span>').join("") + '</div>') : "";
+  const toxic = a.toxic ? ('<div class="ar-toxic"><b>⚠ Toxic combo →</b> a privileged account (' + esc((a.privilegedOperators || []).join(", ")) + ') can operate this agent, and it reaches a crown jewel'
+    + ((a.reach && a.reach[0] && a.reach[0].target) ? ' (' + esc(a.reach[0].target) + ')' : '') + '. Compromise of that account drives the agent straight into crown-jewel data — verified against the resolved admin set.</div>') : "";
   return '<div class="ar-agent ' + cls + '">'
     + '<div class="ar-agent-h"><span class="ar-agent-nm">' + (a.local ? "💻 " : "✦ ") + esc(a.name) + '</span>'
     + '<span class="ar-plat">' + esc(a.platform) + '</span>'
     + '<span style="margin-left:auto;display:flex;gap:5px;flex-wrap:wrap">' + chips.join("") + '</span></div>'
     + '<div class="ar-agent-meta">' + meta.join("") + '</div>'
-    + risks + '</div>';
+    + risks + toxic + '</div>';
 }
 
 // Fleet risk-indicator rollup — which Defender risk indicators are most common across the shown segment.
@@ -18189,21 +18263,26 @@ function render(m){
   const withRisk = list.filter(a => a.risks.length).length;
   const managed = list.filter(a => a.managed).length;
   const external = list.filter(a => a.externalEndpoint).length;
+  const toxicN = list.filter(a => a.toxic).length;
   const score = arScore(list);
   const lede = all.length
     ? all.length + " AI agent" + (all.length === 1 ? "" : "s") + " discovered (" + cloud.length + " cloud · " + local.length + " local)"
       + (noOwner ? (" · " + noOwner + " of " + list.length + " " + (AR_SEG === "local" ? "local" : "cloud") + " have no owner") : "")
-      + (withRisk ? (" · " + withRisk + " Defender-flagged") : "") + "."
+      + (withRisk ? (" · " + withRisk + " Defender-flagged") : "")
+      + (toxicN ? (" · " + toxicN + " toxic combo") : "") + "."
     : "No AI agents to assess.";
   const band = '<div class="ar-band">' + (window.EP && EP.scoreGauge && score != null ? EP.scoreGauge(score, { caption: "agent risk" }) : "")
     + '<div><div class="h1">AI &amp; Agents · inventory</div><div class="lede">' + esc(lede) + '</div></div></div>';
   const tile = (v, l, c) => '<div class="ar-tile ' + (c || "") + '"><div class="v">' + v + '</div><div class="l">' + l + '</div></div>';
-  const tiles = '<div class="ar-tiles">'
-    + tile(list.length, (AR_SEG === "local" ? "Local" : "Cloud") + " agents", list.length ? "" : "ok")
+  let tilesInner = tile(list.length, (AR_SEG === "local" ? "Local" : "Cloud") + " agents", list.length ? "" : "ok")
     + tile(noOwner, "No owner / sponsor", noOwner ? "high" : "ok")
     + tile(withRisk, "Defender-flagged", withRisk ? "crit" : "ok")
     + tile(external, "External endpoint", external ? "high" : "ok")
-    + tile(managed, "Managed (Entra ID)", "") + '</div>';
+    + tile(managed, "Managed (Entra ID)", "");
+  // Toxic combo is a managed-only signal (needs an exposure-graph identity) — show it on the cloud segment once
+  // there are managed agents to assess, so an honest 0 reads as "assessed, none" rather than "not looked at".
+  if (AR_SEG === "cloud" && managed) tilesInner += tile(toxicN, "Toxic: privileged → crown jewel", toxicN ? "crit" : "ok");
+  const tiles = '<div class="ar-tiles">' + tilesInner + '</div>';
   const seg = '<div class="ar-seg">'
     + '<button class="' + (AR_SEG === "cloud" ? "on" : "") + '" data-seg="cloud">☁ Cloud <span class="ct">' + cloud.length + '</span></button>'
     + '<button class="' + (AR_SEG === "local" ? "on" : "") + '" data-seg="local">💻 Local <span class="ct">' + local.length + '</span></button></div>';
@@ -18218,7 +18297,7 @@ function render(m){
   const src = (window.EP && EP.DEMO) ? "Demo data." : "Live — Microsoft Defender AgentsInfo via advanced hunting.";
   const note = '<div class="ar-note"><b>Read-only. ' + src + '</b> The agent fleet from Defender’s <b>AgentsInfo</b> table — Copilot Studio, Foundry, M365 Copilot, third-party and endpoint-discovered <b>local</b> agents in one inventory. '
     + 'The headline signals are the <b>owner / sponsor gap</b> (who is accountable for each agent’s lifecycle) and Defender’s <b>risk indicators</b> (e.g. Weak Instructions, Privileged Business-system Access, Published Agent). <b>No Entra ID</b> = not registered with Microsoft Entra Agent ID (legacy / third-party). '
-    + 'Risk indicators need E7 / Agent 365; local-agent discovery needs Defender for Endpoint on onboarded devices. Reach into data (which labelled site / mailbox) and the privileged-operator toxic combo are the next slices.</div>';
+    + 'Risk indicators need E7 / Agent 365; local-agent discovery needs Defender for Endpoint on onboarded devices. For the <b>managed</b> agents we also join the exposure graph: a <b>toxic combo</b> is a verified privileged operator (resolved admin set, never a name guess) who can drive an agent into a crown jewel — compromise the account and the agent carries the attacker into crown-jewel data. Reach into labelled data (which site / mailbox) is the next slice.</div>';
   root.innerHTML = band + tiles + seg + riskRollupHtml(list) + '<div class="ar-h2">Agents · worst-first</div>' + filterChip + rows + note;
   const r2 = document.getElementById("ar-root");
   r2.querySelectorAll("[data-seg]").forEach(el => el.addEventListener("click", () => { AR_SEG = el.getAttribute("data-seg"); AR_RISK = null; render(AR_LAST); }));
@@ -18241,19 +18320,23 @@ function __agentReachSummary(){
   const noOwner = all.filter(a => !a.owner);
   const flagged = all.filter(a => a.risks.length);
   const score = arScore(all);
+  const toxic = all.filter(a => a.toxic);
   const recs = all.slice()
-    .filter(a => a.risks.length || !a.owner)
+    .filter(a => a.toxic || a.risks.length || !a.owner)
     .sort((a, b) => agRank(b) - agRank(a))
     .map(a => {
-      const sev = (a.risks.length && !a.owner) ? "crit" : a.risks.length ? "high" : "med";
-      const reason = a.risks.length ? (" — " + a.risks.slice(0, 2).join(", ") + (a.owner ? "" : " (no owner)")) : " — no owner / sponsor";
-      const fix = a.owner ? "Review the Defender risk indicators and scope this agent's tools / permissions."
+      const sev = (a.toxic || (a.risks.length && !a.owner)) ? "crit" : (a.risks.length || a.reachesCritical) ? "high" : "med";
+      const reason = a.toxic ? (" — privileged operator (" + (a.privilegedOperators || []).join(", ") + ") can drive it into a crown jewel")
+        : a.risks.length ? (" — " + a.risks.slice(0, 2).join(", ") + (a.owner ? "" : " (no owner)"))
+        : " — no owner / sponsor";
+      const fix = a.toxic ? "Scope this agent's tools / permissions away from crown-jewel data, and protect the privileged operator (PIM + phishing-resistant MFA)."
+        : a.owner ? "Review the Defender risk indicators and scope this agent's tools / permissions."
         : "Assign an owner / sponsor accountable for this agent's lifecycle, then review its risk indicators.";
       return { title: a.name + reason, sev: sev, fix: fix };
     });
   return { label: "AI & Agents", score: score, grade: "",
-    lead: all.length + " AI agent(s)" + (noOwner.length ? (" · " + noOwner.length + " with no owner") : "") + (flagged.length ? (" · " + flagged.length + " Defender-flagged") : ""),
-    sev: { crit: all.filter(a => a.risks.length && !a.owner).length, high: all.filter(a => a.risks.length && a.owner).length, med: noOwner.filter(a => !a.risks.length).length, low: all.filter(a => a.owner && !a.risks.length).length },
+    lead: all.length + " AI agent(s)" + (toxic.length ? (" · " + toxic.length + " toxic combo") : "") + (noOwner.length ? (" · " + noOwner.length + " with no owner") : "") + (flagged.length ? (" · " + flagged.length + " Defender-flagged") : ""),
+    sev: { crit: all.filter(a => a.toxic || (a.risks.length && !a.owner)).length, high: all.filter(a => !a.toxic && (a.risks.length && a.owner || a.reachesCritical)).length, med: noOwner.filter(a => !a.risks.length && !a.toxic).length, low: all.filter(a => a.owner && !a.risks.length && !a.toxic && !a.reachesCritical).length },
     top: recs.slice(0, 5).map(r => ({ title: r.title, sev: r.sev, impact: "", search: "" })),
     recs: recs };
 }
