@@ -246,6 +246,8 @@
   .sx-more > .sx-more-sum:hover { color:var(--accent); }
   .sx-more-body { padding:2px 14px 14px; }
   .sx-cov-panel .sx-corr-body { padding-top:10px; }
+  .sx-chain-list { list-style:none; margin:8px 0 0; padding:0; display:flex; flex-direction:column; gap:6px; }
+  .sx-chain-list li { display:flex; align-items:flex-start; gap:8px; font-size:12px; color:var(--text); line-height:1.5; }
   .sx-tc { border:1px solid var(--border); border-left:3px solid var(--border); border-radius:11px; background:var(--card,rgba(255,255,255,.02)); padding:11px 14px; margin-bottom:9px; }
   .sx-tc.crit { border-left-color:var(--sev-crit,#FF4D6D); } .sx-tc.high { border-left-color:var(--amber,#FFC15E); } .sx-tc.med { border-left-color:var(--sev-med,#FFC15E); }
   .sx-tc.go { cursor:pointer; transition:border-color .13s, background .13s; } .sx-tc.go:hover { border-color:var(--accent); background:color-mix(in srgb,var(--accent) 6%,var(--card)); }
@@ -8584,6 +8586,18 @@ window.EP = (function () {
         ingredients: ["A Tier-0 (Global Admin) account", "Interactively signed in on a high-risk, internet-facing device (contoso-ws-01)", "No phishing-resistant method registered (FIDO2 / Windows Hello / Token Protection)"],
         why: "A Global Admin signs in on a high-risk, internet-facing endpoint with a phishable credential — compromise the device or phish the account and the attacker inherits the top of the directory. The identity and endpoint weaknesses meet on one account.",
         fix: "Enforce phishing-resistant MFA (FIDO2) + Token Protection for Tier-0 accounts, and keep Global Admins off high-risk / internet-facing endpoints (use privileged access workstations)." }),
+      _comboOf({ id: "compliance-chain", name: "Non-compliant device · require-compliant CA report-only · reaches data",
+        exp: 3, reach: 3, impact: 3, confidence: "inferred", key: "endpoint", view: "devices", focus: { quick: "exposed" },
+        chain: [{ label: "contoso-nuc-04 · non-compliant", kind: "device" }, { label: "require-compliant CA · report-only", kind: "role" }, { label: "ava.devries0@contoso.com · external forwarding", kind: "data" }],
+        ingredients: ["A non-compliant / high-threat device that enforcement should stop", "Require-compliant Conditional Access is report-only — nothing blocks a device that has drifted", "A user on the device reaches labelled data"],
+        why: "Require-compliant Conditional Access is report-only, so a non-compliant device that should be blocked still has access, and a user on it reaches labelled data — the compliance chain is open end to end.",
+        fix: "Set the require-compliant Conditional Access policy to enforced (not report-only), and bring the drifted devices back into compliance." }),
+      _comboOf({ id: "agent-data", name: "Agent · write permission · no owner / sponsor · reaches highly-confidential data",
+        exp: 3, reach: 3, impact: 3, confidence: "verified", key: "identity", view: "agentreach",
+        chain: [{ label: "Finance Copilot Agent", kind: "agent" }, { label: "Sites.ReadWrite.All", kind: "role" }, { label: "client secret · live", kind: "cve" }, { label: "Highly confidential · Finance — Board Reporting", kind: "data" }],
+        ingredients: ["An AI agent with a write-level permission (Sites.ReadWrite.All)", "A live client secret — a leaked key is the agent", "No owner / sponsor — no accountability", "Reaches highly-confidential data (Finance — Board Reporting)"],
+        why: "An AI agent that can write, holds a live secret with no accountable sponsor, and reaches highly-confidential data — compromise the credential and the agent drives straight into the board-reporting site.",
+        fix: "Assign an owner / sponsor, scope the agent's permissions to least privilege, replace its secret with a managed identity / federated credential, and restrict its access to the site." }),
       _comboOf({ id: "bec", name: "Finance mailbox · external forwarding · weak authentication",
         exp: 3, reach: 2, impact: 2, confidence: "inferred", key: "data", view: "email",
         chain: [{ label: "ava.devries0@contoso.com · Finance", kind: "user" }, { label: "inbox rule → proton.me", kind: "data" }, { label: "no phishing-resistant MFA", kind: "role" }],
@@ -8774,6 +8788,53 @@ window.EP = (function () {
     if (crown && (c.impact || 0) < 3) { const s = _comboScore(c.exp, c.reach, 3); return { crown: crown, score: s.score, sev: s.sev, boosted: true }; }
     return { crown: crown, score: c.score, sev: c.sev, boosted: false };
   }
+  // Live (C6 #2): the compliance chain, made an entity-level combo — devices that should be gated (non-compliant /
+  // high-threat) while require-compliant Conditional Access is report-only / disabled, raised when a correlated device
+  // reaches labelled data. Built from the device chain roll-up + the correlation links; device specifics live in the
+  // Devices view (deep-linked), the data leg is named from a link when present.
+  function _comboCompliance(st) {
+    const chain = st && st.chain; if (!chain) return [];
+    const posture = chain.caPosture, need = chain.needsGating || 0;
+    if (posture === "enforced" || !need) return [];
+    const dataLink = ((st && st.links) || []).find(l => l.data);
+    const lbl = posture === "reportonly" ? "report-only" : posture === "off" ? "disabled" : "not configured";
+    return [_comboOf({ id: "compliance-chain", name: need + " non-compliant / high-threat device" + (need === 1 ? "" : "s") + " · require-compliant CA " + lbl + (dataLink ? " · reaches data" : ""),
+      exp: 3, reach: dataLink ? 3 : 2, impact: dataLink ? 3 : 2, confidence: "inferred", key: "endpoint", view: "devices", focus: { quick: "exposed" },
+      chain: [{ label: need + " drifted device" + (need === 1 ? "" : "s"), kind: "device" }, { label: "require-compliant CA · " + lbl, kind: "role" }].concat(dataLink ? [{ label: (dataLink.data.upn || "mailbox") + " · " + dataLink.data.issue, kind: "data" }] : []),
+      ingredients: [].concat(need + " non-compliant / high-threat device" + (need === 1 ? "" : "s") + " that enforcement should stop", "Require-compliant Conditional Access is " + lbl + " — nothing blocks a device that has drifted", dataLink ? ["A user on a correlated device reaches labelled data (" + (dataLink.data.upn || "mailbox") + ")"] : []),
+      why: "Require-compliant Conditional Access is " + lbl + ", so " + need + " non-compliant / high-threat device" + (need === 1 ? "" : "s") + " that should be blocked still ha" + (need === 1 ? "s" : "ve") + " access" + (dataLink ? ", and a user on a correlated device reaches labelled data" : "") + " — the compliance chain is open end to end.",
+      fix: "Set the require-compliant Conditional Access policy to enforced (not report-only), and bring the drifted devices back into compliance." })];
+  }
+  // Live (C6 #3): an AI agent that can WRITE, holds a standing credential and reaches sensitive data, with no owner /
+  // sponsor — compromise the credential and the agent drives straight into the data. Read from the shared exposure
+  // graph's agent nodes (a native write / authenticate-as edge terminating at a sensitive data node). Credential
+  // liveness reuses _appCredState (C7); emitted only when write AND a sensitive-data reach are both present.
+  function _comboAgent(g) {
+    if (!g || !g.nodes) return [];
+    const E = g.edges, nm = g.nmap, out = [];
+    g.nodes.filter(n => n.kind === "agent").forEach(n => {
+      const raw = (n.props && (n.props.rawData || n.props)) || {};
+      let flat = ""; try { flat = JSON.stringify(raw).toLowerCase(); } catch (e) { flat = ""; }
+      const writeEdge = E.some(e => e.from === n.id && /permission|role on|authenticate as/i.test(e.label) && /write|readwrite|mail\.|sites\.|directory\.|full_access/i.test((e.label + " " + (e.toName || "")).toLowerCase()));
+      if (!writeEdge) return;
+      let dataT = null;
+      E.filter(e => e.from === n.id).forEach(e => { const t = nm[e.to]; if (t && t.kind === "data" && (t.sensitive || t.sensitivity)) dataT = dataT || t; });
+      if (!dataT) E.filter(e => e.from === n.id && /authenticate as/i.test(e.label)).forEach(e => { const sp = nm[e.to]; if (!sp) return; E.filter(x => x.from === sp.id).forEach(x => { const t = nm[x.to]; if (t && t.kind === "data" && (t.sensitive || t.sensitivity)) dataT = dataT || t; }); });
+      if (!dataT) return;
+      const cred = _appCredState(raw, flat), liveCred = cred === "live" || cred === "unknown" || /federated|clientassertion/.test(flat);
+      const ownerless = !E.some(e => e.to === n.id && /owns|owner|sponsor/i.test(e.label)) && !(raw.owners && raw.owners.length);
+      if (!liveCred && !ownerless) return;
+      const gaps = [].concat(ownerless ? ["no owner / sponsor"] : [], liveCred ? ["a standing credential"] : []);
+      const sens = dataT.sensitivity ? dataT.sensitivity.toLowerCase() + " data" : "sensitive data";
+      out.push(_comboOf({ id: "agent-" + n.id, name: "Agent · write permission · " + gaps.join(" · ") + " · reaches " + sens,
+        exp: ownerless ? 3 : 2, reach: 3, impact: 3, confidence: "verified", key: "identity", view: "agentreach",
+        chain: [{ label: _cbName(n), kind: "agent" }, { label: "write permission", kind: "role" }].concat(liveCred ? [{ label: "standing credential", kind: "cve" }] : []).concat([{ label: (dataT.sensitivity ? dataT.sensitivity + " · " : "") + _cbName(dataT), kind: "data" }]),
+        ingredients: [].concat("An AI agent with a write-level permission", liveCred ? ["A standing credential — a leaked key is the agent"] : [], ownerless ? ["No owner / sponsor — no accountability"] : [], "Reaches " + sens + " (" + _cbName(dataT) + ")"),
+        why: "An AI agent that can write" + (liveCred ? ", holds a standing credential" : "") + (ownerless ? " with no accountable sponsor" : "") + ", and reaches " + sens + " — compromise the credential and the agent drives straight into the data.",
+        fix: "Assign an owner / sponsor, scope the agent's permissions to least privilege, replace its secret with a managed identity / federated credential, and restrict its access to that data." }));
+    });
+    return out.sort((a, b) => b.score - a.score).slice(0, 3);
+  }
   // C1: the engine records which sources actually fed it (loaded? how many items?), so the panel can show a
   // coverage strip and only call "none" honest when every source loaded. Set on each run.
   let _comboSources = null;
@@ -8810,8 +8871,10 @@ window.EP = (function () {
     try { out.push.apply(out, _comboApp(g)); } catch (e) {}
     try { out.push.apply(out, _comboInternetKev(st, apg)); } catch (e) {}
     try { out.push.apply(out, _comboIdentityEndpoint((st && st.links) || [])); } catch (e) {}
+    try { out.push.apply(out, _comboCompliance(st)); } catch (e) {}
     try { out.push.apply(out, _comboBec(st)); } catch (e) {}
     try { out.push.apply(out, _comboGuest(g)); } catch (e) {}
+    try { out.push.apply(out, _comboAgent(g)); } catch (e) {}
     const seen = new Set();
     return out.filter(c => c && c.name && !seen.has(c.id || c.name) && (seen.add(c.id || c.name), true)).sort((a, b) => b.score - a.score).slice(0, 8);
   }
@@ -8946,8 +9009,12 @@ window.EP = (function () {
     suiteChainBreaks(st).forEach(c => tier1.push({ title: c.title, sev: c.sev, pillar: "Endpoint ↔ Identity", key: "endpoint", view: "devices", focus: { quick: c.quick }, chain: true, _score: 82 }));
     ((st && st.combos) || []).map(c => { const cs = _crownScore(c); return { c: c, score: cs.score, sev: cs.sev, crown: !!cs.crown }; })
       .forEach(e => { const c = e.c; tier1.push({ title: c.name + " — " + c.fix, sev: e.sev, pillar: "Toxic combo", key: c.key || "identity", view: c.view || null, focus: c.focus || null, combo: true, crown: e.crown, _score: e.score + (e.crown ? 200 : 100) }); });
-    tier1.sort((a, b) => (b._score || 0) - (a._score || 0));
-    tier1.slice(0, 4).forEach(pushIf);   // keep room below for choke points + single findings
+    // Combinations lead (top 3 by score), then the single highest-leverage correlated path, then the compliance-chain
+    // / admin-on-risky-device breaks — so the cross-domain cuts (including C11's admin-device item) aren't crowded out
+    // by the combos, while combinations still head the list.
+    tier1.filter(x => x.combo).sort((a, b) => (b._score || 0) - (a._score || 0)).slice(0, 3).forEach(pushIf);
+    tier1.filter(x => x.path).forEach(pushIf);
+    tier1.filter(x => x.chain).slice(0, 2).forEach(pushIf);
     // ── Tier 2: choke points — a node many attack paths pass through (fix once, cut many) ──
     let _apg = null; try { _apg = viewApi("attackpaths").graph(); } catch (e) { _apg = null; }
     if (_apg && !_apg.needsExp && Array.isArray(_apg.chokes)) {
@@ -8958,7 +9025,7 @@ window.EP = (function () {
     const singles = [];
     SUITE_PILLARS.forEach(p => (perPillar[p.key] || []).forEach(it => singles.push(it)));
     singles.sort((a, b) => sevScore(b.sev) - sevScore(a.sev) || (porder[a.key] == null ? 9 : porder[a.key]) - (porder[b.key] == null ? 9 : porder[b.key]));
-    for (let i = 0; i < singles.length && top.length < 8; i++) pushIf(singles[i]);
+    for (let i = 0; i < singles.length && top.length < 10; i++) pushIf(singles[i]);
     if (st) st.fixTop = actTop.concat(top);   // AI brief prioritises incidents first, then the path/posture items
     const aiLink = llm && llm.ready() ? '<button class="ov-fix-ai" id="suiteAiBtn">✦ brief with AI</button>' : '<span class="ov-chg-cap" title="Set a model in Configuration to enable the AI brief">✦ AI needs a model</span>';
     // A "why #1" chip makes the ranking visible: cross-estate path cut, a Microsoft-flagged/confirmed-compromised
@@ -9542,8 +9609,9 @@ window.EP = (function () {
         : { sev: "high", quick: "exposed",
             title: "Require-compliant Conditional Access is " + lbl + " — compliance is advisory; nothing blocks a device that drifts or carries a Defender alert" });
     }
-    if (adminR) items.push({ sev: "crit", quick: "adminrisk",
-      title: adminR + " high-risk device" + (adminR === 1 ? "" : "s") + " used by an administrator — a compromised endpoint becomes privileged-account takeover" });
+    if (adminR) { const ad = chain.adminDistinct || 0;   // C11: the Devices-banner wording — an ownership record, not a sign-in
+      items.push({ sev: "crit", quick: "adminrisk",
+        title: adminR + " high-risk device" + (adminR === 1 ? "" : "s") + " whose Intune primary user is an administrator" + (ad ? " · " + ad + " distinct admin" + (ad === 1 ? "" : "s") : "") + " — a compromised endpoint becomes privileged-account takeover (primary user is an ownership record, not a verified sign-in)" }); }
     if (blind) items.push({ sev: "high", quick: "blindspot",
       title: blind + " compliant device" + (blind === 1 ? "" : "s") + " with a High Defender alert — compliance isn't turning Defender risk into non-compliance" });
     return items;
@@ -9723,12 +9791,13 @@ window.EP = (function () {
     const steps = ["Defender risk", "Intune compliance", "Entra", "Conditional Access", "access"];
     const flow = '<div class="sx-chain-flow">' + steps.map((s, i) => (i ? '<span class="sx-chain-ar">&rarr;</span>' : "") + '<span class="sx-chain-step">' + esc(s) + '</span>').join("") + '</div>';
     const status = items.length
-      ? '<b style="color:var(--sev-crit)">' + items.length + ' enforcement gap' + (items.length === 1 ? "" : "s") + '</b> — where the chain breaks, a risky device still gets in. ' + (items.length === 1 ? "It is" : "They are") + ' ranked in <b>Fix this first</b> above.'
+      ? '<b style="color:var(--sev-crit)">' + items.length + ' enforcement gap' + (items.length === 1 ? "" : "s") + '</b> — where the chain breaks, a risky device still gets in; the worst also rank in <b>Top risks</b>:'
       : (chain.caPosture === "enforced"
           ? '<b style="color:var(--green)">✓ The chain holds</b> — risky and non-compliant devices are gated end-to-end by an enforced require-compliant policy.'
           : 'Compliance-chain enforcement not assessed yet — open the Endpoint pillar to evaluate the require-compliant Conditional Access chain.');
+    const list = items.length ? '<ul class="sx-chain-list">' + items.map(it => '<li>' + ovSevBadge(it.sev) + '<span>' + esc(it.title) + '</span></li>').join("") + '</ul>' : "";
     return '<div class="ov-panel sx-corr"><div class="ov-panel-h">Cross-domain enforcement<span class="ov-chg-cap">compliance chain · live</span></div>'
-      + '<div class="sx-corr-body">' + flow + '<div class="sx-lede">' + status + '</div></div></div>';
+      + '<div class="sx-corr-body">' + flow + '<div class="sx-lede">' + status + '</div>' + list + '</div></div>';
   }
   // §2 Toxic-combination catalogue panel — the scored cross-domain chains, worst-first. Each row shows the score
   // (exploitability × reachability × impact), the chain as kind-coded ingredient chips, the confidence (verified /
@@ -27327,7 +27396,9 @@ function __dpDevSummary(){
   // Cross-domain compliance-chain counts, so the CA view can mirror the enforcement gaps from the policy side.
   const chain = { total: ds.length, needsGating: ds.filter(chainNeedsGating).length, blindspot: ds.filter(chainBlindspot).length,
     nonCompliant: ds.filter(d => d.compliance === "noncompliant").length, highThreat: ds.filter(d => d.threat === "High").length,
-    adminRisk: ds.filter(adminAtRisk).length, caPosture: (DALL.ca && DALL.ca.posture) || null };
+    adminRisk: ds.filter(adminAtRisk).length,
+    adminDistinct: new Set(ds.filter(adminAtRisk).map(d => String(d.user || "").toLowerCase().trim()).filter(u => u && u !== "—")).size,   // distinct admins (Intune primary user), not device count (C11)
+    caPosture: (DALL.ca && DALL.ca.posture) || null };
   // Complete internet-facing host list (authoritative IsInternetFacing from the inventory) for the Endpoint
   // overview's exposure surface; IP + reach-to-critical are enriched from the attack-paths graph there.
   const internetFacing = ds.filter(d => d.internet === true).map(d => ({ name: d.name, crit: (d.criticality && d.criticality !== "—") ? d.criticality : null, reason: d.internetReason || null, threat: d.threat || null, exposure: (d.exposure && d.exposure !== "—") ? d.exposure : null, ports: (d.openPorts && d.openPorts.length) ? d.openPorts : null }));
