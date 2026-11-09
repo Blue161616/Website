@@ -1840,6 +1840,7 @@
 #view-agentreach .ar-chip.ext { color:var(--sev-high); background:color-mix(in srgb,var(--sev-high) 13%,transparent); }
 #view-agentreach .ar-chip.toxic { color:#fff; background:color-mix(in srgb,var(--sev-crit) 72%,transparent); }
 #view-agentreach .ar-chip.reach { color:var(--sev-crit); background:color-mix(in srgb,var(--sev-crit) 14%,transparent); }
+#view-agentreach .ar-chip.data { color:#34D3A6; background:color-mix(in srgb,#34D3A6 15%,transparent); }
 #view-agentreach .ar-priv { font-size:9.5px; font-weight:800; letter-spacing:.03em; text-transform:uppercase; color:var(--sev-crit); background:color-mix(in srgb,var(--sev-crit) 15%,transparent); border-radius:5px; padding:1px 5px; margin-left:4px; }
 #view-agentreach .ar-toxic { margin-top:8px; font-size:11.5px; line-height:1.55; color:var(--text); background:color-mix(in srgb,var(--sev-crit) 10%,transparent); border-left:2px solid var(--sev-crit); padding:6px 10px; border-radius:0 7px 7px 0; }
 #view-agentreach .ar-toxic b { color:var(--sev-crit); font-weight:700; }
@@ -10095,6 +10096,11 @@ window.EP = (function () {
       if (/user/.test(s) && /guest|external/.test(s)) return "guest";
       if (/guest/.test(s)) return "guest";
       if (/device|virtualmachine|ec2|machine/.test(s)) return "device";
+      // §2 data-reach: cloud data stores + labelled M365 content become first-class "data" nodes so reach can
+      // terminate at the DATA, not just at a crown-jewel tag. Matched before the user/"account" branch so a
+      // storageAccount isn't misread as an identity. (SharePoint/OneDrive/Exchange appear only when a DSPM / Purview
+      // connector feeds the graph; Azure/AWS/GCP data stores are native to Exposure Management.)
+      if (/storage|blob|bucket|datalake|data.?lake|cosmos|sqlserver|sqldatabase|\bsql\b|database|keyvault|key.?vault|fileshare|file.?share|dataverse|redshift|bigquery|sharepoint|onedrive|mailbox|exchange.?online/.test(s)) return "data";
       if (/serviceprincipal|\bsp\b/.test(s)) return "sp";
       if (/app|application|oauth/.test(s)) return "app";
       if (/group/.test(s)) return "group";
@@ -10120,6 +10126,60 @@ window.EP = (function () {
       let out = rows.map(r => ({ id: r.NodeId, name: r.NodeName, kind: kindOf(r.NodeLabel), rawLabel: r.NodeLabel, crit: CRIT_LABELS[+r.L] || "High", critLevel: +r.L }));
       if (opts.kind) out = out.filter(n => n.kind === opts.kind);
       return out;
+    }
+
+    // ===== §2 data-reach: make DATA a first-class, reachable node =====
+    // Cloud data stores (Azure/AWS/GCP storage, SQL, Key Vault, data lake, Dataverse) are native to the Exposure
+    // Management graph; SharePoint/OneDrive/Exchange content is present only when a DSPM / Purview connector feeds
+    // the graph (never fabricated here). The overlay pulls data nodes the base cap may have missed, stamps a
+    // human data-kind + a best-effort sensitivity, and pulls the one-hop inbound edges that REACH them — so the
+    // consumers (§1 agent toxic combo, Attack Paths, correlation) can terminate reach at the data, verified.
+    const DATA_TOKENS = ["storage", "blob", "bucket", "datalake", "cosmos", "sqlserver", "sqldatabase", "keyvault",
+      "fileshare", "dataverse", "redshift", "bigquery", "sharepoint", "onedrive", "mailbox"];
+    function dataKindOf(label) {
+      const s = String(label || "").toLowerCase();
+      if (/sharepoint|onedrive/.test(s)) return "SharePoint / OneDrive";
+      if (/mailbox|exchange/.test(s)) return "Mailbox";
+      if (/keyvault|key.?vault/.test(s)) return "Key Vault";
+      if (/sqlserver|sqldatabase|\bsql\b|database|cosmos|redshift|bigquery/.test(s)) return "Database";
+      if (/datalake|data.?lake/.test(s)) return "Data lake";
+      if (/dataverse/.test(s)) return "Dataverse";
+      if (/blob|bucket|storage|fileshare|file.?share/.test(s)) return "Object / file storage";
+      return "Data store";
+    }
+    // Best-effort sensitivity from a node's raw properties (Defender for Cloud / Purview surface these unevenly) —
+    // null when nothing in the properties indicates a classification, so we never claim sensitivity we didn't read.
+    function dataSensitivity(props) {
+      try { const raw = (props && (props.rawData || props)) || {}; const flat = JSON.stringify(raw).toLowerCase();
+        if (/highly.?confidential|top.?secret|restricted/.test(flat)) return "Highly confidential";
+        if (/confidential|secret|\bpii\b|sensitivedata|sensitivitylabel|classification/.test(flat)) return "Sensitive";
+      } catch (e) {}
+      return null;
+    }
+    function annotateData(n) { n.kind = "data"; n.dataKind = dataKindOf(n.rawLabel);
+      n.sensitivity = dataSensitivity(n.props); n.sensitive = !!n.sensitivity; return n; }
+    // Data stores with their sensitivity, independent of the cached graph (one hunt). kind filter already "data".
+    async function dataAssets(opts) {
+      opts = opts || {};
+      const rows = await hunt("ExposureGraphNodes | where tolower(NodeLabel) has_any ('" + DATA_TOKENS.join("','") + "')"
+        + " | project NodeId, NodeName, NodeLabel, NodeProperties | take " + (opts.max || 400));
+      return rows.map(normNode).map(annotateData);
+    }
+    async function dataReachOverlay(graph) {
+      const nmap = graph.nmap, addNodes = [], addEdges = [];
+      // 1) annotate data nodes already in the loaded graph (kind set by kindOf; add the human kind + sensitivity).
+      graph.nodes.filter(n => n.kind === "data").forEach(n => { if (!n.dataKind) annotateData(n); });
+      // 2) pull data stores the base node cap may have missed, add the ones not already present.
+      let extra = []; try { extra = await dataAssets({ max: 400 }); } catch (e) { extra = []; }
+      extra.forEach(n => { if (!nmap[n.id]) { nmap[n.id] = n; addNodes.push(n); } });
+      // 3) one-hop inbound edges reaching the data nodes we just added (who / what can read the data). Native → verified.
+      const addedIds = addNodes.map(n => n.id);
+      if (addedIds.length) {
+        try { (await hunt("ExposureGraphEdges | where TargetNodeId in " + idList(addedIds)
+          + " | project EdgeId, EdgeLabel, SourceNodeId, SourceNodeName, SourceNodeLabel, TargetNodeId, TargetNodeName, TargetNodeLabel, EdgeProperties | take 1000"))
+          .map(normEdge).filter(e => e.from && e.to && (nmap[e.from] || nmap[e.to])).forEach(e => addEdges.push(e)); } catch (e) {}
+      }
+      return { nodes: addNodes, edges: addEdges };
     }
 
     // Shortest back-path (BFS up inbound edges) from an entry point to targetId; null if none.
@@ -10182,8 +10242,10 @@ window.EP = (function () {
     function graph() { return _cache; }
     function reset() { _cache = null; }
 
+    addOverlay("data-reach", dataReachOverlay);   // §2 — DATA becomes a reachable node on every load()
+
     return { hunt: hunt, idList: idList, isGuid: isGuid, kindOf: kindOf, CRIT_LABELS: CRIT_LABELS,
-      normNode: normNode, normEdge: normEdge, criticalAssets: criticalAssets, backPaths: backPaths,
+      normNode: normNode, normEdge: normEdge, criticalAssets: criticalAssets, dataAssets: dataAssets, backPaths: backPaths,
       neighbors: neighbors, chokePoints: chokePoints, addOverlay: addOverlay, load: load,
       nodes: nodes, edges: edges, graph: graph, reset: reset };
   })();
@@ -18161,7 +18223,7 @@ function normAgent(r){
     risks: risks, tools: tools, mcp: mcp, connected: connected,
     externalEndpoint: endpointExternal(r.Endpoints), published: /^publish/i.test(r.PublishedStatus || ""),
     // exposure-graph enrichment (filled for managed agents by joinExposureToxic; honest defaults otherwise)
-    exposureMatched: false, operators: [], privilegedOperators: [], reach: [], reachesCritical: false, toxic: false
+    exposureMatched: false, operators: [], privilegedOperators: [], reach: [], reachesCritical: false, reachesData: false, toxic: false
   };
 }
 
@@ -18243,26 +18305,29 @@ async function joinExposureToxic(agents){
     authAs.forEach(sp => {
       E.filter(e => e.from === sp.id && /permissions to|has role on/i.test(e.label)).forEach(e => {
         const t = nm[e.to]; if (!t) return;
-        reach.push({ via: dName(sp), target: dName(t), crit: t.crit || null, saas: t.rawLabel === "SaaS Application" });
+        reach.push({ via: dName(sp), target: dName(t), crit: t.crit || null, saas: t.rawLabel === "SaaS Application",
+          data: t.kind === "data", sensitivity: t.sensitivity || null });
       });
-      if (sp.crit) reach.push({ via: dName(sp), target: dName(sp), crit: sp.crit, saas: false });
+      if (sp.crit) reach.push({ via: dName(sp), target: dName(sp), crit: sp.crit, saas: false, data: false, sensitivity: null });
     });
     a.exposureMatched = true;
     a.operators = operators;
     a.reach = reach;
     a.reachesCritical = reach.some(r => r.crit) || authAs.some(s => s.crit);
+    a.reachesData = reach.some(r => r.data);   // §2: reach terminates at a labelled data store, not just a crown-jewel tag
     a.privilegedOperators = operators.filter(o => o.privileged).map(o => o.name);
-    a.toxic = !!(a.reachesCritical && a.privilegedOperators.length);
+    // Toxic when a privileged operator meets EITHER crown-jewel reach OR sensitive-data reach.
+    a.toxic = !!((a.reachesCritical || reach.some(r => r.data && r.sensitivity)) && a.privilegedOperators.length);
   });
 }
 
 // ---- demo: a realistic fleet — cloud (Copilot Studio + third-party, mostly unowned, Defender-flagged) + local ----
 function demoModel(){
-  const A = (o) => Object.assign({ platform:"Copilot Studio", local:false, model:null, version:null, managed:false, blueprint:null, owner:false, ownerCount:0, risks:[], tools:0, mcp:0, connected:0, externalEndpoint:false, published:true, exposureMatched:false, operators:[], privilegedOperators:[], reach:[], reachesCritical:false, toxic:false }, o);
+  const A = (o) => Object.assign({ platform:"Copilot Studio", local:false, model:null, version:null, managed:false, blueprint:null, owner:false, ownerCount:0, risks:[], tools:0, mcp:0, connected:0, externalEndpoint:false, published:true, exposureMatched:false, operators:[], privilegedOperators:[], reach:[], reachesCritical:false, reachesData:false, toxic:false }, o);
   return { live:false, licensed:true, agents:[
     A({ id:"c1", name:"Message Center Adoption Agent", platform:"Other", risks:["Published Agent","Weak Instructions"], tools:3, published:true }),
     A({ id:"c2", name:"Finance Copilot Agent", platform:"Copilot Studio", managed:true, owner:true, ownerCount:1, ownerNames:["ava.devries@contoso.com"], model:"GPT-4o", risks:["Privileged Business-system Access"], tools:5, mcp:1, externalEndpoint:true,
-       exposureMatched:true, operators:[{name:"ava.devries@contoso.com",privileged:true}], privilegedOperators:["ava.devries@contoso.com"], reach:[{via:"svc-finance-bot",target:"Finance — Board Reporting (SharePoint)",crit:"Very high",saas:false}], reachesCritical:true, toxic:true }),
+       exposureMatched:true, operators:[{name:"ava.devries@contoso.com",privileged:true}], privilegedOperators:["ava.devries@contoso.com"], reach:[{via:"svc-finance-bot",target:"Finance — Board Reporting (SharePoint)",crit:"Very high",saas:false,data:true,sensitivity:"Highly confidential"}], reachesCritical:true, reachesData:true, toxic:true }),
     A({ id:"c3", name:"Seaworthy Insurance Bot", platform:"Other", risks:["Published Agent"], tools:1 }),
     A({ id:"c4", name:"HR Onboarding Agent", platform:"Copilot Studio", managed:true, owner:false, model:"GPT-4o-mini", risks:["Weak Instructions"], tools:2 }),
     A({ id:"c5", name:"Nexoya", platform:"Other", risks:["Published Agent","Indirect Prompt Injection Exposure"], tools:4, externalEndpoint:true }),
@@ -18272,20 +18337,22 @@ function demoModel(){
   ] };
 }
 
-function agRank(a){ return (a.toxic ? 120 : 0) + (a.reachesCritical ? 30 : 0) + (a.risks.length ? 40 + a.risks.length * 8 : 0) + (!a.owner ? 20 : 0) + (a.externalEndpoint ? 8 : 0) + (!a.managed ? 4 : 0) + (a.mcp ? 3 : 0); }
+function agRank(a){ return (a.toxic ? 120 : 0) + (a.reachesCritical ? 30 : 0) + (a.reachesData ? 26 : 0) + (a.risks.length ? 40 + a.risks.length * 8 : 0) + (!a.owner ? 20 : 0) + (a.externalEndpoint ? 8 : 0) + (!a.managed ? 4 : 0) + (a.mcp ? 3 : 0); }
 function arScore(list){
   if (!list || !list.length) return null;
-  let pen = 0; list.forEach(a => { if (!a.owner) pen += 4; if (a.risks.length) pen += 6 + a.risks.length * 2; if (a.externalEndpoint) pen += 2; if (a.toxic) pen += 12; else if (a.reachesCritical) pen += 5; });
+  let pen = 0; list.forEach(a => { if (!a.owner) pen += 4; if (a.risks.length) pen += 6 + a.risks.length * 2; if (a.externalEndpoint) pen += 2; if (a.toxic) pen += 12; else if (a.reachesCritical || a.reachesData) pen += 5; });
   return Math.max(0, 100 - Math.min(100, Math.round(pen / Math.max(1, list.length) * 6)));
 }
 
 function agentCard(a){
-  const cls = (a.toxic || (a.risks.length && !a.owner)) ? "critflag" : (a.risks.length || !a.owner || a.reachesCritical) ? "flag" : "";
+  const cls = (a.toxic || (a.risks.length && !a.owner)) ? "critflag" : (a.risks.length || !a.owner || a.reachesCritical || a.reachesData) ? "flag" : "";
+  const dataReach = (a.reach || []).find(r => r.data) || null;   // §2: the labelled data store this agent reaches
   const chips = [];
   if (a.toxic) chips.push('<span class="ar-chip toxic">⚠ toxic combo</span>');
   if (!a.owner) chips.push('<span class="ar-chip noowner">⚠ no owner</span>');
   chips.push(a.managed ? '<span class="ar-chip managed">managed</span>' : '<span class="ar-chip shadow">no Entra ID</span>');
-  if (a.reachesCritical && !a.toxic) chips.push('<span class="ar-chip reach">reaches crown jewel</span>');
+  if (a.reachesData && !a.toxic) chips.push('<span class="ar-chip data">reaches ' + (dataReach && dataReach.sensitivity ? esc(dataReach.sensitivity.toLowerCase()) + ' data' : 'data') + '</span>');
+  if (a.reachesCritical && !a.reachesData && !a.toxic) chips.push('<span class="ar-chip reach">reaches crown jewel</span>');
   if (a.externalEndpoint) chips.push('<span class="ar-chip ext">external endpoint</span>');
   if (a.risks.length) chips.push('<span class="ar-chip risk">' + a.risks.length + ' risk</span>');
   const meta = [];
@@ -18298,8 +18365,12 @@ function agentCard(a){
     : '<span class="ar-owner-note">no owner / sponsor — accountability gap</span>');
   if (a.privilegedOperators && a.privilegedOperators.length) meta.push('<span><b>Privileged operator' + (a.privilegedOperators.length === 1 ? "" : "s") + ':</b> ' + esc(a.privilegedOperators.join(", ")) + '<span class="ar-priv">privileged</span></span>');
   const risks = a.risks.length ? ('<div class="ar-risks">' + a.risks.slice(0, 6).map(r => '<span class="ar-risk">' + esc(r) + '</span>').join("") + '</div>') : "";
-  const toxic = a.toxic ? ('<div class="ar-toxic"><b>⚠ Toxic combo →</b> a privileged account (' + esc((a.privilegedOperators || []).join(", ")) + ') can operate this agent, and it reaches a crown jewel'
-    + ((a.reach && a.reach[0] && a.reach[0].target) ? ' (' + esc(a.reach[0].target) + ')' : '') + '. Compromise of that account drives the agent straight into crown-jewel data — verified against the resolved admin set.</div>') : "";
+  const tTgt = dataReach || (a.reach || []).find(r => r.crit) || (a.reach && a.reach[0]) || null;
+  const tData = !!(tTgt && tTgt.data);
+  const toxic = a.toxic ? ('<div class="ar-toxic"><b>⚠ Toxic combo →</b> a privileged account (' + esc((a.privilegedOperators || []).join(", ")) + ') can operate this agent, and it reaches '
+    + (tData ? ((tTgt.sensitivity ? esc(tTgt.sensitivity.toLowerCase()) + ' data' : 'labelled data') + (tTgt.target ? ' (' + esc(tTgt.target) + ')' : ''))
+             : ('a crown jewel' + (tTgt && tTgt.target ? ' (' + esc(tTgt.target) + ')' : '')))
+    + '. Compromise of that account drives the agent straight into ' + (tData ? 'the data' : 'crown-jewel data') + ' — verified against the resolved admin set.</div>') : "";
   return '<div class="ar-agent ' + cls + '">'
     + '<div class="ar-agent-h"><span class="ar-agent-nm">' + (a.local ? "💻 " : "✦ ") + esc(a.name) + '</span>'
     + '<span class="ar-plat">' + esc(a.platform) + '</span>'
@@ -18376,7 +18447,7 @@ function render(m){
   const src = (window.EP && EP.DEMO) ? "Demo data." : "Live — Microsoft Defender AgentsInfo via advanced hunting.";
   const note = '<div class="ar-note"><b>Read-only. ' + src + '</b> The agent fleet from Defender’s <b>AgentsInfo</b> table — Copilot Studio, Foundry, M365 Copilot, third-party and endpoint-discovered <b>local</b> agents in one inventory. '
     + 'The headline signals are the <b>owner / sponsor gap</b> (who is accountable for each agent’s lifecycle) and Defender’s <b>risk indicators</b> (e.g. Weak Instructions, Privileged Business-system Access, Published Agent). <b>No Entra ID</b> = not registered with Microsoft Entra Agent ID (legacy / third-party). '
-    + 'Risk indicators need E7 / Agent 365; local-agent discovery needs Defender for Endpoint on onboarded devices. For the <b>managed</b> agents we also join the exposure graph: a <b>toxic combo</b> is a verified privileged operator (resolved admin set, never a name guess) who can drive an agent into a crown jewel — compromise the account and the agent carries the attacker into crown-jewel data. Reach into labelled data (which site / mailbox) is the next slice.</div>';
+    + 'Risk indicators need E7 / Agent 365; local-agent discovery needs Defender for Endpoint on onboarded devices. For the <b>managed</b> agents we also join the exposure graph: a <b>toxic combo</b> is a verified privileged operator (resolved admin set, never a name guess) who can drive an agent into a crown jewel — compromise the account and the agent carries the attacker into crown-jewel data. Where the agent reaches a <b>labelled data store</b> (SharePoint / mailbox / cloud storage) the combo names the data and its sensitivity — data is a first-class node on the shared map, present live only when a DSPM / Purview connector feeds the exposure graph.</div>';
   root.innerHTML = band + tiles + seg + riskRollupHtml(list) + '<div class="ar-h2">Agents · worst-first</div>' + filterChip + rows + note;
   const r2 = document.getElementById("ar-root");
   r2.querySelectorAll("[data-seg]").forEach(el => el.addEventListener("click", () => { AR_SEG = el.getAttribute("data-seg"); AR_RISK = null; render(AR_LAST); }));
@@ -18400,22 +18471,26 @@ function __agentReachSummary(){
   const flagged = all.filter(a => a.risks.length);
   const score = arScore(all);
   const toxic = all.filter(a => a.toxic);
+  const dataTgt = a => (a.reach || []).find(r => r.data) || null;
   const recs = all.slice()
-    .filter(a => a.toxic || a.risks.length || !a.owner)
+    .filter(a => a.toxic || a.risks.length || !a.owner || a.reachesData)
     .sort((a, b) => agRank(b) - agRank(a))
     .map(a => {
-      const sev = (a.toxic || (a.risks.length && !a.owner)) ? "crit" : (a.risks.length || a.reachesCritical) ? "high" : "med";
-      const reason = a.toxic ? (" — privileged operator (" + (a.privilegedOperators || []).join(", ") + ") can drive it into a crown jewel")
+      const dt = dataTgt(a);
+      const sev = (a.toxic || (a.risks.length && !a.owner)) ? "crit" : (a.risks.length || a.reachesCritical || a.reachesData) ? "high" : "med";
+      const reason = a.toxic ? (" — privileged operator (" + (a.privilegedOperators || []).join(", ") + ") can drive it into " + (dt ? ((dt.sensitivity ? dt.sensitivity.toLowerCase() + " data" : "labelled data")) : "a crown jewel"))
         : a.risks.length ? (" — " + a.risks.slice(0, 2).join(", ") + (a.owner ? "" : " (no owner)"))
+        : a.reachesData ? (" — reaches " + (dt && dt.sensitivity ? dt.sensitivity.toLowerCase() + " data" : "labelled data") + (dt && dt.target ? " (" + dt.target + ")" : ""))
         : " — no owner / sponsor";
-      const fix = a.toxic ? "Scope this agent's tools / permissions away from crown-jewel data, and protect the privileged operator (PIM + phishing-resistant MFA)."
+      const fix = a.toxic ? ("Scope this agent's tools / permissions away from " + (dt ? "that data" : "crown-jewel data") + ", and protect the privileged operator (PIM + phishing-resistant MFA).")
+        : (a.reachesData && !a.risks.length && a.owner) ? "Scope this agent's data permissions to least privilege and confirm the sensitivity label / access on the data it reaches."
         : a.owner ? "Review the Defender risk indicators and scope this agent's tools / permissions."
         : "Assign an owner / sponsor accountable for this agent's lifecycle, then review its risk indicators.";
       return { title: a.name + reason, sev: sev, fix: fix };
     });
   return { label: "AI & Agents", score: score, grade: "",
     lead: all.length + " AI agent(s)" + (toxic.length ? (" · " + toxic.length + " toxic combo") : "") + (noOwner.length ? (" · " + noOwner.length + " with no owner") : "") + (flagged.length ? (" · " + flagged.length + " Defender-flagged") : ""),
-    sev: { crit: all.filter(a => a.toxic || (a.risks.length && !a.owner)).length, high: all.filter(a => !a.toxic && (a.risks.length && a.owner || a.reachesCritical)).length, med: noOwner.filter(a => !a.risks.length && !a.toxic).length, low: all.filter(a => a.owner && !a.risks.length && !a.toxic && !a.reachesCritical).length },
+    sev: { crit: all.filter(a => a.toxic || (a.risks.length && !a.owner)).length, high: all.filter(a => !a.toxic && (a.risks.length && a.owner || a.reachesCritical || a.reachesData)).length, med: noOwner.filter(a => !a.risks.length && !a.toxic).length, low: all.filter(a => a.owner && !a.risks.length && !a.toxic && !a.reachesCritical && !a.reachesData).length },
     top: recs.slice(0, 5).map(r => ({ title: r.title, sev: r.sev, impact: "", search: "" })),
     recs: recs };
 }
@@ -29336,9 +29411,9 @@ const CRIT_LABELS = ["Very high", "High", "Medium", "Low"];   // Exposure Manage
 
 // Node kind → colour (shared look with the Threat attack-graph). Critical assets are crowned separately.
 const AP_COLOR = { internet:"#FF9A6B", device:"#93ACD3", user:"#4FB8FF", guest:"#FFC15E", group:"#8FE3FF",
-  app:"#B48CFF", sp:"#7C9CFF", cve:"#FF5C7A", identity:"#5AD1E6", resource:"#3FA9FF", role:"#FF7A8A" };
+  app:"#B48CFF", sp:"#7C9CFF", cve:"#FF5C7A", identity:"#5AD1E6", resource:"#3FA9FF", role:"#FF7A8A", data:"#34D3A6" };
 const AP_KINDLBL = { internet:"Internet", device:"Device", user:"User", guest:"Guest", group:"Group",
-  app:"App / OAuth", sp:"Service principal", cve:"Vulnerability", identity:"Identity", resource:"Resource", role:"Role" };
+  app:"App / OAuth", sp:"Service principal", cve:"Vulnerability", identity:"Identity", resource:"Resource", role:"Role", data:"Data" };
 // Many exposure-graph nodes (identities, apps, service principals) have a GUID for a NodeName — unreadable in a
 // graph. Relabel those by type with a short GUID suffix ("Identity · 25cae2ca"); keep the full GUID for the tooltip.
 function isGuid(s){ return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(s||"").trim()); }
@@ -29360,7 +29435,7 @@ function demoGraph(){
     { id:"srv",   kind:"device",   label:"CONTOSO-DC01", crit:"Very high", role:"Domain Controller" },
     { id:"guest", kind:"guest",    label:"guest@partner.com" },
     { id:"app",   kind:"app",      label:"ReportBot (OAuth app)" },
-    { id:"win",   kind:"device",   label:"CONTOSO-SQL01", crit:"High", role:"SQL Server" },
+    { id:"fin",   kind:"data",     label:"Finance workspace (SharePoint)", crit:"Very high", role:"Highly Confidential" },
     { id:"cve_ws01", kind:"cve", label:"CVE-2026-54875" },
     { id:"cve_srv",    kind:"cve", label:"CVE-2026-70583 +2" }
   ];
@@ -29374,14 +29449,14 @@ function demoGraph(){
     { from:"alex",  to:"la",     label:"credential theft" },
     { from:"la",    to:"srv",    label:"admin logon (lateral)" },
     { from:"guest", to:"app",    label:"owns" },
-    { from:"app",   to:"win",    label:"high-priv Graph access" }
+    { from:"app",   to:"fin",    label:"read/write all SharePoint (Graph app role)" }
   ];
   const paths = [
     { id:"ext0", sev:"crit", external:true, seq:["net","cve_ws01","ws01"], cut:{ node:"net", fix:"Close internet-exposed port 3389 on contoso-ws-01 (or patch CVE-2026-54875) — an exposed service with an exploitable CVE is direct external initial access." } },
     { id:"ext1", sev:"crit", external:true, seq:["net","cve_srv","srv"],       cut:{ node:"net", fix:"Close internet-exposed port 3389 on CONTOSO-DC01 (or patch CVE-2026-70583) — an exposed Domain Controller with an exploitable CVE is the most critical external path." } },
     { id:"p1", sev:"crit", seq:["net","ws01","la","srv"], cut:{ node:"la", fix:"Rotate the shared local-admin credential (Windows LAPS) — both paths to the Domain Controller pass through it." } },
     { id:"p2", sev:"crit", seq:["net","alex","la","srv"],   cut:{ node:"la", fix:"Patch contoso-nuc-04's public-exploit CVE and rotate the reused local-admin credential it hands to the DC." } },
-    { id:"p3", sev:"high", seq:["guest","app","win"],       cut:{ node:"app", fix:"Review ReportBot's Graph permissions and the guest that owns it — an over-privileged OAuth app reaching SQL Server." } }
+    { id:"p3", sev:"crit", seq:["guest","app","fin"],       cut:{ node:"app", fix:"Review ReportBot's Graph permissions and the guest that owns it — a guest-owned OAuth app with read/write to all SharePoint reaches the Highly-Confidential Finance workspace (labelled data)." } }
   ];
   // Who is signed in on each device (the device→identity bridge). Administrator on the internet-facing ws01
   // host means the internet→DC path also inherits a privileged identity — the credential-inheritance pivot.
@@ -29567,10 +29642,11 @@ async function collect(){
     + " | extend L=toint(NodeProperties.rawData.criticalityLevel.criticalityLevel)"
     + " | where L between (0 .. 1)"
     + " | project NodeId, NodeName, NodeLabel, L | take 60");
-  // Endpoint pillar: keep only device/endpoint critical targets. Identity targets (Entra ID, directory
-  // roles, users, groups, service principals) live in the Identity pillar — the exposure graph is
-  // cross-domain, but this view is the device side of it.
-  crit = crit.filter(c => kindOf(c.NodeLabel) === "device");
+  // Endpoint pillar: keep device/endpoint critical targets AND labelled data stores (§2 data-reach — the data
+  // the devices and apps can reach). Identity targets (Entra ID, directory roles, users, groups, service
+  // principals) live in the Identity pillar — the exposure graph is cross-domain, this view is the device +
+  // data side of it. Data crown jewels appear live only when a data source (Defender for Cloud / DSPM) feeds them.
+  crit = crit.filter(c => { const k = kindOf(c.NodeLabel); return k === "device" || k === "data"; });
   if (!crit.length) return { live:true, nodes:[], edges:[], paths:[], usersByName:{}, ipByName:{} };
   const critById = {}; crit.forEach(c => critById[c.NodeId] = c);
   const critIds = crit.map(c => c.NodeId);
@@ -29755,7 +29831,7 @@ function render(D){
     + kpi("cred", credPaths, "Credential-inheritance paths", "admin signed in on a path host — filter", credPaths?"crit":"ok", { on: pf==="cred", clickable: credPaths>0 })
     + kpi("list", critTargets.length, "Critical assets exposed", "reachable from an entry point", critTargets.length?"high":"ok", { clickable: critTargets.length>0 })
     + kpi("chokes", chokes.length, "Choke points", "fix once, cut many paths", chokes.length?"high":"ok", { clickable: chokes.length>0 }) + '</div>';
-  const legend = [["internet","Internet"],["device","Device"],["user","Identity"],["guest","Guest"],["app","App / OAuth"],["cve","Vulnerability"]]
+  const legend = [["internet","Internet"],["device","Device"],["user","Identity"],["guest","Guest"],["app","App / OAuth"],["data","Data"],["cve","Vulnerability"]]
     .map(([k,l]) => '<span><i style="background:' + (AP_COLOR[k]||"#7C9CFF") + '"></i>' + l + '</span>').join("")
     + '<span><i class="crown" style="background:#FFD166"></i>Critical asset</span>'
     + '<span>🔑 Admin signed in (credential inheritance)</span>';
