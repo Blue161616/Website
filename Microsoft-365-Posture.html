@@ -11504,11 +11504,16 @@ function fmtStamp(t) { try { return new Date(t).toLocaleString(undefined, { mont
 // Optional — PIM activation policy per role: does activating an eligible role require APPROVAL? An eligible role that
 // needs approval to turn on is materially less abusable than one that self-activates, so it lowers the priv score.
 const PIMPOL_SCOPES = ["RoleManagementPolicy.Read.Directory"];
+// Optional — access-review definitions: are privileged role assignments and guest access periodically re-attested?
+const AR_SCOPES = ["AccessReview.Read.All"];
+// Optional + licence-gated — Defender for Identity sensor/agent health across the hybrid identity infra (DCs / Entra
+// Connect). Only on the MDI plan / M365 E5 Security; absent → reported N/A, not a failure (like Global Secure Access).
+const MDI_SCOPES = ["SecurityIdentitiesHealthIssues.Read.All"];
 // Every optional scope in one list. Consent lives in the tenant of the account that signed in, not in the tenant
 // that registered the app — so an admin of another tenant has to grant it there, and the only way this page can
 // ask is an interactive prompt. It requests all of them at once; an admin ticks "consent on behalf of your
 // organisation", and the scan runs again with whatever was granted.
-const OPTIONAL_SCOPES = [...new Set([...AUTH_SCOPES, ...CA_SCOPES, ...RISK_SCOPES, ...PIMPOL_SCOPES, ...LIC_SCOPES])];
+const OPTIONAL_SCOPES = [...new Set([...AUTH_SCOPES, ...CA_SCOPES, ...RISK_SCOPES, ...PIMPOL_SCOPES, ...AR_SCOPES, ...MDI_SCOPES, ...LIC_SCOPES])];
 async function grantOptional() {
   try {
     setStatus("Asking for consent to the optional permissions…", false, true);
@@ -11785,7 +11790,7 @@ async function analyze() {
     // PIM activation-approval policy (optional — RoleManagementPolicy.Read.Directory). For each built-in role, does
     // activating it from ELIGIBLE require approval? Read before role assembly so eligible roles can be tagged as
     // approval-gated. roleManagementPolicyAssignments.roleDefinitionId is the role template GUID → matches PRIV_ROLES.
-    MODEL.approvalAvailable = false; MODEL.approvalByRole = {};
+    MODEL.approvalAvailable = false; MODEL.approvalByRole = {}; MODEL.pimByRole = {};
     const pimPolToken = await optionalToken(PIMPOL_SCOPES);
     if (pimPolToken) {
       try {
@@ -11794,10 +11799,56 @@ async function analyze() {
         pols.forEach((pa) => {
           const rules = (pa.policy && pa.policy.rules) || [];
           const appr = rules.find((r) => /ApprovalRule/i.test(r["@odata.type"] || "") || r.id === "Approval_EndUser_Assignment");
-          if (appr && appr.setting && appr.setting.isApprovalRequired) MODEL.approvalByRole[pa.roleDefinitionId] = true;
+          const approval = !!(appr && appr.setting && appr.setting.isApprovalRequired);
+          if (approval) MODEL.approvalByRole[pa.roleDefinitionId] = true;
+          // The other activation rules on the SAME policy (§4): MFA + justification on activation (the Enablement
+          // rule's enabledRules), and the maximum activation duration (the Expiration rule). All read-only, same scope.
+          const enable = rules.find((r) => /EnablementRule/i.test(r["@odata.type"] || "") || r.id === "Enablement_EndUser_Assignment");
+          const expire = rules.find((r) => /ExpirationRule/i.test(r["@odata.type"] || "") || r.id === "Expiration_EndUser_Assignment");
+          const en = (enable && enable.enabledRules) || [];
+          MODEL.pimByRole[pa.roleDefinitionId] = { approval: approval,
+            mfa: en.some((x) => /MultiFactorAuthentication/i.test(x)),
+            justification: en.some((x) => /Justification/i.test(x)),
+            maxHours: _pimHours(expire && expire.maximumDuration) };
         });
         MODEL.approvalAvailable = true;
+        computePimHygiene();
       } catch (e) { MODEL.approvalError = e.message || String(e); }
+    }
+
+    // Access-review definitions (optional — AccessReview.Read.All): are privileged role assignments and guest access
+    // periodically re-attested? Standing access that is never re-reviewed is how stale admin rights and forgotten
+    // guests accumulate. Best-effort classification by the definition's displayName + scope (labelled inferred).
+    MODEL.accessReviews = null;
+    const arToken = await optionalToken(AR_SCOPES);
+    if (arToken) {
+      try {
+        setStatus("Reading access-review definitions…", false, true);
+        const defs = await graphGetAll(base + "/identityGovernance/accessReviews/definitions?$select=id,displayName,scope,status", arToken);
+        const active = defs.filter((d) => !/applied|completed/i.test(d.status || ""));   // recurring / in-flight, not a finished one-off
+        const blob = (d) => { try { return (JSON.stringify(d) || "").toLowerCase(); } catch (e) { return String(d.displayName || "").toLowerCase(); } };
+        const coversPriv = active.some((d) => /privileg|\brole\b|roleassignment|rolemanagement|directoryrole|\badmin/i.test(blob(d)));
+        const coversGuests = active.some((d) => /guest|b2b|external|#ext#/i.test(blob(d)));
+        MODEL.accessReviews = { assessed: true, total: active.length, coversPriv: coversPriv, coversGuests: coversGuests };
+      } catch (e) { MODEL.accessReviewError = e.message || String(e); }
+    }
+
+    // Defender for Identity sensor/agent health (optional + licence-gated — SecurityIdentitiesHealthIssues.Read.All).
+    // Open MDI health issues across the hybrid identity infrastructure (DCs / Entra Connect). MDI is the control that
+    // catches Tier-0 on-prem identity attacks (DCSync, Golden Ticket, lateral movement), so a down or misconfigured
+    // sensor is a blind spot on the crown jewels. Licence-aware: any failure (no MDI licence / no consent / API
+    // absent) leaves MODEL.mdi null → the view reports N/A, never a failure (same pattern as Global Secure Access).
+    MODEL.mdi = null;
+    const mdiToken = await optionalToken(MDI_SCOPES);
+    if (mdiToken) {
+      try {
+        setStatus("Reading Defender for Identity sensor health…", false, true);
+        const issues = await graphGetAll(base + "/security/identities/healthIssues?$filter=" + enc("status eq 'open'"), mdiToken);
+        const sev = (i) => String(i.severity || "").toLowerCase();
+        MODEL.mdi = { assessed: true, available: true, open: issues.length,
+          high: issues.filter((i) => sev(i) === "high").length,
+          sensor: issues.filter((i) => /sensor/i.test(i.healthIssueType || "")).length };
+      } catch (e) { MODEL.mdiError = e.message || String(e); }   // stays null → N/A notice
     }
 
     // 2 · Privileged directory roles held (active + PIM-eligible) → mapped to users.
@@ -12181,6 +12232,22 @@ function detectBreakGlass(users) {
 // computeUserFlags / userRisk / postureTier, so nothing a demo says about how an account is scored
 // is invented for the demo.
 const DEMO = /[?&]demo(=1)?(&|$)/.test(location.search);
+// ISO-8601 activation duration ("PT8H", "PT1H30M", "P1D") → hours; null when absent/unparseable.
+function _pimHours(iso) { if (!iso) return null; const m = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?)?$/.exec(String(iso).trim()); if (!m) return null; return (+(m[1] || 0)) * 24 + (+(m[2] || 0)) + (+(m[3] || 0)) / 60; }
+// PIM activation hygiene across the PRIVILEGED built-in roles that have a policy (§4): which can be activated without
+// MFA, without justification, or for longer than 8 hours. Scoped to PRIV_ROLES so it reflects the roles that matter.
+function computePimHygiene() {
+  const by = MODEL.pimByRole; if (!by) { MODEL.pimHygiene = null; return; }
+  const noMfa = [], longDur = [], noJust = []; let assessed = 0;
+  Object.keys(by).forEach((rid) => {
+    const r = PRIV_ROLES[rid]; if (!r) return;   // privileged built-in roles only
+    assessed++; const p = by[rid];
+    if (!p.mfa) noMfa.push(r.name);
+    if (!p.justification) noJust.push(r.name);
+    if (p.maxHours != null && p.maxHours > 8) longDur.push({ name: r.name, hours: p.maxHours });
+  });
+  MODEL.pimHygiene = assessed ? { assessed: assessed, noMfa: noMfa, longDur: longDur, noJust: noJust } : null;
+}
 function demoUsers() {
   const days = d => new Date(Date.now() - d * 86400000).toISOString();
   const role = (name, tier, kind, ro, approval) => ({ name, tier, kind, ro: !!ro, approval: !!approval });
@@ -12231,6 +12298,18 @@ function startDemo() {
   MODEL.users = demoUsers();
   MODEL.mfaAvailable = true; MODEL.caAvailable = true; MODEL.riskAvailable = true;
   MODEL.approvalAvailable = true; MODEL.caCapped = false; MODEL.legacyOpen = true;
+  // PIM activation hygiene demo: Global Admin well-governed (approval + MFA + short window), but Application
+  // Administrator self-activates with no MFA, and Exchange Administrator allows a 24h window with no justification.
+  MODEL.pimByRole = {
+    "62e90394-69f5-4237-9190-012177145e10": { approval: true, mfa: true, justification: true, maxHours: 4 },   // Global Administrator
+    "9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3": { approval: false, mfa: false, justification: true, maxHours: 8 },  // Application Administrator — no MFA on activation
+    "29232cdf-9323-42fd-ade2-1d097af3e4de": { approval: false, mfa: true, justification: false, maxHours: 24 }  // Exchange Administrator — 24h + no justification
+  };
+  computePimHygiene();
+  // Access reviews demo: guests are reviewed, but no review covers privileged role assignments (a common real gap).
+  MODEL.accessReviews = { assessed: true, total: 1, coversPriv: false, coversGuests: true };
+  // Defender for Identity demo: MDI is licensed, with two open health issues (one sensor-level) on the DCs.
+  MODEL.mdi = { assessed: true, available: true, open: 2, high: 1, sensor: 1 };
   MODEL.p2 = p2From([{ skuPartNumber: "SPE_E5", capabilityStatus: "Enabled", consumedUnits: 228, prepaidUnits: { enabled: 250 },
                        servicePlans: [{ servicePlanId: P2_PLAN, servicePlanName: "AAD_PREMIUM_P2", provisioningStatus: "Success" }] }]);
   MODEL.generatedAt = new Date(Date.now() - 4 * 60000);
@@ -12277,6 +12356,31 @@ function renderNotices() {
   if (!MODEL.riskAvailable && !noP2) n.push('<div class="notice notice-warn">Identity Protection risk not read — grant <code>IdentityRiskyUser.Read.All</code> (Entra ID P2) to fold each user’s risk state into the score.' + (MODEL.riskError ? ' <span class="mono">(' + escapeHtml(MODEL.riskError) + ')</span>' : "") + '</div>');
   if (MODEL.caAvailable && MODEL.legacyOpen) n.push('<div class="notice notice-warn">Legacy authentication is <b>not blocked</b> tenant-wide — password-only sign-in bypasses MFA for every account below. Block it via Conditional Access. <span class="ep-xlink" data-view="ca" title="Open the Conditional Access posture view">⤳ Conditional Access</span></div>');
   if (!MODEL.approvalAvailable) n.push('<div class="notice notice-warn">PIM activation policy not read — grant <code>RoleManagementPolicy.Read.Directory</code> to detect which eligible roles require <b>approval</b> to activate. Without it, every eligible role is scored as self-activatable (worst case).' + (MODEL.approvalError ? ' <span class="mono">(' + escapeHtml(MODEL.approvalError) + ')</span>' : "") + '</div>');
+  // PIM activation hygiene (§4): MFA / justification / max-duration on activating a privileged role.
+  const ph = MODEL.pimHygiene;
+  if (ph) {
+    if (ph.noMfa.length) n.push('<div class="notice notice-warn"><b>' + ph.noMfa.length + ' privileged role' + (ph.noMfa.length === 1 ? '' : 's') + ' can be activated from PIM without MFA</b> — activating an eligible role should always require (ideally phish-resistant) MFA, or a stolen session elevates with no second factor. Roles: ' + escapeHtml(ph.noMfa.slice(0, 8).join(', ')) + (ph.noMfa.length > 8 ? ' +' + (ph.noMfa.length - 8) + ' more' : '') + '. Set <b>Require multifactor authentication on activation</b> in each role’s PIM policy.</div>');
+    if (ph.longDur.length) n.push('<div class="notice notice-warn"><b>' + ph.longDur.length + ' privileged role' + (ph.longDur.length === 1 ? '' : 's') + ' allow activation for longer than 8 hours</b> — a long activation window widens the time a compromised elevation stays usable. ' + escapeHtml(ph.longDur.slice(0, 6).map(x => x.name + ' (' + (Number.isInteger(x.hours) ? x.hours : x.hours.toFixed(1)) + 'h)').join(', ')) + '. Shorten the maximum activation duration (≤ 8h).</div>');
+    if (ph.noJust.length) n.push('<div class="notice notice-info">' + ph.noJust.length + ' privileged role' + (ph.noJust.length === 1 ? '' : 's') + ' can be activated without a justification — turning on <b>Require justification on activation</b> leaves an audit trail of why each elevation happened: ' + escapeHtml(ph.noJust.slice(0, 8).join(', ')) + '.</div>');
+  }
+  // Access reviews (§4): is standing privileged access and guest access periodically re-attested?
+  const ar = MODEL.accessReviews;
+  if (ar && ar.assessed) {
+    if (!ar.total) n.push('<div class="notice notice-warn"><b>No access reviews are configured</b> — privileged role assignments and guest access are never periodically re-attested, so stale admin rights and forgotten guests accumulate unchecked. Set up recurring access reviews (Identity Governance) over the privileged directory roles and over guest access.</div>');
+    else {
+      if (!ar.coversPriv) n.push('<div class="notice notice-warn"><b>No access review covers privileged role assignments</b> — ' + ar.total + ' review' + (ar.total === 1 ? '' : 's') + ' configured, but none appears to re-attest who holds privileged roles, so standing admin rights are never challenged. Add a recurring access review over the privileged directory roles. <span style="opacity:.7">(inferred from each review’s name and scope)</span></div>');
+      if (!ar.coversGuests) n.push('<div class="notice notice-info">No access review appears to cover <b>guest access</b> — add a recurring review of guests so external accounts that no longer need access are removed. <span style="opacity:.7">(inferred from each review’s name and scope)</span></div>');
+      if (ar.coversPriv && ar.coversGuests) n.push('<div class="notice notice-info"><b>Access reviews cover privileged roles and guest access</b> — ' + ar.total + ' active review' + (ar.total === 1 ? '' : 's') + ' re-attest standing access.</div>');
+    }
+  }
+  // Defender for Identity sensor health (§4) — licence-aware: N/A when MDI isn't present, a real finding when it is.
+  const mdi = MODEL.mdi;
+  if (mdi && mdi.available) {
+    if (mdi.open) n.push('<div class="notice notice-warn"><b>' + mdi.open + ' open Defender for Identity health issue' + (mdi.open === 1 ? '' : 's') + ' on your identity infrastructure</b>' + (mdi.high ? ' (' + mdi.high + ' high)' : '') + (mdi.sensor ? ' — ' + mdi.sensor + ' sensor-level' : '') + '. MDI is what catches Tier-0 on-prem identity attacks (DCSync, Golden Ticket, lateral movement) on your DCs and Entra Connect; a down or misconfigured sensor is a blind spot on the crown jewels. Resolve the health issues in the Defender portal (Settings → Identities → Health issues).</div>');
+    else n.push('<div class="notice notice-info"><b>Defender for Identity reports no open sensor-health issues</b> — the MDI sensors on your DCs / Entra Connect are healthy and reporting.</div>');
+  } else {
+    n.push('<div class="notice notice-info"><b>Defender for Identity sensor health not read</b> — the health API needs the MDI licence (Microsoft 365 E5 Security / Defender for Identity) and <code>SecurityIdentitiesHealthIssues.Read.All</code>. On a tenant without MDI this is <b>N/A</b>, not a gap; with MDI, grant the permission to surface down or misconfigured sensors on your DCs / Entra Connect.' + (MODEL.mdiError ? ' <span class="mono">(' + escapeHtml(MODEL.mdiError) + ')</span>' : '') + '</div>');
+  }
   if (!MODEL.mfaAvailable || !MODEL.caAvailable || !MODEL.riskAvailable || !MODEL.approvalAvailable || !(MODEL.p2 && MODEL.p2.available != null))
     n.push('<div class="notice notice-info">Missing an optional permission above? Consent lives in the tenant of the account you signed in with, not in the tenant that registered this app. <a data-grant="1" style="cursor:pointer;font-weight:600">Grant the optional permissions \u2192</a> opens one consent prompt for all of them; an admin can consent on behalf of the organisation, and the scan runs again.</div>');
   $("notices").innerHTML = n.join("");
@@ -12970,6 +13074,7 @@ function __epUserSummary() {
   if (!MODEL.caAvailable) gaps.push("Conditional Access enforcement (Policy.Read.All)");
   if (!MODEL.riskAvailable) gaps.push("Identity Protection risk (IdentityRiskyUser.Read.All)");
   if (!MODEL.approvalAvailable) gaps.push("PIM activation policy (RoleManagementPolicy.Read.Directory)");
+  if (!MODEL.accessReviews) gaps.push("Access reviews (AccessReview.Read.All)");
   return {
     domain: "Users", score: s.tenantScore, grade: s.tenantGrade,
     counts: { critical: s.critical, high: s.high, medium: s.medium, low: s.low },
@@ -21075,6 +21180,13 @@ function requiresPhishResistant(p) {
 const requiresCompliantDevice = p => builtIn(p).some(c => /^(compliantDevice|domainJoinedDevice)$/i.test(c));
 const blocksAccess            = p => builtIn(p).indexOf('block') >= 0;
 const hasGrantControls        = p => !!(grant(p).authenticationStrength) || builtIn(p).length > 0;
+// Session controls (E5 / Entra ID P2) — Token Protection binds the token to the device; CAE revokes in near-real-time.
+const tokenProtOn = p => { const s = p.sessionControls; return !!(s && s.secureSignInSession && s.secureSignInSession.isEnabled); };
+const caeDisabled = p => { const s = p.sessionControls; return !!(s && s.continuousAccessEvaluation && String(s.continuousAccessEvaluation.mode).toLowerCase() === 'disabled'); };
+// Global Secure Access (Entra Suite / E7): a policy that targets the GSA traffic-forwarding profiles, or references
+// Global Secure Access in its app scope. Best-effort — absent → the view reports N/A on E5, never a failure.
+const targetsGsa = p => { const a = appsCond(p); const ids = (a.includeApplications || []).join(' ').toLowerCase();
+  return /globalsecureaccess|global secure access/.test(ids) || !!(p.sessionControls && p.sessionControls.globalSecureAccessFilteringProfile); };
 
 function coversAllApps(p) {
   const a = appsCond(p);
@@ -21124,6 +21236,37 @@ const REF = {
     label: 'Report-only mode (Microsoft Learn)',
     text: 'Report-only evaluates a policy and logs what it would have done without enforcing it. A policy left '
         + 'in report-only protects nobody; it is a pilot, not a control.',
+  },
+  cae: {
+    url: 'https://learn.microsoft.com/en-us/entra/identity/conditional-access/concept-continuous-access-evaluation',
+    label: 'Continuous Access Evaluation (Microsoft Learn)',
+    text: 'CAE lets Entra and the services it protects revoke access in near-real-time on critical events (password '
+        + 'reset, account disable, elevated risk) instead of waiting up to an hour for the access token to expire.',
+  },
+  tokenProt: {
+    url: 'https://learn.microsoft.com/en-us/entra/identity/conditional-access/concept-token-protection',
+    label: 'Token Protection (Microsoft Learn)',
+    text: 'Token Protection cryptographically binds a sign-in session token to the device it was issued to, so a '
+        + 'token stolen from that device cannot be replayed from another machine.',
+  },
+  sysPref: {
+    url: 'https://learn.microsoft.com/en-us/entra/identity/authentication/concept-system-preferred-multifactor-authentication',
+    label: 'System-preferred MFA (Microsoft Learn)',
+    text: 'System-preferred MFA prompts the user for the most secure method they have registered rather than letting '
+        + 'a weaker registered method (such as SMS) be chosen.',
+  },
+  gsa: {
+    url: 'https://learn.microsoft.com/en-us/entra/global-secure-access/how-to-target-resource-conditional-access-policies',
+    label: 'Global Secure Access + Conditional Access (Microsoft Learn)',
+    text: 'Global Secure Access (Entra Internet / Private Access) brings network traffic under Conditional Access. It '
+        + 'is part of the Microsoft Entra Suite (E7), so on E5 it is not applicable rather than a gap.',
+  },
+  consent: {
+    url: 'https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/configure-user-consent',
+    label: 'User & admin consent (Microsoft Learn)',
+    text: 'When users can consent to any app, one click on a malicious OAuth app grants it standing delegated access '
+        + 'to their mail and files — the illicit-consent phishing path. Restricting consent and routing requests '
+        + 'through an admin-consent workflow closes it.',
   },
 };
 
@@ -21305,6 +21448,108 @@ function buildFindings(ctx) {
         'TAP gives a time-boxed passcode for onboarding and for recovering a lost factor without falling back '
         + 'to a weaker method or a password reset.',
         'Enable Temporary Access Pass to bootstrap phish-resistant methods without an SMS fallback.');
+    // System-preferred MFA (GA, on by default) — Entra offers the strongest method a user has registered first.
+    // state: enabled | default (both = on) | disabled. A tenant that turned it OFF has re-opened weaker-method choice.
+    const sysPref = am.systemCredentialPreferences;
+    if (sysPref && String(sysPref.state).toLowerCase() === 'disabled')
+      add('medium', 'A4', 'System-preferred MFA is turned off',
+        'System-preferred multifactor authentication — prompting the strongest method a user has registered — is '
+        + 'explicitly disabled, so a user with a phish-resistant method can still fall back to a weaker one such as '
+        + 'SMS. The strong factor is registered but not preferred.',
+        'Set system-preferred MFA to Microsoft managed (enabled) in the authentication-methods policy so the '
+        + 'strongest registered method is always offered first.',
+        'authenticationMethodsPolicy.systemCredentialPreferences.state = disabled', REF.sysPref);
+  }
+
+  // ── Session hardening: Continuous Access Evaluation + Token Protection (E5 / Entra ID P2) ────────────────
+  // CAE is on by default; a policy that disables it re-opens the token-revocation lag. Token Protection binds the
+  // session token to the device (stops replay of a stolen token). Global Secure Access is Entra Suite (E7), so it is
+  // reported licence-aware — N/A on E5, never a failure.
+  const caeOff = enabled.filter(caeDisabled);
+  if (caeOff.length)
+    add('high', 'S1', 'Continuous Access Evaluation is disabled by policy',
+      caeOff.length + ' enabled ' + plural(caeOff.length, 'policy', 'policies') + ' set Continuous Access Evaluation '
+      + 'to disabled. CAE revokes access in near-real-time when a token is invalidated (password reset, account '
+      + 'disable, elevated risk) instead of waiting up to an hour for it to expire — turning it off re-opens that window.',
+      'Remove the disabled-CAE setting so Continuous Access Evaluation stays on (it is on by default).',
+      caeOff.map(pname).join('\n'), REF.cae);
+  if (!enforcing.some(tokenProtOn))
+    add('low', 'S2', 'Token Protection is not enforced for sign-in sessions',
+      'No enabled policy requires Token Protection (sign-in session), which cryptographically binds the refresh '
+      + 'token to the device so a stolen token cannot be replayed from another machine. Phish-resistant MFA stops '
+      + 'the phish; Token Protection stops replay of an already-issued token. (Requires Entra ID P2; Windows sign-ins.)',
+      'Pilot a Token Protection session policy for privileged roles on Windows, then widen it as device support allows.',
+      '', REF.tokenProt);
+  else
+    add('info', 'S2b', 'Token Protection is enforced',
+      'At least one enabled policy requires Token Protection for the sign-in session, binding the token to the device '
+      + 'so a stolen token cannot be replayed elsewhere.',
+      'Keep it on and widen coverage to all privileged roles on supported devices.');
+  // Global Secure Access (Entra Suite / E7) — licence-aware: absence is N/A on E5, not a gap.
+  if (pol.filter(targetsGsa).length)
+    add('info', 'G1', 'Global Secure Access is targeted by Conditional Access',
+      pol.filter(targetsGsa).length + ' ' + plural(pol.filter(targetsGsa).length, 'policy', 'policies') + ' reference '
+      + 'Global Secure Access, so network access is being brought under the same Conditional Access decisions as apps '
+      + '— the Entra Suite (E7) is in use.',
+      'Confirm the GSA profiles enforce compliant-network / device for the traffic that matters.', '', REF.gsa);
+  else
+    add('info', 'G1', 'Global Secure Access not in use — N/A without Entra Suite (E7)',
+      'No Conditional Access policy targets Global Secure Access. GSA (Entra Internet / Private Access) brings network '
+      + 'traffic under Conditional Access and needs the Entra Suite (E7) licence, so on E5 this is not applicable '
+      + 'rather than a gap.',
+      'If licensed for the Entra Suite (E7), onboard traffic to Global Secure Access and gate it with Conditional '
+      + 'Access; otherwise no action.', '', REF.gsa);
+
+  // ── App-consent governance: user consent policy + admin-consent request workflow ─────────────────────────
+  // Who can grant an OAuth app standing access to the tenant, and whether app requests have a review route. The
+  // illicit-consent phishing path lives here: a user who can consent to any app is one click from granting a
+  // malicious app delegated access to their mail and files.
+  const apRoles = ctx.authPolicy && ctx.authPolicy.defaultUserRolePermissions;
+  if (apRoles) {
+    const grants = apRoles.permissionGrantPoliciesAssigned || [];
+    const legacy = grants.some(g => /legacy/i.test(g));   // ...default-legacy = consent to anything
+    const low = grants.some(g => /low/i.test(g));          // ...default-low = verified publishers, low-risk only (recommended)
+    const canConsent = grants.length > 0;
+    const restricted = !canConsent || low;                 // consent is restricted (disabled, or limited to verified/low)
+    if (legacy)
+      add('high', 'AC1', 'Users can consent to any application',
+        'The tenant lets non-admin users grant consent to any app for any permission that does not itself require '
+        + 'admin consent (the legacy default). This is exactly what OAuth / illicit-consent phishing abuses — one '
+        + 'user clicks "Accept" on a malicious app and it holds standing delegated access to their mailbox and files.',
+        'Set user consent to "Allow for verified publishers, for selected permissions", or disable user consent and '
+        + 'route requests through the admin-consent workflow.',
+        'authorizationPolicy.permissionGrantPoliciesAssigned: ' + grants.join(', '), REF.consent);
+    else if (!canConsent)
+      add('info', 'AC1', 'User app-consent is disabled',
+        'Non-admin users cannot consent to applications; every delegated grant goes through an administrator — the '
+        + 'most restrictive setting, and the illicit-consent phishing path is closed.',
+        'Keep it disabled, and make sure the admin-consent request workflow is on so legitimate app requests have a route.');
+    else if (low)
+      add('info', 'AC1', 'User app-consent is limited to verified publishers',
+        'Users may consent only to apps from verified publishers for low-risk permissions — the Microsoft-recommended '
+        + 'setting. The broad illicit-consent path is closed.',
+        'Keep this setting, and review the admin-consent workflow for the requests it routes.');
+    else
+      add('medium', 'AC1', 'User app-consent uses a non-standard policy',
+        'Users may consent under a custom permission-grant policy rather than the recommended verified-publisher / '
+        + 'low-risk setting, so the exact scope users can self-consent is unclear.',
+        'Review the custom permission-grant policy and move to "verified publishers, low-risk permissions" unless the '
+        + 'custom scope is deliberate and tighter.',
+        'authorizationPolicy.permissionGrantPoliciesAssigned: ' + grants.join(', '), REF.consent);
+    // Admin-consent request workflow — only meaningful when user consent is restricted (else there is nothing to route).
+    const acw = ctx.adminConsent;
+    if (acw && acw.isEnabled === false && restricted)
+      add('medium', 'AC2', 'No admin-consent request workflow',
+        'User consent is restricted, but there is no admin-consent request workflow — a user who needs an app has no '
+        + 'in-product way to ask. The usual result is shadow IT, or an admin granting tenant-wide consent ad hoc to '
+        + 'unblock them: a broad grant made under pressure.',
+        'Enable the admin-consent request workflow and set reviewers, so app requests are captured, reviewed and scoped.',
+        'adminConsentRequestPolicy.isEnabled = false', REF.consent);
+    else if (acw && acw.isEnabled === true)
+      add('info', 'AC2', 'Admin-consent request workflow is enabled',
+        'Users can request admin consent for the apps they need and reviewers approve or deny, so requests are '
+        + 'captured and scoped instead of becoming shadow IT or an ad-hoc tenant-wide grant.',
+        'Keep it on; confirm the reviewer list is current.');
   }
 
   F.sort((a, b) => SEV_RANK[b.sev] - SEV_RANK[a.sev]);
@@ -22609,7 +22854,13 @@ async function run() {
     try { authMethods = await graph('/v1.0/policies/authenticationMethodsPolicy', tok); }
     catch (e) { amErr = e.message || String(e); }
 
-    LAST = { policies, namedLocations, secDefaults, authMethods,
+    // App-consent governance: the tenant authorization policy (can users consent to apps?) + the admin-consent
+    // request workflow. Both read with Policy.Read.All; optional (null → the consent findings read "not assessed").
+    let authPolicy = null, adminConsent = null;
+    try { authPolicy = await graph('/v1.0/policies/authorizationPolicy', tok); } catch (e) { /* not assessed */ }
+    try { adminConsent = await graph('/v1.0/policies/adminConsentRequestPolicy', tok); } catch (e) { /* not assessed */ }
+
+    LAST = { policies, namedLocations, secDefaults, authMethods, authPolicy, adminConsent,
              nlErr, secErr, amErr, demo: false, at: new Date() };
     LAST.findings = buildFindings(LAST);
     render(LAST);
@@ -22681,7 +22932,9 @@ function demoContext() {
     // consolidation + lockout-outlier analysis.
     { id: 'p-mfa-pilot', displayName: 'Require MFA for all users (pilot)', state: 'enabled',
       conditions: { users: { includeUsers: ['All'] }, applications: { includeApplications: ['All'] }, clientAppTypes: ['all'] },
-      grantControls: { operator: 'OR', builtInControls: ['mfa'] } }
+      grantControls: { operator: 'OR', builtInControls: ['mfa'] },
+      // A pilot that was left on with Continuous Access Evaluation switched off — exercises the CAE check (S1).
+      sessionControls: { continuousAccessEvaluation: { mode: 'disabled' } } }
   ].concat([
     ['Block Device Code Flow', ['block']],
     ['Require Device Compliance on iOS', ['compliantDevice']],
@@ -22705,8 +22958,13 @@ function demoContext() {
   const authMethods = { authenticationMethodConfigurations: [
     { id: 'Sms', state: 'enabled' }, { id: 'Voice', state: 'enabled' },
     { id: 'Fido2', state: 'enabled' }, { id: 'TemporaryAccessPass', state: 'disabled' }
-  ] };
-  return { policies, namedLocations, secDefaults: { isEnabled: false }, authMethods,
+  ], systemCredentialPreferences: { state: 'disabled' } };   // system-preferred MFA turned off — exercises A4
+  // Consent governance (sound config, so the checks read as assessed-and-passing): user consent limited to verified
+  // publishers (recommended → AC1 info) with the admin-consent request workflow on (→ AC2 info). The live checks still
+  // flag the bad states (legacy "consent to anything" → high; restricted + no workflow → medium) on a real tenant.
+  const authPolicy = { defaultUserRolePermissions: { permissionGrantPoliciesAssigned: ['ManagePermissionGrantsForSelf.microsoft-user-default-low'] } };
+  const adminConsent = { isEnabled: true };
+  return { policies, namedLocations, secDefaults: { isEnabled: false }, authMethods, authPolicy, adminConsent,
            demo: true, at: new Date() };
 }
 
@@ -22727,7 +22985,7 @@ function importRender() {
   try { $('gate').style.display = 'none'; $('app').style.display = ''; } catch (e) {}
   try { $('who-user').textContent = 'Imported — Conditional Access policy export'; } catch (e) {}
   const R = window.EP.IMPORT.raw, policies = R.caPolicies || [], namedLocations = R.namedLocations || [];
-  LAST = { policies, namedLocations, secDefaults: R.secDefaults || null, authMethods: R.authMethods || null, nlErr: null, secErr: null, amErr: null, imported: true, demo: false, at: new Date() };
+  LAST = { policies, namedLocations, secDefaults: R.secDefaults || null, authMethods: R.authMethods || null, authPolicy: R.authPolicy || null, adminConsent: R.adminConsent || null, nlErr: null, secErr: null, amErr: null, imported: true, demo: false, at: new Date() };
   LAST.findings = buildFindings(LAST);
   render(LAST);
 }
