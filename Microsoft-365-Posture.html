@@ -1855,6 +1855,14 @@
 #view-agentreach .ar-rollup-bar { flex:0 0 120px; max-width:120px; height:7px; background:color-mix(in srgb,var(--muted) 16%,transparent); border-radius:999px; overflow:hidden; }
 #view-agentreach .ar-rollup-bar span { display:block; height:100%; background:linear-gradient(90deg,var(--sev-crit),var(--sev-high)); border-radius:999px; }
 #view-agentreach .ar-rollup-l { color:var(--muted); }
+#view-agentreach .ar-rollup-click { width:100%; border:1px solid transparent; background:transparent; color:inherit; font:inherit; text-align:left; cursor:pointer; padding:3px 6px; border-radius:7px; transition:background .12s,border-color .12s; }
+#view-agentreach .ar-rollup-click:hover { background:color-mix(in srgb,var(--accent) 9%,transparent); }
+#view-agentreach .ar-rollup-click.on { background:color-mix(in srgb,var(--accent) 16%,transparent); border-color:color-mix(in srgb,var(--accent) 45%,transparent); }
+#view-agentreach .ar-rollup-click.on .ar-rollup-l { color:var(--text); }
+#view-agentreach .ar-filter { display:flex; align-items:center; gap:8px; margin:0 0 10px; padding:7px 11px; border:1px solid color-mix(in srgb,var(--accent) 40%,var(--border)); border-radius:9px; background:color-mix(in srgb,var(--accent) 8%,transparent); font-size:12px; color:var(--text); }
+#view-agentreach .ar-filter b { color:var(--accent); font-weight:700; }
+#view-agentreach .ar-filter-x { margin-left:auto; border:1px solid var(--border); background:var(--card); color:var(--muted); font:inherit; font-size:11px; font-weight:700; padding:2px 9px; border-radius:7px; cursor:pointer; }
+#view-agentreach .ar-filter-x:hover { border-color:var(--accent); color:var(--text); }
 /* ================= view: external ================= */
 #view-external * {box-sizing:border-box;margin:0;padding:0}
 #view-external {font-family:var(--body);   
@@ -18047,7 +18055,7 @@ EP.registerView("agentreach", (function () {
   let account = EP.ACCOUNT, msalInstance = EP.msalShim();
 
 function esc(s){ return window.EP ? EP.esc(s) : String(s==null?"":s); }
-let AR_LAST = null, AR_SEG = "cloud";   // which segment is shown (cloud | local)
+let AR_LAST = null, AR_SEG = "cloud", AR_RISK = null;   // segment (cloud|local) + active risk-indicator filter
 
 // AgentsInfo dynamic columns arrive as JSON (arrays / dicts) or already-parsed values — parse defensively.
 function pArr(v){ if (Array.isArray(v)) return v; if (v && typeof v === "object") return Object.values(v); if (typeof v === "string"){ const s = v.trim(); if (!s || s === "[]" || s === "{}") return []; try { const j = JSON.parse(s); return Array.isArray(j) ? j : (j && typeof j === "object" ? Object.values(j) : []); } catch(e){ return []; } } return []; }
@@ -18065,7 +18073,7 @@ function normAgent(r){
     id: r.AgentId, name: r.Name || r.AgentName || "(unnamed agent)", platform: platform, local: local,
     model: r.Model || null, version: r.Version || null,
     managed: !!(r.EntraAgentID), blueprint: r.EntraBlueprintID || null,
-    owner: owners.length > 0, ownerCount: owners.length,
+    owner: owners.length > 0, ownerCount: owners.length, ownerIds: owners, ownerNames: null,
     risks: risks, tools: tools, mcp: mcp, connected: connected,
     externalEndpoint: endpointExternal(r.Endpoints), published: /^publish/i.test(r.PublishedStatus || "")
   };
@@ -18080,7 +18088,25 @@ async function buildModel(){
     + " | where isempty(LifecycleStatus) or LifecycleStatus != 'Deleted'"
     + " | project AgentId, Name, Platform, Version, Model, EntraAgentID, EntraBlueprintID, Owners, RiskIndicators, DeclaredTools, McpServers, Endpoints, ConnectedAgents, PublishedStatus";
   const rows = await EP.exposureGraph.hunt(q);
-  return { live: true, licensed: rows.length > 0, agents: rows.map(normAgent) };
+  const agents = rows.map(normAgent);
+  await resolveOwnerNames(agents);   // turn owner objectId GUIDs into display names (best-effort)
+  return { live: true, licensed: rows.length > 0, agents: agents };
+}
+// Resolve owner objectId GUIDs → display names via Graph directoryObjects/getByIds (any principal type).
+// Read-only (Directory.Read.All, already granted). Best-effort: on failure a name falls back to a short id.
+async function resolveOwnerNames(agents){
+  const ids = [...new Set(agents.flatMap(a => a.ownerIds || []).map(String).filter(x => /^[0-9a-f-]{20,}$/i.test(x)))];
+  const map = {};
+  if (ids.length && window.EP && EP.tokenSilent && EP.graphBase){
+    try {
+      const at = await EP.tokenSilent(["Directory.Read.All"]);
+      for (let i = 0; i < ids.length; i += 900){
+        const r = await fetch(EP.graphBase() + "/directoryObjects/getByIds", { method: "POST", headers: { Authorization: "Bearer " + at, "Content-Type": "application/json" }, body: JSON.stringify({ ids: ids.slice(i, i + 900), types: ["user", "group", "servicePrincipal"] }) });
+        if (r.ok){ ((await r.json()).value || []).forEach(o => { map[o.id] = o.displayName || o.userPrincipalName || o.id; }); }
+      }
+    } catch(e){}
+  }
+  agents.forEach(a => { a.ownerNames = (a.ownerIds || []).map(id => map[id] || ("id " + String(id).slice(0, 8))); });
 }
 
 // ---- demo: a realistic fleet — cloud (Copilot Studio + third-party, mostly unowned, Defender-flagged) + local ----
@@ -18088,11 +18114,11 @@ function demoModel(){
   const A = (o) => Object.assign({ platform:"Copilot Studio", local:false, model:null, version:null, managed:false, blueprint:null, owner:false, ownerCount:0, risks:[], tools:0, mcp:0, connected:0, externalEndpoint:false, published:true }, o);
   return { live:false, licensed:true, agents:[
     A({ id:"c1", name:"Message Center Adoption Agent", platform:"Other", risks:["Published Agent","Weak Instructions"], tools:3, published:true }),
-    A({ id:"c2", name:"Finance Copilot Agent", platform:"Copilot Studio", managed:true, owner:true, ownerCount:1, model:"GPT-4o", risks:["Privileged Business-system Access"], tools:5, mcp:1, externalEndpoint:true }),
+    A({ id:"c2", name:"Finance Copilot Agent", platform:"Copilot Studio", managed:true, owner:true, ownerCount:1, ownerNames:["ava.devries@contoso.com"], model:"GPT-4o", risks:["Privileged Business-system Access"], tools:5, mcp:1, externalEndpoint:true }),
     A({ id:"c3", name:"Seaworthy Insurance Bot", platform:"Other", risks:["Published Agent"], tools:1 }),
     A({ id:"c4", name:"HR Onboarding Agent", platform:"Copilot Studio", managed:true, owner:false, model:"GPT-4o-mini", risks:["Weak Instructions"], tools:2 }),
     A({ id:"c5", name:"Nexoya", platform:"Other", risks:["Published Agent","Indirect Prompt Injection Exposure"], tools:4, externalEndpoint:true }),
-    A({ id:"c6", name:"Exec Briefing Agent", platform:"Copilot Studio", managed:true, owner:true, ownerCount:2, model:"GPT-4o", risks:[], tools:1 }),
+    A({ id:"c6", name:"Exec Briefing Agent", platform:"Copilot Studio", managed:true, owner:true, ownerCount:2, ownerNames:["dana.okafor@contoso.com","Platform Team"], model:"GPT-4o", risks:[], tools:1 }),
     A({ id:"l1", name:"Claude Code", platform:"LocalAgents", local:true, owner:false, model:"claude", mcp:3, risks:["Running on a critical device","Privileged Software Development Access"] }),
     A({ id:"l2", name:"Ollama", platform:"LocalAgents", local:true, owner:false, model:"llama3", mcp:1, risks:["Used by a critical user"] })
   ] };
@@ -18117,7 +18143,8 @@ function agentCard(a){
   meta.push('<span><b>' + a.tools + '</b> tool' + (a.tools === 1 ? "" : "s") + '</span>');
   meta.push('<span><b>' + a.mcp + '</b> MCP server' + (a.mcp === 1 ? "" : "s") + '</span>');
   if (a.connected) meta.push('<span><b>' + a.connected + '</b> connected agent' + (a.connected === 1 ? "" : "s") + '</span>');
-  meta.push(a.owner ? ('<span><b>' + a.ownerCount + '</b> owner' + (a.ownerCount === 1 ? "" : "s") + '</span>')
+  meta.push(a.owner
+    ? ('<span><b>Owner' + (a.ownerCount === 1 ? "" : "s") + ':</b> ' + esc((a.ownerNames && a.ownerNames.length) ? a.ownerNames.join(", ") : String(a.ownerCount)) + '</span>')
     : '<span class="ar-owner-note">no owner / sponsor — accountability gap</span>');
   const risks = a.risks.length ? ('<div class="ar-risks">' + a.risks.slice(0, 6).map(r => '<span class="ar-risk">' + esc(r) + '</span>').join("") + '</div>') : "";
   return '<div class="ar-agent ' + cls + '">'
@@ -18135,10 +18162,10 @@ function riskRollupHtml(list){
   const items = Object.keys(m).map(k => ({ name: k, n: m[k] })).sort((a, b) => b.n - a.n);
   if (!items.length) return "";
   const max = items[0].n || 1;
-  return '<div class="ar-rollup"><div class="ar-rollup-h">Risk indicators · ' + (AR_SEG === "local" ? "local" : "cloud") + ' fleet</div>'
-    + items.map(it => '<div class="ar-rollup-row"><span class="ar-rollup-n">' + it.n + '</span>'
+  return '<div class="ar-rollup"><div class="ar-rollup-h">Risk indicators · ' + (AR_SEG === "local" ? "local" : "cloud") + ' fleet <span style="font-weight:600;text-transform:none;letter-spacing:0;opacity:.8">· click to filter</span></div>'
+    + items.map(it => '<button type="button" class="ar-rollup-row ar-rollup-click' + (AR_RISK === it.name ? " on" : "") + '" data-risk="' + esc(it.name) + '"><span class="ar-rollup-n">' + it.n + '</span>'
       + '<span class="ar-rollup-bar"><span style="width:' + Math.max(4, Math.round(it.n / max * 100)) + '%"></span></span>'
-      + '<span class="ar-rollup-l">' + esc(it.name) + '</span></div>').join("")
+      + '<span class="ar-rollup-l">' + esc(it.name) + '</span></button>').join("")
     + '</div>';
 }
 function render(m){
@@ -18181,17 +18208,22 @@ function render(m){
     + '<button class="' + (AR_SEG === "cloud" ? "on" : "") + '" data-seg="cloud">☁ Cloud <span class="ct">' + cloud.length + '</span></button>'
     + '<button class="' + (AR_SEG === "local" ? "on" : "") + '" data-seg="local">💻 Local <span class="ct">' + local.length + '</span></button></div>';
   const CAP = 40;   // large fleets (hundreds of agents) — show the worst-first slice, not every card
-  const sorted = list.slice().sort((a, b) => agRank(b) - agRank(a));
-  const more = sorted.length > CAP ? ('<div class="ar-empty">Showing the ' + CAP + ' highest-risk of ' + sorted.length + ' ' + (AR_SEG === "local" ? "local" : "cloud") + ' agents (worst-first).</div>') : "";
-  const rows = list.length ? (sorted.slice(0, CAP).map(agentCard).join("") + more)
-    : '<div class="ar-empty">No ' + (AR_SEG === "local" ? "local" : "cloud") + ' agents' + (AR_SEG === "local" ? " discovered (local agents need Defender for Endpoint discovery on onboarded devices)." : ".") + '</div>';
+  const flist = AR_RISK ? list.filter(a => (a.risks || []).includes(AR_RISK)) : list;
+  const sorted = flist.slice().sort((a, b) => agRank(b) - agRank(a));
+  const more = sorted.length > CAP ? ('<div class="ar-empty">Showing the ' + CAP + ' highest-risk of ' + sorted.length + (AR_RISK ? ' matching' : (' ' + (AR_SEG === "local" ? "local" : "cloud"))) + ' agents (worst-first).</div>') : "";
+  const filterChip = AR_RISK ? ('<div class="ar-filter">Filtered by <b>' + esc(AR_RISK) + '</b> · ' + flist.length + ' agent' + (flist.length === 1 ? "" : "s") + ' <button type="button" class="ar-filter-x" data-clearrisk>✕ clear</button></div>') : "";
+  const rows = flist.length ? (sorted.slice(0, CAP).map(agentCard).join("") + more)
+    : (AR_RISK ? '<div class="ar-empty">No ' + (AR_SEG === "local" ? "local" : "cloud") + ' agents with “' + esc(AR_RISK) + '”.</div>'
+       : '<div class="ar-empty">No ' + (AR_SEG === "local" ? "local" : "cloud") + ' agents' + (AR_SEG === "local" ? " discovered (local agents need Defender for Endpoint discovery on onboarded devices)." : ".") + '</div>');
   const src = (window.EP && EP.DEMO) ? "Demo data." : "Live — Microsoft Defender AgentsInfo via advanced hunting.";
   const note = '<div class="ar-note"><b>Read-only. ' + src + '</b> The agent fleet from Defender’s <b>AgentsInfo</b> table — Copilot Studio, Foundry, M365 Copilot, third-party and endpoint-discovered <b>local</b> agents in one inventory. '
     + 'The headline signals are the <b>owner / sponsor gap</b> (who is accountable for each agent’s lifecycle) and Defender’s <b>risk indicators</b> (e.g. Weak Instructions, Privileged Business-system Access, Published Agent). <b>No Entra ID</b> = not registered with Microsoft Entra Agent ID (legacy / third-party). '
     + 'Risk indicators need E7 / Agent 365; local-agent discovery needs Defender for Endpoint on onboarded devices. Reach into data (which labelled site / mailbox) and the privileged-operator toxic combo are the next slices.</div>';
-  root.innerHTML = band + tiles + seg + riskRollupHtml(list) + '<div class="ar-h2">Agents · worst-first</div>' + rows + note;
+  root.innerHTML = band + tiles + seg + riskRollupHtml(list) + '<div class="ar-h2">Agents · worst-first</div>' + filterChip + rows + note;
   const r2 = document.getElementById("ar-root");
-  r2.querySelectorAll("[data-seg]").forEach(el => el.addEventListener("click", () => { AR_SEG = el.getAttribute("data-seg"); render(AR_LAST); }));
+  r2.querySelectorAll("[data-seg]").forEach(el => el.addEventListener("click", () => { AR_SEG = el.getAttribute("data-seg"); AR_RISK = null; render(AR_LAST); }));
+  r2.querySelectorAll("[data-risk]").forEach(el => el.addEventListener("click", () => { const rk = el.getAttribute("data-risk"); AR_RISK = (AR_RISK === rk) ? null : rk; render(AR_LAST); }));
+  const _clr = r2.querySelector("[data-clearrisk]"); if (_clr) _clr.addEventListener("click", () => { AR_RISK = null; render(AR_LAST); });
 }
 
 async function analyze(){
