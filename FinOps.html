@@ -115,7 +115,7 @@
     <button class="nav-btn" data-view="licences">Copilot licences</button>
     <button class="nav-btn" data-view="usage">Copilot usage</button>
     <div class="sect">Agents &amp; other AI</div>
-    <button class="nav-btn" data-view="agents">Copilot Studio agents<span class="ph">next</span></button>
+    <button class="nav-btn" data-view="agents">Copilot Studio agents</button>
     <button class="nav-btn" data-view="github">GitHub Copilot<span class="ph">next</span></button>
     <button class="nav-btn" data-view="foundry">Azure AI Foundry<span class="ph">phase 2</span></button>
   </nav>
@@ -139,8 +139,9 @@ const DEMO = /[?&]demo(=1)?(&|$)/.test(location.search);
 const redirectUri = location.origin + location.pathname;
 
 // ---- money assumptions (editable; list price, USD/month) ----
-const PRICE = { m365copilot: 30, githubcopilot: 19 };   // per seat / month — adjust to your contract
+const PRICE = { m365copilot: 30, githubcopilot: 19, credit: 0.01 };   // seat $/month + est. $ per Copilot Credit — adjust to your contract
 const fmtUsd = n => "$" + (Math.round(n)).toLocaleString();
+const fmtRate = n => "$" + Number(n).toFixed(n<1?3:2).replace(/0+$/,"").replace(/\.$/,"");   // per-credit rate, keeps cents
 
 // ============ AUTH ============
 let msalInstance = null, account = null;
@@ -210,7 +211,7 @@ function startApp(){
 }
 
 // ============ DATA (live + demo) ============
-const MODEL = { licences:null, usage:null, loaded:{} };
+const MODEL = { licences:null, usage:null, agents:null, importAgents:null, loaded:{} };
 
 // Is this SKU / its service plans a Copilot thing?
 const isCopilotSku = s => /copilot/i.test(s.skuPartNumber||"") ||
@@ -249,10 +250,15 @@ async function loadUsage(){
   try {
     const tok = await tokenFor(["Reports.Read.All"]);
     // JSON output is documented on BETA; the v1.0 function returns a 302 → CSV on reports.office.com
-    // which a browser can't follow cross-origin. So read beta with $format=application/json. Field names
-    // per getMicrosoft365CopilotUsageUserDetail. Delegated access ALSO needs the signed-in account to hold
-    // a role (Global Reader / Reports Reader / AI Admin / …) — the Reports.Read.All scope alone 403s.
-    const j = await gGet("https://graph.microsoft.com/beta/reports/getMicrosoft365CopilotUsageUserDetail(period='D30')?$format=application/json", tok);
+    // which a browser can't follow cross-origin. So read beta with $format=application/json. The v2 report
+    // uses rolling-window periods (RL7/RL28/…), not D7/D30 — start with RL28 and, if Graph says "Use 'X'
+    // instead", retry once with the value it names. Delegated access ALSO needs the signed-in account to
+    // hold a role (Global Reader / Reports Reader / AI Admin / …) — the Reports.Read.All scope alone 403s.
+    let j = null, period = "RL28";
+    for(let attempt=0; attempt<2; attempt++){
+      try { j = await gGet("https://graph.microsoft.com/beta/reports/getMicrosoft365CopilotUsageUserDetail(period='"+period+"')?$format=application/json", tok); break; }
+      catch(e){ const m = /Use '([^']+)' instead/.exec(e.message||""); if(m && m[1] && attempt===0){ period = m[1]; continue; } throw e; }
+    }
     const rows = (j.value||[]).map(r => ({
       upn:r.userPrincipalName, name:r.displayName, last:r.lastActivityDate||null,
       apps:{
@@ -287,6 +293,7 @@ async function show(name){
     if(name==="overview") await renderOverview(v);
     else if(name==="licences") await renderLicences(v);
     else if(name==="usage") await renderUsage(v);
+    else if(name==="agents") await renderAgents(v);
     else renderPlaceholder(v, name);
   } catch(e){ v.innerHTML = '<div class="card"><h2>Could not load</h2><div class="hint">'+esc(e.message||String(e))+'</div></div>'; }
 }
@@ -296,7 +303,7 @@ const demoBanner = () => DEMO ? '<div class="demo-note"><b>Demo data</b> — a s
 function seatOptimization(lic, usage){
   if(!lic || !lic.users || !lic.users.length) return null;
   const lastByUpn = {}; (usage&&usage.rows||[]).forEach(r => { if(r.upn) lastByUpn[String(r.upn).toLowerCase()] = r.last; });
-  const INACTIVE = 30;
+  const INACTIVE = 28;   // matches the report's rolling-28-day window
   const seats = lic.users.map(u => { const last = lastByUpn[String(u.upn).toLowerCase()]; const d = daysSince(last);
     return { ...u, copilotLast:last||null, idleDays:d, inactive: usage&&usage.available ? (d==null || d>INACTIVE) : null }; });
   const inactive = seats.filter(s => s.inactive===true);
@@ -305,19 +312,21 @@ function seatOptimization(lic, usage){
 }
 
 async function renderOverview(v){
-  const [lic, usage] = await Promise.all([loadLicences(), loadUsage()]);
+  const [lic, usage, ag] = await Promise.all([loadLicences(), loadUsage(), loadAgents()]);
+  const agOpt = (ag && ag.available) ? agentOptimization(ag.agents||[]) : null;
   const seats = (lic.users||[]).length;
   const copilotSku = (lic.skus||[]).reduce((a,s)=>a+(s.enabled||0),0);
   const assigned = (lic.skus||[]).reduce((a,s)=>a+(s.consumed||0),0);
   const opt = seatOptimization(lic, usage);
-  const activeUsers = (usage&&usage.rows||[]).filter(r => daysSince(r.last)!=null && daysSince(r.last)<=30).length;
+  const activeUsers = (usage&&usage.rows||[]).filter(r => daysSince(r.last)!=null && daysSince(r.last)<=28).length;
   let h = demoBanner();
   h += '<div class="tiles">';
   h += tile(copilotSku, "Copilot seats owned", (assigned?assigned+" assigned":""), copilotSku?"":"mut");
   h += tile(seats||"—", "Licensed users", "hold a Copilot licence");
-  h += tile((usage&&usage.available)?activeUsers:"N/A", "Active (30d)", (usage&&usage.available)?"used Copilot in last 30 days":"Reports.Read.All needed", (usage&&usage.available)?"good":"mut");
-  if(opt) h += tile(opt.inactive.length, "Inactive seats", "assigned · no Copilot in 30d", opt.inactive.length?"warn":"good");
-  h += tile("—", "Agents on credits", "phase 1b — Copilot Studio", "mut");
+  h += tile((usage&&usage.available)?activeUsers:"N/A", "Active (28d)", (usage&&usage.available)?"used Copilot in last 28 days":"Reports.Read.All needed", (usage&&usage.available)?"good":"mut");
+  if(opt) h += tile(opt.inactive.length, "Inactive seats", "assigned · no Copilot in 28d", opt.inactive.length?"warn":"good");
+  if(agOpt) h += tile(agOpt.gh.length, "Agents on GitHub harness", agOpt.totalCredits.toLocaleString()+" credits/mo · "+fmtUsd(agOpt.totalCredits*PRICE.credit), agOpt.gh.length?"warn":"good");
+  else h += tile("—", "Agents on credits", "connect Power Platform / import", "mut");
   h += '</div>';
   // optimization card
   h += '<div class="card opt"><h2>Save money <span class="pill">optimization</span></h2>';
@@ -325,9 +334,10 @@ async function renderOverview(v){
     h += '<div class="tiles" style="margin-bottom:12px"><div class="tile bad"><div class="n">'+fmtUsd(opt.monthlyWaste)+'</div><div class="l">/ month reclaimable</div><div class="sub">'+opt.inactive.length+' inactive Copilot seat'+(opt.inactive.length===1?"":"s")+' × '+fmtUsd(PRICE.m365copilot)+'</div></div>'
       + '<div class="tile"><div class="n">'+fmtUsd(opt.monthlyWaste*12)+'</div><div class="l">/ year</div><div class="sub">at list price — adjust in PRICE</div></div></div>';
     h += '<ul class="recs">';
-    if(opt.inactive.length) h += '<li><b>'+opt.inactive.length+'</b> Copilot seats assigned but no activity in 30 days — reclaim or reassign. <span class="save">saves '+fmtUsd(opt.monthlyWaste)+'/mo</span> <a data-go="licences">review →</a></li>';
+    if(opt.inactive.length) h += '<li><b>'+opt.inactive.length+'</b> Copilot seats assigned but no activity in 28 days — reclaim or reassign. <span class="save">saves '+fmtUsd(opt.monthlyWaste)+'/mo</span> <a data-go="licences">review →</a></li>';
     if(opt.unknown.length) h += '<li><b>'+opt.unknown.length+'</b> seats with no usage record yet — confirm they are actually being used.</li>';
-    h += '<li>Copilot Studio agents on the <b>GitHub Copilot harness</b> burn credits from the moment they are built — the Agents view (next) flags ones that could run as a <b>Standard</b> harness for free.</li>';
+    if(agOpt && agOpt.candidates.length) h += '<li><b>'+agOpt.candidates.length+'</b> GitHub-Copilot-harness agent'+(agOpt.candidates.length===1?"":"s")+' are unpublished or barely used — move to a Standard/Chat harness to stop the credit burn. <span class="save">est. '+fmtUsd(agOpt.monthlySave)+'/mo</span> <a data-go="agents">review →</a></li>';
+    else h += '<li>Copilot Studio agents on the <b>GitHub Copilot harness</b> burn credits from the moment they are built — the <a data-go="agents">Agents view</a> flags ones that could run as a <b>Standard</b> harness for free.</li>';
     h += '</ul>';
   } else {
     const parts = [];
@@ -373,27 +383,149 @@ async function renderUsage(v){
   let h = demoBanner();
   if(!usage.available){ v.innerHTML = h + '<div class="card"><h2>Copilot usage not read</h2><div class="hint">The Microsoft 365 Copilot usage report needs <code>Reports.Read.All</code> and a Reports/Global Reader role. '+(usage.error?'<br><span class="na">'+esc(usage.error)+'</span>':'')+'</div></div>'; return; }
   const n = usage.rows.length;
-  const act = f => usage.rows.filter(r => daysSince(r.apps[f])!=null && daysSince(r.apps[f])<=30).length;
-  const active30 = usage.rows.filter(r => daysSince(r.last)!=null && daysSince(r.last)<=30).length;
+  const act = f => usage.rows.filter(r => daysSince(r.apps[f])!=null && daysSince(r.apps[f])<=28).length;
+  const active30 = usage.rows.filter(r => daysSince(r.last)!=null && daysSince(r.last)<=28).length;
   h += '<div class="tiles">'
     + tile(n, "Users in report", "licensed Copilot users")
-    + tile(active30, "Active (30d)", "any Copilot surface", active30?"good":"warn")
-    + tile(n-active30, "Idle (30d)", "no Copilot activity", (n-active30)?"warn":"good")
+    + tile(active30, "Active (28d)", "any Copilot surface", active30?"good":"warn")
+    + tile(n-active30, "Idle (28d)", "no Copilot activity", (n-active30)?"warn":"good")
     + '</div>';
   if(usage.anonymized) h += '<div class="demo-note"><b>Usernames are anonymized</b> by the tenant’s report setting (Admin center → Reports → “Display concealed user names”). Turn it off to see who, or join on seat IDs.</div>';
   // per-app adoption
   const apps = [["chat","Copilot Chat"],["teams","Teams"],["outlook","Outlook"],["word","Word"],["excel","Excel"],["powerpoint","PowerPoint"],["onenote","OneNote"],["loop","Loop"]];
-  h += '<div class="card"><h2>Adoption by surface <span class="hint" style="font-weight:400">· active users (30d)</span></h2><table><thead><tr><th>Surface</th><th>Active users</th><th>Adoption</th></tr></thead><tbody>';
+  h += '<div class="card"><h2>Adoption by surface <span class="hint" style="font-weight:400">· active users (28d)</span></h2><table><thead><tr><th>Surface</th><th>Active users</th><th>Adoption</th></tr></thead><tbody>';
   apps.forEach(([k,label])=>{ const a=act(k); const pct = n?Math.round(a/n*100):0;
     h += '<tr><td>'+label+'</td><td>'+a+'</td><td><div style="display:flex;align-items:center;gap:8px"><div style="flex:1;max-width:220px;height:8px;background:var(--border);border-radius:5px;overflow:hidden"><div style="height:100%;width:'+pct+'%;background:'+(pct>=50?'var(--green)':pct>=20?'var(--amber)':'var(--sev-crit)')+'"></div></div><span class="hint">'+pct+'%</span></div></td></tr>'; });
-  h += '</tbody></table>'+(usage.refreshed?'<div class="hint" style="margin-top:8px">Report refreshed '+esc(usage.refreshed)+' · 30-day window.</div>':'')+'</div>';
+  h += '</tbody></table>'+(usage.refreshed?'<div class="hint" style="margin-top:8px">Report refreshed '+esc(usage.refreshed)+' · 28-day window.</div>':'')+'</div>';
   v.innerHTML = h;
+}
+
+// ============ AGENTS (Copilot Studio) ============
+// Harness decides cost: GitHub Copilot harness burns Copilot Credits from the moment it is built; Standard
+// harness bills only after publish; Copilot Chat harness isn't charged. (In the Power Platform inventory a
+// GitHub-Copilot-harness agent reports its feature as "Process Agent".)
+const PP_API = "https://api.powerplatform.com";
+const HARNESS = {
+  "GitHub Copilot": { credits:true, note:"burns credits from build", cls:"b-bad" },
+  "Standard":       { credits:true, note:"billed only after publish", cls:"b-warn" },
+  "Copilot Chat":   { credits:false, note:"not charged", cls:"b-ok" }
+};
+function harnessOf(a){ return HARNESS[a.harness] ? a.harness : (a.harness||"Standard"); }
+
+async function loadAgents(){
+  if(MODEL.loaded.agents) return MODEL.agents;
+  if(DEMO){ MODEL.agents = demoAgents(); MODEL.loaded.agents=true; return MODEL.agents; }
+  if(MODEL.importAgents){ MODEL.agents = { agents:MODEL.importAgents, available:true, source:"import" }; MODEL.loaded.agents=true; return MODEL.agents; }
+  // Best-effort live read via the Power Platform API. api.powerplatform.com may not send CORS headers to a
+  // browser origin — if so this throws and we fall back to the import path (a read-only collection script).
+  try {
+    const tok = await tokenFor(["https://api.powerplatform.com/.default"]);
+    const cap = await (await fetch(PP_API+"/licensing/entitlements/MCSMessages?api-version=2024-10-01",{headers:{Authorization:"Bearer "+tok}})).json();
+    const res = await (await fetch(PP_API+"/licensing/entitlements/MCSMessages/resources?api-version=2024-10-01",{headers:{Authorization:"Bearer "+tok}})).json();
+    const list = (res.value||res.resources||[]).map(r => ({
+      name:r.resourceName||r.name||r.resourceId, id:r.resourceId, harness:r.harness||r.featureName||"Standard",
+      creditsMonth:r.consumedUnits||r.consumption||0, cap:r.limit!=null?r.limit:null, env:r.environmentName||r.environmentId||"",
+      published:r.published!==false, lastUsed:r.lastActivityDate||null, sessions:r.sessions!=null?r.sessions:null, owner:r.owner||"" }));
+    MODEL.agents = { agents:list, available:true, source:"live", tenantCredits:(cap&&(cap.consumedUnits||cap.consumption))||null };
+  } catch(e){ MODEL.agents = { agents:[], available:false, source:"live", error:(e&&e.message)||String(e) }; }
+  MODEL.loaded.agents = true; return MODEL.agents;
+}
+
+function agentOptimization(list){
+  const credit = list.filter(a => (HARNESS[harnessOf(a)]||{}).credits);
+  const gh = list.filter(a => harnessOf(a)==="GitHub Copilot");
+  // conversion candidates: GitHub-Copilot harness that is unpublished OR low traffic (≤ a handful of sessions)
+  const candidates = gh.filter(a => a.published===false || (a.sessions!=null && a.sessions<=5) || (a.creditsMonth||0)===0);
+  const noCap = credit.filter(a => a.cap==null);
+  const idle = credit.filter(a => (a.creditsMonth||0)>0 && ((a.sessions!=null && a.sessions===0) || (a.lastUsed && daysSince(a.lastUsed)>30)));
+  const totalCredits = list.reduce((s,a)=>s+(a.creditsMonth||0),0);
+  const candCredits = candidates.reduce((s,a)=>s+(a.creditsMonth||0),0);
+  return { credit, gh, candidates, noCap, idle, totalCredits, candCredits,
+    monthlySave: candidates.reduce((s,a)=>s+(a.creditsMonth||0),0)*PRICE.credit };
+}
+
+async function renderAgents(v){
+  const data = await loadAgents();
+  let h = demoBanner();
+  if(!data.available){
+    v.innerHTML = h + agentImportCard(data.error);
+    wireAgentImport(v);
+    return;
+  }
+  const list = data.agents||[];
+  if(!list.length){ v.innerHTML = h + '<div class="card"><h2>No Copilot Studio agents</h2><div class="hint">No V2 Copilot Studio agents were returned'+(data.source==="import"?" in the imported file":"")+'.</div></div>' + agentImportCard(null); wireAgentImport(v); return; }
+  const opt = agentOptimization(list);
+  const estMonth = opt.totalCredits*PRICE.credit;
+  h += '<div class="tiles">'
+    + tile(list.length, "Agents", "Copilot Studio (V2)")
+    + tile(opt.gh.length, "GitHub Copilot harness", "burn credits from build", opt.gh.length?"warn":"good")
+    + tile(opt.totalCredits.toLocaleString(), "Credits / month", "across all agents")
+    + tile(fmtUsd(estMonth), "Est. cost / month", "at "+fmtRate(PRICE.credit)+"/credit (editable)", estMonth?"warn":"good")
+    + tile(opt.noCap.length, "No consumption cap", "credit-consuming agents", opt.noCap.length?"warn":"good")
+    + '</div>';
+  // optimization
+  h += '<div class="card opt"><h2>Save money <span class="pill">optimization</span></h2>';
+  if(opt.candidates.length || opt.noCap.length || opt.idle.length){
+    if(opt.candidates.length) h += '<div class="tiles" style="margin-bottom:12px"><div class="tile good"><div class="n">'+fmtUsd(opt.monthlySave)+'</div><div class="l">/ month if converted</div><div class="sub">'+opt.candidates.length+' GitHub-Copilot agent'+(opt.candidates.length===1?"":"s")+' → Standard / Chat</div></div><div class="tile"><div class="n">'+fmtUsd(opt.monthlySave*12)+'</div><div class="l">/ year</div></div></div>';
+    h += '<ul class="recs">';
+    if(opt.candidates.length) h += '<li><b>'+opt.candidates.length+'</b> GitHub-Copilot-harness agent'+(opt.candidates.length===1?"":"s")+' are unpublished or barely used — rebuild on the <b>Standard</b> harness (free until publish) or <b>Copilot Chat</b> harness (not charged). <span class="save">est. '+fmtUsd(opt.monthlySave)+'/mo</span></li>';
+    if(opt.noCap.length) h += '<li><b>'+opt.noCap.length+'</b> credit-consuming agent'+(opt.noCap.length===1?"":"s")+' have <b>no monthly consumption cap</b> — set a per-agent limit so a runaway agent can’t blow the budget.</li>';
+    if(opt.idle.length) h += '<li><b>'+opt.idle.length+'</b> agent'+(opt.idle.length===1?"":"s")+' are burning credits but look idle (no recent sessions) — review or retire.</li>';
+    h += '</ul>';
+  } else h += '<div class="hint">No obvious agent-credit waste — credit-consuming agents are published, used and capped.</div>';
+  h += '<div class="hint" style="margin-top:10px;font-size:11.5px">Credit cost is an estimate at <code>'+fmtRate(PRICE.credit)+'</code>/credit — set your contract rate in the <code>PRICE</code> constant. Credit counts are the hard number.</div></div>';
+  // table
+  h += '<div class="card"><h2>Agents <span class="hint" style="font-weight:400">· '+(data.source==="live"?"live":data.source==="import"?"imported":"demo")+' · worst credit burn first</span></h2>'
+    + '<table><thead><tr><th>Agent</th><th>Harness</th><th>Published</th><th>Credits / mo</th><th>Cap</th><th>Last used</th></tr></thead><tbody>';
+  list.slice().sort((a,b)=>(b.creditsMonth||0)-(a.creditsMonth||0)).forEach(a => {
+    const hn = harnessOf(a), hm = HARNESS[hn]||{cls:"b-mut",note:""};
+    const cand = hn==="GitHub Copilot" && (a.published===false || (a.sessions!=null && a.sessions<=5) || (a.creditsMonth||0)===0);
+    h += '<tr><td><b>'+esc(a.name||a.id)+'</b>'+(a.env?'<div class="hint" style="font-size:11px">'+esc(a.env)+'</div>':'')+(cand?'<div><span class="badge b-ok" title="Could run as Standard/Chat harness without credits">→ convert candidate</span></div>':'')+'</td>'
+      + '<td><span class="badge '+hm.cls+'" title="'+esc(hm.note)+'">'+esc(hn)+'</span></td>'
+      + '<td>'+(a.published===false?'<span class="badge b-mut">building</span>':'<span class="badge b-ok">published</span>')+'</td>'
+      + '<td>'+((a.creditsMonth||0).toLocaleString())+(hm.credits?'':' <span class="hint">(free)</span>')+'</td>'
+      + '<td>'+(a.cap!=null?a.cap.toLocaleString():(hm.credits?'<span class="badge b-warn">none</span>':'<span class="na">n/a</span>'))+'</td>'
+      + '<td>'+(a.lastUsed?esc(a.lastUsed):'<span class="na">—</span>')+'</td></tr>';
+  });
+  h += '</tbody></table></div>';
+  v.innerHTML = h;
+}
+
+function agentImportCard(error){
+  const ps = "# Read-only: Copilot Studio agent credit consumption (Power Platform API)\n"
+    + "$tok = (Get-AzAccessToken -ResourceUrl 'https://api.powerplatform.com').Token\n"
+    + "$h = @{ Authorization = \"Bearer $tok\" }\n"
+    + "$res = Invoke-RestMethod 'https://api.powerplatform.com/licensing/entitlements/MCSMessages/resources?api-version=2024-10-01' -Headers $h\n"
+    + "$res.value | ConvertTo-Json -Depth 6 | Out-File finops-agents.json";
+  return '<div class="card"><h2>Copilot Studio agents — not read from the browser'+(error?' <span class="badge b-mut">live failed</span>':'')+'</h2>'
+    + '<div class="hint" style="line-height:1.7">The Power Platform API (<code>api.powerplatform.com</code>) usually doesn’t allow direct browser calls (CORS), and reading it needs an <b>AI Administrator</b> / <b>Power Platform Administrator</b> role. '
+    + (error?'<br><span class="na">'+esc(error)+'</span>':'')
+    + '<br><br>Run this read-only snippet as an admin, then load the JSON below — same pattern as the posture suite’s consultant collection:</div>'
+    + '<pre style="background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:12px;overflow:auto;font-size:12px;margin:12px 0;white-space:pre-wrap">'+esc(ps)+'</pre>'
+    + '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center"><input type="file" id="agImport" accept="application/json,.json"><span class="hint">or paste JSON:</span></div>'
+    + '<textarea id="agPaste" placeholder="paste finops-agents.json here" style="width:100%;height:90px;margin-top:8px;background:var(--input-bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:Cascadia Code,Consolas,monospace;font-size:12px;padding:9px"></textarea>'
+    + '<div style="margin-top:8px"><button id="agLoad" style="background:var(--accent);color:#06101f;font-weight:700;border:0;border-radius:8px;padding:8px 15px;font:inherit;cursor:pointer">Load collection</button> <span class="hint" id="agMsg"></span></div>'
+    + '<div class="hint" style="margin-top:10px;font-size:11.5px">Expected: an array of agents with <code>name</code>, <code>harness</code> (GitHub Copilot / Standard / Copilot Chat), <code>creditsMonth</code>, <code>published</code>, optional <code>cap</code>, <code>lastUsed</code>, <code>sessions</code>. Raw Power Platform field names are normalized on load.</div></div>';
+}
+function wireAgentImport(v){
+  const fileEl=v.querySelector("#agImport"), pasteEl=v.querySelector("#agPaste"), loadEl=v.querySelector("#agLoad"), msg=v.querySelector("#agMsg");
+  if(fileEl) fileEl.addEventListener("change", e=>{ const f=e.target.files[0]; if(!f) return; const r=new FileReader(); r.onload=()=>{ if(pasteEl) pasteEl.value=r.result; }; r.readAsText(f); });
+  if(loadEl) loadEl.addEventListener("click", ()=>{
+    try {
+      const raw = JSON.parse((pasteEl&&pasteEl.value||"").trim());
+      const arr = Array.isArray(raw) ? raw : (raw.value||raw.agents||raw.resources||[]);
+      const norm = arr.map(r => ({ name:r.name||r.resourceName||r.resourceId||"(unnamed)", id:r.id||r.resourceId,
+        harness:r.harness||r.featureName||"Standard", creditsMonth:+(r.creditsMonth||r.consumedUnits||r.consumption||0),
+        cap:(r.cap!=null?r.cap:(r.limit!=null?r.limit:null)), env:r.env||r.environmentName||r.environmentId||"",
+        published:r.published!==false, lastUsed:r.lastUsed||r.lastActivityDate||null, sessions:(r.sessions!=null?r.sessions:null), owner:r.owner||"" }));
+      MODEL.importAgents = norm; MODEL.loaded.agents=false; MODEL.agents=null;
+      show("agents");
+    } catch(e){ if(msg){ msg.textContent = "Couldn't parse JSON — "+(e.message||e); msg.style.color="var(--sev-crit)"; } }
+  });
 }
 
 function renderPlaceholder(v, name){
   const info = {
-    agents:{ t:"Copilot Studio agents", p:"Phase 1b", d:"Inventory every Copilot Studio agent and its <b>harness type</b>, and show per-agent <b>Copilot Credit</b> burn. GitHub-Copilot-harness agents consume credits from the moment they are built; this view flags ones that could run as a <b>Standard</b> harness (billed only after publish) or <b>Copilot Chat</b> harness (not charged), plus per-agent monthly caps.",
-      s:"Power Platform API (<code>api.powerplatform.com</code> · <code>/licensing/entitlements/MCSMessages</code>) or Azure Resource Graph, with the consultant-collection fallback if browser CORS blocks it." },
     github:{ t:"GitHub Copilot", p:"Phase 1c", d:"Seats (source of truth for licences, with last-activity → unused seats) and per-user <b>AI credits consumed</b>. Reclaim idle seats; right-size the plan.",
       s:"GitHub REST API — <code>/orgs/{org}/copilot/billing/seats</code> and <code>/orgs/{org}/copilot/metrics</code>, authenticated with a GitHub token (stored in this browser)." },
     foundry:{ t:"Azure AI Foundry", p:"Phase 2", d:"Per-model token cost (input/output meters) for Azure OpenAI / Foundry deployments, with right-sizing against the Retail Prices rates.",
@@ -423,6 +555,23 @@ function demoUsage(){
       apps:{ chat:idle&&days(i%9), teams:i%2?a(1):null, outlook:i%3?a(2):null, word:i<10?a(1):null, excel:i%4===0?a(3):null, powerpoint:i%5===0?a(4):null, onenote:null, loop:null } };
   });
   return { rows, available:true, refreshed:new Date(Date.now()-864e5).toISOString().slice(0,10), anonymized:false };
+}
+function demoAgents(){
+  const d = n => new Date(Date.now()-n*864e5).toISOString().slice(0,10);
+  const A = (name,harness,creditsMonth,published,cap,lastUsed,sessions,env,owner) => ({name,harness,creditsMonth,published,cap,lastUsed,sessions,env,owner});
+  const agents = [
+    A("HR Policy Assistant","GitHub Copilot",8200,true,null,d(1),640,"Default","hr@contoso.demo"),
+    A("Finance Approvals Bot","GitHub Copilot",3100,true,5000,d(2),210,"Finance","fin@contoso.demo"),
+    A("IT Service Desk","Standard",0,true,null,d(1),880,"Default","it@contoso.demo"),
+    A("Sales Playbook Draft","GitHub Copilot",1450,false,null,d(3),3,"Sales","—"),          // unpublished, barely used → candidate
+    A("Onboarding Buddy (test)","GitHub Copilot",260,false,null,d(9),1,"Dev","—"),            // test build → candidate
+    A("Legal Clause Lookup","GitHub Copilot",540,true,null,d(41),4,"Legal","legal@contoso.demo"), // idle + low use → candidate
+    A("Marketing Copywriter","GitHub Copilot",2600,true,3000,d(2),175,"Marketing","mktg@contoso.demo"),
+    A("Expense FAQ","Copilot Chat",0,true,null,d(2),410,"Default","fin@contoso.demo"),
+    A("Procurement Helper","GitHub Copilot",0,false,null,d(16),0,"Ops","—"),                  // built, never used, burning build credits → candidate
+    A("Facilities Bot","Standard",0,false,null,null,0,"Ops","—")
+  ];
+  return { agents, available:true, source:"demo", tenantCredits:agents.reduce((s,a)=>s+a.creditsMonth,0) };
 }
 
 // ============ WIRE ============
