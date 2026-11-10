@@ -4113,6 +4113,8 @@
 #view-attackpaths .ap-node.entry { border-color:var(--sev-high); color:var(--sev-high); }
 #view-attackpaths .ap-arrow { color:var(--muted); font-size:11px; }
 #view-attackpaths .ap-port { display:inline-flex; align-items:center; font-size:10px; font-weight:700; letter-spacing:.2px; color:var(--sev-high,#FF7A45); border:1px solid color-mix(in srgb,var(--sev-high,#FF7A45) 40%,transparent); border-radius:5px; padding:1px 6px; white-space:nowrap; }
+#view-attackpaths .ap-port.matched { color:#0A1C42; background:var(--sev-crit,#FF4D6D); border-color:var(--sev-crit,#FF4D6D); }
+#view-attackpaths .ap-fullchain { display:inline-flex; align-items:center; font-size:9px; font-weight:800; letter-spacing:.4px; color:#0A1C42; background:var(--sev-crit,#FF4D6D); border-radius:5px; padding:2px 7px; text-transform:uppercase; }
 #view-attackpaths .ap-cut { margin-top:7px; font-size:11px; color:var(--text); line-height:1.5; }
 #view-attackpaths .ap-cut b { color:var(--accent); font-weight:700; }
 #view-attackpaths .ap-cred { margin-top:7px; font-size:11px; color:#FFE6A3; line-height:1.5; background:rgba(255,209,102,.07); border-left:2px solid #FFD166; padding:5px 9px; border-radius:0 6px 6px 0; }
@@ -5022,7 +5024,7 @@
   <div class="ep-pillar-nav" data-pillar="suite">
     <button class="nav" data-view="suite">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12l9-8 9 8" stroke-linejoin="round"/><path d="M5 10v9h14v-9" stroke-linejoin="round"/><path d="M9.5 19v-4.5h5V19" stroke-linecap="round"/></svg>
-      Cross-domain View<span class="nav-ai" aria-hidden="true">✦</span></button>
+      Overview<span class="nav-ai" aria-hidden="true">✦</span></button>
     <button class="nav" data-view="ask" data-scope="copilot">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5.5h16v10H8l-4 3.5z" stroke-linejoin="round"/><path d="M8.5 10h7M8.5 12.6h4.5" stroke-linecap="round"/><path d="M17.6 3.2l.7 1.6 1.6.7-1.6.7-.7 1.6-.7-1.6L15.3 5.5l1.6-.7z" fill="currentColor" stroke="none"/></svg>
       Ask<span class="nav-ai" aria-hidden="true">✦</span></button>
@@ -11626,9 +11628,13 @@ window.EP = (function () {
     // Choke points: non-terminal nodes many paths pass THROUGH (fix once, cut many). With opts.nodeMap each
     // result carries its resolved node (unresolved ids dropped) — matching the device view's shape exactly.
     function chokePoints(paths, opts) {
-      opts = opts || {}; const min = opts.min || 2, top = opts.top || 5, nm = opts.nodeMap || null;
+      opts = opts || {}; const min = opts.min || 2, top = opts.top || 5, nm = opts.nodeMap || null, targetOf = opts.targetOf || null;
       const count = {};
-      (paths || []).forEach(p => (p.seq || []).forEach((id, i) => { if (i > 0 && i < p.seq.length - 1) count[id] = (count[id] || 0) + 1; }));
+      // Count only genuine pass-through nodes: after the entry (i>0) and before the path's TARGET. targetOf lets a
+      // caller name a target that isn't the last node (e.g. a chain extended past the host with a software/CVE tail),
+      // so the reached asset and any trailing annotation nodes are never mistaken for choke points.
+      (paths || []).forEach(p => { const seq = p.seq || []; let tIdx = targetOf ? seq.indexOf(targetOf(p)) : (seq.length - 1); if (tIdx < 0) tIdx = seq.length - 1;
+        seq.forEach((id, i) => { if (i > 0 && i < tIdx) count[id] = (count[id] || 0) + 1; }); });
       let arr = Object.keys(count).map(id => { const o = { id: id, n: count[id] }; if (nm) o.node = nm[id] || null; return o; });
       if (nm) arr = arr.filter(c => c.node);
       return arr.filter(c => c.n >= min).sort((a, b) => b.n - a.n).slice(0, top);
@@ -31599,9 +31605,43 @@ const CRIT_LABELS = ["Very high", "High", "Medium", "Low"];   // Exposure Manage
 
 // Node kind → colour (shared look with the Threat attack-graph). Critical assets are crowned separately.
 const AP_COLOR = { internet:"#FF9A6B", device:"#93ACD3", user:"#4FB8FF", guest:"#FFC15E", group:"#8FE3FF",
-  app:"#B48CFF", sp:"#7C9CFF", cve:"#FF5C7A", identity:"#5AD1E6", resource:"#3FA9FF", role:"#FF7A8A", data:"#34D3A6" };
+  app:"#B48CFF", sp:"#7C9CFF", cve:"#FF5C7A", identity:"#5AD1E6", resource:"#3FA9FF", role:"#FF7A8A", data:"#34D3A6", software:"#8FA8FF" };
 const AP_KINDLBL = { internet:"Internet", device:"Device", user:"User", guest:"Guest", group:"Group",
-  app:"App / OAuth", sp:"Service principal", cve:"Vulnerability", identity:"Identity", resource:"Resource", role:"Role", data:"Data" };
+  app:"App / OAuth", sp:"Service principal", cve:"Vulnerability", identity:"Identity", resource:"Resource", role:"Role", data:"Data", software:"Software" };
+// Well-known-port → service family, with the software-name keywords that service runs under. Reference data (like the
+// Microsoft-tenants map) — the one inference layer that lets us ask "does the EXPOSED port actually run the vulnerable
+// software?". A hit turns an internet-facing host that merely HAS a CVE into a confirmed port → service → CVE → host
+// chain; a miss keeps the CVE host-level and says the exposed service isn't confirmed vulnerable (never fabricated).
+const PORT_SERVICE = {
+  21:{ svc:"FTP", match:["ftp","filezilla","vsftpd","proftpd"] },
+  22:{ svc:"SSH", match:["openssh"," ssh"] },
+  23:{ svc:"Telnet", match:["telnet"] },
+  25:{ svc:"SMTP", match:["exchange","smtp","postfix","sendmail","exim"] },
+  53:{ svc:"DNS", match:["bind","named","dns server"] },
+  80:{ svc:"HTTP", match:["iis","apache","nginx","httpd","tomcat","node.js","jetty"] },
+  110:{ svc:"POP3", match:["dovecot","pop3"] },
+  143:{ svc:"IMAP", match:["dovecot","imap","exchange"] },
+  389:{ svc:"LDAP", match:["ldap","active directory"] },
+  443:{ svc:"HTTPS", match:["iis","apache","nginx","httpd","tomcat","openssl","node.js","jetty"] },
+  445:{ svc:"SMB", match:["server message block","smb"] },
+  1433:{ svc:"SQL Server", match:["sql server","mssql"] },
+  1521:{ svc:"Oracle DB", match:["oracle database"] },
+  2049:{ svc:"NFS", match:["nfs"] },
+  3306:{ svc:"MySQL", match:["mysql","mariadb"] },
+  3389:{ svc:"RDP", match:["remote desktop","terminal services","terminal server","rdp"] },
+  5432:{ svc:"PostgreSQL", match:["postgresql","postgres"] },
+  5985:{ svc:"WinRM", match:["remote management","winrm"] },
+  5986:{ svc:"WinRM", match:["remote management","winrm"] },
+  8080:{ svc:"HTTP-alt", match:["tomcat","jetty","node.js","http"] }
+};
+// Does any exposed port run a service whose software is in this host's vulnerable set? Returns the first match (the
+// confirmed port → service → software → CVE link) or null (host is exposed AND vulnerable, but not on the open service).
+function portServiceMatch(ports, vulns){
+  for (const p of (ports || [])){ const ps = PORT_SERVICE[p]; if (!ps) continue;
+    const hit = (vulns || []).find(v => ps.match.some(k => String(v.software || "").toLowerCase().includes(k)));
+    if (hit) return { port:p, svc:ps.svc, software:hit.software, cve:hit.cve, cvss:hit.cvss }; }
+  return null;
+}
 // Many exposure-graph nodes (identities, apps, service principals) have a GUID for a NodeName — unreadable in a
 // graph. Relabel those by type with a short GUID suffix ("Identity · 25cae2ca"); keep the full GUID for the tooltip.
 function isGuid(s){ return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(s||"").trim()); }
@@ -31624,14 +31664,20 @@ function demoGraph(){
     { id:"guest", kind:"guest",    label:"guest@partner.com" },
     { id:"app",   kind:"app",      label:"ReportBot (OAuth app)" },
     { id:"fin",   kind:"data",     label:"Finance workspace (SharePoint)", crit:"Very high", role:"Highly Confidential" },
+    { id:"sw_rdp",   kind:"software", label:"Remote Desktop" },
+    { id:"sw_ssl",   kind:"software", label:"OpenSSL" },
     { id:"cve_ws01", kind:"cve", label:"CVE-2026-54875" },
     { id:"cve_srv",    kind:"cve", label:"CVE-2026-70583 +2" }
   ];
   const edges = [
-    { from:"net",        to:"cve_ws01", label:"exposed · port 3389" },
-    { from:"cve_ws01", to:"ws01",     label:"exploitable · CVSS 9.8" },
-    { from:"net",        to:"cve_srv",    label:"exposed · port 3389" },
-    { from:"cve_srv",    to:"srv",        label:"exploitable · CVSS 9.1" },
+    // FULL CHAIN: the exposed RDP port runs the vulnerable Remote Desktop software (port → service → CVE → host).
+    { from:"net",     to:"ws01",     label:"exposed · port 3389" },
+    { from:"ws01",    to:"sw_rdp",   label:"exposed via :3389" },
+    { from:"sw_rdp",  to:"cve_ws01", label:"exploitable · CVSS 9.8" },
+    // Host-level: FTP is exposed but the host's CVE is in OpenSSL — the open service isn't the vulnerable one.
+    { from:"net",     to:"srv",      label:"exposed · port 21" },
+    { from:"srv",     to:"sw_ssl",   label:"carries" },
+    { from:"sw_ssl",  to:"cve_srv",  label:"exploitable · CVSS 9.1" },
     { from:"ws01",to:"la",     label:"credential theft" },
     { from:"net",   to:"alex",   label:"exploitable CVE (public)" },
     { from:"alex",  to:"la",     label:"credential theft" },
@@ -31640,8 +31686,8 @@ function demoGraph(){
     { from:"app",   to:"fin",    label:"read/write all SharePoint (Graph app role)" }
   ];
   const paths = [
-    { id:"ext0", sev:"crit", external:true, seq:["net","cve_ws01","ws01"], cut:{ node:"net", fix:"Close internet-exposed port 3389 on contoso-ws-01 (or patch CVE-2026-54875) — an exposed service with an exploitable CVE is direct external initial access." } },
-    { id:"ext1", sev:"crit", external:true, seq:["net","cve_srv","srv"],       cut:{ node:"net", fix:"Close internet-exposed port 3389 on CONTOSO-DC01 (or patch CVE-2026-70583) — an exposed Domain Controller with an exploitable CVE is the most critical external path." } },
+    { id:"ext0", sev:"crit", external:true, portMatched:true, target:"ws01", seq:["net","ws01","sw_rdp","cve_ws01"], cut:{ node:"net", fix:"FULL CHAIN — internet-exposed port 3389 (RDP) runs Remote Desktop with CVE-2026-54875 on contoso-ws-01 — confirmed external initial access. Patch Remote Desktop / CVE-2026-54875 and restrict the port." } },
+    { id:"ext1", sev:"high", external:true, portMatched:false, target:"srv", seq:["net","srv","sw_ssl","cve_srv"], cut:{ node:"net", fix:"Restrict internet exposure of port 21 on CONTOSO-DC01. Host also carries 3 critical/high CVEs (host-level — the exposed service isn't confirmed vulnerable)." } },
     { id:"p1", sev:"crit", seq:["net","ws01","la","srv"], cut:{ node:"la", fix:"Rotate the shared local-admin credential (Windows LAPS) — both paths to the Domain Controller pass through it." } },
     { id:"p2", sev:"crit", seq:["net","alex","la","srv"],   cut:{ node:"la", fix:"Patch contoso-nuc-04's public-exploit CVE and rotate the reused local-admin credential it hands to the DC." } },
     { id:"p3", sev:"crit", seq:["guest","app","fin"],       cut:{ node:"app", fix:"Review ReportBot's Graph permissions and the guest that owns it — a guest-owned OAuth app with read/write to all SharePoint reaches the Highly-Confidential Finance workspace (labelled data)." } }
@@ -31713,8 +31759,8 @@ function narrDigest(p){
     if (n.kind==="device" && i<last && n.priv && n.priv.length) step.signedInPrivileged = n.priv; return step; });
   const edges = [];
   for (let i=0;i<(p.seq||[]).length-1;i++){ const a=p.seq[i], b=p.seq[i+1]; const e = EDGES.find(x => x.from===a && x.to===b); edges.push({ from: displayLabel(nodeOf(a)), to: displayLabel(nodeOf(b)), how: (e&&e.label)||"" }); }
-  const t = nodeOf(p.seq[p.seq.length-1]) || {};
-  return JSON.stringify({ target: displayLabel(t), targetCriticality: t.crit||"", severity: p.sev, hops: (p.seq||[]).length-1, steps: seq, edges, cut: p.cut ? p.cut.fix : "" }, null, 1);
+  const t = targetNode(p) || {};
+  return JSON.stringify({ target: displayLabel(t), targetCriticality: t.crit||"", severity: p.sev, hops: hopsOf(p), portMatched: !!p.portMatched, steps: seq, edges, cut: p.cut ? p.cut.fix : "" }, null, 1);
 }
 async function runNarr(){
   const p = activePath(); if (!p || !(window.EP && EP.llmComplete) || _narrBusy) return;
@@ -31724,8 +31770,16 @@ async function runNarr(){
   _narrBusy = ""; render(LAST);
 }
 function nodeOf(id){ return NODE_MAP[id] || null; }
+// The titled / crowned target of a path. Usually the last node, but an external chain extended with the host's
+// exploitable surface (… → endpoint → software → CVE) sets p.target to the endpoint, so the header, crown and
+// "Very high" count still key on the reached asset, not the trailing CVE node.
+function targetId(p){ return (p && p.target) || (p && p.seq && p.seq[p.seq.length - 1]); }
+function targetNode(p){ return nodeOf(targetId(p)); }
+// Network hops to the reached asset — the index of the target node. For a surface-extended external chain the
+// trailing software / CVE nodes aren't hops, so "1 hop" (internet → host) stays 1, not 3.
+function hopsOf(p){ const s = (p && p.seq) || []; const ti = s.indexOf(targetId(p)); return ti > 0 ? ti : Math.max(1, s.length - 1); }
 function isCrit(n){ return !!(n && n.crit); }
-function isVeryHighTarget(p){ const t = NODE_MAP[p.seq[p.seq.length-1]]; return !!(t && t.crit === "Very high"); }
+function isVeryHighTarget(p){ const t = targetNode(p); return !!(t && t.crit === "Very high"); }
 // The KPI tiles filter the path list; "veryhigh" keeps paths to a Very-high (crown-jewel) asset, "cred" keeps
 // paths where a privileged identity is signed in on a device along the way (the device↔identity merge).
 function filteredPaths(){
@@ -31788,6 +31842,7 @@ function graphStyle(){
     // device with a privileged user signed in — amber border marks the credential-inheritance pivot
     { selector:'node[priv="1"]', style:{ "border-color":"#FFD166","border-width":2,"color":"#FFE6A3" } },
     { selector:'node[kind="cve"]',      style:{ "border-color":"#FF5C7A","color":"#FFD1D9" } },
+    { selector:'node[kind="software"]', style:{ "border-color":"#8FA8FF","color":"#DCE6FF" } },
     // critical assets — gold crown glyph, gold border + glow halo
     { selector:'node[crit="1"]', style:{ "border-color":"#FFD166","border-width":2.4,"color":"#FFE6A3","font-size":10,
       "background-image": () => crownGlyph(),"background-width":13,"background-height":11,"background-position-x":"7px",
@@ -31913,12 +31968,15 @@ async function externalChains(deviceNodesByName){
     if (!Array.isArray(pp)) pp = [pp];
     portsById[f.DeviceId] = [...new Set(pp.map(x => parseInt(x, 10)).filter(x => x > 0))].sort((a, b) => a - b); });
   const ids = facing.map(f => f.DeviceId).filter(Boolean);
-  const cvesById = {}, sevById = {};
+  // Per-host vulnerable software + CVE (worst CVSS first) — keeps the software name so the chain can read
+  // endpoint → software → CVE and the port→service match can be evaluated.
+  const vulnsById = {};
   try { (await hunt("DeviceTvmSoftwareVulnerabilities | where DeviceId in " + idList(ids)
     + " | where VulnerabilitySeverityLevel in ('Critical','High')"
-    + " | summarize Cves=make_set(CveId, 3), Sev=max(CvssScore) by DeviceId"))
-    .forEach(v => { let c = v.Cves; if (typeof c === "string"){ try { c = JSON.parse(c); } catch(_){ c = [c]; } }
-      cvesById[v.DeviceId] = (c || []).filter(Boolean); sevById[v.DeviceId] = v.Sev; }); } catch(e){}
+    + " | summarize Cvss=max(CvssScore) by DeviceId, SoftwareName, CveId"
+    + " | order by Cvss desc | take 1000"))
+    .forEach(v => { if (!v.DeviceId || !v.CveId) return;
+      (vulnsById[v.DeviceId] = vulnsById[v.DeviceId] || []).push({ software: v.SoftwareName || "", cve: v.CveId, cvss: v.Cvss || 0 }); }); } catch(e){}
   const nodes = [], edges = [], paths = [], netId = "ext:net";
   nodes.push({ id:netId, kind:"internet", label:"Internet" });
   facing.forEach(f => {
@@ -31926,19 +31984,25 @@ async function externalChains(deviceNodesByName){
     const nm = f.DeviceName || f.DeviceId, existing = deviceNodesByName[String(nm).toLowerCase()];
     const hostId = existing ? existing.id : ("ext:host:" + nm);
     if (!existing) nodes.push({ id:hostId, kind:"device", label:nm });
-    const cves = cvesById[f.DeviceId] || [], portStr = ports.slice(0, 4).join(", ");
-    if (cves.length){
-      const cveId = "ext:cve:" + f.DeviceId, cveLbl = cves[0] + (cves.length > 1 ? " +" + (cves.length - 1) : "");
-      nodes.push({ id:cveId, kind:"cve", label:cveLbl });
-      edges.push({ from:netId, to:cveId, label:"exposed · port " + portStr });
-      edges.push({ from:cveId, to:hostId, label:"exploitable" + (sevById[f.DeviceId] ? (" · CVSS " + sevById[f.DeviceId]) : "") });
-      paths.push({ id:"ext" + paths.length, sev:"crit", external:true, seq:[netId, cveId, hostId],
-        cut:{ node:netId, fix:"Close internet-exposed port " + portStr + " on " + nm + " (or patch " + cves[0] + ") — an exposed service with an exploitable CVE is direct external initial access." } });
-    } else {
-      edges.push({ from:netId, to:hostId, label:"exposed · port " + portStr });
-      paths.push({ id:"ext" + paths.length, sev:"high", external:true, seq:[netId, hostId],
-        cut:{ node:netId, fix:"Restrict internet exposure of port " + portStr + " on " + nm + "." } });
+    const portStr = ports.slice(0, 4).join(", ");
+    const vulns = vulnsById[f.DeviceId] || [];
+    const matched = portServiceMatch(ports, vulns);   // confirmed port → service → software → CVE?
+    const surface = matched || vulns[0] || null;      // the software/CVE to show (the matched one, else the worst)
+    const seq = [netId, hostId];
+    edges.push({ from:netId, to:hostId, label:"exposed · port " + portStr });
+    if (surface){   // endpoint → software → CVE: the exploitable surface on the exposed host
+      const swId = "ext:sw:" + f.DeviceId, cveNodeId = "ext:cve:" + f.DeviceId;
+      const more = vulns.length > 1 ? (" +" + (vulns.length - 1)) : "";
+      nodes.push({ id:swId, kind:"software", label: surface.software || "software" });
+      nodes.push({ id:cveNodeId, kind:"cve", label: surface.cve + more });
+      edges.push({ from:hostId, to:swId, label: matched ? ("exposed via :" + matched.port) : "carries" });
+      edges.push({ from:swId, to:cveNodeId, label: "exploitable" + (surface.cvss ? (" · CVSS " + surface.cvss) : "") });
+      seq.push(swId, cveNodeId);
     }
+    paths.push({ id:"ext" + paths.length, sev: matched ? "crit" : "high", external:true, seq, target: hostId, portMatched: !!matched,
+      cut:{ node:netId, fix: matched
+        ? ("FULL CHAIN — internet-exposed port " + matched.port + " (" + matched.svc + ") runs " + matched.software + " with " + matched.cve + " on " + nm + " — confirmed external initial access. Patch " + matched.software + " / " + matched.cve + " and restrict the port.")
+        : ("Restrict internet exposure of port " + portStr + " on " + nm + "." + (vulns.length ? (" Host also carries " + vulns.length + " critical/high CVE" + (vulns.length === 1 ? "" : "s") + " (host-level — the exposed service isn't confirmed vulnerable).") : "")) } });
   });
   return { nodes, edges, paths };
 }
@@ -31948,11 +32012,11 @@ function chokePoints(){
   // Intermediate nodes only (not the entry at i=0, not the target at the end): a node many paths pass THROUGH,
   // whose removal cuts them all. The entry (internet/guest) and the critical target aren't "cut here" fixes.
   // Generic logic now lives in the shared adapter; pass NODE_MAP so each choke carries its resolved node.
-  return EP.exposureGraph.chokePoints(PATHS, { nodeMap: NODE_MAP });
+  return EP.exposureGraph.chokePoints(PATHS, { nodeMap: NODE_MAP, targetOf: targetId });
 }
 
 // ---------- render ----------
-function flowHtml(seq){
+function flowHtml(seq, portMatched){
   const last = seq.length - 1;
   return '<div class="ap-flow">' + seq.map((id, i) => { const n = nodeOf(id) || { label:id, kind:"resource" };
     const crit = isCrit(n), entry = i===0;
@@ -31972,20 +32036,22 @@ function flowHtml(seq){
         const m = e && /ports?\s+([0-9][0-9,\s]*)/i.exec(e.label || "");
         if (m) portLbl = "port " + m[1].replace(/\s+/g, "");
       }
-      arrow = '<span class="ap-arrow">→</span>' + (portLbl ? '<span class="ap-port" title="Internet-exposed ' + (/,/.test(portLbl) ? "ports" : "port") + '">' + esc(portLbl) + '</span><span class="ap-arrow">→</span>' : '');
+      arrow = '<span class="ap-arrow">→</span>' + (portLbl ? '<span class="ap-port' + (portMatched ? ' matched' : '') + '" title="' + (portMatched ? 'This exposed port runs the vulnerable software below — a confirmed service match' : 'Internet-exposed ' + (/,/.test(portLbl) ? 'ports' : 'port')) + '">' + esc(portLbl) + '</span><span class="ap-arrow">→</span>' : '');
     }
     return arrow + '<span class="' + cls + '" title="' + title + '">' + ic + esc(displayLabel(n)) + key + '</span>';
   }).join("") + '</div>';
 }
 function pathRow(p){
-  const target = nodeOf(p.seq[p.seq.length-1]);
+  const target = targetNode(p);
   const on = activePathId() === p.id;
+  const hops = hopsOf(p);
   return '<div class="ap-path' + (on?" on":"") + '" data-path="' + esc(p.id) + '">'
     + '<div class="ap-path-h"><span class="ap-sev sev-' + p.sev + '">' + (p.sev==="crit"?"CRITICAL":"HIGH") + '</span>'
     + (p.external ? '<span class="ap-ext" title="Internet-facing host with an exposed port and an exploitable CVE — direct external initial access">🌐 INTERNET</span>' : '')
+    + (p.portMatched ? '<span class="ap-fullchain" title="Confirmed end-to-end: the internet-exposed port runs the vulnerable software that carries this CVE — port → service → CVE → host is a real initial-access chain, not a port and a CVE seen separately.">✓ FULL CHAIN</span>' : '')
     + '<span style="font-size:11.5px;color:var(--text);font-weight:600" title="' + (target?esc(target.label):"") + '">to ' + (target?esc(displayLabel(target)):"?") + (target&&target.crit?(' · ' + esc(target.crit)):'') + '</span>'
-    + '<span class="ap-path-t">' + (p.seq.length-1) + ' hop' + (p.seq.length-1===1?"":"s") + '</span></div>'
-    + flowHtml(p.seq)
+    + '<span class="ap-path-t">' + hops + ' hop' + (hops===1?"":"s") + '</span></div>'
+    + flowHtml(p.seq, p.portMatched)
     + credLine(p)
     + (p.cut ? '<div class="ap-cut"><b>Cut →</b> ' + esc(p.cut.fix) + '</div>' : '')
     + '</div>';
@@ -32008,8 +32074,8 @@ function render(D){
   USERSBY = D.usersByName || {}; IPSBY = D.ipByName || {}; enrichUsers();   // attach signed-in users + device IPs (device→identity + host join)
   buildPathGraph();   // display graph = only the nodes/edges on an attack path
   const root = document.getElementById("ap-root"); if (!root) return;
-  const critTargets = PATHS.map(p => p.seq[p.seq.length-1]).filter((v,i,a) => a.indexOf(v)===i);
-  const toVeryHigh = PATHS.filter(p => { const t = nodeOf(p.seq[p.seq.length-1]); return t && t.crit === "Very high"; }).length;
+  const critTargets = PATHS.map(p => targetId(p)).filter((v,i,a) => a.indexOf(v)===i);
+  const toVeryHigh = PATHS.filter(p => { const t = targetNode(p); return t && t.crit === "Very high"; }).length;
   const credPaths = PATHS.filter(pathHasCred).length;   // paths where a privileged identity is signed in on a path host
   const chokes = chokePoints();
   const score = Math.min(100, PATHS.reduce((a,p) => a + (p.sev==="crit"?26:14), 0));
@@ -32033,7 +32099,7 @@ function render(D){
     + kpi("cred", credPaths, "Credential-inheritance paths", "admin signed in on a path host — filter", credPaths?"crit":"ok", { on: pf==="cred", clickable: credPaths>0 })
     + kpi("list", critTargets.length, "Critical assets exposed", "reachable from an entry point", critTargets.length?"high":"ok", { clickable: critTargets.length>0 })
     + kpi("chokes", chokes.length, "Choke points", "fix once, cut many paths", chokes.length?"high":"ok", { clickable: chokes.length>0 }) + '</div>';
-  const legend = [["internet","Internet"],["device","Device"],["user","Identity"],["guest","Guest"],["app","App / OAuth"],["data","Data"],["cve","Vulnerability"]]
+  const legend = [["internet","Internet"],["device","Device"],["software","Software"],["user","Identity"],["guest","Guest"],["app","App / OAuth"],["data","Data"],["cve","Vulnerability"]]
     .map(([k,l]) => '<span><i style="background:' + (AP_COLOR[k]||"#7C9CFF") + '"></i>' + l + '</span>').join("")
     + '<span><i class="crown" style="background:#FFD166"></i>Critical asset</span>'
     + '<span>🔑 Admin signed in (credential inheritance)</span>';
@@ -32064,7 +32130,7 @@ function render(D){
         const full = (c.node || {}).label || c.id, kind = AP_KINDLBL[(c.node || {}).kind] || "Node";
         const through = (PATHS || []).filter(p => (p.seq || []).indexOf(c.id) >= 0);
         const idLine = isGuid(full) ? '<div class="ap-choke-id">' + esc(kind) + ' id <code>' + esc(full) + '</code> — look it up in Entra ▸ Enterprise applications (or Microsoft Graph) by this id</div>' : '';
-        const list = through.map(p => { const t = nodeOf(p.seq[p.seq.length - 1]);
+        const list = through.map(p => { const t = targetNode(p);
           return '<div class="ap-choke-path" data-path="' + esc(p.id) + '" title="Isolate this path in the graph">'
             + '<span class="ap-sev sev-' + p.sev + '">' + (p.sev === "crit" ? "CRIT" : "HIGH") + '</span>'
             + '<span class="ap-choke-pt">to ' + (t ? esc(displayLabel(t)) : "?") + (t && t.crit ? (' · ' + esc(t.crit)) : '') + '</span>'
@@ -32112,12 +32178,12 @@ async function analyze(){
 // ---------- shell integration (Overview + Report) ----------
 function __dpPathsSummary(){
   if (!LAST || LAST.needsExp) return null;
-  const toVeryHigh = PATHS.filter(p => { const t = NODE_MAP[p.seq[p.seq.length-1]]; return t && t.crit === "Very high"; }).length;
+  const toVeryHigh = PATHS.filter(p => { const t = targetNode(p); return t && t.crit === "Very high"; }).length;
   const credPaths = PATHS.filter(pathHasCred).length;
   const score = Math.min(100, PATHS.reduce((a,p) => a + (p.sev==="crit"?26:14), 0));
   return { label:"Attack paths", score, grade:"", lead: PATHS.length + " attack path(s) to critical assets" + (toVeryHigh?(" · " + toVeryHigh + " to Very-high"):"") + (credPaths?(" · " + credPaths + " with a privileged account signed in on-path (credential inheritance)"):""),
     sev:{ crit:PATHS.filter(p=>p.sev==="crit").length, high:PATHS.filter(p=>p.sev==="high").length, med:0, low:0 },
-    top: PATHS.slice(0,5).map(p => { const t = NODE_MAP[p.seq[p.seq.length-1]]; return { title: (t?displayLabel(t):"?") + " — " + (p.seq.length-1) + " hop path", sev: p.sev, impact:"", search:"" }; }) };
+    top: PATHS.slice(0,5).map(p => { const t = targetNode(p); return { title: (t?displayLabel(t):"?") + " — " + (p.seq.length-1) + " hop path", sev: p.sev, impact:"", search:"" }; }) };
 }
 function __dpPathsFocus(){ try { const r = document.getElementById("ap-root"); if (r) r.scrollIntoView({ behavior:"smooth", block:"start" }); } catch(e){} }
 // Compact graph accessor for the Endpoint overview's bottom row: the top paths (as readable node sequences),
