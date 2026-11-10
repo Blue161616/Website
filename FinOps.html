@@ -101,6 +101,8 @@
       <div class="r"><span class="sp">User.Read.All</span><span class="sw">Per-user Copilot seat assignment</span></div>
       <div class="r"><span class="sp">Reports.Read.All</span><span class="sw">Microsoft 365 Copilot usage (active users, last activity)</span></div>
       <div class="r"><span class="sp">AuditLog.Read.All</span><span class="sw">Optional — account sign-in staleness</span></div>
+      <div class="r"><span class="sp">Dynamics CRM · user_impersonation</span><span class="sw">Optional — Copilot Studio agent inventory + sessions (Dataverse; only GETs are made)</span></div>
+      <div class="r"><span class="sp">Power Platform API</span><span class="sw">Optional — Copilot Studio credit consumption per agent</span></div>
     </div>
     <p class="hint" style="margin-top:14px">Register a single-tenant <b>SPA</b> app in Entra with these delegated, read-only scopes and a redirect URI of this page’s URL. A <b>Global Reader</b> / <b>Reports Reader</b> role is enough to read everything here.</p>
   </div>
@@ -337,8 +339,9 @@ async function renderOverview(v){
   h += tile(seats||"—", "Licensed users", "hold a Copilot licence");
   h += tile((usage&&usage.available)?activeUsers:"N/A", "Active (28d)", (usage&&usage.available)?"used Copilot in last 28 days":"Reports.Read.All needed", (usage&&usage.available)?"good":"mut");
   if(opt) h += tile(opt.inactive.length, "Inactive seats", "assigned · no Copilot in 28d", opt.inactive.length?"warn":"good");
-  if(agOpt) h += tile(agOpt.gh.length, "Agents on GitHub harness", agOpt.totalCredits.toLocaleString()+" credits/mo · "+fmtUsd(agOpt.totalCredits*PRICE.credit), agOpt.gh.length?"warn":"good");
-  else h += tile("—", "Agents on credits", "connect Power Platform / import", "mut");
+  if(agOpt && !DEMO && !ag.creditsKnown) h += tile((ag.agents||[]).length, "Copilot Studio agents", "inventory live · credits not read", "mut");
+  else if(agOpt) h += tile(agOpt.gh.length, "Agents on GitHub harness", agOpt.totalCredits.toLocaleString()+" credits/mo · "+fmtUsd(agOpt.totalCredits*PRICE.credit), agOpt.gh.length?"warn":"good");
+  else h += tile("—", "Agents on credits", "connect Dataverse on the Agents page", "mut");
   h += '</div>';
   // optimization card
   h += '<div class="card opt"><h2>Save money <span class="pill">optimization</span></h2>';
@@ -424,22 +427,93 @@ const HARNESS = {
 };
 function harnessOf(a){ return HARNESS[a.harness] ? a.harness : (a.harness||"Standard"); }
 
+// ---- live read, two sources, both silent (a missing consent is surfaced as a button, never a surprise popup) ----
+//  1. Dataverse  — the agent INVENTORY (bot table per environment) + 30-day sessions (conversationtranscript).
+//                  Dataverse allows browser calls; needs the Dynamics CRM → user_impersonation delegated permission.
+//  2. Power Platform API — CREDIT consumption per agent (not stored in Dataverse). Best-effort.
+const DV_GDS = "https://globaldisco.crm.dynamics.com";
+const resScope = r => [r.replace(/\/$/,"") + "/.default"];
+async function tokenSilent(scopes){ return (await msalInstance.acquireTokenSilent({ account, scopes })).accessToken; }
+async function dvGetAll(url, token, maxPages){
+  let out = [], next = url, n = 0;
+  while(next && (!maxPages || n < maxPages)){
+    const r = await fetch(next, { headers:{ Authorization:"Bearer "+token, Accept:"application/json", "OData-MaxVersion":"4.0", "OData-Version":"4.0",
+      Prefer:'odata.include-annotations="OData.Community.Display.V1.FormattedValue"' } });
+    if(!r.ok) throw new Error(r.status+" "+(await r.text().catch(()=> "")).slice(0,200));
+    const j = await r.json(); out = out.concat(j.value||[]); next = j["@odata.nextLink"]||null; n++;
+  }
+  return out;
+}
+const errMsg = e => (e && (e.errorMessage || e.message)) || String(e);
+
+async function readDataverseAgents(){
+  const inst = await dvGetAll(DV_GDS+"/api/discovery/v2.0/Instances?$select=ApiUrl,FriendlyName", await tokenSilent(resScope(DV_GDS)));
+  const since = new Date(Date.now()-30*864e5).toISOString();
+  const agents = [], skipped = []; let envsRead = 0, sessionsRead = false;
+  for(const i of inst){
+    const org = (i.ApiUrl||"").replace(/\/$/,""); if(!org) continue;
+    const envName = i.FriendlyName || org.replace(/^https?:\/\//,"").split(".")[0];
+    try {
+      const tok = await tokenSilent(resScope(org)), api = org+"/api/data/v9.2";
+      const bots = await dvGetAll(api+"/bots?$select=name,botid,_ownerid_value,createdon,modifiedon,publishedon", tok);
+      envsRead++;
+      if(!bots.length) continue;
+      // sessions = conversation transcripts in the last 30 days (best-effort; capped at 10 pages)
+      const stat = {}; let txOk = false;
+      try {
+        const tx = await dvGetAll(api+"/conversationtranscripts?$select=_bot_conversationtranscriptid_value,conversationstarttime&$filter=createdon ge "+since, tok, 10);
+        txOk = true; sessionsRead = true;
+        tx.forEach(t => { const k = t._bot_conversationtranscriptid_value; if(!k) return; const st = stat[k] || (stat[k] = { n:0, last:"" });
+          st.n++; if((t.conversationstarttime||"") > st.last) st.last = t.conversationstarttime; });
+      } catch(e){}
+      bots.forEach(b => { const st = stat[b.botid];
+        agents.push({ name:b.name||b.botid, id:b.botid, harness:"Unknown", creditsMonth:null, cap:null, env:envName,
+          published:!!b.publishedon, lastUsed:st&&st.last?st.last.slice(0,10):null, sessions:txOk?(st?st.n:0):null,
+          owner:b["_ownerid_value@OData.Community.Display.V1.FormattedValue"]||"" }); });
+    } catch(e){ skipped.push(envName+": "+errMsg(e).slice(0,120)); }
+  }
+  if(!envsRead && skipped.length) throw new Error(skipped[0]);
+  return { agents, envs:envsRead, skipped, sessionsRead };
+}
+
+const normCredit = r => ({ name:r.name||r.resourceName||r.resourceId||"(unnamed)", id:r.id||r.resourceId,
+  harness:r.harness||r.featureName||"Standard", creditsMonth:+(r.creditsMonth||r.consumedUnits||r.consumption||0),
+  cap:(r.cap!=null?r.cap:(r.limit!=null?r.limit:null)), env:r.env||r.environmentName||r.environmentId||"",
+  published:r.published!==false, lastUsed:r.lastUsed||r.lastActivityDate||null, sessions:(r.sessions!=null?r.sessions:null), owner:r.owner||"" });
+
+async function readPpCredits(){
+  const tok = await tokenSilent(resScope(PP_API));
+  const get = async path => { const r = await fetch(PP_API+path, { headers:{ Authorization:"Bearer "+tok } });
+    if(!r.ok) throw new Error(r.status+" "+(await r.text().catch(()=> "")).slice(0,200)); return r.json(); };
+  const res = await get("/licensing/entitlements/MCSMessages/resources?api-version=2024-10-01");
+  let cap = null; try { cap = await get("/licensing/entitlements/MCSMessages?api-version=2024-10-01"); } catch(e){}
+  return { list:(res.value||res.resources||[]).map(normCredit), tenantCredits:(cap&&(cap.consumedUnits||cap.consumption))||null };
+}
+
+// Lay credit records over the Dataverse inventory (join on bot id, else name). Unmatched credit rows are kept.
+function mergeCredits(base, credits){
+  const key = x => String(x||"").toLowerCase(), byId = {}, byName = {};
+  base.forEach(a => { if(a.id) byId[key(a.id)] = a; if(a.name) byName[key(a.name)] = a; });
+  credits.forEach(c => { const a = (c.id && byId[key(c.id)]) || byName[key(c.name)];
+    if(!a){ base.push(c); return; }
+    a.creditsMonth = c.creditsMonth; a.cap = c.cap; if(c.harness) a.harness = c.harness;
+    if(a.sessions==null) a.sessions = c.sessions; if(!a.lastUsed) a.lastUsed = c.lastUsed; });
+  return base;
+}
+
 async function loadAgents(){
   if(MODEL.loaded.agents) return MODEL.agents;
   if(DEMO){ MODEL.agents = demoAgents(); MODEL.loaded.agents=true; return MODEL.agents; }
-  if(MODEL.importAgents){ MODEL.agents = { agents:MODEL.importAgents, available:true, source:"import" }; MODEL.loaded.agents=true; return MODEL.agents; }
-  // Best-effort live read via the Power Platform API. api.powerplatform.com may not send CORS headers to a
-  // browser origin — if so this throws and we fall back to the import path (a read-only collection script).
-  try {
-    const tok = await tokenFor(["https://api.powerplatform.com/.default"]);
-    const cap = await (await fetch(PP_API+"/licensing/entitlements/MCSMessages?api-version=2024-10-01",{headers:{Authorization:"Bearer "+tok}})).json();
-    const res = await (await fetch(PP_API+"/licensing/entitlements/MCSMessages/resources?api-version=2024-10-01",{headers:{Authorization:"Bearer "+tok}})).json();
-    const list = (res.value||res.resources||[]).map(r => ({
-      name:r.resourceName||r.name||r.resourceId, id:r.resourceId, harness:r.harness||r.featureName||"Standard",
-      creditsMonth:r.consumedUnits||r.consumption||0, cap:r.limit!=null?r.limit:null, env:r.environmentName||r.environmentId||"",
-      published:r.published!==false, lastUsed:r.lastActivityDate||null, sessions:r.sessions!=null?r.sessions:null, owner:r.owner||"" }));
-    MODEL.agents = { agents:list, available:true, source:"live", tenantCredits:(cap&&(cap.consumedUnits||cap.consumption))||null };
-  } catch(e){ MODEL.agents = { agents:[], available:false, source:"live", error:(e&&e.message)||String(e) }; }
+  let dv = null, dvErr = null, pp = null, ppErr = null;
+  try { dv = await readDataverseAgents(); } catch(e){ dvErr = errMsg(e); }
+  if(MODEL.importAgents) pp = { list:MODEL.importAgents, tenantCredits:null, imported:true };
+  else { try { pp = await readPpCredits(); } catch(e){ ppErr = errMsg(e); } }
+  if(!dv && !pp) MODEL.agents = { agents:[], available:false, source:"live", dvErr, ppErr };
+  else MODEL.agents = { available:true, dvErr, ppErr,
+    agents: dv ? (pp ? mergeCredits(dv.agents, pp.list) : dv.agents) : pp.list,
+    source: (dv ? "Dataverse" : "") + (dv&&pp ? " + " : "") + (pp ? (pp.imported ? "imported credits" : "Power Platform API") : ""),
+    inventory:!!dv, creditsKnown:!!pp, envs:dv?dv.envs:null, skipped:dv?dv.skipped:[], sessionsRead:!!(dv&&dv.sessionsRead),
+    tenantCredits:pp?pp.tenantCredits:null };
   MODEL.loaded.agents = true; return MODEL.agents;
 }
 
@@ -460,21 +534,28 @@ async function renderAgents(v){
   const data = await loadAgents();
   let h = demoBanner();
   if(!data.available){
-    v.innerHTML = h + agentImportCard(data.error);
+    v.innerHTML = h + agentConnectCard(data);
     wireAgentImport(v);
     return;
   }
   const list = data.agents||[];
-  if(!list.length){ v.innerHTML = h + '<div class="card"><h2>No Copilot Studio agents</h2><div class="hint">No V2 Copilot Studio agents were returned'+(data.source==="import"?" in the imported file":"")+'.</div></div>' + agentImportCard(null); wireAgentImport(v); return; }
+  if(!list.length){ v.innerHTML = h + '<div class="card"><h2>No Copilot Studio agents</h2><div class="hint">No Copilot Studio agents were returned ('+esc(data.source)+').</div></div>' + (DEMO?'':agentConnectCard(data)); wireAgentImport(v); return; }
   const opt = agentOptimization(list);
   const estMonth = opt.totalCredits*PRICE.credit;
-  h += '<div class="tiles">'
-    + tile(list.length, "Agents", "Copilot Studio (V2)")
-    + tile(opt.gh.length, "GitHub Copilot harness", "burn credits from build", opt.gh.length?"warn":"good")
+  const credits = DEMO || data.creditsKnown;
+  const sessions = list.reduce((s,a)=>s+(a.sessions||0),0), anySessions = list.some(a=>a.sessions!=null);
+  h += '<div class="tiles">' + tile(list.length, "Agents", "Copilot Studio"+(data.envs?" · "+data.envs+" environment"+(data.envs===1?"":"s"):""));
+  if(credits) h += tile(opt.gh.length, "GitHub Copilot harness", "burn credits from build", opt.gh.length?"warn":"good")
     + tile(opt.totalCredits.toLocaleString(), "Credits / month", "across all agents")
     + tile(fmtUsd(estMonth), "Est. cost / month", "at "+fmtRate(PRICE.credit)+"/credit (editable)", estMonth?"warn":"good")
-    + tile(opt.noCap.length, "No consumption cap", "credit-consuming agents", opt.noCap.length?"warn":"good")
-    + '</div>';
+    + tile(opt.noCap.length, "No consumption cap", "credit-consuming agents", opt.noCap.length?"warn":"good");
+  else h += tile(list.filter(a=>a.published!==false).length, "Published", "live agents")
+    + tile(list.filter(a=>a.published===false).length, "Unpublished", "still building")
+    + tile(anySessions?sessions.toLocaleString():"N/A", "Sessions (30d)", anySessions?"conversation transcripts":"transcripts not readable", anySessions?"":"mut")
+    + tile("—", "Credits / month", "not read yet", "mut");
+  h += '</div>';
+  if(!credits) h += agentConnectCard(data);
+  else {
   // optimization
   h += '<div class="card opt"><h2>Save money <span class="pill">optimization</span></h2>';
   if(opt.candidates.length || opt.noCap.length || opt.idle.length){
@@ -486,38 +567,65 @@ async function renderAgents(v){
     h += '</ul>';
   } else h += '<div class="hint">No obvious agent-credit waste — credit-consuming agents are published, used and capped.</div>';
   h += '<div class="hint" style="margin-top:10px;font-size:11.5px">Credit cost is an estimate at <code>'+fmtRate(PRICE.credit)+'</code>/credit — set your contract rate in the <code>PRICE</code> constant. Credit counts are the hard number.</div></div>';
+  }
   // table
-  h += '<div class="card"><h2>Agents <span class="hint" style="font-weight:400">· '+(data.source==="live"?"live":data.source==="import"?"imported":"demo")+' · worst credit burn first</span></h2>'
-    + '<table><thead><tr><th>Agent</th><th>Harness</th><th>Published</th><th>Credits / mo</th><th>Cap</th><th>Last used</th></tr></thead><tbody>';
-  list.slice().sort((a,b)=>(b.creditsMonth||0)-(a.creditsMonth||0)).forEach(a => {
-    const hn = harnessOf(a), hm = HARNESS[hn]||{cls:"b-mut",note:""};
+  const skip = data.skipped&&data.skipped.length ? ' · <span title="'+esc(data.skipped.join("\n"))+'">'+data.skipped.length+' environment'+(data.skipped.length===1?"":"s")+' skipped</span>' : '';
+  h += '<div class="card"><h2>Agents <span class="hint" style="font-weight:400">· '+esc(data.source)+' · '+(credits?"worst credit burn first":"most used first")+skip+'</span></h2>'
+    + '<table><thead><tr><th>Agent</th><th>Harness</th><th>Published</th><th>Credits / mo</th><th>Cap</th><th>Sessions (30d)</th><th>Last used</th></tr></thead><tbody>';
+  list.slice().sort((a,b)=>((b.creditsMonth||0)-(a.creditsMonth||0)) || ((b.sessions||0)-(a.sessions||0))).forEach(a => {
+    const hn = harnessOf(a), hm = HARNESS[hn]||{cls:"b-mut",note:"Harness isn’t exposed in Dataverse — it comes with the credit read"};
     const cand = hn==="GitHub Copilot" && (a.published===false || (a.sessions!=null && a.sessions<=5) || (a.creditsMonth||0)===0);
-    h += '<tr><td><b>'+esc(a.name||a.id)+'</b>'+(a.env?'<div class="hint" style="font-size:11px">'+esc(a.env)+'</div>':'')+(cand?'<div><span class="badge b-ok" title="Could run as Standard/Chat harness without credits">→ convert candidate</span></div>':'')+'</td>'
+    h += '<tr><td><b>'+esc(a.name||a.id)+'</b>'+((a.env||a.owner)?'<div class="hint" style="font-size:11px">'+esc([a.env,a.owner].filter(x=>x&&x!=="—").join(" · "))+'</div>':'')+(cand?'<div><span class="badge b-ok" title="Could run as Standard/Chat harness without credits">→ convert candidate</span></div>':'')+'</td>'
       + '<td><span class="badge '+hm.cls+'" title="'+esc(hm.note)+'">'+esc(hn)+'</span></td>'
       + '<td>'+(a.published===false?'<span class="badge b-mut">building</span>':'<span class="badge b-ok">published</span>')+'</td>'
-      + '<td>'+((a.creditsMonth||0).toLocaleString())+(hm.credits?'':' <span class="hint">(free)</span>')+'</td>'
+      + '<td>'+(a.creditsMonth==null?'<span class="na">—</span>':(a.creditsMonth.toLocaleString()+(hm.credits?'':' <span class="hint">(free)</span>')))+'</td>'
       + '<td>'+(a.cap!=null?a.cap.toLocaleString():(hm.credits?'<span class="badge b-warn">none</span>':'<span class="na">n/a</span>'))+'</td>'
+      + '<td>'+(a.sessions!=null?a.sessions.toLocaleString():'<span class="na">—</span>')+'</td>'
       + '<td>'+(a.lastUsed?esc(a.lastUsed):'<span class="na">—</span>')+'</td></tr>';
   });
   h += '</tbody></table></div>';
   v.innerHTML = h;
+  wireAgentImport(v);
 }
 
-function agentImportCard(error){
+// Turn a token/consent failure into the one thing to do about it.
+function agentAuthHint(msg, api, perm){
+  msg = String(msg||"");
+  if(/650057|invalid_client|invalid resource/i.test(msg)) return 'This app registration doesn’t list the API yet — in Entra: <b>App registrations → this app → API permissions → Add a permission → '+api+' → Delegated → '+perm+'</b>, then <b>Grant admin consent</b> and reload.';
+  if(/interaction_required|consent_required|65001|65004|login_required|no_tokens|monitor_window_timeout/i.test(msg)) return 'Consent is needed once — use the button below.';
+  if(/failed to fetch|networkerror|cors/i.test(msg)) return 'The browser call was blocked (CORS) — use the import below instead.';
+  return '';
+}
+const AG_BTN = 'background:var(--accent);color:#06101f;font-weight:700;border:0;border-radius:8px;padding:8px 15px;font:inherit;cursor:pointer';
+
+// Shown when the inventory and/or the credits are missing: what failed, the one-click consent, and the import fallback.
+function agentConnectCard(data){
+  const inv = !!data.inventory, cred = !!data.creditsKnown;
+  const errLine = (e, api, perm) => e ? '<div class="na" style="margin-top:6px;font-size:11.5px;word-break:break-word">'+esc(e)+'</div>'+(agentAuthHint(e,api,perm)?'<div style="margin-top:4px">'+agentAuthHint(e,api,perm)+'</div>':'') : '';
+  let h = '<div class="card"><h2>'+(inv?'Credit consumption not read yet':'Copilot Studio agents — connect once, then it’s automatic')+'</h2><div class="hint" style="line-height:1.7">';
+  if(!inv) h += '<b>1 · Agent inventory — Dataverse.</b> Agents live in each environment’s <code>bot</code> table; Dataverse allows browser calls, so this is read automatically on every load once the app has the <b>Dynamics CRM → user_impersonation</b> delegated permission (used read-only — you see the environments your account can open).'
+    + errLine(data.dvErr, "Dynamics CRM", "user_impersonation")
+    + '<div style="margin:8px 0 14px"><button id="agDv" style="'+AG_BTN+'">Read agents from Dataverse</button> <span class="hint" id="agDvMsg"></span></div>';
+  if(!cred) h += '<b>'+(inv?'':'2 · ')+'Credit consumption — Power Platform API.</b> Credits and harness aren’t stored in Dataverse'+(inv?', so the table shows the live inventory and sessions without them':'')+'. Reading them needs the <b>Power Platform API</b> delegated permission plus an <b>AI Administrator</b> / <b>Power Platform Administrator</b> role, and <code>api.powerplatform.com</code> may refuse browser calls (CORS).'
+    + errLine(data.ppErr, "Power Platform API", "the Licensing read permission")
+    + '<div style="margin:8px 0 4px"><button id="agPp" style="'+AG_BTN+'">Read credits from Power Platform</button> <span class="hint" id="agPpMsg"></span></div>';
+  h += '</div>';
+  if(!cred) h += agentImportBlock(inv);
+  return h + '</div>';
+}
+
+function agentImportBlock(inv){
   const ps = "# Read-only: Copilot Studio agent credit consumption (Power Platform API)\n"
     + "$tok = (Get-AzAccessToken -ResourceUrl 'https://api.powerplatform.com').Token\n"
     + "$h = @{ Authorization = \"Bearer $tok\" }\n"
     + "$res = Invoke-RestMethod 'https://api.powerplatform.com/licensing/entitlements/MCSMessages/resources?api-version=2024-10-01' -Headers $h\n"
     + "$res.value | ConvertTo-Json -Depth 6 | Out-File finops-agents.json";
-  return '<div class="card"><h2>Copilot Studio agents — not read from the browser'+(error?' <span class="badge b-mut">live failed</span>':'')+'</h2>'
-    + '<div class="hint" style="line-height:1.7">The Power Platform API (<code>api.powerplatform.com</code>) usually doesn’t allow direct browser calls (CORS), and reading it needs an <b>AI Administrator</b> / <b>Power Platform Administrator</b> role. '
-    + (error?'<br><span class="na">'+esc(error)+'</span>':'')
-    + '<br><br>Run this read-only snippet as an admin, then load the JSON below — same pattern as the posture suite’s consultant collection:</div>'
+  return '<details style="margin-top:12px"><summary class="hint" style="cursor:pointer">Fallback — import credits from a read-only script'+(inv?' (merged onto the live inventory)':'')+'</summary>'
     + '<pre style="background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:12px;overflow:auto;font-size:12px;margin:12px 0;white-space:pre-wrap">'+esc(ps)+'</pre>'
     + '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center"><input type="file" id="agImport" accept="application/json,.json"><span class="hint">or paste JSON:</span></div>'
     + '<textarea id="agPaste" placeholder="paste finops-agents.json here" style="width:100%;height:90px;margin-top:8px;background:var(--input-bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:Cascadia Code,Consolas,monospace;font-size:12px;padding:9px"></textarea>'
     + '<div style="margin-top:8px"><button id="agLoad" style="background:var(--accent);color:#06101f;font-weight:700;border:0;border-radius:8px;padding:8px 15px;font:inherit;cursor:pointer">Load collection</button> <span class="hint" id="agMsg"></span></div>'
-    + '<div class="hint" style="margin-top:10px;font-size:11.5px">Expected: an array of agents with <code>name</code>, <code>harness</code> (GitHub Copilot / Standard / Copilot Chat), <code>creditsMonth</code>, <code>published</code>, optional <code>cap</code>, <code>lastUsed</code>, <code>sessions</code>. Raw Power Platform field names are normalized on load.</div></div>';
+    + '<div class="hint" style="margin-top:10px;font-size:11.5px">Expected: an array of agents with <code>name</code>, <code>harness</code> (GitHub Copilot / Standard / Copilot Chat), <code>creditsMonth</code>, <code>published</code>, optional <code>cap</code>, <code>lastUsed</code>, <code>sessions</code>. Raw Power Platform field names are normalized on load.</div></details>';
 }
 function wireAgentImport(v){
   const fileEl=v.querySelector("#agImport"), pasteEl=v.querySelector("#agPaste"), loadEl=v.querySelector("#agLoad"), msg=v.querySelector("#agMsg");
@@ -526,14 +634,18 @@ function wireAgentImport(v){
     try {
       const raw = JSON.parse((pasteEl&&pasteEl.value||"").trim());
       const arr = Array.isArray(raw) ? raw : (raw.value||raw.agents||raw.resources||[]);
-      const norm = arr.map(r => ({ name:r.name||r.resourceName||r.resourceId||"(unnamed)", id:r.id||r.resourceId,
-        harness:r.harness||r.featureName||"Standard", creditsMonth:+(r.creditsMonth||r.consumedUnits||r.consumption||0),
-        cap:(r.cap!=null?r.cap:(r.limit!=null?r.limit:null)), env:r.env||r.environmentName||r.environmentId||"",
-        published:r.published!==false, lastUsed:r.lastUsed||r.lastActivityDate||null, sessions:(r.sessions!=null?r.sessions:null), owner:r.owner||"" }));
+      const norm = arr.map(normCredit);
       MODEL.importAgents = norm; MODEL.loaded.agents=false; MODEL.agents=null;
       show("agents");
     } catch(e){ if(msg){ msg.textContent = "Couldn't parse JSON — "+(e.message||e); msg.style.color="var(--sev-crit)"; } }
   });
+  // one-time consent: the popup opens straight from the click; afterwards every load reads silently
+  const consent = (btnId, msgId, resource, api, perm) => { const b = v.querySelector(btnId), m = v.querySelector(msgId); if(!b) return;
+    b.addEventListener("click", async ()=>{ b.disabled = true; if(m){ m.style.color=""; m.textContent = "Waiting for sign-in…"; }
+      try { await msalInstance.acquireTokenPopup({ account, scopes:resScope(resource) }); MODEL.loaded.agents=false; MODEL.agents=null; show("agents"); }
+      catch(e){ b.disabled = false; if(m){ m.innerHTML = esc(errMsg(e).slice(0,260))+(agentAuthHint(errMsg(e),api,perm)?'<br>'+agentAuthHint(errMsg(e),api,perm):''); m.style.color="var(--sev-crit)"; } } }); };
+  consent("#agDv", "#agDvMsg", DV_GDS, "Dynamics CRM", "user_impersonation");
+  consent("#agPp", "#agPpMsg", PP_API, "Power Platform API", "the Licensing read permission");
 }
 
 function renderPlaceholder(v, name){
