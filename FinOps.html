@@ -481,13 +481,46 @@ const normCredit = r => ({ name:r.name||r.resourceName||r.resourceId||"(unnamed)
   cap:(r.cap!=null?r.cap:(r.limit!=null?r.limit:null)), env:r.env||r.environmentName||r.environmentId||"",
   published:r.published!==false, lastUsed:r.lastUsed||r.lastActivityDate||null, sessions:(r.sessions!=null?r.sessions:null), owner:r.owner||"" });
 
+// Power Platform API — Licensing / Entitlement Insight (documented, api-version 2024-10-01):
+//   GET /licensing/entitlements/MCSMessages/resources?fromDate&toDate   per-agent consumption (+ metadata.Feature = harness)
+//   GET /licensing/entitlements/MCSMessages/resourceThresholds          per-agent monthly cap
+//   GET /licensing/entitlements/MCSMessages                             tenant total
+const PP_VER = "api-version=2024-10-01";
+function harnessFromFeature(f){
+  f = String(f||"").trim(); if(!f) return null;
+  if(/process agent|github/i.test(f)) return "GitHub Copilot";   // the GitHub-Copilot harness reports as "Process Agent"
+  if(/chat/i.test(f)) return "Copilot Chat";
+  if(/standard|classic/i.test(f)) return "Standard";
+  return f;                                                      // unrecognised: show Microsoft's own label rather than guess
+}
 async function readPpCredits(){
   const tok = await tokenSilent(resScope(PP_API));
-  const get = async path => { const r = await fetch(PP_API+path, { headers:{ Authorization:"Bearer "+tok } });
-    if(!r.ok) throw new Error(r.status+" "+(await r.text().catch(()=> "")).slice(0,200)); return r.json(); };
-  const res = await get("/licensing/entitlements/MCSMessages/resources?api-version=2024-10-01");
-  let cap = null; try { cap = await get("/licensing/entitlements/MCSMessages?api-version=2024-10-01"); } catch(e){}
-  return { list:(res.value||res.resources||[]).map(normCredit), tenantCredits:(cap&&(cap.consumedUnits||cap.consumption))||null };
+  const get = async url => { const r = await fetch(/^https?:/.test(url)?url:PP_API+url, { headers:{ Authorization:"Bearer "+tok } });
+    if(!r.ok) throw new Error(r.status+" "+url.replace(/^https?:\/\/[^/]+/,"").split("?")[0]+" "+(await r.text().catch(()=> "")).slice(0,200));
+    return r.status===204 ? {} : r.json(); };
+  const now = new Date(), ymd = d => d.toISOString().slice(0,10);
+  const base = "/licensing/entitlements/MCSMessages";
+  const first = base+"/resources?fromDate="+ymd(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)))+"&toDate="+ymd(now)+"&"+PP_VER;
+  // month-to-date consumption per resource; follow the continuation, cap at 20 pages
+  const rows = []; let url = first;
+  for(let n = 0; url && n < 20; n++){
+    const j = await get(url); (j.value||[]).forEach(r => rows.push(r));
+    const ct = j.continuationtoken || j.continuationToken;
+    url = j["@odata.nextLink"] || (ct ? first+"&continuationToken="+encodeURIComponent(ct) : null);
+  }
+  const byId = {};
+  rows.forEach(r => { const id = r.resourceId; if(!id) return;
+    const md = {}; Object.entries(r.metadata||{}).forEach(([k,v]) => md[k.toLowerCase()] = v);
+    const a = byId[id] || (byId[id] = { name:md.resourcename||md.name||md.displayname||id, id, harness:null, creditsMonth:0, cap:null,
+      env:md.environmentname||r.environmentId||"", published:true, lastUsed:null, sessions:null, owner:"" });
+    a.creditsMonth += +r.consumed||0;
+    a.harness = a.harness || harnessFromFeature(md.feature);
+  });
+  // per-agent caps and the tenant total are extras — a failure there doesn't lose the consumption
+  try { (await get(base+"/resourceThresholds?"+PP_VER) || []).forEach(t => { const a = byId[t.resourceId]; if(a && t.limit!=null) a.cap = t.limit; }); } catch(e){}
+  let tenantCredits = null;
+  try { const t = await get(base+"?"+PP_VER); const c = t && t.entitlement && t.entitlement.capacity && t.entitlement.capacity.consumed; tenantCredits = c && c.value!=null ? c.value : null; } catch(e){}
+  return { list:Object.values(byId).map(a => ({ ...a, creditsMonth:Math.round(a.creditsMonth) })), tenantCredits };
 }
 
 // Lay credit records over the Dataverse inventory (join on bot id, else name). Unmatched credit rows are kept.
@@ -593,6 +626,7 @@ function agentAuthHint(msg, api, perm){
   msg = String(msg||"");
   if(/650057|invalid_client|invalid resource/i.test(msg)) return 'This app registration doesn’t list the API yet — in Entra: <b>App registrations → this app → API permissions → Add a permission → '+api+' → Delegated → '+perm+'</b>, then <b>Grant admin consent</b> and reload.';
   if(/interaction_required|consent_required|65001|65004|login_required|no_tokens|monitor_window_timeout/i.test(msg)) return 'Consent is needed once — use the button below.';
+  if(/^403\b/.test(msg)) return 'The token was accepted but the call isn’t authorised. Two things to check: the signed-in account holds <b>Power Platform Administrator</b> (or Global Administrator), and the app has every <b>Licensing … .Read</b> permission the Power Platform API offers (entitlements / resources / thresholds, next to <code>Licensing.Allocations.Read</code>) with admin consent. Then sign out and in again so the token carries the new scope.';
   if(/failed to fetch|networkerror|cors/i.test(msg)) return 'The browser call was blocked (CORS) — use the import below instead.';
   return '';
 }
