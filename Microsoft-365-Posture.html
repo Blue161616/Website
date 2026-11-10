@@ -8740,10 +8740,15 @@ window.EP = (function () {
         fix: "Rotate and remove the client secret (use a certificate or managed identity), assign an accountable owner, scope the Graph permissions to least privilege, and require a verified publisher." }),
       _comboOf({ id: "inet-kev-priv", name: "Internet-facing host · exploitable CVE · privileged sign-in",
         exp: 3, reach: 3, impact: 3, confidence: "verified", key: "endpoint", view: "attackpaths",
-        chain: [{ label: "Internet", kind: "internet" }, { label: "CVE-2026-54875 · CVSS 9.8", kind: "cve" }, { label: "contoso-ws-01 · Very high", kind: "device" }, { label: "Administrator signed in", kind: "user" }, { label: "CONTOSO-DC01", kind: "device" }],
-        ingredients: ["An internet-exposed service (RDP / port 3389)", "An exploitable Critical CVE on that host", "A privileged account interactively signed in — credential inheritance", "A verified exposure-graph path onward to a Domain Controller"],
-        why: "The host is reachable from the internet, carries a Critical exploitable CVE, and a privileged account is signed in on it — so initial access, privilege inheritance and a path to the DC are one chain, not three separate findings.",
-        fix: "Patch CVE-2026-54875 and close internet-exposed port 3389 on contoso-ws-01, rotate the shared local-admin credential (Windows LAPS), and keep privileged accounts off internet-facing endpoints." }),
+        chain: (function () {   // host-level enrichment: the open-port host, then the CVEs Defender TVM attributes to it (verified join)
+          const c = [{ label: "Internet", kind: "internet" }, { label: "contoso-ws-01 · Very high", kind: "device" }];
+          const n = _hostCveNode("contoso-ws-01"); if (n) c.push({ label: n.label, kind: "cve", sub: n.sub });
+          c.push({ label: "Administrator signed in", kind: "user" }, { label: "CONTOSO-DC01", kind: "device" });
+          return c;
+        })(),
+        ingredients: ["An internet-exposed service (RDP / port 3389)", "Exploitable CVEs on that host (Defender TVM)", "A privileged account interactively signed in — credential inheritance", "A verified exposure-graph path onward to a Domain Controller"],
+        why: "The host is reachable from the internet, carries exploitable CVEs, and a privileged account is signed in on it — so initial access, privilege inheritance and a path to the DC are one chain, not three separate findings. Host-level CVE match (Defender TVM); which open port maps to a vulnerable service is inferred.",
+        fix: "Patch the exploitable CVEs and close internet-exposed port 3389 on contoso-ws-01, rotate the shared local-admin credential (Windows LAPS), and keep privileged accounts off internet-facing endpoints." }),
       _comboOf({ id: "id-endpoint", name: "Tier-0 admin · signed in on a high-risk device · no phishing-resistant MFA",
         exp: 3, reach: 3, impact: 3, confidence: "verified", key: "identity", view: "user",
         chain: [{ label: "Ava de Vries (Global Admin)", kind: "user" }, { label: "contoso-ws-01 · Very high · internet-facing", kind: "device" }, { label: "no phishing-resistant method", kind: "role" }, { label: "Tier-0 directory", kind: "role" }],
@@ -8827,6 +8832,19 @@ window.EP = (function () {
     });
     return out.sort((a, b) => b.score - a.score).slice(0, 4);
   }
+  // A chain node for the CVEs Defender TVM attributes to one host — the verified host-level join behind the map's
+  // internet combo. Returns null when the host has no collected CVEs (honest N/A, no node). Carries the raw rollup
+  // on ._host so callers can word the why / ingredients. The affected software rides the node's sub-line as the
+  // inferred open-port→service hint; the host-level match itself is verified.
+  function _hostCveNode(hostName) {
+    let hc = null;
+    try { const va = viewApi("vuln"); hc = (va && va.cvesForHost) ? va.cvesForHost(String(hostName || "").split("·")[0].trim()) : null; } catch (e) {}
+    if (!hc || !(hc.exploited || hc.crit || hc.count)) return null;
+    const lbl = hc.exploited ? (hc.exploited + " exploited · " + hc.count + " CVE" + (hc.count === 1 ? "" : "s"))
+      : hc.crit ? (hc.crit + " critical · " + hc.count + " CVE" + (hc.count === 1 ? "" : "s"))
+      : (hc.count + " CVE" + (hc.count === 1 ? "" : "s"));
+    return { label: lbl, kind: "cve", sub: hc.software.length ? hc.software.join(", ") : (hc.topCve || ""), _host: hc };
+  }
   // Live: an internet-facing host carrying an exploitable CVE, with a privileged account signed in on it. Read from
   // the Attack Paths graph (a native exposure-graph path: internet → CVE → device) cross-referenced with that
   // device's collected privileged sign-ins — both ends are collected facts, so the chain is verified.
@@ -8847,13 +8865,30 @@ window.EP = (function () {
       if (!dev) return;
       if (seen.has(dev.label)) return; seen.add(dev.label);
       const priv = privOf(dev.label), crit = seq.some(s => s.crit);
-      if (!cve && !crit && !priv.length) return;   // a bare internet-facing host with no onward reach isn't a combo
-      const name = "Internet-facing host · " + (cve ? "exploitable CVE · " : "") + (priv.length ? "privileged sign-in" : crit ? "path to a critical asset" : "exposed");
+      // When the exposure-graph path carries no CVE node of its own, enrich the internet-facing host with the CVEs
+      // Defender TVM attributes to it (a verified host-level join). The hostname is the node label stripped of any
+      // " · criticality" suffix. The open-port→vulnerable-service match stays inferred (shown as a software hint).
+      const hostNode = !cve ? _hostCveNode(dev.label) : null;
+      const hostCve = hostNode ? hostNode._host : null;
+      const hasHostCve = !!hostNode;
+      if (!cve && !crit && !priv.length && !(hostCve && hostCve.exploited)) return;   // a bare host with no onward reach / no exploitable CVE isn't a combo
+      const chain = seq.map(s => ({ label: s.label, kind: s.kind }));
+      if (hasHostCve) {   // splice a CVE node in right after the internet-facing device: internet → host → carries → [CVEs]
+        const node = { label: hostNode.label, kind: "cve", sub: hostNode.sub };
+        const di = chain.findIndex(n => n.kind === "device");
+        if (di >= 0) chain.splice(di + 1, 0, node); else chain.push(node);
+      }
+      const cveWord = (cve || (hostCve && hostCve.exploited)) ? "exploitable CVE · " : hasHostCve ? "vulnerable · " : "";
+      const name = "Internet-facing host · " + cveWord + (priv.length ? "privileged sign-in" : crit ? "path to a critical asset" : "exposed");
       out.push(_comboOf({ id: "inet-" + i, name: name,
         exp: 3, reach: 3, impact: (crit || priv.length) ? 3 : 2, confidence: "verified", key: "endpoint", view: "attackpaths",
-        chain: seq.map(s => ({ label: s.label, kind: s.kind })),
-        ingredients: [].concat("An internet-exposed host", cve ? ["An exploitable CVE (" + cve.label + ") on it"] : [], priv.length ? ["A privileged account signed in — credential inheritance (" + priv.join(", ") + ")"] : [], crit ? ["A verified path onward to a critical asset"] : []),
-        why: "An internet-facing host" + (cve ? " with an exploitable CVE" : "") + (priv.length ? " and a privileged account signed in on it" : "") + " — initial access and " + (priv.length ? "privilege inheritance" : "lateral movement") + " are one verified exposure-graph chain.",
+        chain: chain,
+        ingredients: [].concat("An internet-exposed host",
+          cve ? ["An exploitable CVE (" + cve.label + ") on it"]
+            : hasHostCve ? [hostCve.count + " CVE" + (hostCve.count === 1 ? "" : "s") + " on it" + (hostCve.exploited ? " (" + hostCve.exploited + " actively exploited)" : "") + (hostCve.software.length ? " — " + hostCve.software.join(", ") : "")] : [],
+          priv.length ? ["A privileged account signed in — credential inheritance (" + priv.join(", ") + ")"] : [],
+          crit ? ["A verified path onward to a critical asset"] : []),
+        why: "An internet-facing host" + (cve ? " with an exploitable CVE" : hasHostCve ? " carrying " + hostCve.count + " CVE" + (hostCve.count === 1 ? "" : "s") + (hostCve.exploited ? " (" + hostCve.exploited + " actively exploited)" : "") : "") + (priv.length ? " and a privileged account signed in on it" : "") + " — initial access and " + (priv.length ? "privilege inheritance" : "lateral movement") + " are one verified exposure-graph chain." + (hasHostCve ? " Host-level CVE match (Defender TVM); which open port maps to a vulnerable service is inferred." : ""),
         fix: p.cutFix || "Patch the CVE and close the internet-exposed port; keep privileged accounts off internet-facing hosts and rotate any shared local-admin credential." }));
     });
     return out.slice(0, 3);
@@ -9018,11 +9053,13 @@ window.EP = (function () {
         { name: "Mailboxes", ok: true, n: (ents.mailboxes || []).length, unit: "with issues" },
         { name: "Devices", ok: true, n: (ents.devices || []).length, unit: "collected" }
       ];
+      try { await ensureLoaded("vuln"); } catch (e) {}   // demo: so the internet combo's host-CVE enrichment is ready on first paint
       try { return _demoToxicCombos(); } catch (e) { return []; }
     }
     // Make sure the Attack Paths graph has actually rendered (LAST set) before we read it, so the strongest
     // detector sees the live internet→CVE→critical paths instead of an empty graph() during the roll-up.
     try { await ensureLoaded("attackpaths"); } catch (e) {}
+    try { await ensureLoaded("vuln"); } catch (e) {}   // so the internet-combo can enrich its host with Defender TVM CVEs
     const out = [];
     let g = null; try { g = await exposureGraph.load(); } catch (e) { g = null; }
     let apg = null; try { apg = viewApi("attackpaths").graph(); } catch (e) { apg = null; }
@@ -9753,7 +9790,7 @@ window.EP = (function () {
   // The relationship a hop represents — so every edge says WHY it matters instead of a bare "→".
   function _sxHopLabel(fromKind, toKind, portLbl) {
     if (fromKind === "internet") return portLbl || "exposed";
-    if (toKind === "cve") return "exploitable";
+    if (toKind === "cve") return fromKind === "device" ? "carries" : "exploitable";
     if (toKind === "data") return "reaches";
     if (toKind === "role") return "grants";
     if (toKind === "user") return "signed in";
@@ -9775,7 +9812,7 @@ window.EP = (function () {
       const crown = !!(critAssets.match(n.label || ""));
       const sev = (n.kind === "data" || n.kind === "cve") ? "crit" : "high";
       const isEntry = i > 0 && ns[i - 1].kind === "internet";   // the internet-facing node carries the open ports
-      const sub = (isEntry && ports.length) ? ("open :" + ports.slice(0, 4).join(", ")) : "";
+      const sub = n.sub || ((isEntry && ports.length) ? ("open :" + ports.slice(0, 4).join(", ")) : "");   // a cve node carries its own sub (affected software — the inferred service hint)
       cells.push(sxCard({ key: null, eyebrow: _SXK_EYE[n.kind] || "Asset", main: n.label, sev: sev, crown: crown, sub: sub, badge: crown ? "★ CROWN" : String(n.kind || "").toUpperCase(), icon: _SXK_ICON[n.kind] || "finding" }, "grid-column:" + gc + ";grid-row:1"));
     });
     // Footer: name WHY this chain is risky in a line, and a clickable Fix → that deep-links to the combo's view.
@@ -31515,6 +31552,25 @@ function __dpVulnSummary(){
   const recs = vRecs(CVES).slice(0,4).map(r => ({ title:r[1], detail:r[2], count:r[0], sev:/critical/i.test(r[2])?"critical":"high" }));
   return { label:"Vulnerabilities", score:LAST.score, grade:LAST.grade, lead:LAST.lede, sev:sevCounts(), top, recs };
 }
+// Per-host CVE rollup for the cross-domain map: the CVEs Defender TVM attributes to one device name, with the
+// exploited / critical counts and the affected software. The device↔CVE join is a collected fact on both ends,
+// so it is VERIFIED at the host level — it says the exposed host is vulnerable, not that a specific open port is
+// the vulnerable service (that port→service match is only inferable without a banner; SightLine's nmap -sV does it).
+// deviceNames comes from a make_set capped at 50, so a very widespread CVE can be undercounted here — never over.
+function __dpVulnHostCves(name){
+  if (!name || !LAST || LAST.needsDefender) return null;
+  const key = String(name).toLowerCase().trim();
+  if (!key) return null;
+  const list = (CVES||[]).filter(c => (c.deviceNames||[]).some(n => String(n).toLowerCase() === key));
+  if (!list.length) return null;
+  const exploited = list.filter(c => c.kev || c.exploit || c.zeroday).length;
+  const crit = list.filter(c => c.sev === "Critical").length;
+  const sw = []; list.forEach(c => (c.software||[]).forEach(s => { if (s && sw.indexOf(s) < 0) sw.push(s); }));
+  const _rk = c => (c.kev?3:0) + (c.sev==="Critical"?2:0) + ((c.exploit||c.zeroday)?1:0);
+  const top = list.slice().sort((a,b) => _rk(b)-_rk(a) || (b.cvss||0)-(a.cvss||0))[0];
+  return { count: list.length, exploited, crit, software: sw.slice(0,3),
+           topCve: top ? top.cve : null, topCvss: top ? (top.cvss||null) : null };
+}
 function __dpVulnFocus(f){
   try {
     const r = document.getElementById("vuln-root"); if (r) r.scrollIntoView({ behavior:"smooth", block:"start" });
@@ -31527,7 +31583,7 @@ function __dpVulnFocus(f){
 }
 if (window.EP && EP.DEMO) { try { analyze(); } catch(e){ console.error("[vuln demo]", e); } }
 
-;return { load: (typeof analyze === "function") ? analyze : null, summary: (typeof __dpVulnSummary === 'function' ? __dpVulnSummary : null), focus: (typeof __dpVulnFocus === 'function' ? __dpVulnFocus : null) };
+;return { load: (typeof analyze === "function") ? analyze : null, summary: (typeof __dpVulnSummary === 'function' ? __dpVulnSummary : null), focus: (typeof __dpVulnFocus === 'function' ? __dpVulnFocus : null), cvesForHost: (typeof __dpVulnHostCves === 'function' ? __dpVulnHostCves : null) };
 })());
 </script>
 <script>
