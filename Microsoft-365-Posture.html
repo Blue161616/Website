@@ -11433,6 +11433,24 @@ window.EP = (function () {
     copyScript("#epImpCopyAll", PS_ALL);
   }
 
+  // Advanced hunting answered (so ThreatHunting.Read.All is fine) but a Defender table isn't in this tenant's
+  // schema: "Failed to resolve table or column expression named 'DeviceInfo'". That is a licence / provisioning
+  // state, not a consent problem — Defender for Business (Microsoft 365 Business Premium) has no advanced-hunting
+  // device data (Plan 2 only), and a just-onboarded tenant has no tables until devices report. Every view that
+  // reads Defender through hunting shows this instead of "grant the permission". Returns null for any other error.
+  function huntDiag(err) {
+    const m = /Failed to resolve table or column expression named '([A-Za-z]+)'/.exec(String((err && err.message) || err || ""));
+    if (!m) return null;
+    const t = m[1];
+    return { table: t,
+      lead: "Not assessed — Defender device data isn't in advanced hunting for this tenant (Defender for Endpoint P2 needed).",
+      title: "Defender device data isn't available through advanced hunting in this tenant.",
+      html: "The <b>ThreatHunting.Read.All</b> permission is working — Defender answered the query, but the <code>" + esc(t) + "</code> table does not exist in this tenant. Two causes:"
+        + "<br>• <b>Licence</b> — Microsoft 365 Business Premium includes <b>Defender for Business</b>. It protects the devices and shows them in the Defender portal, but advanced-hunting device data is part of <b>Defender for Endpoint Plan 2</b> (Microsoft 365 E5 / E5 Security) only."
+        + "<br>• <b>Just set up</b> — in a newly onboarded tenant the tables appear only after the first devices have reported, typically within a few hours."
+        + "<br>There is no other read from a browser: Defender's own REST API does not allow browser (CORS) calls. Nothing to grant or fix in this app." };
+  }
+
   // Compact score gauge (no grade/label) — the Endpoint (Device) views call EP.scoreGauge(score,{size}).
   // Same 270° arc + green→gold→red fill as the Overview gauge. Higher score = worse (red).
   let _spGaugeN = 0;
@@ -11717,7 +11735,7 @@ window.EP = (function () {
       nodes: nodes, edges: edges, graph: graph, reset: reset };
   })();
   return { registerView, viewApi, ensureLoaded, makeAsk, token, tokenSilent, tokenOptional, graphBase, exposureGraph, exceptions, critAssets, setStatus, esc, DEMO,
-    scopedDoc, msalShim, ACCOUNT, llm, llmComplete, goto, mitre: mitreFor, scoreGauge: scoreGaugeCompact, llmLive: () => llmState === "ok",
+    scopedDoc, msalShim, ACCOUNT, llm, llmComplete, goto, mitre: mitreFor, scoreGauge: scoreGaugeCompact, huntDiag, llmLive: () => llmState === "ok",
     estateAsk: (host) => renderSuiteAsk(host),   // the cross-estate copilot, mountable into the unified Ask page's "✦ Copilot — all domains" scope
     get account() { return account; }, get signedIn() { return !!account; },
     get IMPORT() { return IMPORT; }, get IMPORTED() { return IMPORTED; },
@@ -27931,9 +27949,11 @@ function paint(){
   const score = D.devices.length ? Math.round(100 * _sw / D.devices.length) : 0;
   const grade = score>=70?"D":score>=50?"C":score>=30?"B":"A";
   const band = '<div class="di-band">' + EP.scoreGauge(score)
-    + '<div><div class="h1">Device posture · every signal per asset</div><div class="lede">' + D.devices.length + ' devices · ' + hi + ' high-risk' + (crit?(' · ' + crit + ' critical asset' + (crit===1?'':'s')):'') + ' · ' + unm + ' unmanaged · ' + nc + ' non-compliant' + (D.hasMde ? '' : ' · <span style="color:var(--sev-high)">connect Defender for risk + exposure levels</span>') + ' · <span style="color:var(--muted)">click a row for the full posture card</span></div></div></div>';
+    + '<div><div class="h1">Device posture · every signal per asset</div><div class="lede">' + D.devices.length + ' devices · ' + hi + ' high-risk' + (crit?(' · ' + crit + ' critical asset' + (crit===1?'':'s')):'') + ' · ' + unm + ' unmanaged · ' + nc + ' non-compliant' + (D.hasMde ? '' : ' · <span style="color:var(--sev-high)">' + (D.mdeErr && EP.huntDiag && EP.huntDiag(D.mdeErr) ? 'Defender risk + exposure not available in this tenant' : 'connect Defender for risk + exposure levels') + '</span>') + ' · <span style="color:var(--muted)">click a row for the full posture card</span></div></div></div>';
   const src = D.imported ? ("Imported CSV · " + D.devices.length + " devices (" + (D.hasMde ? "Entra + Intune + Defender exports" : "Entra + Intune exports") + ") — not a live scan.") : D.live ? (D.hasMde ? "Live — Entra + Intune + Defender." : "Live — Entra + Intune (Defender not connected).") : "Demo data.";
-  const mdeBanner = (D.live && !D.hasMde) ? '<div class="di-err" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">'
+  const mdeDg = D.mdeErr && EP.huntDiag ? EP.huntDiag(D.mdeErr) : null;
+  const mdeBanner = (D.live && !D.hasMde && mdeDg) ? '<div class="di-err" style="margin-bottom:12px;line-height:1.6"><b>' + mdeDg.title + '</b> Risk, exposure and onboarding state are not shown.<br>' + mdeDg.html + '</div>'
+    : (D.live && !D.hasMde) ? '<div class="di-err" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">'
     + '<span style="flex:1;min-width:260px"><b>Defender not connected — risk &amp; exposure are unavailable.</b> '
     + (D.mdeErr ? esc(D.mdeErr.message || String(D.mdeErr)) : "The Defender (MDE) API returned no data.")
     + ' Grant Microsoft Graph <b>ThreatHunting.Read.All</b> (advanced hunting — the Defender REST API can’t be called from a browser) and connect.</span>'
@@ -29924,9 +29944,10 @@ function render(D){
   const band = '<div class="dp-band">' + EP.scoreGauge(D.score)
     + '<div><div class="h1">Hardening · secure-configuration workspace</div><div class="lede">' + esc(D.lede||"") + '</div></div></div>';
   if (D.needsDefender){
+    const dg = D.err && EP.huntDiag ? EP.huntDiag(D.err) : null;
     root.innerHTML = band + '<div style="margin-top:10px;padding:16px 18px;border:1px dashed var(--accent);border-radius:12px;background:rgba(63,169,255,.06);font-size:13px;line-height:1.6;color:var(--text)">'
-      + '<b>Connect Defender to populate this view.</b><br>Hardening reads the Defender secure-configuration assessment via Graph advanced hunting — grant <b>ThreatHunting.Read.All</b> (and Defender for Endpoint P2). Once connected, this lists every failing control, the devices affected, and the exact remediation.'
-      + (D.err ? '<br><span style="color:var(--sev-high)">' + esc(D.err) + '</span>' : '') + '</div>';
+      + (dg ? '<b>' + dg.title + '</b><br>' + dg.html : '<b>Connect Defender to populate this view.</b><br>Hardening reads the Defender secure-configuration assessment via Graph advanced hunting — grant <b>ThreatHunting.Read.All</b> (and Defender for Endpoint P2). Once connected, this lists every failing control, the devices affected, and the exact remediation.')
+      + (D.err ? '<br><span style="color:' + (dg ? 'var(--muted)' : 'var(--sev-high)') + '">' + esc(D.err) + '</span>' : '') + '</div>';
     return;
   }
   CONTROLS = D.controls || [];
@@ -30015,7 +30036,7 @@ async function analyze(){
 function sevCounts(){ const c = { crit:0, high:0, med:0, low:0 }; CONTROLS.forEach(x => { const k = SEV_CLS[x.sev]; if (c[k]!=null) c[k]++; }); return c; }
 function __dpHardSummary(){
   if (!LAST) return null;
-  if (LAST.needsDefender) return { label:"Hardening", score:null, grade:"–", lead:"Not assessed — connect Defender (MDE).", sev:{crit:0,high:0,med:0,low:0}, top:[] };
+  if (LAST.needsDefender) return { label:"Hardening", score:null, grade:"–", lead:(LAST.err && EP.huntDiag && EP.huntDiag(LAST.err) || {}).lead || "Not assessed — connect Defender (MDE).", sev:{crit:0,high:0,med:0,low:0}, top:[] };
   return { label:"Hardening", score:LAST.score, grade:LAST.grade, lead:LAST.lede, sev:sevCounts(),
     recs: hwRecs().slice(0,4).map(r => ({ title:r[1], detail:r[2], count:r[0], sev:/impact (8|9|10)\//.test(r[1])?"critical":"high" })),
     // Full control list (+ pillar group, fail/assessed counts) so the Framework scorecard can map device
@@ -31518,9 +31539,10 @@ function render(D){
   const band = '<div class="dp-band">' + EP.scoreGauge(D.score)
     + '<div><div class="h1">Vulnerabilities · CVE workspace</div><div class="lede">' + esc(lede) + '</div></div></div>';
   if (D.needsDefender){
+    const dg = D.err && EP.huntDiag ? EP.huntDiag(D.err) : null;
     root.innerHTML = band + '<div style="margin-top:10px;padding:16px 18px;border:1px dashed var(--accent);border-radius:12px;background:rgba(63,169,255,.06);font-size:13px;line-height:1.6;color:var(--text)">'
-      + '<b>Connect Defender to populate this view.</b><br>CVEs read from Defender TVM via Graph advanced hunting — grant <b>ThreatHunting.Read.All</b> (and Defender for Endpoint P2).'
-      + (D.err ? '<br><span style="color:var(--sev-high)">' + esc(D.err) + '</span>' : '') + '</div>';
+      + (dg ? '<b>' + dg.title + '</b><br>' + dg.html : '<b>Connect Defender to populate this view.</b><br>CVEs read from Defender TVM via Graph advanced hunting — grant <b>ThreatHunting.Read.All</b> (and Defender for Endpoint P2).')
+      + (D.err ? '<br><span style="color:' + (dg ? 'var(--muted)' : 'var(--sev-high)') + '">' + esc(D.err) + '</span>' : '') + '</div>';
     return;
   }
   const crit = SEGCVES.filter(c => c.sev==="Critical").length, exp = SEGCVES.filter(c => c.exploit||c.zeroday).length, kev = SEGCVES.filter(c => c.kev).length;
@@ -31621,7 +31643,7 @@ function sevCounts(){
 }
 function __dpVulnSummary(){
   if (!LAST) return null;
-  if (LAST.needsDefender) return { label:"Vulnerabilities", score:null, grade:"–", lead:"Not assessed — connect Defender (MDE).", sev:{ crit:0, high:0, med:0, low:0 }, top:[] };
+  if (LAST.needsDefender) return { label:"Vulnerabilities", score:null, grade:"–", lead:(LAST.err && EP.huntDiag && EP.huntDiag(LAST.err) || {}).lead || "Not assessed — connect Defender (MDE).", sev:{ crit:0, high:0, med:0, low:0 }, top:[] };
   // Rank actively-exploited (KEV) CVEs first in the fix-first list, then critical / public-exploit / zero-day.
   const _rk = c => (c.kev?3:0) + (c.sev==="Critical"?2:0) + (c.exploit||c.zeroday?1:0);
   const top = visibleCves(CVES).filter(c => c.kev || c.sev==="Critical" || c.exploit || c.zeroday)
@@ -32748,9 +32770,10 @@ function render(D){
   const band = '<div class="dp-band">' + EP.scoreGauge(score, { caption: "risk" })
     + '<div><div class="h1">' + (STATUS_KNOWN ? "Alerts · active on your devices" : "Alerts · last 30 days") + '</div><div class="lede">' + esc(lede) + '</div></div></div>';
   if (D.needsDefender){
+    const dg = D.err && EP.huntDiag ? EP.huntDiag(D.err) : null;
     root.innerHTML = band + '<div style="margin-top:10px;padding:16px 18px;border:1px dashed var(--accent);border-radius:12px;background:rgba(63,169,255,.06);font-size:13px;line-height:1.6;color:var(--text)">'
-      + '<b>Connect Defender to populate this view.</b><br>Active alerts read from Defender for Endpoint via Graph advanced hunting — grant <b>ThreatHunting.Read.All</b>.'
-      + (D.err ? '<br><span style="color:var(--sev-high)">' + esc(D.err) + '</span>' : '') + '</div>';
+      + (dg ? '<b>' + dg.title + '</b><br>' + dg.html : '<b>Connect Defender to populate this view.</b><br>Active alerts read from Defender for Endpoint via Graph advanced hunting — grant <b>ThreatHunting.Read.All</b>.')
+      + (D.err ? '<br><span style="color:' + (dg ? 'var(--muted)' : 'var(--sev-high)') + '">' + esc(D.err) + '</span>' : '') + '</div>';
     return;
   }
   const internetDev = DEVICES.filter(KPI_TEST.internet).length;
@@ -32819,7 +32842,7 @@ async function analyze(){
 function sevCounts(){ const c = { crit:0, high:0, med:0, low:0 }; DEVICES.forEach(d => { const k = d.worstSev==="Critical"?"crit":d.worstSev==="High"?"high":d.worstSev==="Medium"?"med":"low"; c[k]++; }); return c; }
 function __dpThreatSummary(){
   if (!LAST) return null;
-  if (LAST.needsDefender) return { label:"Alerts", score:null, grade:"–", lead:"Not assessed — connect Defender (MDE).", sev:{ crit:0, high:0, med:0, low:0 }, top:[] };
+  if (LAST.needsDefender) return { label:"Alerts", score:null, grade:"–", lead:(LAST.err && EP.huntDiag && EP.huntDiag(LAST.err) || {}).lead || "Not assessed — connect Defender (MDE).", sev:{ crit:0, high:0, med:0, low:0 }, top:[] };
   const aWord = STATUS_KNOWN ? "active alert" : "alert";
   const top = DEVICES.slice().sort((a,b)=>b.score-a.score).slice(0,5).map(d => ({
     title: (d.critical?"👑 ":"") + d.name + " — " + d.activeCount + " " + aWord + (d.activeCount===1?"":"s") + (d.critical?" · critical asset":"") + (d.internet?" · internet-facing":""),
