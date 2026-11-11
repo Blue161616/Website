@@ -354,7 +354,8 @@ function skuSeatPrice(sku){
   return null;
 }
 async function renderOverview(v){
-  const [lic, usage, ag] = await Promise.all([loadLicences(), loadUsage(), loadAgents()]);
+  // credits-by-service is read silently only — a missing consent just leaves those rows "not connected"
+  const [lic, usage, ag, svc] = await Promise.all([loadLicences(), loadUsage(), loadAgents(), loadServiceCredits().catch(()=>null)]);
   const agOn = !!(ag && ag.available), list = agOn ? (ag.agents||[]) : [];
   const agOpt = agOn ? agentOptimization(list) : null;
   const seats = (lic.users||[]).length;
@@ -373,15 +374,75 @@ async function renderOverview(v){
   const seatCost = skuRows.reduce((x,k)=>x+(k.cost||0),0), unpriced = skuRows.filter(k=>k.price==null).length;
   const agentCost = creditTotal!=null ? creditTotal*PRICE.credit : null;
   const money = n => "$"+Number(n||0).toLocaleString(undefined,{minimumFractionDigits:n%1?2:0, maximumFractionDigits:2});
+  // usage-billed Copilot services (Cowork, Code, Autopilot …) from the Graph cost-management read
+  const svcOn = !!(svc && svc.available);
+  const svcQty = rx => svcOn ? Object.entries(svc.services).filter(([id]) => rx.test(id)).reduce((x,[,q]) => x+q, 0) : null;
+  const sCowork = svcQty(/cowork/i), sCode = svcQty(/code/i), sAuto = svcQty(/autopilot|scout/i);
+  // anything else usage-billed, minus Copilot Studio (already counted from the Power Platform read — no double count)
+  const sOther = svcOn ? Object.entries(svc.services).filter(([id]) => !/cowork|code|autopilot|scout|studio/i.test(id)).reduce((x,[,q]) => x+q, 0) : null;
+  const svcCredits = svcOn ? sCowork+sCode+sAuto+sOther : null;
+  const svcUsers = svcOn ? Object.keys(svc.users||{}).length || (svc.top||[]).length : null;
+  const grand = seatCost + (agentCost||0) + (svcCredits||0)*PRICE.credit;
   let h = demoBanner();
 
   // ---- cost at a glance ----
   h += sec("Monthly cost") + '<div class="tiles">'
-    + tile(money(seatCost+(agentCost||0)), "Est. AI spend / month", "licences + agent credits", (seatCost+(agentCost||0))?"warn":"mut")
+    + tile(money(grand), "Est. AI spend / month", "licences + all Copilot Credits", grand?"warn":"mut")
     + tile(money(seatCost), "Copilot licences", copilotSku+" seat"+(copilotSku===1?"":"s")+" owned · list price", seatCost?"":"mut")
     + tile(agentCost!=null?money(agentCost):"—", "Copilot Studio credits", agentCost!=null?f2(creditTotal)+" credits · month to date":"not read yet", agentCost?"warn":"mut")
     + tile(opt&&usageOn?money(opt.monthlyWaste):"N/A", "Reclaimable", opt&&usageOn?opt.inactive.length+" inactive seat"+(opt.inactive.length===1?"":"s"):"needs the usage report", opt&&usageOn&&opt.monthlyWaste?"bad":"mut")
     + '</div>';
+
+  // ---- everything in one table: each kind of AI an end user can run, with who uses it and what it costs ----
+  {
+    const na = '<span class="na">—</span>', cost = n => n==null ? na : '<b>'+money(n)+'</b>';
+    const byH = hn => list.filter(a => harnessOf(a)===hn);
+    const std = byH("Standard"), gh = agOn ? agOpt.gh : [], chatH = byH("Copilot Chat");
+    const sess = arr => arr.some(a => a.sessions!=null) ? arr.reduce((x,a) => x+(a.sessions||0), 0).toLocaleString()+' sessions (30d)' : null;
+    const hCred = arr => arr.reduce((x,a) => x+(a.creditsMonth||0), 0);
+    const name = (t, badge, cls) => '<td style="min-width:210px"><b>'+t+'</b><div><span class="badge '+cls+'">'+badge+'</span></div></td>';
+    const cell = (main, sub) => '<td>'+(main==null?na:main)+(sub?'<div class="hint" style="font-size:11px">'+sub+'</div>':'')+'</td>';
+    const go = (view, label) => '<td><a data-go="'+view+'">'+label+' →</a></td>';
+    const notConn = '<a data-go="credits">connect →</a>';
+    let t = '<div class="card"><h2>All AI in one view <span class="hint" style="font-weight:400">· who uses it and what it costs this month · <a data-go="explain">what each type is →</a></span></h2>'
+      + '<div style="overflow-x:auto"><table><thead><tr><th>Type</th><th>Users / agents</th><th>Activity</th><th>Copilot Credits</th><th>Cost / month</th><th>Details</th></tr></thead><tbody>';
+    // Copilot Chat & apps — the licence
+    t += '<tr>'+name("Copilot Chat &amp; Copilot in the apps","Included","b-ok")
+      + cell(seats ? seats+' user'+(seats===1?"":"s") : (copilotSku ? "0 users" : null), copilotSku+' seat'+(copilotSku===1?"":"s")+' owned · '+assigned+' assigned')
+      + cell(usageOn ? activeUsers+' active (28d)' : null, usageOn && opt ? opt.inactive.length+' inactive' : (usageOn?'':'needs the usage report'))
+      + cell('<span class="hint">included in the licence</span>') + '<td>'+cost(seatCost)+'<div class="hint" style="font-size:11px">list price</div></td>' + go("licences","Licences")+'</tr>';
+    // Copilot Studio — two harnesses; credits per harness only when per-agent credits are known
+    const split = agOn && ag.creditsKnown, csTotal = cr ? cr.prepaid+cr.payGo : (split ? agOpt.totalCredits : null);
+    const csCells = split ? null : '<td rowspan="2" style="vertical-align:middle">'+(csTotal!=null?f2(csTotal):(agOn?na:'<a data-go="agents">connect →</a>'))+'<div class="hint" style="font-size:11px">'+(csTotal!=null?'both harnesses · month to date':'')+'</div></td>'
+      + '<td rowspan="2" style="vertical-align:middle">'+cost(csTotal!=null?csTotal*PRICE.credit:null)+'</td>';
+    t += '<tr>'+name("Copilot Studio agent — Standard harness","Credits after publish","b-warn")
+      + cell(agOn ? std.length+' agent'+(std.length===1?"":"s") : null, agOn ? std.filter(a=>a.published!==false).length+' published'+(chatH.length?' · +'+chatH.length+' on the Copilot Chat harness (not charged)':'') : 'not connected')
+      + cell(agOn ? sess(std) : null)
+      + (split ? cell(f2(hCred(std)))+'<td>'+cost(hCred(std)*PRICE.credit)+'</td>' : csCells) + go("agents","Agents")+'</tr>';
+    t += '<tr>'+name("Copilot Studio agent — GitHub Copilot harness","Credits from build","b-bad")
+      + cell(agOn ? gh.length+' agent'+(gh.length===1?"":"s") : null, agOn ? gh.filter(a=>a.published!==false).length+' published' : 'not connected')
+      + cell(agOn ? sess(gh) : null)
+      + (split ? cell(f2(hCred(gh)))+'<td>'+cost(hCred(gh)*PRICE.credit)+'</td>' : '') + go("agents","Agents")+'</tr>';
+    // usage-billed Copilot experiences
+    const svcRows = [["Cowork","Credits per task","b-warn",sCowork],["Copilot Code","Credits per build","b-warn",sCode],["Autopilot","Credits, always on","b-bad",sAuto]];
+    if(svcOn && sOther>0) svcRows.push(["Other usage-billed services","Credits","b-mut",sOther]);
+    svcRows.forEach((r,i) => {
+      t += '<tr>'+name(r[0],r[1],r[2])
+        + (i===0 ? '<td rowspan="'+svcRows.length+'" style="vertical-align:middle">'+(svcOn ? svcUsers+' user'+(svcUsers===1?"":"s")+'<div class="hint" style="font-size:11px">consumed credits · all these services</div>' : '<span class="na">not connected</span><div class="hint" style="font-size:11px">'+notConn+'</div>')+'</td>'
+                   + '<td rowspan="'+svcRows.length+'" style="vertical-align:middle">'+(svcOn ? svc.days.length+' day'+(svc.days.length===1?"":"s")+' reported<div class="hint" style="font-size:11px">month to date</div>' : na)+'</td>' : '')
+        + cell(svcOn ? f2(r[3]) : null) + '<td>'+cost(svcOn ? r[3]*PRICE.credit : null)+'</td>' + go("credits","Credits")+'</tr>'; });
+    // total
+    const allCredits = (csTotal||0) + (svcCredits||0), anyCredits = csTotal!=null || svcCredits!=null;
+    t += '<tr style="border-top:2px solid var(--border)"><td><b>Total</b></td>'
+      + cell('<b>'+(seats||0)+' licensed user'+(seats===1?"":"s")+(agOn?' · '+list.length+' agents':'')+'</b>')
+      + cell(usageOn ? '<b>'+activeUsers+' active</b>' : null)
+      + cell(anyCredits ? '<b>'+f2(allCredits)+'</b>' : null, anyCredits ? 'month to date' : '')
+      + '<td><b style="font-size:15px">'+money(grand)+'</b></td><td></td></tr>';
+    t += '</tbody></table></div><div class="hint" style="margin-top:8px;font-size:11.5px">Licences at list price for the seats owned; Copilot Credits month to date at '+fmtRate(PRICE.credit)+'/credit (both editable in <code>PRICE</code>). '
+      + (agOn && !ag.creditsKnown ? 'Microsoft doesn’t offer Copilot Studio credits per agent, so the two harnesses share one figure. ' : '')
+      + (svcOn ? 'Users of Cowork, Code and Autopilot are reported together, not per service.' : 'Cowork, Code and Autopilot are not connected yet — their rows and the total exclude them.')+'</div></div>';
+    h += t;
+  }
 
   // ---- Microsoft 365 Copilot ----
   h += sec("Microsoft 365 Copilot", "licences") + '<div class="tiles">'
