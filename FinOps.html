@@ -325,43 +325,116 @@ function seatOptimization(lic, usage){
   return { seats, inactive, unknown, monthlyWaste: inactive.length*PRICE.m365copilot };
 }
 
+function skuSeatPrice(sku){
+  const part = String(sku.part||"");
+  if(/^(Microsoft_365_Copilot|M365_Copilot)/i.test(part)) return PRICE.m365copilot;
+  if(/github.*copilot/i.test(part)) return PRICE.githubcopilot;
+  return null;
+}
 async function renderOverview(v){
   const [lic, usage, ag] = await Promise.all([loadLicences(), loadUsage(), loadAgents()]);
-  const agOpt = (ag && ag.available) ? agentOptimization(ag.agents||[]) : null;
+  const agOn = !!(ag && ag.available), list = agOn ? (ag.agents||[]) : [];
+  const agOpt = agOn ? agentOptimization(list) : null;
   const seats = (lic.users||[]).length;
   const copilotSku = (lic.skus||[]).reduce((a,s)=>a+(s.enabled||0),0);
   const assigned = (lic.skus||[]).reduce((a,s)=>a+(s.consumed||0),0);
   const opt = seatOptimization(lic, usage);
+  const usageOn = !!(usage && usage.available);
   const activeUsers = (usage&&usage.rows||[]).filter(r => daysSince(r.last)!=null && daysSince(r.last)<=28).length;
+  const f2 = n => Number(n||0).toLocaleString(undefined,{maximumFractionDigits:2});
+  const sec = (t, go) => '<div class="hint" style="text-transform:uppercase;letter-spacing:.09em;font-size:11.5px;margin:18px 2px 8px">'+t+(go?' · <a data-go="'+go+'">open →</a>':'')+'</div>';
+  // credits: tenant month-to-date from licensing when we have it, else the per-agent sum
+  const cr = agOn ? ag.credits : null;
+  const creditTotal = cr ? cr.prepaid+cr.payGo : (agOn && ag.creditsKnown ? agOpt.totalCredits : null);
+  // monthly cost: seats owned at list price + agent credits month to date
+  const skuRows = (lic.skus||[]).map(k => { const price = skuSeatPrice(k); return { ...k, price, cost: price!=null ? price*(k.enabled||0) : null }; });
+  const seatCost = skuRows.reduce((x,k)=>x+(k.cost||0),0), unpriced = skuRows.filter(k=>k.price==null).length;
+  const agentCost = creditTotal!=null ? creditTotal*PRICE.credit : null;
+  const money = n => "$"+Number(n||0).toLocaleString(undefined,{minimumFractionDigits:n%1?2:0, maximumFractionDigits:2});
   let h = demoBanner();
-  h += '<div class="tiles">';
-  h += tile(copilotSku, "Copilot seats owned", (assigned?assigned+" assigned":""), copilotSku?"":"mut");
-  h += tile(seats||"—", "Licensed users", "hold a Copilot licence");
-  h += tile((usage&&usage.available)?activeUsers:"N/A", "Active (28d)", (usage&&usage.available)?"used Copilot in last 28 days":"Reports.Read.All needed", (usage&&usage.available)?"good":"mut");
-  if(opt) h += tile(opt.inactive.length, "Inactive seats", "assigned · no Copilot in 28d", opt.inactive.length?"warn":"good");
-  if(agOpt && !ag.creditsKnown) h += tile((ag.agents||[]).length, "Copilot Studio agents", (ag.credits ? Number(ag.credits.prepaid+ag.credits.payGo).toLocaleString(undefined,{maximumFractionDigits:2})+" credits this month · " : "")+agOpt.gh.length+" on GitHub harness", agOpt.gh.length?"warn":"");
-  else if(agOpt) h += tile(agOpt.gh.length, "Agents on GitHub harness", agOpt.totalCredits.toLocaleString()+" credits/mo · "+fmtUsd(agOpt.totalCredits*PRICE.credit), agOpt.gh.length?"warn":"good");
-  else h += tile("—", "Agents on credits", "connect Dataverse on the Agents page", "mut");
-  h += '</div>';
-  // optimization card
-  h += '<div class="card opt"><h2>Save money <span class="pill">optimization</span></h2>';
-  if(opt && usage && usage.available){
+
+  // ---- cost at a glance ----
+  h += sec("Monthly cost") + '<div class="tiles">'
+    + tile(money(seatCost+(agentCost||0)), "Est. AI spend / month", "licences + agent credits", (seatCost+(agentCost||0))?"warn":"mut")
+    + tile(money(seatCost), "Copilot licences", copilotSku+" seat"+(copilotSku===1?"":"s")+" owned · list price", seatCost?"":"mut")
+    + tile(agentCost!=null?money(agentCost):"—", "Copilot Studio credits", agentCost!=null?f2(creditTotal)+" credits · month to date":"not read yet", agentCost?"warn":"mut")
+    + tile(opt&&usageOn?money(opt.monthlyWaste):"N/A", "Reclaimable", opt&&usageOn?opt.inactive.length+" inactive seat"+(opt.inactive.length===1?"":"s"):"needs the usage report", opt&&usageOn&&opt.monthlyWaste?"bad":"mut")
+    + '</div>';
+
+  // ---- Microsoft 365 Copilot ----
+  h += sec("Microsoft 365 Copilot", "licences") + '<div class="tiles">'
+    + tile(copilotSku, "Copilot seats owned", (assigned?assigned+" assigned":""), copilotSku?"":"mut")
+    + tile(seats||"—", "Licensed users", "hold a Copilot licence")
+    + tile(usageOn?activeUsers:"N/A", "Active (28d)", usageOn?"used Copilot in last 28 days":"Reports.Read.All needed", usageOn?"good":"mut")
+    + (opt ? tile(opt.inactive.length, "Inactive seats", "assigned · no Copilot in 28d", opt.inactive.length?"warn":"good") : '')
+    + '</div>';
+  if(skuRows.length){
+    h += '<div class="card"><h2>Licences &amp; monthly cost <span class="hint" style="font-weight:400">· subscribed SKUs · list price, USD</span></h2>'
+      + '<table><thead><tr><th>Licence</th><th>Owned</th><th>Assigned</th><th>Unassigned</th><th>Price / seat</th><th>Cost / month</th></tr></thead><tbody>';
+    skuRows.forEach(k => { const free = Math.max(0,(k.enabled||0)-(k.consumed||0));
+      h += '<tr><td><b>'+esc(k.name||k.part)+'</b><div class="hint" style="font-size:11px">'+esc(k.part||"")+'</div></td><td>'+(k.enabled||0)+'</td><td>'+(k.consumed||0)+'</td>'
+        + '<td>'+(free?'<span class="badge b-warn">'+free+'</span>':'0')+'</td>'
+        + '<td>'+(k.price!=null?money(k.price):'<span class="na" title="Copilot is included in a larger licence — no separate Copilot price">bundled</span>')+'</td>'
+        + '<td>'+(k.cost!=null?'<b>'+money(k.cost)+'</b>':'<span class="na">—</span>')+'</td></tr>'; });
+    h += '<tr><td><b>Total</b></td><td>'+copilotSku+'</td><td>'+assigned+'</td><td>'+Math.max(0,copilotSku-assigned)+'</td><td></td><td><b>'+money(seatCost)+'</b></td></tr></tbody></table>'
+      + '<div class="hint" style="margin-top:8px;font-size:11.5px">List prices from the <code>PRICE</code> constant ('+money(PRICE.m365copilot)+'/seat for Microsoft 365 Copilot) — set your contract rate there.'
+      + (unpriced?' '+unpriced+' licence'+(unpriced===1?" is a bundle that includes":"s are bundles that include")+' Copilot and '+(unpriced===1?"is":"are")+' not priced here.':'')+' <a data-go="licences">seat holders →</a></div></div>';
+  }
+
+  // ---- Copilot Studio agents ----
+  h += sec("Copilot Studio agents", "agents");
+  if(agOn){
+    const sessions = list.reduce((x,a)=>x+(a.sessions||0),0), anySessions = list.some(a=>a.sessions!=null);
+    h += '<div class="tiles">'
+      + tile(list.length, "Agents", (ag.envs?ag.envs+" environment"+(ag.envs===1?"":"s")+" · ":"")+list.filter(a=>a.published!==false).length+" published")
+      + tile(agOpt.gh.length, "GitHub Copilot harness", "burn credits from build", agOpt.gh.length?"warn":"good")
+      + (cr ? tile(f2(cr.payGo), "Pay-as-you-go credits", "month to date · billed to Azure", cr.payGo?"warn":"good")
+              + tile(f2(cr.prepaid)+(cr.entitled?" / "+f2(cr.entitled):""), "Prepaid credits used", cr.entitled?"of purchased capacity":"no prepaid capacity purchased", cr.entitled?"":"mut")
+            : tile(creditTotal!=null?f2(creditTotal):"—", "Credits / month", creditTotal!=null?"across all agents":"not read yet", creditTotal!=null?"":"mut"))
+      + tile(creditTotal!=null?"$"+(creditTotal*PRICE.credit).toFixed(2):"—", "Est. agent cost", "at "+fmtRate(PRICE.credit)+"/credit (editable)", creditTotal?"warn":"mut")
+      + tile(anySessions?sessions.toLocaleString():"N/A", "Sessions (30d)", anySessions?"conversation transcripts":"transcripts not readable", anySessions?"":"mut")
+      + '</div>';
+    // the credit-burning agents, most used first
+    const ghFirst = a => harnessOf(a)==="GitHub Copilot" ? 1 : 0;
+    const top = list.filter(a => ghFirst(a) || (a.creditsMonth||0)>0)
+      .sort((x,y)=>((y.creditsMonth||0)-(x.creditsMonth||0)) || ((y.sessions||0)-(x.sessions||0))).slice(0,5);
+    if(top.length){
+      h += '<div class="card"><h2>Credit-burning agents <span class="hint" style="font-weight:400">· top '+top.length+' of '+list.filter(a=>ghFirst(a)||(a.creditsMonth||0)>0).length+' · <a data-go="agents">all agents →</a></span></h2>'
+        + '<table><thead><tr><th>Agent</th><th>Powered by</th><th>Published</th><th>Credits / mo</th><th>Sessions (30d)</th><th>Last used</th></tr></thead><tbody>';
+      top.forEach(a => { const hn = harnessOf(a), hm = HARNESS[hn]||{cls:"b-mut"};
+        h += '<tr><td><b>'+esc(a.name||a.id)+'</b>'+(a.env?'<div class="hint" style="font-size:11px">'+esc(a.env)+'</div>':'')+'</td>'
+          + '<td><span class="badge '+hm.cls+'">'+esc(hn)+'</span></td>'
+          + '<td>'+(a.published===false?'<span class="badge b-mut">building</span>':'<span class="badge b-ok">published</span>')+'</td>'
+          + '<td>'+(a.creditsMonth==null?'<span class="na">—</span>':a.creditsMonth.toLocaleString())+'</td>'
+          + '<td>'+(a.sessions!=null?a.sessions.toLocaleString():'<span class="na">—</span>')+'</td>'
+          + '<td>'+(a.lastUsed?esc(a.lastUsed):'<span class="na">—</span>')+'</td></tr>'; });
+      h += '</tbody></table>'+(ag.creditsKnown?'':'<div class="hint" style="margin-top:8px;font-size:11.5px">Per-agent credits aren’t offered by Microsoft’s API — the tenant total above is the hard number.</div>')+'</div>';
+    }
+  } else h += '<div class="tiles">'+tile("—", "Agents", "connect Dataverse on the Agents page", "mut")+'</div>';
+
+  // ---- optimization: seats + agents ----
+  h += sec("Optimization") + '<div class="card opt"><h2>Save money <span class="pill">optimization</span></h2>';
+  const recs = [];
+  if(opt && usageOn){
     h += '<div class="tiles" style="margin-bottom:12px"><div class="tile bad"><div class="n">'+fmtUsd(opt.monthlyWaste)+'</div><div class="l">/ month reclaimable</div><div class="sub">'+opt.inactive.length+' inactive Copilot seat'+(opt.inactive.length===1?"":"s")+' × '+fmtUsd(PRICE.m365copilot)+'</div></div>'
       + '<div class="tile"><div class="n">'+fmtUsd(opt.monthlyWaste*12)+'</div><div class="l">/ year</div><div class="sub">at list price — adjust in PRICE</div></div></div>';
-    h += '<ul class="recs">';
-    if(opt.inactive.length) h += '<li><b>'+opt.inactive.length+'</b> Copilot seats assigned but no activity in 28 days — reclaim or reassign. <span class="save">saves '+fmtUsd(opt.monthlyWaste)+'/mo</span> <a data-go="licences">review →</a></li>';
-    if(opt.unknown.length) h += '<li><b>'+opt.unknown.length+'</b> seats with no usage record yet — confirm they are actually being used.</li>';
-    if(agOpt && agOpt.candidates.length) h += '<li><b>'+agOpt.candidates.length+'</b> GitHub-Copilot-harness agent'+(agOpt.candidates.length===1?"":"s")+' are unpublished or barely used — move to a Standard/Chat harness to stop the credit burn. <span class="save">est. '+fmtUsd(agOpt.monthlySave)+'/mo</span> <a data-go="agents">review →</a></li>';
-    else h += '<li>Copilot Studio agents on the <b>GitHub Copilot harness</b> burn credits from the moment they are built — the <a data-go="agents">Agents view</a> flags ones that could run as a <b>Standard</b> harness for free.</li>';
-    h += '</ul>';
-  } else {
+    if(opt.inactive.length) recs.push('<b>'+opt.inactive.length+'</b> Copilot seats assigned but no activity in 28 days — reclaim or reassign. <span class="save">saves '+fmtUsd(opt.monthlyWaste)+'/mo</span> <a data-go="licences">review →</a>');
+    if(opt.unknown.length) recs.push('<b>'+opt.unknown.length+'</b> seats with no usage record yet — confirm they are actually being used.');
+  }
+  if(agOpt && agOpt.candidates.length) recs.push('<b>'+agOpt.candidates.length+'</b> GitHub-Copilot-harness agent'+(agOpt.candidates.length===1?"":"s")+' are unpublished or barely used — move to a Standard/Chat harness to stop the credit burn.'
+    + (ag.creditsKnown ? ' <span class="save">est. '+fmtUsd(agOpt.monthlySave)+'/mo</span>' : '')+' <a data-go="agents">review →</a>');
+  else if(agOn && agOpt.gh.length) recs.push('<b>'+agOpt.gh.length+'</b> agent'+(agOpt.gh.length===1?" runs":"s run")+' on the <b>GitHub Copilot harness</b> and burn credits from the moment they are built — all are published and in use. <a data-go="agents">review →</a>');
+  if(agOpt && ag.creditsKnown && agOpt.noCap.length) recs.push('<b>'+agOpt.noCap.length+'</b> credit-consuming agent'+(agOpt.noCap.length===1?" has":"s have")+' no monthly consumption cap. <a data-go="agents">review →</a>');
+  if(cr && cr.payGo>0 && !cr.entitled) recs.push('All <b>'+f2(cr.payGo)+'</b> Copilot Credits this month are <b>pay-as-you-go</b> — no prepaid capacity is purchased. Compare against a prepaid credit pack once monthly use is steady.');
+  if(recs.length) h += '<ul class="recs">'+recs.map(r=>'<li>'+r+'</li>').join('')+'</ul>';
+  if(!(opt && usageOn)){
     const parts = [];
     parts.push((lic.users&&lic.users.length) ? ('<b>'+lic.users.length+'</b> Copilot seat holders loaded.') : 'Seat list needs <code>User.Read.All</code>.');
-    parts.push((usage&&usage.available) ? 'Usage loaded.' : ('Copilot usage unavailable'+(usage&&usage.error?(' — <span class="na">'+esc(usage.error)+'</span>'):'.')));
-    h += '<div class="hint">'+parts.join(' ')+'<br>Reclaimable-spend needs <b>both</b> the seat list and the usage report. If usage returns 403, the <b>signed-in account</b> needs a <b>Reports Reader</b> / <b>Global Reader</b> (or AI Administrator) role — the granted scope alone isn’t enough. Agent-credit and GitHub-Copilot savings arrive in phase 1b/1c.</div>';
-  }
+    parts.push(usageOn ? 'Usage loaded.' : ('Copilot usage unavailable'+(usage&&usage.error?(' — <span class="na">'+esc(usage.error)+'</span>'):'.')));
+    h += '<div class="hint">'+parts.join(' ')+'<br>Reclaimable seat spend needs <b>both</b> the seat list and the usage report. If usage returns 403, the <b>signed-in account</b> needs a <b>Reports Reader</b> / <b>Global Reader</b> (or AI Administrator) role — the granted scope alone isn’t enough.</div>';
+  } else if(!recs.length) h += '<div class="hint">Nothing to reclaim right now — seats are in use and no agent looks wasteful.</div>';
   h += '</div>';
-  h += '<div class="card"><h2>What this reads</h2><div class="hint">Phase 1 is browser-only Microsoft Graph (read-only): <b>subscribed SKUs</b> for Copilot licences owned, <b>per-user assigned licences</b> for seat holders, and the <b>Microsoft 365 Copilot usage report</b> for activity. Agents (Copilot Studio credits), GitHub Copilot and Azure AI Foundry each use a different connection and arrive next — shown as <i>phase</i> until then.</div></div>';
+  h += '<div class="card"><h2>What this reads</h2><div class="hint" style="line-height:1.7">All read-only, straight from the browser. <b>Microsoft Graph</b>: subscribed SKUs (Copilot licences owned), per-user assigned licences (seat holders) and the Microsoft 365 Copilot usage report (activity). <b>Dataverse</b>: the Copilot Studio agent inventory per environment, what each agent is powered by, and 30-day sessions. <b>Power Platform API</b>: Copilot Credits month to date — prepaid vs pay-as-you-go, per environment, and billing plans. GitHub Copilot and Azure AI Foundry use a different connection and arrive next — shown as <i>phase</i> until then.</div></div>';
   v.innerHTML = h;
   v.querySelectorAll("[data-go]").forEach(a => a.addEventListener("click", e=>{ e.preventDefault(); show(a.dataset.go); }));
 }
