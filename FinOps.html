@@ -102,7 +102,7 @@
       <div class="r"><span class="sp">Reports.Read.All</span><span class="sw">Microsoft 365 Copilot usage (active users, last activity)</span></div>
       <div class="r"><span class="sp">AuditLog.Read.All</span><span class="sw">Optional — account sign-in staleness</span></div>
       <div class="r"><span class="sp">Dynamics CRM · user_impersonation</span><span class="sw">Optional — Copilot Studio agent inventory + sessions (Dataverse; only GETs are made)</span></div>
-      <div class="r"><span class="sp">Power Platform API</span><span class="sw">Optional — Copilot Studio credit consumption per agent</span></div>
+      <div class="r"><span class="sp">Power Platform API</span><span class="sw">Optional — Copilot Credits: <code>Licensing.Allocations.Read</code> (prepaid / pay-as-you-go, per environment) + <code>Licensing.BillingPolicies.Read</code> (billing plans)</span></div>
     </div>
     <p class="hint" style="margin-top:14px">Register a single-tenant <b>SPA</b> app in Entra with these delegated, read-only scopes and a redirect URI of this page’s URL. A <b>Global Reader</b> / <b>Reports Reader</b> role is enough to read everything here.</p>
   </div>
@@ -339,7 +339,7 @@ async function renderOverview(v){
   h += tile(seats||"—", "Licensed users", "hold a Copilot licence");
   h += tile((usage&&usage.available)?activeUsers:"N/A", "Active (28d)", (usage&&usage.available)?"used Copilot in last 28 days":"Reports.Read.All needed", (usage&&usage.available)?"good":"mut");
   if(opt) h += tile(opt.inactive.length, "Inactive seats", "assigned · no Copilot in 28d", opt.inactive.length?"warn":"good");
-  if(agOpt && !ag.creditsKnown) h += tile((ag.agents||[]).length, "Copilot Studio agents", "inventory live · credits not read", "mut");
+  if(agOpt && !ag.creditsKnown) h += tile((ag.agents||[]).length, "Copilot Studio agents", (ag.credits ? Number(ag.credits.prepaid+ag.credits.payGo).toLocaleString(undefined,{maximumFractionDigits:2})+" credits this month · " : "")+agOpt.gh.length+" on GitHub harness", agOpt.gh.length?"warn":"");
   else if(agOpt) h += tile(agOpt.gh.length, "Agents on GitHub harness", agOpt.totalCredits.toLocaleString()+" credits/mo · "+fmtUsd(agOpt.totalCredits*PRICE.credit), agOpt.gh.length?"warn":"good");
   else h += tile("—", "Agents on credits", "connect Dataverse on the Agents page", "mut");
   h += '</div>';
@@ -455,12 +455,13 @@ function harnessFromTemplate(t){
   return t ? t : "Unknown";
 }
 async function readDataverseAgents(){
-  const inst = await dvGetAll(DV_GDS+"/api/discovery/v2.0/Instances?$select=ApiUrl,FriendlyName", await tokenSilent(resScope(DV_GDS)));
+  const inst = await dvGetAll(DV_GDS+"/api/discovery/v2.0/Instances?$select=ApiUrl,FriendlyName,EnvironmentId", await tokenSilent(resScope(DV_GDS)));
   const since = new Date(Date.now()-30*864e5).toISOString();
-  const agents = [], skipped = []; let envsRead = 0, sessionsRead = false;
+  const agents = [], skipped = [], envList = []; let envsRead = 0, sessionsRead = false;
   for(const i of inst){
     const org = (i.ApiUrl||"").replace(/\/$/,""); if(!org) continue;
     const envName = i.FriendlyName || org.replace(/^https?:\/\//,"").split(".")[0];
+    if(i.EnvironmentId) envList.push({ id:i.EnvironmentId, name:envName });
     try {
       const tok = await tokenSilent(resScope(org)), api = org+"/api/data/v9.2";
       const bots = await dvGetAll(api+"/bots?$select=name,botid,template,_ownerid_value,createdon,modifiedon,publishedon", tok);
@@ -481,7 +482,7 @@ async function readDataverseAgents(){
     } catch(e){ skipped.push(envName+": "+errMsg(e).slice(0,120)); }
   }
   if(!envsRead && skipped.length) throw new Error(skipped[0]);
-  return { agents, envs:envsRead, skipped, sessionsRead };
+  return { agents, envs:envsRead, skipped, sessionsRead, envList };
 }
 
 const normCredit = r => ({ name:r.name||r.resourceName||r.resourceId||"(unnamed)", id:r.id||r.resourceId,
@@ -501,7 +502,7 @@ function harnessFromFeature(f){
   if(/standard|classic/i.test(f)) return "Standard";
   return f;                                                      // unrecognised: show Microsoft's own label rather than guess
 }
-async function readPpCredits(){
+async function readPpCredits(envs){
   const tok = await tokenSilent(resScope(PP_API));
   const get = async url => { const r = await fetch(/^https?:/.test(url)?url:PP_API+url, { headers:{ Authorization:"Bearer "+tok } });
     if(!r.ok) throw new Error(r.status+" "+url.replace(/^https?:\/\/[^/]+/,"").split("?")[0]+" "+(await r.text().catch(()=> "")).slice(0,200));
@@ -528,10 +529,32 @@ async function readPpCredits(){
   });
   // per-agent caps and the tenant total are extras — a failure there doesn't lose the consumption
   try { (await get(base+"/resourceThresholds?"+PP_VER) || []).forEach(t => { const a = byId[t.resourceId]; if(a && t.limit!=null) a.cap = t.limit; }); } catch(e){}
-  let tenantCredits = null;
-  try { const t = await get(base+"?"+PP_VER), en = (t && t.entitlement) || {}, val = x => x && x.consumed && x.consumed.value;
-    if(val(en.capacity)!=null || val(en.payGo)!=null) tenantCredits = Math.round((val(en.capacity)||0) + (val(en.payGo)||0)); } catch(e){ if(perAgentErr) throw new Error(perAgentErr); }
-  return { list:perAgentErr ? null : Object.values(byId).map(a => ({ ...a, creditsMonth:Math.round(a.creditsMonth) })), tenantCredits, perAgentErr };
+  // tenant month-to-date: prepaid capacity vs pay-as-you-go (what the admin center's Copilot Studio licensing page shows)
+  let tenantCredits = null, credits = null;
+  try { const t = await get(base+"?"+PP_VER), en = (t && t.entitlement) || {}, c = en.capacity || {}, pg = en.payGo || {};
+    const num = x => (x && x.value!=null) ? +x.value : null;
+    if(num(c.consumed)!=null || num(pg.consumed)!=null){
+      credits = { prepaid:num(c.consumed)||0, payGo:num(pg.consumed)||0, writeOff:(c.consumed && +c.consumed.writeOff)||0, entitled:num(c.entitled),
+        refreshed:(pg.consumed && pg.consumed.lastUpdatedOn) || (c.consumed && c.consumed.lastUpdatedOn) || null, byEnv:[], plans:null, plansErr:null };
+      tenantCredits = Math.round(credits.prepaid + credits.payGo);
+    }
+  } catch(e){ if(perAgentErr) throw new Error(perAgentErr); }
+  if(credits){
+    // per environment (documented: Get Many Environment Entitlements) — best-effort, in parallel
+    await Promise.all((envs||[]).filter(e => e.id).map(async e => { try {
+      const r = await get("/licensing/environments/"+e.id+"/entitlements?"+PP_VER);
+      const x = (Array.isArray(r) ? r : (r.value||[])).find(y => y.entitlementId==="MCSMessages"); if(!x) return;
+      const en = x.entitlement || {}, v = o => (o && o.consumed && +o.consumed.value) || 0;
+      credits.byEnv.push({ name:x.environmentName||e.name, prepaid:v(en.capacity), payGo:v(en.payGo) });
+    } catch(_){} }));
+    credits.byEnv.sort((x,y) => (y.prepaid+y.payGo) - (x.prepaid+x.payGo));
+    // billing plans (needs Licensing.BillingPolicies.Read)
+    try { const bp = await get("/licensing/billingPolicies?api-version=2022-03-01-preview");
+      credits.plans = (bp.value||[]).map(q => ({ name:q.name||"", status:q.status||(q.billingInstrument && q.billingInstrument.provisioningStatus)||"",
+        rg:(q.billingInstrument && q.billingInstrument.resourceGroup)||"", envs:(q.environmentIds||[]).length })); }
+    catch(e){ credits.plansErr = errMsg(e); }
+  }
+  return { list:perAgentErr ? null : Object.values(byId).map(a => ({ ...a, creditsMonth:Math.round(a.creditsMonth) })), tenantCredits, credits, perAgentErr };
 }
 
 // Lay credit records over the Dataverse inventory (join on bot id, else name). Unmatched credit rows are kept.
@@ -551,14 +574,14 @@ async function loadAgents(){
   let dv = null, dvErr = null, pp = null, ppErr = null;
   try { dv = await readDataverseAgents(); } catch(e){ dvErr = errMsg(e); }
   if(MODEL.importAgents) pp = { list:MODEL.importAgents, tenantCredits:null, imported:true };
-  else { try { pp = await readPpCredits(); if(pp.perAgentErr) ppErr = pp.perAgentErr; } catch(e){ ppErr = errMsg(e); } }
+  else { try { pp = await readPpCredits(dv ? dv.envList : []); if(pp.perAgentErr) ppErr = pp.perAgentErr; } catch(e){ ppErr = errMsg(e); } }
   const hasList = !!(pp && pp.list);
   if(!dv && !hasList) MODEL.agents = { agents:[], available:false, source:"live", dvErr, ppErr };
   else MODEL.agents = { available:true, dvErr, ppErr,
     agents: dv ? (hasList ? mergeCredits(dv.agents, pp.list) : dv.agents) : pp.list,
     source: (dv ? "Dataverse" : "") + (dv&&hasList ? " + " : "") + (hasList ? (pp.imported ? "imported credits" : "Power Platform API") : ""),
     inventory:!!dv, creditsKnown:hasList, envs:dv?dv.envs:null, skipped:dv?dv.skipped:[], sessionsRead:!!(dv&&dv.sessionsRead),
-    tenantCredits:pp?pp.tenantCredits:null };
+    tenantCredits:pp?pp.tenantCredits:null, credits:(pp&&pp.credits)||null };
   MODEL.loaded.agents = true; return MODEL.agents;
 }
 
@@ -597,9 +620,9 @@ async function renderAgents(v){
   else h += tile(opt.gh.length, "GitHub Copilot harness", "burn credits from build", opt.gh.length?"warn":"good")
     + tile(list.filter(a=>a.published!==false).length, "Published", list.filter(a=>a.published===false).length+" still building")
     + tile(anySessions?sessions.toLocaleString():"N/A", "Sessions (30d)", anySessions?"conversation transcripts":"transcripts not readable", anySessions?"":"mut")
-    + (data.tenantCredits!=null ? tile(data.tenantCredits.toLocaleString(), "Credits · tenant", "month to date · per-agent split not readable")
+    + (data.credits ? tile(Number(data.credits.prepaid+data.credits.payGo).toLocaleString(undefined,{maximumFractionDigits:2}), "Credits · tenant", "month to date · all agents")
                                : tile("—", "Credits / month", "not read yet", "mut"));
-  h += '</div>';
+  h += '</div>' + creditsCard(data.credits);
   if(!credits) h += agentConnectCard(data);
   else {
   // optimization
@@ -635,6 +658,31 @@ async function renderAgents(v){
   wireAgentImport(v);
 }
 
+// Copilot Credits summary — mirrors Power Platform admin center → Licensing → Copilot Studio.
+function creditsCard(c){
+  if(!c) return '';
+  const f = n => Number(n||0).toLocaleString(undefined,{maximumFractionDigits:2});
+  const total = c.prepaid + c.payGo, cost = "$"+(total*PRICE.credit).toFixed(2);
+  let h = '<div class="card"><h2>Copilot Credits <span class="hint" style="font-weight:400">· Power Platform licensing · month to date'+(c.refreshed?' · refreshed '+esc(String(c.refreshed).slice(0,10)):'')+'</span></h2><div class="tiles">'
+    + tile(f(c.payGo), "Pay-as-you-go credits", "billed to your Azure subscription", c.payGo?"warn":"good")
+    + tile(f(c.prepaid)+(c.entitled?" / "+f(c.entitled):""), "Prepaid credits used", c.entitled?"of purchased capacity":"no prepaid capacity purchased", c.entitled?"":"mut")
+    + tile(cost, "Est. cost", "at "+fmtRate(PRICE.credit)+"/credit (editable)", total?"warn":"good")
+    + (c.plans ? tile(c.plans.length, "Billing plans", c.plans.map(q=>q.name).filter(Boolean).join(", ")||"pay-as-you-go", c.plans.length?"":"mut")
+               : tile("—", "Billing plans", "add Licensing.BillingPolicies.Read", "mut"))
+    + '</div>';
+  const used = c.byEnv.filter(e => e.prepaid+e.payGo > 0), max = Math.max(1, ...used.map(e => e.prepaid+e.payGo));
+  if(used.length){
+    h += '<table><thead><tr><th>Environment</th><th>Prepaid</th><th>Pay-as-you-go</th><th>Share</th></tr></thead><tbody>';
+    used.forEach(e => { const t = e.prepaid+e.payGo;
+      h += '<tr><td><b>'+esc(e.name)+'</b></td><td>'+f(e.prepaid)+'</td><td>'+f(e.payGo)+'</td><td><div style="display:flex;align-items:center;gap:8px"><div style="flex:1;max-width:260px;height:8px;background:var(--border);border-radius:5px;overflow:hidden;display:flex"><div style="height:100%;width:'+(e.prepaid/max*100)+'%;background:var(--accent)"></div><div style="height:100%;width:'+(e.payGo/max*100)+'%;background:var(--amber)"></div></div><span class="hint">'+(total?Math.round(t/total*100):0)+'%</span></div></td></tr>'; });
+    h += '</tbody></table>';
+  } else if(c.byEnv.length) h += '<div class="hint">No environment has consumed Copilot Credits this month.</div>';
+  h += '<div class="hint" style="margin-top:10px;font-size:11.5px">Same numbers as <b>Power Platform admin center → Licensing → Copilot Studio</b>.'
+    + (c.writeOff?' Write-off reported by Microsoft: '+f(c.writeOff)+' credits.':'')
+    + ' The admin center’s “Top 5 agents / users” and daily trend aren’t offered to apps by the API.</div></div>';
+  return h;
+}
+
 // Turn a token/consent failure into the one thing to do about it.
 function agentAuthHint(msg, api, perm){
   msg = String(msg||"");
@@ -650,11 +698,12 @@ const AG_BTN = 'background:var(--accent);color:#06101f;font-weight:700;border:0;
 function agentConnectCard(data){
   const inv = !!data.inventory, cred = !!data.creditsKnown;
   const errLine = (e, api, perm) => e ? '<div class="na" style="margin-top:6px;font-size:11.5px;word-break:break-word">'+esc(e)+'</div>'+(agentAuthHint(e,api,perm)?'<div style="margin-top:4px">'+agentAuthHint(e,api,perm)+'</div>':'') : '';
-  let h = '<div class="card"><h2>'+(inv?'Credit consumption not read yet':'Copilot Studio agents — connect once, then it’s automatic')+'</h2><div class="hint" style="line-height:1.7">';
+  let h = '<div class="card"><h2>'+(inv?(/^403\b/.test(data.ppErr||"")?'Per-agent credits — not available from Microsoft’s API':'Credit consumption not read yet'):'Copilot Studio agents — connect once, then it’s automatic')+'</h2><div class="hint" style="line-height:1.7">';
   if(!inv) h += '<b>1 · Agent inventory — Dataverse.</b> Agents live in each environment’s <code>bot</code> table; Dataverse allows browser calls, so this is read automatically on every load once the app has the <b>Dynamics CRM → user_impersonation</b> delegated permission (used read-only — you see the environments your account can open).'
     + errLine(data.dvErr, "Dynamics CRM", "user_impersonation")
     + '<div style="margin:8px 0 14px"><button id="agDv" style="'+AG_BTN+'">Read agents from Dataverse</button> <span class="hint" id="agDvMsg"></span></div>';
-  if(!cred) h += '<b>'+(inv?'':'2 · ')+'Credit consumption — Power Platform API.</b> Per-agent credits aren’t stored in Dataverse'+(inv?', so the table shows the live inventory, harness and sessions without them':'')+'. Reading them needs the <b>Power Platform API</b> delegated permission plus an <b>AI Administrator</b> / <b>Power Platform Administrator</b> role, and <code>api.powerplatform.com</code> may refuse browser calls (CORS).'
+  if(!cred) h += '<b>'+(inv?'':'2 · ')+'Credit consumption — Power Platform API.</b> Per-agent credits aren’t stored in Dataverse'+(inv?', so the table shows the live inventory, harness and sessions without them':'')+'.'
+    + (/^403\b/.test(data.ppErr||"") ? '' : ' Reading them needs the <b>Power Platform API</b> delegated permission plus an <b>AI Administrator</b> / <b>Power Platform Administrator</b> role, and <code>api.powerplatform.com</code> may refuse browser calls (CORS).')
     + errLine(data.ppErr, "Power Platform API", "Licensing → Licensing.Allocations.Read")
     + (/^403\b/.test(data.ppErr||"") ? '' : '<div style="margin:8px 0 4px"><button id="agPp" style="'+AG_BTN+'">Read credits from Power Platform</button> <span class="hint" id="agPpMsg"></span></div>');
   h += '</div>';
@@ -743,7 +792,10 @@ function demoAgents(){
     A("Procurement Helper","GitHub Copilot",0,false,null,d(16),0,"Ops","—"),                  // built, never used, burning build credits → candidate
     A("Facilities Bot","Standard",0,false,null,null,0,"Ops","—")
   ];
-  return { agents, available:true, source:"demo", creditsKnown:true, tenantCredits:agents.reduce((s,a)=>s+a.creditsMonth,0) };
+  const credits = { prepaid:10000, payGo:6150, writeOff:0, entitled:10000, refreshed:d(1), plansErr:null,
+    byEnv:[{name:"Default",prepaid:6200,payGo:2000},{name:"Finance",prepaid:2100,payGo:1000},{name:"Marketing",prepaid:1700,payGo:900},{name:"Sales",prepaid:0,payGo:1450},{name:"Legal",prepaid:0,payGo:540},{name:"Dev",prepaid:0,payGo:260}],
+    plans:[{name:"Contoso-CopilotStudio-PAYG",status:"Succeeded",rg:"rg-ai-agents",envs:3}] };
+  return { agents, available:true, source:"demo", creditsKnown:true, credits, tenantCredits:agents.reduce((s,a)=>s+a.creditsMonth,0) };
 }
 
 // ============ WIRE ============
