@@ -223,6 +223,7 @@
   .ov-fix-chip { font-family:var(--label); font-size:9px; font-weight:800; letter-spacing:.07em; text-transform:uppercase; padding:2px 6px; border-radius:5px; white-space:nowrap; }
   .ov-fix-chip.path { color:var(--accent); background:color-mix(in srgb,var(--accent) 14%,transparent); border:1px solid color-mix(in srgb,var(--accent) 40%,transparent); }
   .ov-fix-chip.ms { color:var(--sev-crit,#FF4D6D); background:color-mix(in srgb,var(--sev-crit,#FF4D6D) 13%,transparent); border:1px solid color-mix(in srgb,var(--sev-crit,#FF4D6D) 42%,transparent); }
+  .ov-fix-chip.expo { color:#FFB454; background:color-mix(in srgb,#FFB454 13%,transparent); border:1px solid color-mix(in srgb,#FFB454 40%,transparent); }
   .ov-fix-chip.sc { color:#B48CFF; background:color-mix(in srgb,#B48CFF 13%,transparent); border:1px solid color-mix(in srgb,#B48CFF 42%,transparent); }
   .ov-fix-chip.sx-chip-chain { color:#5AD1E6; background:color-mix(in srgb,#5AD1E6 13%,transparent); border:1px solid color-mix(in srgb,#5AD1E6 42%,transparent); }
   .ov-fix-chip.toxic { color:#fff; background:color-mix(in srgb,var(--sev-crit,#FF4D6D) 70%,transparent); border:1px solid color-mix(in srgb,var(--sev-crit,#FF4D6D) 80%,transparent); }
@@ -6193,7 +6194,8 @@ window.EP = (function () {
     ["DelegatedAdminRelationship.Read.All", "Delegated admin (GDAP) relationships", "external"],
     // Endpoint (Device) pillar — Intune + Entra device objects + Defender via advanced hunting
     ["DeviceManagementManagedDevices.Read.All", "Intune managed devices — compliance, OS, encryption, last sync", "endpoint: coverage · compliance"],
-    ["DeviceManagementConfiguration.Read.All", "Intune settings-catalog / endpoint-security policies (attack surface reduction rules)", "endpoint: asr rules"],
+    ["DeviceManagementConfiguration.Read.All", "Intune compliance policies and their assignment, the tenant compliance setting, update rings, attack surface reduction policies", "endpoint: compliance · asr rules"],
+    ["DeviceManagementApps.Read.All", "Intune app protection (MAM) policies for iOS / Android", "endpoint: compliance"],
     ["Device.Read.All", "Entra device objects — join/trust type, isCompliant, last sign-in", "endpoint: coverage"],
     ["ThreatHunting.Read.All", "Defender device onboarding, exposure, sensor health, hardware/firmware (advanced hunting)", "endpoint: devices · hardening · vuln"],
     // Apps & Data (M365) pillar — Secure Score backbone + direct workload settings
@@ -8643,12 +8645,37 @@ window.EP = (function () {
     await pull("entrahound", "identities");
     await pull("attackpaths", "devices");
     await pull("email", "mailboxes");   // Apps & Data entity hop (per-mailbox, from the consultant collection)
+    // Asset model: the Devices view's reconciled list (Entra ⋈ Intune ⋈ Defender) is the device spine. Attack-path
+    // devices (which carry the signed-in accounts) attach to it by host name; a device that is only in the inventory
+    // still joins to an identity through its Intune primary user.
+    try { const inv = { devices: [] }; const keep = out.devices; out.devices = [];
+      await pull("devices", "devices"); inv.devices = out.devices; out.devices = _mergeDevices(keep, inv.devices); } catch (e) {}
     // Also record whether the consultant collection was actually loaded, so a clean empty result
     // ("no external-forwarding mailbox") is distinguishable from "collection not run yet".
     try { const ve = views.email; const ee = (ve && typeof ve.entities === "function") ? ve.entities() : null; out.mailboxCollected = !!(ee && ee.collected); } catch (e) { out.mailboxCollected = false; }
     return out;
   }
   const _entLocal = s => String(s || "").toLowerCase().replace(/.*[\\/]/, "").replace(/@.*/, "");
+  // An Entra objectId as the SID Windows reports for a cloud sign-in on an Entra-joined device:
+  // S-1-12-1-<the GUID's 16 bytes as four little-endian unsigned 32-bit numbers>. Deterministic, so a device
+  // sign-in SID matches exactly one Entra account — the verified identity↔device join.
+  function sidFromObjectId(id) {
+    const h = String(id || "").replace(/-/g, "").toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(h)) return "";
+    const le = s => parseInt(s.match(/../g).reverse().join(""), 16);
+    return "S-1-12-1-" + parseInt(h.slice(0, 8), 16) + "-" + parseInt(h.slice(12, 16) + h.slice(8, 12), 16) + "-" + le(h.slice(16, 24)) + "-" + le(h.slice(24, 32));
+  }
+  const _hostKey = s => { s = String(s || "").trim().toLowerCase(); const dot = s.indexOf("."); return dot > 0 ? s.slice(0, dot) : s; };
+  // One device list: attack-path devices (signed-in accounts, IP) attached to the reconciled inventory record (Entra
+  // device id, Intune id, primary user, compliance) by host name. The attack-path name and criticality win where set.
+  function _mergeDevices(pathDevs, invDevs) {
+    const inv = {}; (invDevs || []).forEach(d => { const k = _hostKey(d && d.name); if (k && !inv[k]) inv[k] = d; });
+    const used = new Set(), out = [];
+    (pathDevs || []).forEach(d => { const k = _hostKey(d && d.name), i = inv[k];
+      if (i) { used.add(k); out.push(Object.assign({}, i, d, { criticality: d.criticality || i.criticality })); } else out.push(d); });
+    Object.keys(inv).forEach(k => { if (!used.has(k)) out.push(inv[k]); });
+    return out;
+  }
   // C2: an account only joins to an Entra identity when it IS an Entra sign-in — domain "AzureAD" or a UPN with "@".
   // A domain-qualified local / on-prem account (e.g. SERVER01\admin, CONTOSO\Marcus) must never match an Entra account
   // by bare username, which would fabricate a privileged-takeover correlation (SERVER01\admin → the Global Administrator).
@@ -8660,24 +8687,51 @@ window.EP = (function () {
     if (dom && dom !== "azuread") return false;
     return dom === "azuread" || user.indexOf("@") >= 0;
   }
+  // Identity ↔ device links, each carrying HOW it was matched (link.via), strongest first:
+  //   "sid"     — the sign-in SID Defender reports equals the identity's SID (cloud SID derived from the Entra
+  //               objectId, or the on-prem SID of a synced account). Exact; link.verified = true.
+  //   "name"    — an Entra sign-in whose account name matches exactly one identity (full UPN, or a local part that
+  //               is unique among the collected identities). Used only when no SID is available.
+  //   "primary" — the identity is the device's Intune primary user (exact UPN). Assignment, not an observed sign-in.
+  // When the identities carry ids and a sign-in carries a SID, an unmatched SID means a different account, so it
+  // never falls back to a name match.
+  const _VIA_RANK = { sid: 3, name: 2, primary: 1 };
+  const _VIA_LABEL = { sid: "sign-in SID", name: "account name", primary: "Intune primary user" };
   function correlateEntities(ents) {
-    const idByLocal = {};
-    (ents.identities || []).forEach(i => { const k = _entLocal(i.upn); if (k) idByLocal[k] = i; });
-    const mailByLocal = {};
-    (ents.mailboxes || []).forEach(m => { const k = _entLocal(m.upn); if (k && !mailByLocal[k]) mailByLocal[k] = m; });
-    const links = [];
+    const bySid = {}, byUpn = {}, byLocal = {}, localN = {};
+    (ents.identities || []).forEach(i => {
+      const upn = String(i.upn || "").toLowerCase(); if (upn) byUpn[upn] = i;
+      const cs = sidFromObjectId(i.id); if (cs) bySid[cs.toUpperCase()] = i;
+      if (i.onPremSid) bySid[String(i.onPremSid).toUpperCase()] = i;
+      const k = _entLocal(i.upn); if (k) { localN[k] = (localN[k] || 0) + 1; byLocal[k] = i; } });
+    const haveSids = Object.keys(bySid).length > 0;
+    const mailByUpn = {}, mailByLocal = {};
+    (ents.mailboxes || []).forEach(m => { const u = String(m.upn || "").toLowerCase(), k = _entLocal(m.upn);
+      if (u && !mailByUpn[u]) mailByUpn[u] = m; if (k && !mailByLocal[k]) mailByLocal[k] = m; });
+    const best = {};
+    const add = (dev, acct, id, via) => {
+      const key = String(id.id || id.upn).toLowerCase() + "|" + _hostKey(dev.name), cur = best[key];
+      if (cur && _VIA_RANK[cur.via] >= _VIA_RANK[via]) return;
+      const upn = String(id.upn || "").toLowerCase();
+      best[key] = { device: dev, account: acct, identity: id, via: via, verified: via === "sid", tier0: !!id.tier0Reach,
+        privileged: !!(id.privileged || acct.privileged), data: mailByUpn[upn] || mailByLocal[_entLocal(id.upn)] || null };
+    };
     (ents.devices || []).forEach(dev => {
       (dev.loggedOn || []).forEach(acct => {
+        if (acct.sid && haveSids) { const s = bySid[String(acct.sid).toUpperCase()]; if (s) add(dev, acct, s, "sid"); return; }
         if (!_entIsEntra(acct.sam)) return;   // C2: only Entra sign-ins join — a local / on-prem logon never matches an Entra identity by username
-        const id = idByLocal[_entLocal(acct.sam)];
-        if (id) links.push({ device: dev, account: acct, identity: id, tier0: !!id.tier0Reach, privileged: !!(id.privileged || acct.privileged), data: mailByLocal[_entLocal(id.upn)] || null });
+        const full = String(acct.sam || "").toLowerCase().replace(/^.*[\\/]/, "");
+        if (full.indexOf("@") > 0 && byUpn[full]) { add(dev, acct, byUpn[full], "name"); return; }
+        const k = _entLocal(acct.sam);
+        if (localN[k] === 1) add(dev, acct, byLocal[k], "name");   // a local part shared by several identities is ambiguous → no link
       });
+      const pu = String(dev.primaryUser || "").toLowerCase();
+      if (pu && byUpn[pu]) add(dev, { sam: dev.primaryUser, privileged: !!byUpn[pu].privileged, primary: true }, byUpn[pu], "primary");
     });
     const critRank = { "Very high": 0, "High": 1, "Medium": 2, "Low": 3 };
     const rank = c => (critRank[c] == null ? 9 : critRank[c]);
-    links.sort((a, b) => (b.tier0 ? 1 : 0) - (a.tier0 ? 1 : 0) || (b.privileged ? 1 : 0) - (a.privileged ? 1 : 0) || rank(a.device.criticality) - rank(b.device.criticality));
-    const seen = new Set();
-    return links.filter(l => { const k = l.identity.upn + "|" + l.device.name; if (seen.has(k)) return false; seen.add(k); return true; });
+    return Object.keys(best).map(k => best[k]).sort((a, b) => (b.tier0 ? 1 : 0) - (a.tier0 ? 1 : 0) || (b.privileged ? 1 : 0) - (a.privileged ? 1 : 0)
+      || rank(a.device.criticality) - rank(b.device.criticality) || _VIA_RANK[b.via] - _VIA_RANK[a.via]);
   }
   function suiteWorstDomains(pd, n) {
     return (pd.list || []).map(v => ({ v, s: pd.data[v.name] })).filter(x => x.s)
@@ -8718,7 +8772,8 @@ window.EP = (function () {
     let body, cap;
     if (links.length) {
       // Entity-level: the actual privileged identity ↔ actual weak endpoint, matched by account.
-      cap = "entity-level · matched by account";
+      const _vias = [...new Set(links.map(l => l.via || "name"))].sort((a, b) => _VIA_RANK[b] - _VIA_RANK[a]);
+      cap = "entity-level · matched by " + _vias.map(v => _VIA_LABEL[v]).join(" / ");
       const chains = links.slice(0, 3).map(l => {
         const id = l.identity, dev = l.device;
         const roles = (id.roles || []).slice(0, 2).join(", ") || (id.privileged ? "privileged" : "standard user");
@@ -8730,14 +8785,14 @@ window.EP = (function () {
         const dataCls = "data" + ((l.data || dataN) ? "" : " off");
         return '<div class="sx-echain">'
           + ehop("id", "🔑", "identity", esc(id.displayName || id.upn) + " " + t0, esc(roles) + " · " + esc(id.upn))
-          + '<div class="sx-earrow">signed in on →</div>'
+          + '<div class="sx-earrow" title="Matched by ' + esc(_VIA_LABEL[l.via] || "account name") + (l.verified ? " — exact" : "") + '">' + (l.via === "primary" ? "primary user of →" : "signed in on →") + '</div>'
           + ehop("dev", "💻", "endpoint", esc(dev.name), esc(dev.criticality || "device") + (dev.ip ? " · " + esc(dev.ip) : ""))
           + '<div class="sx-earrow">reaches →</div>'
           + ehop(dataCls, "📩", "data", dataTitle, dh)
           + '</div>';
       }).join("");
       body = '<div class="sx-lede">A privileged identity signed in on a weak endpoint is a <b>live cross-estate path</b> — compromise the endpoint, inherit the identity, reach the data. '
-        + links.length + ' correlation' + (links.length > 1 ? "s" : "") + ' matched by account across the domains'
+        + links.length + ' correlation' + (links.length > 1 ? "s" : "") + ' across the domains, matched by ' + _vias.map(v => _VIA_LABEL[v] + " (" + links.filter(l => (l.via || "name") === v).length + ")").join(", ")
         + (links.length > 3 ? " (top 3 shown)" : "") + '. Break any hop to cut the path.</div>' + chains;
     } else {
       // Signal-level fallback — no account matched across the collected entities.
@@ -8932,7 +8987,9 @@ window.EP = (function () {
       const cveWord = (cve || (hostCve && hostCve.exploited)) ? "exploitable CVE · " : hasHostCve ? "vulnerable · " : "";
       const name = "Internet-facing host · " + cveWord + (priv.length ? "privileged sign-in" : crit ? "path to a critical asset" : "exposed");
       out.push(_comboOf({ id: "inet-" + i, name: name,
-        exp: 3, reach: 3, impact: (crit || priv.length) ? 3 : 2, confidence: "verified", key: "endpoint", view: "attackpaths",
+        // Exploitability from the evidence: an exploitable / actively-exploited CVE on the internet-facing host is 3;
+        // internet-facing with no exploitable CVE collected is 2 (reachable, but no known way in).
+        exp: (cve || (hostCve && hostCve.exploited)) ? 3 : 2, reach: 3, impact: (crit || priv.length) ? 3 : 2, confidence: "verified", key: "endpoint", view: "attackpaths",
         chain: chain,
         ingredients: [].concat("An internet-exposed host",
           cve ? ["An exploitable CVE (" + cve.label + ") on it"]
@@ -8956,10 +9013,14 @@ window.EP = (function () {
       if (!/very high|high/i.test(String(dev.criticality || ""))) return;   // a high-risk / critical endpoint
       if (!(id.noMfa || id.noPhishRes)) return;   // the credential must be phishable for this to be the takeover combo
       const t0 = l.tier0, credGap = id.noMfa ? "no MFA" : "no phishing-resistant MFA";
-      out.push(_comboOf({ id: "idep-" + i, name: (t0 ? "Tier-0 admin" : "Privileged admin") + " · signed in on a high-risk device · " + credGap,
-        exp: 3, reach: 3, impact: t0 ? 3 : 2, confidence: "verified", key: "identity", view: "user",
+      const prim = l.via === "primary";   // assigned primary user (Intune), not an observed sign-in
+      out.push(_comboOf({ id: "idep-" + i, name: (t0 ? "Tier-0 admin" : "Privileged admin") + (prim ? " · primary user of a high-risk device · " : " · signed in on a high-risk device · ") + credGap,
+        // Scored from the evidence: exploitability = how phishable the credential is (no MFA 3, MFA but not
+        // phishing-resistant 2); reachability = how the identity↔device link was established (sign-in SID 3, a name
+        // match or an Intune assignment 2); impact = Tier-0 3, other privileged 2.
+        exp: id.noMfa ? 3 : 2, reach: l.verified ? 3 : 2, impact: t0 ? 3 : 2, confidence: l.verified ? "verified" : "inferred", key: "identity", view: "user",
         chain: [{ label: (id.displayName || id.upn), kind: "user" }, { label: dev.name + (dev.criticality ? " · " + dev.criticality : ""), kind: "device" }, { label: id.noMfa ? "no MFA registered" : "no phishing-resistant method", kind: "role" }, { label: t0 ? "Tier-0 directory" : "privileged roles", kind: "role" }],
-        ingredients: [].concat((t0 ? "A Tier-0 (GA-class) admin" : "A privileged admin"), "Interactively signed in on a high-risk / critical device (" + dev.name + ")", id.noMfa ? "No MFA registered — password-only" : "No phishing-resistant method (FIDO2 / Windows Hello / Token Protection)"),
+        ingredients: [].concat((t0 ? "A Tier-0 (GA-class) admin" : "A privileged admin"), (prim ? "Is the Intune primary user of a high-risk / critical device (" : "Interactively signed in on a high-risk / critical device (") + dev.name + ") — matched by " + (_VIA_LABEL[l.via] || "account name"), id.noMfa ? "No MFA registered — password-only" : "No phishing-resistant method (FIDO2 / Windows Hello / Token Protection)"),
         why: "A " + (t0 ? "Tier-0" : "privileged") + " account signs in on a high-risk device with " + (id.noMfa ? "no MFA" : "a phishable credential") + " — compromise the device, or phish the account, and the attacker inherits " + (t0 ? "the top of the directory" : "privileged access") + ". The identity and endpoint weaknesses meet on one account.",
         fix: "Enforce phishing-resistant MFA (FIDO2) and Token Protection for this account, and keep " + (t0 ? "Tier-0" : "privileged") + " accounts off high-risk / shared endpoints (use privileged access workstations)." }));
     });
@@ -9177,6 +9238,52 @@ window.EP = (function () {
     } } catch (e) {}
     return title;
   }
+  // ── Exposure context ("enrich posture with exposure") ─────────────────────────────────────────────────────────────
+  // Posture says a control is weak; exposure says whether an attacker can get to it and what it leads to. _expoIndex
+  // gathers the exposure facts already collected across the estate, keyed by asset; _expoOf matches one finding to
+  // them and returns the factors plus a multiplier (1 = nothing known, capped at 2.5). Every factor is a collected
+  // fact — a signal the owning view computed (kev / exploit / internet), an asset named in the finding (device host
+  // name, UPN, display name — whole-token match), or a customer crown-jewel tag. Nothing is inferred from severity.
+  const _EXPO_W = { kev: 0.6, crown: 0.6, tier0: 0.6, internet: 0.5, critical: 0.5, path: 0.4, priv: 0.3, privOn: 0.3, exploit: 0.2 };
+  const _EXPO_LABEL = { kev: "actively exploited", crown: "★ crown jewel", tier0: "Tier-0 identity", internet: "internet-facing", critical: "critical asset",
+    path: "on attack path", priv: "privileged identity", privOn: "privileged sign-in", exploit: "public exploit" };
+  function _expoIndex(st, pills) {
+    const idx = { dev: {}, ident: [], byUpn: {} };
+    const dev = name => { const k = _hostKey(String(name || "").split(" · ")[0]); if (!k) return null; return idx.dev[k] || (idx.dev[k] = { key: k }); };
+    try { ((st && st.ents && st.ents.devices) || []).forEach(d => { const x = dev(d.name); if (!x) return;
+      if (d.internetFacing) x.internet = true;
+      if (/^(very high|high)$/i.test(String(d.criticality || ""))) x.critical = d.criticality;
+      if ((d.loggedOn || []).some(u => u.privileged)) x.privOn = true; }); } catch (e) {}
+    try { const ds = pills && pills.endpoint && pills.endpoint.data && pills.endpoint.data.devices;
+      ((ds && ds.internetFacing) || []).forEach(d => { const x = dev(d.name); if (x) x.internet = true; }); } catch (e) {}
+    try { const apg = viewApi("attackpaths").graph();
+      if (apg && !apg.needsExp) (apg.paths || []).forEach(p => (p.seq || []).forEach(s => { if (s.kind === "device") { const x = dev(s.label); if (x) x.path = true; } })); } catch (e) {}
+    try { ((st && st.links) || []).forEach(l => { const x = dev(l.device && l.device.name); if (x && (l.tier0 || l.privileged)) x.privOn = true; }); } catch (e) {}
+    try { ((st && st.ents && st.ents.identities) || []).forEach(i => { const upn = String(i.upn || "").toLowerCase();
+      const o = { upn: upn, name: String(i.displayName || "").toLowerCase(), tier0: !!i.tier0Reach, priv: !!i.privileged };
+      if (!(o.tier0 || o.priv)) return; idx.ident.push(o); if (upn) idx.byUpn[upn] = o; }); } catch (e) {}
+    // Only assets that carry an exposure fact are worth matching against finding titles.
+    idx.devList = Object.keys(idx.dev).map(k => idx.dev[k]).filter(x => x.key.length >= 5 && (x.internet || x.critical || x.path || x.privOn));
+    return idx;
+  }
+  const _tokRe = s => new RegExp("(^|[^a-z0-9._-])" + String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "($|[^a-z0-9_-])");
+  function _expoOf(it, idx) {
+    const f = {}, why = {}, t = String(it.title || "").toLowerCase();
+    if (it.kev) f.kev = true; else if (it.exploit) f.exploit = true;
+    if (it.internet) f.internet = true;
+    if (it.critical) f.critical = true;
+    try { (idx.devList || []).forEach(x => { if (!_tokRe(x.key).test(t)) return;
+      if (x.internet) f.internet = true; if (x.critical) { f.critical = true; why.critical = x.key + " · " + x.critical; }
+      if (x.path) { f.path = true; why.path = x.key; } if (x.privOn) { f.privOn = true; why.privOn = x.key; } }); } catch (e) {}
+    try { const fid = String(it.fid || "").toLowerCase();
+      let id = idx.byUpn && idx.byUpn[fid];
+      if (!id) id = (idx.ident || []).find(o => (o.upn && t.indexOf(o.upn) >= 0) || (o.name.length >= 6 && _tokRe(o.name).test(t)));
+      if (id) { if (id.tier0) f.tier0 = true; else f.priv = true; why[id.tier0 ? "tier0" : "priv"] = id.upn || id.name; } } catch (e) {}
+    try { const cj = critAssets.match(it.title); if (cj) { f.crown = true; why.crown = cj.label; } } catch (e) {}
+    const keys = Object.keys(f).sort((a, b) => _EXPO_W[b] - _EXPO_W[a]);
+    const mult = Math.min(2.5, 1 + keys.reduce((a, k) => a + _EXPO_W[k], 0));
+    return { mult: mult, factors: keys.map(k => ({ k: k, label: _EXPO_LABEL[k], why: why[k] || "" })) };
+  }
   function suiteFixFirst(pills, st) {
     // Cross-estate fix-first. Severity alone lets one pillar monopolise the list — Endpoint has
     // dozens of "crit" device-config controls, which drowns out Identity (fewer findings but the
@@ -9194,7 +9301,8 @@ window.EP = (function () {
     const _plain = s => _dec(String(s || "").replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();   // strip tags, decode entities, collapse
     const _sev = v => { v = String(v || "").toLowerCase(); return v === "critical" ? "crit" : v === "medium" ? "med" : (RANK[v] != null ? v : "med"); };
     const recOf = s => {
-      if (Array.isArray(s.recs) && s.recs.length) return s.recs.filter(r => r && r.title).map(r => ({ title: _plain(r.title), sev: _sev(r.sev), focus: r.focus || null }));
+      const _sig = x => ({ kev: !!x.kev, exploit: !!(x.exploit || x.zeroday), internet: !!x.internet, critical: !!x.critical });   // exposure signals a view computed itself
+      if (Array.isArray(s.recs) && s.recs.length) return s.recs.filter(r => r && r.title).map(r => Object.assign({ title: _plain(r.title), sev: _sev(r.sev), focus: r.focus || null, fid: r.id || null }, _sig(r)));
       if (Array.isArray(s.top) && s.top.length) return s.top.map(t => {
         const sev = _sev(t.sev || t.severity || t.level || t.tier);
         const base = t.fix || t.title || t.name || (t.reasons && t.reasons[0]) || "";
@@ -9203,7 +9311,7 @@ window.EP = (function () {
         // "(+N)" weights we strip for display).
         const reason = (t.reasons && t.reasons[0]) || (t.why ? String(t.why).replace(/\s*\(\+\d+\)/g, "") : "");
         const why = (!t.fix && !t.title && t.name && reason) ? (" — " + _plain(reason).slice(0, 90)) : "";
-        return { title: _plain(base) + why, sev, focus: t.focus || null };
+        return Object.assign({ title: _plain(base) + why, sev, focus: t.focus || null, fid: t.id || t.appId || t.upn || (t.focus && t.focus.cve) || null }, _sig(t));
       }).filter(x => x.title);
       return [];
     };
@@ -9213,7 +9321,7 @@ window.EP = (function () {
       // Carry the source VIEW (domain) and a focus payload on each item, so "Fix →" deep-links straight to
       // the page the risk comes from (e.g. Workload, Hardening) and focuses the finding — not the Overview.
       if (pd) (pd.list || []).forEach(v => { const s = pd.data[v.name]; if (!s) return;
-        recOf(s).forEach(r => { if (r.title) items.push({ title: r.title, sev: r.sev, pillar: p.label, key: p.key, view: v.name, focus: r.focus || null }); }); });
+        recOf(s).forEach(r => { if (r.title) items.push({ title: r.title, sev: r.sev, pillar: p.label, key: p.key, view: v.name, focus: r.focus || null, fid: r.fid || null, kev: r.kev, exploit: r.exploit, internet: r.internet, critical: r.critical }); }); });
       items.sort((a, b) => (RANK[a.sev] == null ? 4 : RANK[a.sev]) - (RANK[b.sev] == null ? 4 : RANK[b.sev]));
       perPillar[p.key] = items;
     });
@@ -9243,7 +9351,7 @@ window.EP = (function () {
     // Risk exceptions (§5): an ACTIVE (non-expired) acceptance moves the item into the ledger and out of the open
     // lanes; an EXPIRED acceptance re-opens it, tagged. Keyed by a stable finding id (pillar|view|title).
     const accepted = [];
-    const applyExc = it => { const s = exceptions.status(exceptions.idOf(it)); if (!s) return true;
+    const applyExc = it => { const s = exceptions.statusOf(it); if (!s) return true;
       if (s.expired) { it.excExpired = true; return true; } accepted.push(Object.assign({}, it, { exc: s })); return false; };
     const actTop = actNow.filter(applyExc).slice(0, 5);
     SUITE_PILLARS.forEach(p => { perPillar[p.key] = (perPillar[p.key] || []).filter(applyExc); });
@@ -9279,9 +9387,14 @@ window.EP = (function () {
         pushIf({ title: "Break the choke point " + ch.label + " — it sits on " + ch.n + " attack path" + (ch.n === 1 ? "" : "s") + " to critical assets; fixing it once cuts them all.", sev: (ch.n || 0) >= 3 ? "crit" : "high", pillar: "Endpoint", key: "endpoint", view: "attackpaths", choke: true }); });
     }
     // ── Tier 3: single findings — by severity (one-entity E×R×I), pillar only as a tie-breaker ──
+    // Each finding's severity is multiplied by the exposure of what it sits on (see _expoOf): an internet-facing or
+    // critical asset, a Tier-0 / privileged identity, an attack path, an actively-exploited CVE. So a High finding on
+    // an exposed crown jewel outranks a Critical one on an asset nothing can reach. Severity alone is the fallback
+    // when no exposure is known (multiplier 1) — never a penalty.
     const singles = [];
-    SUITE_PILLARS.forEach(p => (perPillar[p.key] || []).forEach(it => singles.push(it)));
-    singles.sort((a, b) => sevScore(b.sev) - sevScore(a.sev) || (porder[a.key] == null ? 9 : porder[a.key]) - (porder[b.key] == null ? 9 : porder[b.key]));
+    const _xi = _expoIndex(st, pills);
+    SUITE_PILLARS.forEach(p => (perPillar[p.key] || []).forEach(it => { it.expo = _expoOf(it, _xi); it._score = Math.round(sevScore(it.sev) * it.expo.mult); singles.push(it); }));
+    singles.sort((a, b) => (b._score - a._score) || sevScore(b.sev) - sevScore(a.sev) || (porder[a.key] == null ? 9 : porder[a.key]) - (porder[b.key] == null ? 9 : porder[b.key]));
     for (let i = 0; i < singles.length && top.length < 10; i++) pushIf(singles[i]);
     if (st) { st.topRisks = top.slice(); st.fixTop = actTop.concat(top); }   // topRisks drives the map; fixTop (incidents first) the AI brief
     const aiLink = llm && llm.ready() ? '<button class="ov-fix-ai" id="suiteAiBtn">✦ brief with AI</button>' : '<span class="ov-chg-cap" title="Set a model in Configuration to enable the AI brief">✦ AI needs a model</span>';
@@ -9293,6 +9406,9 @@ window.EP = (function () {
       if (c.crown) out += '<span class="ov-fix-chip" style="color:#FFD166;background:color-mix(in srgb,#FFD166 16%,transparent);border:1px solid color-mix(in srgb,#FFD166 42%,transparent)">★ crown jewel</span>';
       if (c.path) out += '<span class="ov-fix-chip path">on attack path</span>';
       if (c.chain) out += '<span class="ov-fix-chip sx-chip-chain">chain</span>';
+      // Exposure factors that moved a single finding up the list — each is a collected fact about the asset it sits on.
+      if (c.expo && c.expo.factors.length) { const tip = "Ranked by severity × exposure: " + sevScore(c.sev) + " × " + c.expo.mult.toFixed(1) + " = " + c._score;
+        c.expo.factors.slice(0, 3).forEach(f => { out += '<span class="ov-fix-chip expo" title="' + esc(tip + (f.why ? " · " + f.why : "")) + '">' + esc(f.label) + '</span>'; }); }
       if (/confirmed[- ]?compromis|known[- ]?compromis/i.test(c.title)) out += '<span class="ov-fix-chip" style="background:color-mix(in srgb,var(--sev-crit) 18%,transparent);color:var(--sev-crit)">incident</span>';
       if (!c.path && /microsoft disabled|malicious|abusive|threat intel/i.test(c.title)) out += '<span class="ov-fix-chip ms">Microsoft-flagged</span>';
       // Supply-chain / third-party trust: external-registered multi-tenant apps, delegated admin (GDAP),
@@ -11526,7 +11642,17 @@ window.EP = (function () {
     function summary() { let total = 0, act = 0, soon = 0, exp = 0;
       list().forEach(s => { total++; if (s.expired) exp++; else { act++; if (s.daysLeft != null && s.daysLeft <= 30) soon++; } });
       return { total: total, active: act, expiring: soon, expired: exp }; }
-    function idOf(c) { return [(c && c.key) || "", (c && c.view) || "", String((c && c.title) || "").toLowerCase().replace(/\s+/g, " ").trim()].join("|"); }
+    // A finding's id must survive a re-scan. Titles carry live counts ("12 devices …"), so an id built from the
+    // raw title changed whenever the count did and the acceptance silently re-opened. The id is now the finding's
+    // own key when the view supplies one (c.fid: a control id, appId, UPN, CVE), else the title with stand-alone
+    // numbers masked — identifiers such as CVE-2024-21412 or contoso-ws-01 are single tokens and stay intact.
+    // legacyIdOf is the old raw-title id, still honoured so acceptances made before this change keep working.
+    const _normTitle = c => String((c && c.title) || "").toLowerCase().replace(/\s+/g, " ").trim();
+    function legacyIdOf(c) { return [(c && c.key) || "", (c && c.view) || "", _normTitle(c)].join("|"); }
+    function idOf(c) {
+      const tail = (c && c.fid) ? "#" + String(c.fid).toLowerCase() : _normTitle(c).split(" ").map(t => /^\(?\d+([.,]\d+)?%?[,.:;)]*$/.test(t) ? "#" : t).join(" ");
+      return [(c && c.key) || "", (c && c.view) || "", tail].join("|"); }
+    function statusOf(c) { return status(idOf(c)) || status(legacyIdOf(c)); }
     // Portable (this browser only): export the accepted-risk ledger as JSON and import it by merging — so a
     // consultant / customer can carry their risk acceptances between browsers or hand them over, with no tenant write.
     function exportJson() { return JSON.stringify(all(), null, 2); }
@@ -11535,7 +11661,7 @@ window.EP = (function () {
         cur[id] = { state: e.state || "accepted", owner: String(e.owner || "").trim(), until: String(e.until || "").trim(),
           note: String(e.note || "").trim(), title: String(e.title || "").trim(), setAt: e.setAt || new Date().toISOString().slice(0, 10) }; n++; });
       save(cur); return n; } catch (e) { return 0; } }
-    return { all: all, get: get, set: set, clear: clear, status: status, active: active, list: list, summary: summary, idOf: idOf, exportJson: exportJson, importJson: importJson };
+    return { all: all, get: get, set: set, clear: clear, status: status, statusOf: statusOf, active: active, list: list, summary: summary, idOf: idOf, legacyIdOf: legacyIdOf, exportJson: exportJson, importJson: importJson };
   })();
 
   // Customer crown-jewel tags (§3c — crown jewels include DATA, not just roles). The customer marks the sites,
@@ -24617,7 +24743,7 @@ EH.collector = (function(){
   var G = EH.graph, V1 = G.V1, BETA = G.BETA, auth = EH.auth;
   var KNOWN_RESOURCES = { '00000003-0000-0000-c000-000000000000': 'Microsoft Graph', '00000002-0000-0000-c000-000000000000': 'Azure AD Graph', '00000002-0000-0ff1-ce00-000000000000': 'Exchange Online', '00000003-0000-0ff1-ce00-000000000000': 'SharePoint Online', '797f4846-ba00-4fd7-ba43-dac1f8f63013': 'Azure Service Management' };
   var SEL = {
-    user: 'id,displayName,userPrincipalName,userType,accountEnabled,createdDateTime,onPremisesSyncEnabled,jobTitle,department,mail,creationType,externalUserState,userPrincipalName,lastPasswordChangeDateTime',
+    user: 'id,displayName,userPrincipalName,userType,accountEnabled,createdDateTime,onPremisesSyncEnabled,onPremisesSecurityIdentifier,jobTitle,department,mail,creationType,externalUserState,userPrincipalName,lastPasswordChangeDateTime',
     group: 'id,displayName,groupTypes,securityEnabled,mailEnabled,membershipRule,membershipRuleProcessingState,isAssignableToRole,createdDateTime,onPremisesSyncEnabled,visibility,mail,description',
     app: 'id,appId,displayName,createdDateTime,signInAudience,passwordCredentials,keyCredentials,publisherDomain,web,spa,publicClient,identifierUris,requiredResourceAccess,tags',
     sp: 'id,appId,displayName,servicePrincipalType,accountEnabled,appOwnerOrganizationId,createdDateTime,publisherName,appRoleAssignmentRequired,tags,passwordCredentials,keyCredentials,signInAudience,alternativeNames',
@@ -26402,6 +26528,10 @@ EH.ui = (function(){
         if(out.length >= 100) return;
         var roles = roleIds.map(function(rid){ var rn = S.g.nodes.get(rid); return rn ? rn.label : null; }).filter(Boolean);
         var o = { upn: n.sub || '', displayName: n.label || '' };
+        // Asset model: the Entra objectId is the identity's key, and with the on-prem SID (synced accounts) it lets the
+        // cross-domain layer join a device sign-in by SID — a verified join — instead of by username.
+        if(n.id) o.id = n.id;
+        if(n.props && n.props.onPremisesSecurityIdentifier) o.onPremSid = n.props.onPremisesSecurityIdentifier;
         if(roles.length) o.roles = roles.slice(0, 12);
         if(f.tier0) o.tier0Reach = true;
         if(f.eligibleOnly) o.pimEligible = true;
@@ -28075,6 +28205,24 @@ function __dpDevSummary(){
     unmanaged, managed, compliant, notOnb, critical, chain, internetFacing, hasMde: DALL.hasMde, live: DALL.live,
     score: null, grade: "–", lead: ds.length + " devices · " + hi + " high-risk" + (critical?(" · " + critical + " critical asset" + (critical===1?"":"s")):"") + " · " + unmanaged + " unmanaged", sev: { crit:0, high:0, med:0, low:0 }, top: [] };
 }
+// Asset model: the reconciled device list (one row per Entra device, joined to Intune and Defender by the Entra
+// device id) for the shell's cross-domain layer — the device spine other sources attach to. Carries the keys
+// (Entra device id, Intune id) and the Intune primary user, so a device links to an identity by exact UPN.
+function __dpDevEntities(){
+  try { if (!DALL || !DALL.devices) return { devices: [] };
+    const has = v => v != null && v !== "" && v !== "—";
+    return { devices: DALL.devices.slice(0, 3000).map(d => { const o = { name: d.name };
+      if (has(d.aadId)) o.aadId = String(d.aadId).toLowerCase();
+      if (has(d.intuneId)) o.intuneId = d.intuneId;
+      if (has(d.user)) o.primaryUser = String(d.user);
+      if (has(d.criticality)) o.criticality = d.criticality;
+      if (has(d.compliance)) o.compliance = d.compliance;
+      if (has(d.risk)) o.risk = d.risk;
+      if (has(d.os)) o.os = d.os;
+      if (d.internet) o.internetFacing = true;
+      return o; }) };
+  } catch(e){ return { devices: [] }; }
+}
 // Per-device criticality — the single source of truth the other device workspaces mirror, so the crown
 // (Very high / High) is identical in every view. Keyed by lower-case AND normalized (suffix-stripped) name.
 function __dpDevCrit(){
@@ -28137,7 +28285,7 @@ function __dpDevFocus(f){
 
 if (window.EP && EP.DEMO){ try { analyze(); } catch(e){ console.error("[devices demo]", e); } }
 
-;return { load: (typeof analyze === "function") ? analyze : null, summary: (typeof __dpDevSummary === 'function' ? __dpDevSummary : null), focus: (typeof __dpDevFocus === 'function' ? __dpDevFocus : null), crit: (typeof __dpDevCrit === 'function' ? __dpDevCrit : null), stale: (typeof __dpDevStale === 'function' ? __dpDevStale : null), privUsers: (typeof __dpDevPrivUsers === 'function' ? __dpDevPrivUsers : null) };
+;return { load: (typeof analyze === "function") ? analyze : null, summary: (typeof __dpDevSummary === 'function' ? __dpDevSummary : null), focus: (typeof __dpDevFocus === 'function' ? __dpDevFocus : null), crit: (typeof __dpDevCrit === 'function' ? __dpDevCrit : null), stale: (typeof __dpDevStale === 'function' ? __dpDevStale : null), privUsers: (typeof __dpDevPrivUsers === 'function' ? __dpDevPrivUsers : null), entities: (typeof __dpDevEntities === 'function' ? __dpDevEntities : null) };
 })());
 </script>
 <script>
@@ -28965,6 +29113,97 @@ async function enrichCriticality(devices){
   const byName = {}; rows.forEach(x => { if (x.DN != null) byName[String(x.DN).toLowerCase()] = { v: CRIT_LABELS[+x.L] || "", roles: parseRoles(x.Rules) }; });
   devices.forEach(d => { const rec = byName[String(d.name||"").toLowerCase()]; if (!rec) return; d.assetValue = rec.v; d.roles = rec.roles; d.critical = /high/i.test(rec.v||""); });   // Very high + High both crown
 }
+// ---------- Intune policy posture (tenant level) ----------
+// The device rows above say which devices drift; this says whether the POLICIES that should catch drift exist, are
+// assigned, and whether the tenant setting behind them is safe. Read-only Graph reads, each independent: a read that
+// fails is recorded in `notRead` and its checks are skipped — never reported as "none configured".
+//   settings      GET /deviceManagement?$select=settings                         (DeviceManagementConfiguration.Read.All)
+//   compliance    GET /deviceManagement/deviceCompliancePolicies?$expand=assignments
+//   update rings  GET /deviceManagement/deviceConfigurations?$expand=assignments  (windowsUpdateForBusinessConfiguration)
+//   app protection GET /deviceAppManagement/{ios|android}ManagedAppProtections    (DeviceManagementApps.Read.All)
+let POLICY = null;
+function polPlatform(odataType){ const t = String(odataType||"").toLowerCase();
+  if (t.indexOf("windows") >= 0) return "windows"; if (t.indexOf("macos") >= 0) return "macos";
+  if (t.indexOf("ios") >= 0) return "ios"; if (t.indexOf("android") >= 0 || t.indexOf("aosp") >= 0) return "android"; return "other"; }
+function devPolPlatform(os){ const s = String(os||"").toLowerCase();
+  if (s.indexOf("windows") >= 0) return "windows"; if (s.indexOf("mac") >= 0) return "macos";
+  if (s.indexOf("ios") >= 0 || s.indexOf("ipad") >= 0) return "ios"; if (s.indexOf("android") >= 0) return "android"; return "other"; }
+const POL_LABEL = { windows:"Windows", macos:"macOS", ios:"iOS / iPadOS", android:"Android" };
+async function collectPolicy(){
+  const P = { read:true, notRead:[], settings:null, compliance:null, rings:null, mam:null };
+  const one = async (path, scopes) => { const at = await EP.tokenSilent(scopes);
+    const r = await fetch(EP.graphBase() + path, { headers:{ Authorization:"Bearer "+at } });
+    if (!r.ok){ const e = new Error("Graph " + r.status); e.status = r.status; throw e; } return r.json(); };
+  const CFG = ["DeviceManagementConfiguration.Read.All"], APPS = ["DeviceManagementApps.Read.All"];
+  const why = e => (e && (e.status === 403 || e.status === 401)) ? "permission not granted" : ((e && e.message) || "read failed");
+  try { const j = await one("/deviceManagement?$select=settings", CFG); P.settings = j.settings || {}; } catch(e){ P.notRead.push("tenant compliance settings — " + why(e)); }
+  try { P.compliance = (await gGetAll("/deviceManagement/deviceCompliancePolicies?$expand=assignments", CFG))
+    .map(p => ({ name: p.displayName || "(policy)", platform: polPlatform(p["@odata.type"]), assigned: (p.assignments||[]).length > 0 })); } catch(e){ P.notRead.push("compliance policies — " + why(e)); }
+  try { P.rings = (await gGetAll("/deviceManagement/deviceConfigurations?$expand=assignments", CFG))
+    .filter(c => /windowsUpdateForBusinessConfiguration/i.test(c["@odata.type"]||""))
+    .map(c => ({ name: c.displayName || "(ring)", assigned: (c.assignments||[]).length > 0, qDefer: c.qualityUpdatesDeferralPeriodInDays, fDefer: c.featureUpdatesDeferralPeriodInDays,
+      qPaused: !!c.qualityUpdatesPaused, fPaused: !!c.featureUpdatesPaused })); } catch(e){ P.notRead.push("update rings — " + why(e)); }
+  try { const m = [];
+    (await gGetAll("/deviceAppManagement/iosManagedAppProtections?$select=id,displayName,isAssigned", APPS)).forEach(p => m.push({ name: p.displayName || "(policy)", platform:"ios", assigned: !!p.isAssigned }));
+    (await gGetAll("/deviceAppManagement/androidManagedAppProtections?$select=id,displayName,isAssigned", APPS)).forEach(p => m.push({ name: p.displayName || "(policy)", platform:"android", assigned: !!p.isAssigned }));
+    P.mam = m; } catch(e){ P.notRead.push("app protection policies — " + why(e)); }
+  return P;
+}
+// Pure: policy facts + the managed devices → findings. Every finding names the fact it rests on.
+function policyFindings(P, devices){
+  const out = []; if (!P || !P.read) return out;
+  const n = {}; (devices||[]).forEach(d => { const k = devPolPlatform(d.os); n[k] = (n[k]||0) + 1; });
+  const pl = x => x === 1 ? "" : "s";
+  if (P.settings && P.settings.secureByDefault === false)
+    out.push({ id:"pol:securebydefault", sev:"high", title:"Devices with no compliance policy count as compliant",
+      detail:"The tenant setting ‘Mark devices with no compliance policy assigned as’ is Compliant. A device that no policy evaluates is reported compliant, so a Conditional Access rule that requires a compliant device lets it through.",
+      fix:"Intune → Devices → Compliance → Compliance settings: set ‘Mark devices with no compliance policy assigned as’ to Not compliant, after confirming every platform has an assigned policy." });
+  if (P.compliance){
+    ["windows","macos","ios","android"].forEach(k => { if (!n[k]) return;
+      const mine = P.compliance.filter(p => p.platform === k), assigned = mine.filter(p => p.assigned);
+      if (!assigned.length) out.push({ id:"pol:nocompliance:" + k, sev:"high", title:"No assigned compliance policy for " + POL_LABEL[k],
+        detail: n[k] + " managed " + POL_LABEL[k] + " device" + pl(n[k]) + ", but " + (mine.length ? ("the " + mine.length + " " + POL_LABEL[k] + " compliance polic" + (mine.length===1?"y is":"ies are") + " not assigned to any group") : ("no " + POL_LABEL[k] + " compliance policy exists")) + ". Nothing checks these devices for encryption, OS version or Defender health.",
+        fix:"Create or assign a " + POL_LABEL[k] + " compliance policy (encryption, minimum OS, Defender for Endpoint risk level) to the groups that hold these devices." }); });
+    const idle = P.compliance.filter(p => !p.assigned);
+    if (idle.length) out.push({ id:"pol:unassigned", sev:"low", title:"Compliance policies that are not assigned",
+      detail: idle.length + " compliance polic" + (idle.length===1?"y is":"ies are") + " not assigned to any group — e.g. " + idle.slice(0,3).map(p => p.name).join(", ") + ". They evaluate nothing.",
+      fix:"Assign each policy to its device or user groups, or delete the ones that were replaced." });
+  }
+  if (P.rings && n.windows){
+    const live = P.rings.filter(r => r.assigned);
+    if (!live.length) out.push({ id:"pol:noring", sev:"med", title:"No assigned Windows update ring",
+      detail: n.windows + " managed Windows device" + pl(n.windows) + " and no assigned Windows Update for Business ring in Intune. Updates may be handled another way (Windows Autopatch, a settings-catalog policy, WSUS or Configuration Manager) — that is not visible to this check.",
+      fix:"If Intune should manage updates, assign an update ring (or enrol in Windows Autopatch) so quality updates have a deadline." });
+    const slow = live.filter(r => (+r.qDefer || 0) > 14), paused = live.filter(r => r.qPaused);
+    if (slow.length) out.push({ id:"pol:ringdefer", sev:"med", title:"Quality updates deferred more than 14 days",
+      detail: slow.length + " assigned update ring" + pl(slow.length) + " defer monthly security updates beyond 14 days — e.g. " + slow[0].name + " (" + slow[0].qDefer + " days). Exploited vulnerabilities stay open for that long after the fix ships.",
+      fix:"Keep the quality-update deferral at 7–14 days for broad rings; use a short pilot ring to catch problems, not a long deferral." });
+    if (paused.length) out.push({ id:"pol:ringpaused", sev:"med", title:"Quality updates paused on an update ring",
+      detail: paused.length + " assigned update ring" + pl(paused.length) + " ha" + (paused.length===1?"s":"ve") + " quality updates paused — e.g. " + paused[0].name + ". Devices in the ring receive no security updates while the pause lasts (up to 35 days).",
+      fix:"Resume the ring once the blocking issue is understood; a pause is a temporary measure." });
+  }
+  if (P.mam){
+    ["ios","android"].forEach(k => { if (P.mam.some(p => p.platform === k && p.assigned)) return;
+      out.push({ id:"pol:nomam:" + k, sev: n[k] ? "med" : "low", title:"No assigned app protection policy for " + POL_LABEL[k],
+        detail:"No " + POL_LABEL[k] + " app protection (MAM) policy is assigned" + (n[k] ? ", with " + n[k] + " managed " + POL_LABEL[k] + " device" + pl(n[k]) : "") + ". Company data in Outlook, Teams and OneDrive on a personal phone has no PIN, no encryption requirement and can be copied to personal apps.",
+        fix:"Assign an app protection policy for " + POL_LABEL[k] + " (PIN / biometric, block copy to unmanaged apps, wipe on sign-out) and require it with Conditional Access." }); });
+  }
+  const rank = { crit:4, high:3, med:2, low:1 };
+  return out.sort((a,b) => rank[b.sev] - rank[a.sev]);
+}
+const DEMO_POLICY = { read:true, notRead:[], settings:{ secureByDefault:false },
+  compliance:[ { name:"Windows 11 — baseline", platform:"windows", assigned:true }, { name:"iOS — corporate", platform:"ios", assigned:true }, { name:"Android — legacy", platform:"android", assigned:false } ],
+  rings:[ { name:"Broad ring", assigned:true, qDefer:21, fDefer:60, qPaused:false, fPaused:false } ],
+  mam:[ { name:"iOS app protection", platform:"ios", assigned:true } ] };
+function policyPanel(){
+  if (!POLICY) return "";
+  const f = policyFindings(POLICY, (DEVS||[]).filter(d => d.platform !== "iot"));
+  const chip = s => '<span class="cv-badge" style="background:var(--sev-' + (s==="med"?"med":s) + ',#888);color:#fff;margin-right:8px">' + (s==="med"?"MEDIUM":s.toUpperCase()) + '</span>';
+  const rows = f.map(x => '<details class="pol-row" style="border-top:1px solid var(--border);padding:9px 2px"><summary style="cursor:pointer;font-weight:600">' + chip(x.sev) + esc(x.title) + '</summary>'
+    + '<div style="margin:7px 0 2px 2px;color:var(--muted);line-height:1.5">' + esc(x.detail) + '</div><div style="margin:4px 0 2px 2px;line-height:1.5"><b>Fix:</b> ' + esc(x.fix) + '</div></details>').join("");
+  const nr = POLICY.notRead.length ? '<div style="margin-top:8px;color:var(--muted);font-size:12px">Not read, so not assessed: ' + esc(POLICY.notRead.join("; ")) + '.</div>' : "";
+  return '<div class="dp-note" style="margin:10px 0"><b>Intune policy posture</b> — ' + (f.length ? f.length + ' finding' + (f.length===1?"":"s") + ' in the policies that should catch drift' : 'no gaps found in the policies read') + '.' + rows + nr + '</div>';
+}
 async function collect(){
   const sel = "id,deviceName,operatingSystem,osVersion,complianceState,isEncrypted,jailBroken,lastSyncDateTime,userPrincipalName";
   const raw = await gGetAll("/deviceManagement/managedDevices?$select=" + sel + "&$top=200", ["DeviceManagementManagedDevices.Read.All"]);
@@ -28980,7 +29219,8 @@ async function collect(){
   const total = devices.length;
   const score = total ? Math.round(100 * devices.reduce((a,d)=>a+cwWeight(d),0) / total) : 0;
   const grade = score>=70?"D":score>=50?"C":score>=30?"B":"A";
-  return { score, grade, live:true, devices };
+  let policy = null; try { policy = await collectPolicy(); } catch(e){ policy = null; }
+  return { score, grade, live:true, devices, policy };
 }
 
 // ---------- build the reason + platform rows ----------
@@ -29261,6 +29501,7 @@ function render(D){
     LAST = null; return;
   }
   DEVS = D.devices || [];
+  POLICY = (window.EP && EP.DEMO) ? DEMO_POLICY : (D.policy || null);
   // Classify each device; IoT / OT / network aren't Intune-managed, so this only ever splits computer vs mobile
   // here — but we filter for consistency with the rest of the suite. Segments: Computers (default) · Mobile · All.
   DEVS.forEach(d => { d.platform = platformClass(d.category, d.deviceType, d.os); d.critical = isCriticalDev(d.assetValue, d.roles); });
@@ -29299,7 +29540,7 @@ function render(D){
   const src = D.imported ? "Imported CSV — Intune Managed devices export." : (window.EP && EP.DEMO) ? "Demo data." : "Live — Intune via Microsoft Graph.";
   const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> Each row is a reason a device fails compliance — expand it for the exact devices and the fix. A device with no compliance result is unevaluated (no policy applied), surfaced here rather than counted as compliant. Compliance applies to <b>both</b> computers and mobile (Intune policies differ per platform); <b>IoT / OT</b> devices aren’t Intune-managed, so they don’t appear here (as on the Devices page). Per-setting Intune detail lives on each device in the Devices page.</div>';
   const body = STATE.view === "device" ? (toolbar() + devTable()) : (toolbar() + activeTable());
-  root.innerHTML = band + complianceChainBanner() + segBar + tiles + body + note;
+  root.innerHTML = band + complianceChainBanner() + policyPanel() + segBar + tiles + body + note;
   repaint(); wireView();
   if (!_chainTried) ensureChain();   // fetch the fused chain summary once, then re-render with the banner
 }
@@ -29348,6 +29589,9 @@ function __dpCompSummary(){
   const all = (DEVS||[]).filter(d => d.platform !== "iot");
   const reasons = buildReasons(all);
   const sev = { crit:0, high:0, med:0, low:0 }; reasons.forEach(r => { if (sev[r.sev]!=null) sev[r.sev]++; });
+  // Tenant policy findings ride along with the device drift: counted by severity and, when critical / high, listed
+  // in `top` with a stable id so the cross-domain ranking and risk acceptance can key on them.
+  const pol = policyFindings(POLICY, all); pol.forEach(f => { if (sev[f.sev]!=null) sev[f.sev]++; });
   const total = all.length;
   const driftDevices = all.filter(d=>worstReasonSevOf(d)).length;
   const score = total ? Math.round(100 * all.reduce((a,d)=>a+cwWeight(d),0) / total) : 0;
@@ -29359,7 +29603,9 @@ function __dpCompSummary(){
     lead: driftDevices + " of " + total + " devices carry compliance drift.",
     sev,
     top: reasons.filter(r => r.sev==="crit" || r.sev==="high").sort((a,b)=>(SEV_RANK[b.sev]-SEV_RANK[a.sev])||(b.count-a.count)).slice(0,6)
-      .map(r => ({ title: r.title + " (" + r.count + " device" + (r.count===1?"":"s") + ")", sev: r.sev, impact:"", search: r.key })) };
+      .map(r => ({ title: r.title + " (" + r.count + " device" + (r.count===1?"":"s") + ")", sev: r.sev, impact:"", search: r.key, id: "drift:" + r.key }))
+      .concat(pol.filter(f => f.sev==="crit" || f.sev==="high").map(f => ({ title: f.title, sev: f.sev, impact:"", id: f.id }))).slice(0, 8),
+    policy: POLICY ? { findings: pol.length, notRead: POLICY.notRead.slice() } : null };
 }
 function __dpCompFocus(f){
   try {
@@ -30095,7 +30341,12 @@ function __dpHardSummary(){
   if (!LAST) return null;
   if (LAST.needsDefender) return { label:"Hardening", score:null, grade:"–", lead:(LAST.err && EP.huntDiag && EP.huntDiag(LAST.err) || {}).lead || "Not assessed — connect Defender (MDE).", sev:{crit:0,high:0,med:0,low:0}, top:[] };
   return { label:"Hardening", score:LAST.score, grade:LAST.grade, lead:LAST.lede, sev:sevCounts(),
-    recs: hwRecs().slice(0,4).map(r => ({ title:r[1], detail:r[2], count:r[0], sev:/impact (8|9|10)\//.test(r[1])?"critical":"high" })),
+    recs: hwRecs().slice(0,4).map(r => { const c = (CONTROLS||[]).find(x => x.id === r[6]) || {};
+      // Exposure of the devices failing this control (from the device names Defender returned, up to 50 per control).
+      const _m = n => DEV_META[n] || DEV_META[String(n||"").toLowerCase()] || {};
+      const names = c.deviceNames || [];
+      return { title:r[1], detail:r[2], count:r[0], sev:/impact (8|9|10)\//.test(r[1])?"critical":"high", id: r[6] ? "ctrl:" + String(r[6]).toLowerCase() : null,
+        internet: names.some(n => _m(n).internetFacing), critical: names.some(n => /high/i.test(String(_m(n).assetValue||""))) }; }),
     // Full control list (+ pillar group, fail/assessed counts) so the Framework scorecard can map device
     // secure-config controls to a benchmark honestly — pass/fail per control with real device ratios.
     devicesAssessed: (LAST && LAST.devicesAssessed) || null,
@@ -31724,7 +31975,15 @@ function __dpVulnSummary(){
     // Exposure / exploitability signals so the Overview "Fix this first" can rank an actively-exploited, internet-facing
     // CVE above a high-KB-impact config setting (which carries none of these). kev = fix-first.
     kev: !!c.kev, exploit: !!c.exploit, zeroday: !!c.zeroday, internet: (c.deviceNames||[]).some(n => NET.has(String(n).toLowerCase())) }));
-  const recs = vRecs(CVES).slice(0,4).map(r => ({ title:r[1], detail:r[2], count:r[0], sev:/critical/i.test(r[2])?"critical":"high" }));
+  // Each patch action carries a stable id and the exposure of the CVEs it closes (actively exploited / public exploit
+  // / on an internet-facing device), so the cross-domain ranking can weigh a patch by exposure, not severity alone.
+  const _byCve = {}; visibleCves(CVES).forEach(c => { _byCve[c.cve] = c; });
+  const _swOf = {}; try { buildSoftware(CVES).forEach(s => { _swOf[s.label] = s; }); } catch(e){}
+  const recs = vRecs(CVES).slice(0,4).map(r => {
+    const cs = ((_swOf[r[4]] && _swOf[r[4]].cveIds) || []).map(id => _byCve[id]).filter(Boolean);
+    return { title:r[1], detail:r[2], count:r[0], sev:/critical/i.test(r[2])?"critical":"high", id: "patch:" + String(r[4]||r[1]).toLowerCase(),
+      kev: cs.some(c => c.kev), exploit: cs.some(c => c.exploit), zeroday: cs.some(c => c.zeroday),
+      internet: cs.some(c => (c.deviceNames||[]).some(n => NET.has(String(n).toLowerCase()))) }; });
   return { label:"Vulnerabilities", score:LAST.score, grade:LAST.grade, lead:LAST.lede, sev:sevCounts(), top, recs };
 }
 // Per-host CVE rollup for the cross-domain map: the CVEs Defender TVM attributes to one device name, with the
@@ -31885,6 +32144,10 @@ function usersOf(n){ return USERSBY[n] || USERSBY[String(n||"").toLowerCase()] |
 let IPSBY = {};
 function ipOf(n){ return IPSBY[n] || IPSBY[String(n||"").toLowerCase()] || ""; }
 // LoggedOnUsers is a JSON array (objects {UserName,DomainName,…} or plain strings) — parse to "DOMAIN\\user".
+// SID per signed-in account ("domain\\user", lower-cased) as DeviceInfo.LoggedOnUsers reports it. The SID belongs
+// to the account, not the device, so one map serves every device; it is exported with each sign-in so the
+// cross-domain layer can match the account to an Entra identity by SID instead of by name.
+const SIDBYSAM = {};
 function parseUsers(v){
   if (!v) return [];
   let arr = v; if (typeof v === "string"){ try { arr = JSON.parse(v); } catch(_){ return v.split(/[;,]/).map(s=>s.trim()).filter(Boolean); } }
@@ -31892,7 +32155,8 @@ function parseUsers(v){
   const out = []; arr.forEach(o => { if (!o) return;
     if (typeof o === "string"){ out.push(o); return; }
     const u = o.UserName || o.userName || o.AccountName || "", d = o.DomainName || o.domainName || "";
-    if (u) out.push(d ? d + "\\" + u : u); });
+    if (u) { const sam = d ? d + "\\" + u : u; out.push(sam);
+      const sid = o.Sid || o.sid || o.AccountSid || ""; if (sid) SIDBYSAM[sam.toLowerCase()] = String(sid); } });
   return [...new Set(out)];
 }
 function userSam(u){ return String(u||"").replace(/^.*\\/, "").trim().toLowerCase(); }
@@ -32377,7 +32641,8 @@ function __dpPathsEntities(){
       if (!n || n.kind !== "device") return;
       const name = n.label || n.id; const k = String(name).toLowerCase();
       if (!name || seen.has(k) || devices.length >= 100) return; seen.add(k);
-      const loggedOn = usersOf(name).map(u => ({ sam: u, privileged: isPrivUser(u) }));
+      const loggedOn = usersOf(name).map(u => { const o = { sam: u, privileged: isPrivUser(u) };
+        const sid = SIDBYSAM[String(u).toLowerCase()]; if (sid) o.sid = sid; return o; });
       const d = { name }; const ip = ipOf(name); if (ip) d.ip = ip;
       if (n.crit) d.criticality = n.crit; if (loggedOn.length) d.loggedOn = loggedOn;
       devices.push(d);
