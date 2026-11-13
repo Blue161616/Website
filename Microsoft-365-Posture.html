@@ -6323,7 +6323,15 @@ window.EP = (function () {
   }
 
   function signOut() {
-    if (msalInstance && account) msalInstance.logoutPopup({ account }).catch(() => {});
+    // Everything collected so far belongs to the tenant being signed out. Drop it, so a second sign-in
+    // (another tenant) never renders the previous tenant's data: mark every view unloaded, clear the shared
+    // account + the Apps & Data / exposure-graph caches now, then reload once the logout popup settles —
+    // the reload is what clears the state the views hold in their own closures.
+    Object.keys(views).forEach(n => { views[n].loaded = false; });
+    Object.keys(ACCOUNT).forEach(k => { delete ACCOUNT[k]; }); ACCOUNT.username = ""; ACCOUNT.name = "";
+    try { if (window.M365LIVE) { window.M365LIVE.setCollection(null); window.M365LIVE.reset(); } } catch (e) {}
+    try { exposureGraph.reset(); } catch (e) {}
+    if (msalInstance && account) msalInstance.logoutPopup({ account }).catch(() => {}).then(() => { try { window.location.reload(); } catch (e) {} });
     account = null;
     $("epWho").innerHTML = "<em>Not signed in</em>";
     $("epSignOut").style.display = "none";
@@ -11800,7 +11808,8 @@ window.M365LIVE = (function () {
     }
     return { controlScores: latest.controlScores || [], profiles: byName };
   }
-  function secureScore() { return _ssPromise || (_ssPromise = _fetchSecureScore()); }
+  // A failed fetch is not cached: the next call retries (e.g. after the admin grants consent).
+  function secureScore() { return _ssPromise || (_ssPromise = _fetchSecureScore().catch(e => { _ssPromise = null; throw e; })); }
 
   async function fromSecureScore(pred) {
     const ss = await secureScore(), rows = [];
@@ -11909,6 +11918,18 @@ window.M365LIVE = (function () {
       // Exclude the routing-only MOERA domain (*.mail.onmicrosoft.com) — users never send as it, so SPF/DKIM/DMARC there is noise (review R12).
       .filter(d => d.name && !/\.mail\.onmicrosoft\.com$/i.test(d.name));
   }
+  // The "all" qualifier of an SPF record ("-", "~", "?", "+"), or null when it has none. A record without
+  // "all" that delegates with redirect= takes its policy from the target record, so follow it (max 3 hops).
+  async function _spfQual(spf, depth) {
+    const m = spf.match(/([-~?+])all\b/i); if (m) return m[1];
+    if (/(?:^|\s)all\b/i.test(spf)) return "+";
+    const rd = spf.match(/(?:^|\s)redirect=(\S+)/i);
+    if (rd && depth < 3) {
+      const next = (await _doh(rd[1].toLowerCase(), "TXT")).find(x => /^v=spf1/i.test(x));
+      if (next) return _spfQual(next, depth + 1);
+    }
+    return null;
+  }
   // Resolve SPF / DKIM / DMARC for a set of domains ({name,managed} or bare strings). ok:true/false/null (null = lookup error).
   async function emailAuth(domains) {
     const list = [];
@@ -11919,8 +11940,8 @@ window.M365LIVE = (function () {
         const txt = await _doh(d.name, "TXT");
         const spf = txt.find(x => /^v=spf1/i.test(x));
         if (!spf) rec.spf = { ok: false, state: "missing" };
-        else { const m = spf.match(/([-~?+])all\b/i), q = m ? m[1] : "+";
-          rec.spf = { ok: (q === "-" || q === "~"), state: q === "-" ? "-all (strict)" : q === "~" ? "~all (soft)" : (m ? q : "no ") + "all", record: spf }; }
+        else { const q = await _spfQual(spf, 0);
+          rec.spf = { ok: (q === "-" || q === "~"), state: q === "-" ? "-all (strict)" : q === "~" ? "~all (soft)" : (q || "no ") + "all", record: spf }; }
       } catch (e) { rec.spf = { ok: null, state: "lookup error" }; }
       try {
         const txt = await _doh("_dmarc." + d.name, "TXT");
@@ -12056,7 +12077,9 @@ window.M365UI = (function () {
     for (let i = 0; i < gs.length; i++) if (gs[i][1].test(hay)) return gs[i][0];
     return ctl.group || FALLBACK[workload] || "Other";
   }
-  function badge(sev) { const c = sev === "ok" ? "ok" : sev === "na" ? "na" : sev; const l = sev === "ok" ? "PASS" : sev === "na" ? "N/A" : String(sev || "").toUpperCase(); return '<span class="mc-badge ' + c + '">' + l + '</span>'; }
+  // sev can come from an uploaded / served collection file — never trust it as markup: the class is taken
+  // from a fixed list and the label is escaped.
+  function badge(sev) { const c = ({ crit: "crit", high: "high", med: "med", low: "low", ok: "ok", na: "na" })[sev] || "na"; const l = sev === "ok" ? "PASS" : sev === "na" ? "N/A" : String(sev || "").toUpperCase(); return '<span class="mc-badge ' + c + '">' + esc(l) + '</span>'; }
   function render(host, list, workload, sub) {
     if (!host) return;
     const scored = list.filter(x => x.status === "pass" || x.status === "fail");
