@@ -12177,6 +12177,9 @@ window.M365LIVE = (function () {
         else { const p = (dm.match(/\bp\s*=\s*([a-z]+)/i) || [, "none"])[1].toLowerCase();
           rec.dmarc = { ok: (p === "reject" || p === "quarantine"), policy: p, state: "p=" + p, record: dm }; }
       } catch (e) { rec.dmarc = { ok: null, policy: null, state: "lookup error" }; }
+      // A *.onmicrosoft.com domain is Microsoft's own zone: Microsoft signs its mail with DKIM automatically and the
+      // customer cannot publish selector records there, so there is nothing to look up or to flag.
+      if (rec.managed) { rec.dkim = { ok: true, state: "Microsoft-signed", selectors: 0, managed: true }; list.push(rec); continue; }
       try {
         // A selector counts as enabled only if it resolves to a managed-key CNAME (M365: selectorN._domainkey → *.onmicrosoft.com)
         // or an inline TXT with a NON-empty p= key. "v=DKIM1; p=" (empty key) is a revoked/unconfigured selector — not enabled.
@@ -33642,7 +33645,8 @@ EP.registerView("email", (function () {
         + (monitor.length ? monitor.length + " domain(s) at p=none (monitoring only): " + monitor.map(function (r) { return r.domain; }).join(", ") + "." : "");
     return { id: "dmarc", title: "DMARC enforcing (p=quarantine or p=reject)", status: status,
       sev: missing.length ? "high" : monitor.length ? "med" : "ok", detail: detail.trim(),
-      fix: ok ? "" : "Publish a _dmarc TXT record and move policy to p=quarantine, then p=reject, after reviewing aggregate reports.",
+      fix: ok ? "" : "Publish a _dmarc TXT record and move policy to p=quarantine, then p=reject, after reviewing aggregate reports."
+        + (missing.concat(monitor).some(function (r) { return r.managed; }) ? " For a *.onmicrosoft.com domain: add it in the Microsoft 365 admin center: Settings → Domains → the domain → DNS records → Add record, TXT name _dmarc, value v=DMARC1; p=reject." : ""),
       src: _eaSrc + " · live" };
   }
   function _emailAuthRows(ea) {
@@ -33771,9 +33775,16 @@ EP.registerView("maildomains", (function () {
   // "partial" (the domain is protected, but only on one leg — or its own mail fails).
   function mailDomainVerdict(r) {
     var spf = r.spf || {}, dk = r.dkim || {}, dm = r.dmarc || {}, why = [], fix = [], notes = [], unread = [];
-    if (spf.ok == null) unread.push("SPF"); if (dk.ok == null) unread.push("DKIM"); if (dm.ok == null) unread.push("DMARC");
-    var spfBad = spf.ok === false, dkBad = dk.ok === false, dmBad = dm.ok === false;
-    if (dmBad) {
+    // A *.onmicrosoft.com domain lives in Microsoft's DNS zone: Microsoft publishes its SPF record and signs its mail
+    // with DKIM, and the customer can change neither. The one record the customer CAN and should add there is DMARC
+    // (Microsoft 365 admin center), so on a managed domain only DMARC is judged.
+    var mg = !!r.managed;
+    if (!mg && spf.ok == null) unread.push("SPF"); if (!mg && dk.ok == null) unread.push("DKIM"); if (dm.ok == null) unread.push("DMARC");
+    var spfBad = !mg && spf.ok === false, dkBad = !mg && dk.ok === false, dmBad = dm.ok === false;
+    if (dmBad && mg) {
+      why.push(dm.policy === "none" ? "DMARC is p=none on the onmicrosoft.com domain" : "no DMARC record on the onmicrosoft.com domain (Microsoft sets SPF and DKIM for it, but not DMARC)");
+      fix.push("Add it in the Microsoft 365 admin center: Settings → Domains → the domain → DNS records → Add record, TXT name _dmarc, value v=DMARC1; p=reject. Use p=reject straight away if the domain is not used to send mail.");
+    } else if (dmBad) {
       if (dm.policy === "none") { why.push("DMARC is p=none (reports only, spoofed mail is still delivered)"); fix.push("Move DMARC from p=none to p=quarantine, then p=reject, once the aggregate reports show only your own senders."); }
       else { why.push("no DMARC record"); fix.push("Publish a _dmarc TXT record — start at p=none with rua= reporting, then move to p=quarantine and p=reject."); }
     } else if (dm.ok === true && typeof dm.pct === "number" && dm.pct < 100) {
@@ -33844,7 +33855,7 @@ EP.registerView("maildomains", (function () {
       var r = x.r, v = x.v;
       h += '<div class="md-row" id="md-' + esc(r.domain) + '"><div class="md-top">'
         + '<span class="md-dom">' + esc(r.domain) + (r.managed ? '<small>Microsoft-managed</small>' : r["default"] ? '<small>default domain</small>' : '') + '</span>'
-        + chip("SPF", r.spf, /~all/.test(String((r.spf || {}).state || ""))) + chip("DKIM", r.dkim) + chip("DMARC", r.dmarc)
+        + chip("SPF", r.spf, /~all/.test(String((r.spf || {}).state || ""))) + (r.managed ? '<span class="md-chip" title="Microsoft signs mail from an onmicrosoft.com domain itself; there is nothing to publish"><b>DKIM</b>Microsoft-signed</span>' : chip("DKIM", r.dkim)) + chip("DMARC", r.dmarc)
         + '<span class="md-verdict ' + v.verdict + '">' + V_LABEL[v.verdict] + '</span></div>';
       if (v.why.length) h += '<div class="md-why">' + esc(v.why.join(" · ")) + '.</div>';
       if (v.notes.length) h += '<div class="md-why">' + esc(v.notes.join(" · ")) + '.</div>';
