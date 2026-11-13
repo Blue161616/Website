@@ -28601,8 +28601,43 @@ async function huntOnboarding(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
   const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by DeviceId | project AadDeviceId, DeviceName, OnboardingStatus, DeviceCategory, DeviceType, OSPlatform, SensorHealthState, IsExcluded, ExclusionReason";
   const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
-  if (!r.ok){ const e2 = new Error("onboarding "+r.status); e2.status=r.status; throw e2; }
+  if (!r.ok){ let m = ""; try { m = ((await r.json()).error || {}).message || ""; } catch(e){} const e2 = new Error(m || ("advanced hunting HTTP " + r.status)); e2.status=r.status; throw e2; }
   return (await r.json()).results || [];
+}
+// ── Defender onboarding without advanced hunting ──
+// Advanced hunting is the only Defender device source a browser can read (the Defender for Endpoint REST API sends no
+// CORS headers), and it is not part of Microsoft Defender for Business (Microsoft 365 Business Premium) or Defender
+// for Endpoint Plan 1. When it is unavailable, the one Defender signal left in Microsoft Graph is the state Defender
+// reports to Intune for a managed device (managedDevice.partnerReportedThreatState, through the Intune–Defender
+// connector). It is POSITIVE evidence only: a reported state proves the device talks to Defender; "unknown" proves
+// nothing (the connector may be off), so it never becomes "no sensor".
+function intuneDefenderEvidence(state){
+  const s = String(state || "").toLowerCase();
+  if (/^(secured|lowseverity|mediumseverity|highseverity|compromised|activated)$/.test(s)) return { mde: 1, sensorHealth: "" };
+  if (s === "unresponsive") return { mde: 1, sensorHealth: "Unresponsive (reported to Intune)" };
+  return { mde: null, sensorHealth: "" };
+}
+/* COV-INTUNE-EVIDENCE:END */
+// Which Defender endpoint plan the tenant holds, from its licences — only to explain WHY hunting is unavailable.
+async function defenderPlan(){
+  try {
+    const at = await EP.tokenSilent(["Organization.Read.All"]);
+    const r = await fetch(EP.graphBase() + "/subscribedSkus?$select=skuPartNumber,capabilityStatus,servicePlans", { headers: { Authorization: "Bearer " + at } });
+    if (!r.ok) return null;
+    const plans = {}; ((await r.json()).value || []).forEach(k => { if (String(k.capabilityStatus || "").toLowerCase() !== "enabled") return;
+      (k.servicePlans || []).forEach(p => { if (String(p.provisioningStatus || "").toLowerCase() !== "disabled") plans[String(p.servicePlanName || "").toUpperCase()] = 1; }); });
+    return { p2: !!plans.WINDEFATP, p1: !!plans.MDE_LITE, mdb: !!plans.MDE_SMB };
+  } catch(e){ return null; }
+}
+// One sentence on why Defender onboarding is not (fully) assessed — the real reason, not a generic "needs a scope".
+function mdeWhy(D){
+  const w = D.huntWhy || {}, p = D.mdePlan, n = D.mdeIntune || 0;
+  const via = n ? " Defender onboarding is shown for the " + n + " device" + (n === 1 ? "" : "s") + " whose Defender state Intune reports; the rest are not assessed, never assumed unprotected."
+                : " No managed device reports a Defender state to Intune either (the Intune–Defender connector may be off), so onboarding is not assessed.";
+  if (p && !p.p2 && (p.mdb || p.p1))
+    return "This tenant is licensed for " + (p.mdb ? "Microsoft Defender for Business (Microsoft 365 Business Premium)" : "Defender for Endpoint Plan 1") + ", which does not include advanced hunting — the only Defender device source a browser can read." + via + " The device inventory in the Defender portal is the complete list.";
+  if (w.kind === "consent") return "ThreatHunting.Read.All has not been granted to this app, so Defender device data could not be read." + via;
+  return "Advanced hunting could not be read" + (w.status ? " (HTTP " + w.status + (w.msg ? " — " + w.msg : "") + ")" : (w.msg ? " (" + w.msg + ")" : "")) + ". Defender for Business and Defender for Endpoint Plan 1 do not include it." + via;
 }
 // Real device criticality from Exposure Management (ExposureGraphNodes), keyed on rawData.deviceName. Sets each
 // device's assetValue (level label) + roles (classification rules). Optional; no crowns if unavailable.
@@ -28622,8 +28657,12 @@ async function enrichExposureCrit(devices){
 async function collect(){
   const entra = await gGetAll("/devices?$select=id,deviceId,displayName,operatingSystem,approximateLastSignInDateTime,accountEnabled&$top=200", ["Device.Read.All"]);
   let intune = [];
-  try { intune = await gGetAll("/deviceManagement/managedDevices?$select=id,deviceName,azureADDeviceId,operatingSystem,lastSyncDateTime&$top=200", ["DeviceManagementManagedDevices.Read.All"]); } catch(e){ intune = []; }
-  let machines = null; try { machines = await huntOnboarding(); } catch(e){ machines = null; }
+  const MD = "/deviceManagement/managedDevices?$select=id,deviceName,azureADDeviceId,operatingSystem,lastSyncDateTime";
+  try { intune = await gGetAll(MD + ",partnerReportedThreatState&$top=200", ["DeviceManagementManagedDevices.Read.All"]); }
+  catch(e){ try { intune = await gGetAll(MD + "&$top=200", ["DeviceManagementManagedDevices.Read.All"]); } catch(e2){ intune = []; } }
+  let machines = null, huntWhy = null, mdePlan = null;
+  try { machines = await huntOnboarding(); }
+  catch(e){ machines = null; huntWhy = { kind: (e && e.status) ? "http" : "consent", status: (e && e.status) || null, msg: String((e && e.message) || "").slice(0, 160) }; mdePlan = await defenderPlan(); }
   const inByAad = {}; intune.forEach(d => { const k = String(d.azureADDeviceId||"").toLowerCase(); if (k) inByAad[k] = d; });
   const mdeByAad = {}, mdeByName = {};
   if (machines) machines.forEach(m => { const k = String(m.AadDeviceId||"").toLowerCase(); if (k) mdeByAad[k] = m; const nk = normName(m.DeviceName); if (nk && !mdeByName[nk]) mdeByName[nk] = m; });
@@ -28633,12 +28672,13 @@ async function collect(){
   const devices = active.map(d => {
     const i = inByAad[String(d.deviceId||"").toLowerCase()];
     const m = mdeOf(d);
+    const ev = (!machines && i) ? intuneDefenderEvidence(i.partnerReportedThreatState) : null;   // hunting unavailable → what Intune was told
     const seen = i && i.lastSyncDateTime ? Date.parse(i.lastSyncDateTime) : (d.approximateLastSignInDateTime ? Date.parse(d.approximateLastSignInDateTime) : NaN);
     const lastSyncDays = seen ? Math.floor((now - seen)/864e5) : null;
     return { name: d.displayName || (i&&i.deviceName) || d.deviceId || "(device)", os: d.operatingSystem || (i&&i.operatingSystem) || (m&&m.OSPlatform) || "—",
-      entra:1, intune: i ? 1 : 0, mde: (m && String(m.OnboardingStatus||"").toLowerCase()==="onboarded") ? 1 : (machines ? 0 : null),
+      entra:1, intune: i ? 1 : 0, mde: (m && String(m.OnboardingStatus||"").toLowerCase()==="onboarded") ? 1 : (machines ? 0 : (ev ? ev.mde : null)), mdeSrc: (ev && ev.mde === 1) ? "intune" : (machines ? "hunting" : ""),
       category: m && m.DeviceCategory, deviceType: m && m.DeviceType, assetValue: m && m.AssetValue, roles: m ? parseRoles(m.DeviceRoles) : [], lastSyncDays, stale: !!(seen && (now - seen) > STALE),
-      sensorHealth: (m && m.SensorHealthState) || "", excluded: truthy(m && m.IsExcluded), exclusionReason: (m && m.ExclusionReason) || "" };
+      sensorHealth: (m && m.SensorHealthState) || (ev ? ev.sensorHealth : ""), excluded: truthy(m && m.IsExcluded), exclusionReason: (m && m.ExclusionReason) || "" };
   });
   // Defender-only machines not matched to any Entra device (endpoints Entra never enrolled). Carry their
   // DeviceCategory / DeviceType so IoT / OT / network devices classify as "iot" and are hidden (render drops them).
@@ -28650,7 +28690,7 @@ async function collect(){
       if (!(ak && eIds.has(ak)) && !(nk && eNames.has(nk))) devices.push({ name: m.DeviceName || "(defender device)", os: m.OSPlatform || "—", entra:0, intune:0, mde:1, lastSyncDays:null, stale:false, category: m.DeviceCategory, deviceType: m.DeviceType, assetValue: m.AssetValue, roles: parseRoles(m.DeviceRoles), sensorHealth: m.SensorHealthState || "", excluded: truthy(m.IsExcluded), exclusionReason: m.ExclusionReason || "" }); });
   }
   try { await enrichExposureCrit(devices); } catch(e){}
-  return { live:true, hasMde: !!machines, devices };
+  return { live:true, hasMde: !!machines, devices, huntWhy, mdePlan, mdeIntune: devices.filter(d => d.mdeSrc === "intune").length };
 }
 
 // ---------- build gap + combo rows ----------
@@ -28977,7 +29017,7 @@ function render(D){
   D.grade = D.score>=70?"D":D.score>=50?"C":D.score>=30?"B":"A";
   const noun = mobile ? "mobile device" : seg==="computer" ? "computer" : "device";
   const lede = total + " " + noun + (total===1?"":"s") + " · " + (total-unmanaged) + " managed by Intune, " + unmanaged + " unmanaged"
-    + (mobile ? "" : (HASMDE ? ", " + notOnb + " with no Defender sensor" : ", Defender onboarding not assessed"))
+    + (mobile ? "" : (HASMDE ? ", " + notOnb + " with no Defender sensor" : (D.mdeIntune ? ", Defender onboarding confirmed for " + D.mdeIntune + " via Intune, not assessed for the rest" : ", Defender onboarding not assessed")))
     + (defOnly ? " · " + defOnly + " not in Entra" : "") + ".";
   const band = '<div class="dp-band">' + EP.scoreGauge(D.score)
     + '<div><div class="h1">Coverage · onboarding workspace</div><div class="lede">' + esc(lede) + '</div></div></div>';
@@ -29009,10 +29049,10 @@ function render(D){
     + (mobile ? "" : kpiCard("excluded", kExcluded==null?"—":kExcluded, "Excluded from scanning", "dropped from vulnerability management", kExcluded?"high":"ok"))
     + kpiCard("stale", kStale, "Stale posture", "no sync in 30+ days — signal is old", kStale?"high":"ok")
     + kpiCard("covered", kCovered, "Fully covered", mobile ? "identity · compliance (Intune)" : "identity · compliance · protection", "ok") + '</div>';
-  const src = D.imported ? ("Imported CSV — Entra + Intune" + (HASMDE ? " + Defender exports." : " exports.")) : (window.EP && EP.DEMO) ? "Demo data." : ("Live — Entra + Intune" + (HASMDE ? " + Defender (advanced hunting)." : " via Microsoft Graph."));
+  const src = D.imported ? ("Imported CSV — Entra + Intune" + (HASMDE ? " + Defender exports." : " exports.")) : (window.EP && EP.DEMO) ? "Demo data." : ("Live — Entra + Intune" + (HASMDE ? " + Defender (advanced hunting)." : (D.mdeIntune ? " via Microsoft Graph, with the Defender state devices report to Intune." : " via Microsoft Graph.")));
   const note = '<div class="dp-note"><b>Read-only. ' + src + '</b> Each source is a different security <b>control</b>, answering a different question: <b>Entra — is the device known?</b> (identity &amp; inventory) · <b>Intune — is it compliant?</b> (enforces policy, encryption, configuration) · <b>Defender — is it protected?</b> (EDR: threat detection &amp; response). Read the gaps by risk: <b style="color:var(--sev-crit)">no Defender</b> = unprotected — a threat on that device goes undetected (an EDR blind spot); <b style="color:var(--sev-high)">no Intune</b> = no compliance baseline is enforced (encryption, OS, config unchecked); <b style="color:var(--sev-high)">stale</b> = the posture signals are too old to trust. A device is only <b style="color:var(--sev-low)">fully covered</b> when all three see it and it is syncing. Two quieter blind spots sit on top of this: an onboarded device whose <b style="color:var(--sev-crit)">sensor is unhealthy</b> (not Active) is really unprotected — EDR is blind though the device looks covered; a device <b style="color:var(--sev-high)">excluded</b> from vulnerability management silently drops out of Hardening &amp; Vulnerabilities, so a clean score there can just mean it wasn’t scanned. The KPIs above filter the list to each gap; <b>By gap</b> and <b>By coverage</b> give the grouped breakdowns with the exact fix.'
     + ' <b>Mobile</b> is assessed on Entra + Intune only — the Defender/EDR sensor is a computer control, so phones aren’t flagged for lacking it. <b>IoT / OT / network</b> devices are managed in Defender, not here (as on the Devices page).'
-    + (HASMDE ? '' : ' <b>Defender onboarding needs ThreatHunting.Read.All (advanced hunting) to complete the protection picture.</b>') + '</div>';
+    + (HASMDE ? '' : ' <b>' + esc(D.live ? mdeWhy(D) : "Defender onboarding was not part of this dataset.") + '</b>') + '</div>';
   // AI recommendations — collapse the segment's gaps into a few ranked, policy-level fixes
   const managedNoSensor = (HASMDE && !mobile) ? SEGDEVS.filter(d => d.entra && d.intune===1 && d.mde===0 && d.platform==="computer").length : 0;
   const entraOnly = SEGDEVS.filter(d => d.entra && d.intune===0).length;
