@@ -7010,6 +7010,65 @@ window.EP = (function () {
   // carries that pillar's grade, recomputed here from the same summaries (once the roll-up has run), so it follows a
   // re-scan or a newly loaded collection. Runs when data changes — a view finished loading, an overview or the
   // roll-up painted — not on every navigation.
+  // ---- Does an open port run the software that carries the CVE? -----------------------------------------------
+  // The one rule for "port and CVE belong together", used by Attack paths, Internet exposure and (through them) the
+  // Command Center. An open port 22 and a CVE in a web server on the same machine are two facts, not a chain; port
+  // 443 and a CVE in the web server behind it are.
+  //   PORT_SERVICE: well-known port → the service on it and the software names that service runs under (reference
+  //   data: a convention, since any service can listen on any port).
+  //   ports: open ports seen from outside · vulns: [{ cve, software, cvss }] from Defender's vulnerability inventory
+  //   cpes: software Shodan saw from outside (optional second witness)
+  // → state "confirmed" (at least one port ↔ software ↔ CVE match), "unrelated" (every CVE has known software and
+  //   none is served by an open port), "unknown" (cannot tell: no ports, or a CVE whose software is not known),
+  //   "none" (no CVEs). A match carries outside:true when Shodan also saw that software from outside.
+  const PORT_SERVICE = {
+    21: { svc: "FTP", match: ["ftp", "filezilla", "vsftpd", "proftpd"] },
+    22: { svc: "SSH", match: ["openssh", " ssh ", "dropbear"] },
+    23: { svc: "Telnet", match: ["telnet"] },
+    25: { svc: "SMTP", match: ["exchange", "smtp", "postfix", "sendmail", "exim"] },
+    53: { svc: "DNS", match: ["bind", "named", "dns server"] },
+    80: { svc: "HTTP", match: ["iis", "internet information services", "apache", "nginx", "httpd", "http server", "tomcat", "node.js", "jetty", "lighttpd"] },
+    110: { svc: "POP3", match: ["dovecot", "pop3"] },
+    143: { svc: "IMAP", match: ["dovecot", "imap", "exchange"] },
+    389: { svc: "LDAP", match: ["ldap", "active directory"] },
+    443: { svc: "HTTPS", match: ["iis", "internet information services", "apache", "nginx", "httpd", "http server", "tomcat", "openssl", "node.js", "jetty", "lighttpd"] },
+    445: { svc: "SMB", match: ["server message block", "smb", "samba"] },
+    1433: { svc: "SQL Server", match: ["sql server", "mssql"] },
+    1521: { svc: "Oracle DB", match: ["oracle database"] },
+    2049: { svc: "NFS", match: ["nfs"] },
+    3306: { svc: "MySQL", match: ["mysql", "mariadb"] },
+    3389: { svc: "RDP", match: ["remote desktop", "terminal services", "terminal server", "rdp"] },
+    5432: { svc: "PostgreSQL", match: ["postgresql", "postgres"] },
+    5900: { svc: "VNC", match: ["vnc"] },
+    5985: { svc: "WinRM", match: ["remote management", "winrm"] },
+    5986: { svc: "WinRM", match: ["remote management", "winrm"] },
+    6379: { svc: "Redis", match: ["redis"] },
+    8080: { svc: "HTTP-alt", match: ["tomcat", "jetty", "node.js", "jenkins", "http server", "apache", "nginx"] },
+    8443: { svc: "HTTPS-alt", match: ["tomcat", "jetty", "node.js", "http server", "apache", "nginx", "openssl"] },
+    9200: { svc: "Elasticsearch", match: ["elasticsearch"] },
+    27017: { svc: "MongoDB", match: ["mongodb"] }
+  };
+  function chainMatch(ports, vulns, cpes) {
+    const P = [...new Set((ports || []).map(Number).filter(p => p > 0))];
+    const V = (vulns || []).filter(v => v && v.cve).map(v => Object.assign({}, v, { software: String(v.software || "").replace(/_/g, " ").trim() }));   // Defender names software with underscores
+    const C = (cpes || []).map(c => String(c).toLowerCase().replace(/_/g, " "));
+    if (!V.length) return { state: "none", matches: [], best: null };
+    const sw = v => " " + String(v.software || "").toLowerCase().replace(/_/g, " ").trim() + " ";
+    const matches = [], seen = {};
+    P.forEach(p => { const ps = PORT_SERVICE[p]; if (!ps) return;
+      V.forEach(v => { const s = sw(v); if (!s.trim() || seen[v.cve] || !ps.match.some(k => s.includes(k))) return;
+        seen[v.cve] = 1;
+        matches.push({ port: p, svc: ps.svc, software: v.software, cve: v.cve, cvss: v.cvss || 0, outside: C.some(c => ps.match.some(k => c.includes(k.trim()))) }); }); });
+    // A service on an unusual port: no table entry, but Shodan names the same software from outside.
+    V.forEach(v => { const s = sw(v).trim(); if (!s || seen[v.cve]) return;
+      const hit = C.some(c => { const prod = (c.split(":")[3] || "").trim(); return prod.length >= 4 && (s.includes(prod) || prod.includes(s)); });
+      if (hit) { seen[v.cve] = 1; matches.push({ port: null, svc: "seen from outside", software: v.software, cve: v.cve, cvss: v.cvss || 0, outside: true }); } });
+    matches.sort((a, b) => ((b.port ? 1 : 0) - (a.port ? 1 : 0)) || (b.cvss - a.cvss));
+    const state = matches.length ? "confirmed" : (!P.length || V.some(v => !String(v.software || "").trim())) ? "unknown" : "unrelated";
+    return { state: state, matches: matches, best: matches[0] || null };
+  }
+  /* CHAIN-MATCH:END */
+
   // ---- KPI change since the previous scan -------------------------------------------------------------------
   // A KPI tile shows how its count moved since the previous scan: ▲ up, ▼ down, and nothing when it did not move, so
   // a mark always means something changed. The counts of the last two scans are kept in this browser per tenant and
@@ -12826,7 +12885,7 @@ window.EP = (function () {
       neighbors: neighbors, chokePoints: chokePoints, addOverlay: addOverlay, load: load,
       nodes: nodes, edges: edges, graph: graph, reset: reset };
   })();
-  return { registerView, viewApi, ensureLoaded, navSync: navSyncSoon, progHtml, kpiTrend, kpiDelta: kpiDeltaHtml, makeAsk, token, tokenSilent, tokenOptional, graphBase, exposureGraph, exceptions, critAssets, setStatus, esc, DEMO,
+  return { registerView, viewApi, ensureLoaded, navSync: navSyncSoon, progHtml, kpiTrend, kpiDelta: kpiDeltaHtml, chainMatch, makeAsk, token, tokenSilent, tokenOptional, graphBase, exposureGraph, exceptions, critAssets, setStatus, esc, DEMO,
     scopedDoc, msalShim, ACCOUNT, llm, llmComplete, goto, mitre: mitreFor, scoreGauge: scoreGaugeCompact, skeleton: skeletonHtml, licenceTier, huntDiag, llmLive: () => llmState === "ok",
     estateAsk: (host) => renderSuiteAsk(host),   // the cross-estate copilot, mountable into the unified Ask page's "✦ Copilot — all domains" scope
     get account() { return account; }, get signedIn() { return !!account; },
@@ -33933,40 +33992,9 @@ const AP_COLOR = { internet:"#FF9A6B", device:"#93ACD3", user:"#4FB8FF", guest:"
   app:"#B48CFF", sp:"#7C9CFF", cve:"#FF5C7A", identity:"#5AD1E6", resource:"#3FA9FF", role:"#FF7A8A", data:"#34D3A6", software:"#8FA8FF" };
 const AP_KINDLBL = { internet:"Internet", device:"Device", user:"User", guest:"Guest", group:"Group",
   app:"App / OAuth", sp:"Service principal", cve:"Vulnerability", identity:"Identity", resource:"Resource", role:"Role", data:"Data", software:"Software" };
-// Well-known-port → service family, with the software-name keywords that service runs under. Reference data (like the
-// Microsoft-tenants map) — the one inference layer that lets us ask "does the EXPOSED port actually run the vulnerable
-// software?". A hit turns an internet-facing host that merely HAS a CVE into a confirmed port → service → CVE → host
-// chain; a miss keeps the CVE host-level and says the exposed service isn't confirmed vulnerable (never fabricated).
-const PORT_SERVICE = {
-  21:{ svc:"FTP", match:["ftp","filezilla","vsftpd","proftpd"] },
-  22:{ svc:"SSH", match:["openssh"," ssh"] },
-  23:{ svc:"Telnet", match:["telnet"] },
-  25:{ svc:"SMTP", match:["exchange","smtp","postfix","sendmail","exim"] },
-  53:{ svc:"DNS", match:["bind","named","dns server"] },
-  80:{ svc:"HTTP", match:["iis","apache","nginx","httpd","tomcat","node.js","jetty"] },
-  110:{ svc:"POP3", match:["dovecot","pop3"] },
-  143:{ svc:"IMAP", match:["dovecot","imap","exchange"] },
-  389:{ svc:"LDAP", match:["ldap","active directory"] },
-  443:{ svc:"HTTPS", match:["iis","apache","nginx","httpd","tomcat","openssl","node.js","jetty"] },
-  445:{ svc:"SMB", match:["server message block","smb"] },
-  1433:{ svc:"SQL Server", match:["sql server","mssql"] },
-  1521:{ svc:"Oracle DB", match:["oracle database"] },
-  2049:{ svc:"NFS", match:["nfs"] },
-  3306:{ svc:"MySQL", match:["mysql","mariadb"] },
-  3389:{ svc:"RDP", match:["remote desktop","terminal services","terminal server","rdp"] },
-  5432:{ svc:"PostgreSQL", match:["postgresql","postgres"] },
-  5985:{ svc:"WinRM", match:["remote management","winrm"] },
-  5986:{ svc:"WinRM", match:["remote management","winrm"] },
-  8080:{ svc:"HTTP-alt", match:["tomcat","jetty","node.js","http"] }
-};
-// Does any exposed port run a service whose software is in this host's vulnerable set? Returns the first match (the
-// confirmed port → service → software → CVE link) or null (host is exposed AND vulnerable, but not on the open service).
-function portServiceMatch(ports, vulns){
-  for (const p of (ports || [])){ const ps = PORT_SERVICE[p]; if (!ps) continue;
-    const hit = (vulns || []).find(v => ps.match.some(k => String(v.software || "").toLowerCase().includes(k)));
-    if (hit) return { port:p, svc:ps.svc, software:hit.software, cve:hit.cve, cvss:hit.cvss }; }
-  return null;
-}
+// Does the exposed port run the vulnerable software? The rule and its port table are shared (EP.chainMatch in the
+// shell), so this page, Internet exposure and the Command Center agree on what a confirmed chain is.
+function portServiceMatch(ports, vulns){ const r = EP.chainMatch(ports, vulns, []); return r.best && r.best.port ? r.best : null; }
 // Many exposure-graph nodes (identities, apps, service principals) have a GUID for a NodeName — unreadable in a
 // graph. Relabel those by type with a short GUID suffix ("Identity · 25cae2ca"); keep the full GUID for the tooltip.
 function isGuid(s){ return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(s||"").trim()); }
@@ -34012,7 +34040,7 @@ function demoGraph(){
   ];
   const paths = [
     { id:"ext0", sev:"crit", external:true, portMatched:true, target:"ws01", seq:["net","ws01","sw_rdp","cve_ws01"], cut:{ node:"net", fix:"FULL CHAIN — internet-exposed port 3389 (RDP) runs Remote Desktop with CVE-2026-54875 on contoso-ws-01 — confirmed external initial access. Patch Remote Desktop / CVE-2026-54875 and restrict the port." } },
-    { id:"ext1", sev:"high", external:true, portMatched:false, target:"srv", seq:["net","srv","sw_ssl","cve_srv"], cut:{ node:"net", fix:"Restrict internet exposure of port 21 on CONTOSO-DC01. Host also carries 3 critical/high CVEs (host-level — the exposed service isn't confirmed vulnerable)." } },
+    { id:"ext1", sev:"high", external:true, portMatched:false, target:"srv", ports:[21], vulns:[{ cve:"CVE-2026-70583", software:"OpenSSL", cvss:9.1 }], seq:["net","srv","sw_ssl","cve_srv"], cut:{ node:"net", fix:"Restrict internet exposure of port 21 on CONTOSO-DC01. Host also carries 3 critical/high CVEs (host-level — the exposed service isn't confirmed vulnerable)." } },
     { id:"p1", sev:"crit", seq:["net","ws01","la","srv"], cut:{ node:"la", fix:"Rotate the shared local-admin credential (Windows LAPS) — both paths to the Domain Controller pass through it." } },
     { id:"p2", sev:"crit", seq:["net","alex","la","srv"],   cut:{ node:"la", fix:"Patch contoso-nuc-04's public-exploit CVE and rotate the reused local-admin credential it hands to the DC." } },
     { id:"p3", sev:"crit", seq:["guest","app","fin"],       cut:{ node:"app", fix:"Review ReportBot's Graph permissions and the guest that owns it — a guest-owned OAuth app with read/write to all SharePoint reaches the Highly-Confidential Finance workspace (labelled data)." } }
@@ -34329,7 +34357,7 @@ async function externalChains(deviceNodesByName){
       edges.push({ from:swId, to:cveNodeId, label: "exploitable" + (surface.cvss ? (" · CVSS " + surface.cvss) : "") });
       seq.push(swId, cveNodeId);
     }
-    paths.push({ id:"ext" + paths.length, sev: matched ? "crit" : "high", external:true, seq, target: hostId, portMatched: !!matched,
+    paths.push({ id:"ext" + paths.length, sev: matched ? "crit" : "high", external:true, seq, target: hostId, portMatched: !!matched, ports: ports, vulns: vulns,
       cut:{ node:netId, fix: matched
         ? ("FULL CHAIN — internet-exposed port " + matched.port + " (" + matched.svc + ") runs " + matched.software + " with " + matched.cve + " on " + nm + " — confirmed external initial access. Patch " + matched.software + " / " + matched.cve + " and restrict the port.")
         : ("Restrict internet exposure of port " + portStr + " on " + nm + "." + (vulns.length ? (" Host also carries " + vulns.length + " critical/high CVE" + (vulns.length === 1 ? "" : "s") + " (host-level — the exposed service isn't confirmed vulnerable).") : "")) } });
@@ -34342,11 +34370,13 @@ async function externalChains(deviceNodesByName){
 // the same machine. They are one story, so they become one path per target: the internet exposure (when there is
 // one) with every exploitable CVE on that machine attached to it. A CVE is a weakness ON the machine, not a place an
 // attacker starts from, so it is never an entry node.
-//   An internet-facing machine with an exploitable CVE is Critical. Unless the exposed port is confirmed to run the
-//   vulnerable software (portMatched), the text says the two are both true of the machine, not that one leads to
-//   the other. Longer paths (through an identity or another machine) are left as they are.
+//   What matters is whether the open port runs the software that carries the CVE (chain, the shared rule):
+//     confirmed  port ↔ software ↔ CVE match                       Critical, "FULL CHAIN"
+//     unrelated  the CVE is in software the open port does not serve   High, the CVE stays a weakness on the machine
+//     unknown    the software behind the CVE is not known              High, said so
+//   Longer paths (through an identity or another machine) are left as they are.
 // Sorted by severity first, then internet-facing, then fewer hops.
-function mergeTargetPaths(paths, nodeOf, label, portOf){
+function mergeTargetPaths(paths, nodeOf, label, portOf, chain){
   const tgt = p => p.target || p.seq[p.seq.length - 1], RK = { crit:4, high:3, med:2, low:1 };
   const groups = {}, order = [], rest = [];
   (paths || []).forEach(p => {
@@ -34359,18 +34389,32 @@ function mergeTargetPaths(paths, nodeOf, label, portOf){
     if (RK[p.sev] > RK[g.sev]) g.sev = p.sev;
   });
   const merged = order.map(t => { const g = groups[t], host = label(nodeOf(t)), cves = g.cves.filter((v, i, a) => v && a.indexOf(v) === i);
-    const port = g.ext ? portOf(g.ext) : "", both = !!g.ext && cves.length > 0;
+    const port = g.ext ? portOf(g.ext) : "";
+    const ch = !g.ext ? { state:"none" } : g.ext.portMatched ? { state:"confirmed", best:null } : chain ? chain(g.ext, cves) : { state: cves.length ? "unknown" : "none" };
+    const conf = ch.state === "confirmed", b = ch.best;
     const patch = cves.length ? "Patch " + cves.slice(0, 3).join(", ") + (cves.length > 3 ? " and " + (cves.length - 3) + " more" : "") + " on " + host + "." : "";
     const fix = (g.ext && g.ext.portMatched) ? g.ext.cut.fix
-      : [g.ext ? "Close " + (port ? "port " + port : "the exposed ports") + " to the internet on " + host + "." : "", patch,
-         both ? "The machine is internet-facing and has an exploitable CVE; that the CVE is reachable through the open port is not confirmed." : ""].filter(Boolean).join(" ");
-    return Object.assign({}, g.ext || { id:"cve:" + t, seq:[t], target:t, cveOnly:true }, { sev: both ? "crit" : g.sev, cves: cves, internet: !!g.ext, port: port, cut:{ node: g.ext ? g.ext.cut.node : t, fix: fix } }); });
+      : (conf && b) ? (b.port ? "Port " + b.port + " (" + b.svc + ")" : "A service seen from outside") + " runs " + b.software + ", which carries " + b.cve + " on " + host + ": a confirmed way in. Patch " + b.software + " and close the port to the internet."
+      : [g.ext ? "Close " + (port ? "port " + port : "the exposed ports") + " to the internet on " + host + "." : "", patch].filter(Boolean).join(" ");
+    return Object.assign({}, g.ext || { id:"cve:" + t, seq:[t], target:t, cveOnly:true }, { sev: g.ext ? (conf ? "crit" : "high") : g.sev, cves: cves, internet: !!g.ext, port: port, chainState: ch.state, chainBest: b || null, portMatched: conf, cut:{ node: g.ext ? g.ext.cut.node : t, fix: fix } }); });
   const hops = p => { const i = p.seq.indexOf(tgt(p)); return i > 0 ? i : Math.max(0, p.seq.length - 1); };
   return merged.concat(rest).sort((a, b) => (RK[b.sev] - RK[a.sev]) || ((b.external ? 1 : 0) - (a.external ? 1 : 0)) || (hops(a) - hops(b)));
 }
 /* AP-MERGE:END */
 // The port(s) on the hop out of the internet, from that edge's label ("exposed · port 21").
 function extPort(p){ const e = EDGES.find(x => x.from === p.seq[0] && x.to === p.seq[1]); const m = e && /ports?\s+([0-9][0-9,\s]*)/i.exec(e.label || ""); return m ? m[1].replace(/\s+/g, "") : ""; }
+
+// The evidence for one internet path: the ports Defender's scanner reached plus what Internet exposure looked up from
+// outside, against the machine's CVEs with their software (Defender's inventory; a CVE the graph names without software
+// stays "unknown").
+function chainOf(ext, cves){
+  const host = nodeOf(ext.target || ext.seq[1]), name = host ? host.label : "";
+  let out = null; try { const a = window.EP && EP.viewApi && EP.viewApi("internet"); out = a && a.outside ? a.outside(name, ipOf(name)) : null; } catch(e){ out = null; }
+  const ports = (ext.ports && ext.ports.length ? ext.ports : extPort(ext).split(",").map(Number)).concat(out ? out.ports : []);
+  const vl = (ext.vulns || []).slice();
+  (cves || []).forEach(c => { const id = String(c).split(" ")[0]; if (!vl.some(v => v.cve === id)) vl.push({ cve:id, software:"" }); });
+  return EP.chainMatch(ports, vl, out ? out.cpes : []);
+}
 
 // ---------- the map: every path, left to right ----------
 // Columns: where a path starts, what it runs through, and the critical asset it reaches. A node on several paths is
@@ -34472,6 +34516,8 @@ function pathRow(p){
     + '<div class="ap-path-h"><span class="ap-sev sev-' + p.sev + '">' + (p.sev==="crit"?"CRITICAL":"HIGH") + '</span>'
     + (p.external ? '<span class="ap-ext" title="Internet-facing host with an exposed port and an exploitable CVE — direct external initial access">🌐 INTERNET</span>' : '')
     + (p.portMatched ? '<span class="ap-fullchain" title="Confirmed end-to-end: the internet-exposed port runs the vulnerable software that carries this CVE — port → service → CVE → host is a real initial-access chain, not a port and a CVE seen separately.">✓ FULL CHAIN</span>' : '')
+    + (p.internet && p.chainState === "unrelated" ? '<span class="ap-ext" style="opacity:.85" title="The machine is internet-facing and has an exploitable CVE, but the CVE is in software that the open port does not serve. Two separate facts, not a chain.">PORT AND CVE UNRELATED</span>' : '')
+    + (p.internet && p.chainState === "unknown" ? '<span class="ap-ext" style="opacity:.85" title="The machine is internet-facing and has an exploitable CVE. Whether the open port runs the software behind that CVE is not known.">PORT-TO-CVE NOT CONFIRMED</span>' : '')
     + '<span style="font-size:11.5px;color:var(--text);font-weight:600" title="' + (target?esc(target.label):"") + '">to ' + (target?esc(displayLabel(target)):"?") + (target&&target.crit?(' · ' + esc(target.crit)):'') + '</span>'
     + (!p.cveOnly && hops > 1 ? '<span class="ap-path-t">' + hops + ' hops</span>' : '') + '</div>'
     + flowHtml(p.seq, p.portMatched, p)
@@ -34494,7 +34540,7 @@ function render(D){
   destroyGraph();
   NODES = D.nodes || []; EDGES = D.edges || [];
   NODE_MAP = {}; NODES.forEach(n => { NODE_MAP[n.id] = n; });
-  PATHS = mergeTargetPaths(D.paths || [], nodeOf, displayLabel, extPort).slice(0, 15);   // one row per target, worst first
+  PATHS = mergeTargetPaths(D.paths || [], nodeOf, displayLabel, extPort, chainOf).slice(0, 15);   // one row per target, worst first
   USERSBY = D.usersByName || {}; IPSBY = D.ipByName || {}; enrichUsers();   // attach signed-in users + device IPs (device→identity + host join)
   buildPathGraph();   // display graph = only the nodes/edges on an attack path
   const root = document.getElementById("ap-root"); if (!root) return;
@@ -34694,7 +34740,7 @@ function buildRows(devices, pips){
     if (isVm) { dev = devByRes[lc(p.vmId)] || null; match = dev ? "resource id" : null;
       if (!dev && p.vmName) { dev = devByName[shortName(p.vmName)] || null; match = dev ? "name" : null; } }
     if (dev) used[dev.id || dev.name] = 1;
-    const r = { ip: p.ip, name: isVm ? (p.vmName || p.attName || p.name) : p.name, src: ["Azure"], sku: p.sku || "", sub: p.sub || "",
+    const r = { ip: p.ip, deviceId: dev ? dev.id : "", name: isVm ? (p.vmName || p.attName || p.name) : p.name, src: ["Azure"], sku: p.sku || "", sub: p.sub || "",
       kind: front ? "gateway" : isVm ? "machine" : "unattached", front: front || null, device: dev ? dev.name : null, match: match,
       sensor: front ? "na" : isVm ? sensorOf(dev) : "na", os: dev ? dev.os : "", msExposure: dev ? dev.exposure : "",
       scannedPort: dev && dev.scannedPort && (!dev.scannedIp || dev.scannedIp === p.ip) ? +dev.scannedPort || null : null, flagged: !!(dev && dev.internetFacing) };
@@ -34706,8 +34752,8 @@ function buildRows(devices, pips){
     const ip = IPV4.test(d.scannedIp || "") ? d.scannedIp : null;
     if (!d.internetFacing && !ip) { if (IPV4.test(d.publicIp || "")) egressOnly++; return; }
     const addr = ip || (IPV4.test(d.publicIp || "") ? d.publicIp : null); if (!addr) return;
-    if (byIp[addr]) { const r = byIp[addr]; if (r.src.indexOf("Defender") < 0) r.src.push("Defender"); if (!r.device) { r.device = d.name; r.match = "address"; if (r.kind === "machine") r.sensor = sensorOf(d); } r.flagged = true; if (!r.scannedPort && d.scannedPort) r.scannedPort = +d.scannedPort || null; return; }
-    const r = { ip: addr, name: d.name, src: ["Defender"], sku: "", sub: "", kind: "machine", front: null, device: d.name, match: "defender", sensor: sensorOf(d), os: d.os || "", msExposure: d.exposure || "",
+    if (byIp[addr]) { const r = byIp[addr]; if (r.src.indexOf("Defender") < 0) r.src.push("Defender"); if (!r.device) { r.device = d.name; r.deviceId = d.id; r.match = "address"; if (r.kind === "machine") r.sensor = sensorOf(d); } r.flagged = true; if (!r.scannedPort && d.scannedPort) r.scannedPort = +d.scannedPort || null; return; }
+    const r = { ip: addr, deviceId: d.id, name: d.name, src: ["Defender"], sku: "", sub: "", kind: "machine", front: null, device: d.name, match: "defender", sensor: sensorOf(d), os: d.os || "", msExposure: d.exposure || "",
       scannedPort: +d.scannedPort || null, flagged: true, unproven: !ip };   // unproven: flagged internet-facing, but only the egress address is known
     byIp[addr] = r; rows.push(r);
   });
@@ -34716,27 +34762,54 @@ function buildRows(devices, pips){
 // How exposed one address is. look: undefined = never looked up, { error } = lookup failed, { ports, vulns } = answer.
 //   out  0-4: worst port the internet reaches (Shodan, or the port Defender's own scanner got in on); CVEs on file = 2
 //   cov  0-3: 3 a machine with no device in Defender, 2 a device that is not onboarded
-// Critical: a critical port is reachable, or a high port on a machine nobody watches. High: a high port, or an
+//   chain: the shared port ↔ software ↔ CVE match for the machine (EP.chainMatch), or null
+// Critical: an open port runs software that carries a CVE on the machine (a confirmed chain), or
+// a critical port is reachable, or a high port on a machine nobody watches. High: a high port, or an
 // internet-facing machine with no Defender device, or an unwatched machine with something on it. Medium: a medium
 // port or CVEs on file, a device that is not onboarded, or Defender rates the device High. Low: the rest.
-function exposureOf(r, look){
+function exposureOf(r, look, chain){
   const answered = !!look && !look.error, ports = answered ? (look.ports || []) : [], vulns = answered ? (look.vulns || []) : [];
   let out = r.scannedPort ? (RK[portRisk(r.scannedPort)] || 0) : 0;
   ports.forEach(p => { out = Math.max(out, RK[portRisk(p)] || 0); });
   if (vulns.length) out = Math.max(out, 2);
   const cov = r.kind === "machine" ? (r.sensor === "nodevice" ? 3 : r.sensor === "notonboarded" ? 2 : 0) : 0;
   const ms = /^high$/i.test(r.msExposure || "") ? 2 : /^medium$/i.test(r.msExposure || "") ? 1 : 0;
-  const sev = (out >= 4 || (out >= 3 && cov >= 2)) ? "Critical"
+  const conf = !!chain && chain.state === "confirmed";
+  const sev = (conf || out >= 4 || (out >= 3 && cov >= 2)) ? "Critical"
     : (out === 3 || cov === 3 || (cov === 2 && out >= 2)) ? "High"
     : (out === 2 || cov === 2 || ms === 2) ? "Medium" : "Low";
   const B = { Critical:[60,100,72], High:[35,59,44], Medium:[15,34,22], Low:[0,14,4] }[sev];
-  const add = Math.min(8, ports.filter(p => portRisk(p)).length * 2) + Math.min(6, vulns.length) + (cov === 3 ? 4 : cov === 2 ? 2 : 0) + ms;
-  return { sev: sev, score: Math.max(B[0], Math.min(B[1], B[2] + add)), out: out, cov: cov, lookedUp: answered, failed: !!(look && look.error), ports: ports, vulns: vulns };
+  const add = Math.min(8, ports.filter(p => portRisk(p)).length * 2) + Math.min(6, vulns.length) + (cov === 3 ? 4 : cov === 2 ? 2 : 0) + ms + (conf ? 12 : 0);
+  return { sev: sev, score: Math.max(B[0], Math.min(B[1], B[2] + add)), out: out, cov: cov, lookedUp: answered, failed: !!(look && look.error), ports: ports, vulns: vulns, confirmed: conf };
 }
 /* IX-RULES:END */
 
 // ---------- state ----------
 let M = null, ROWS = [], LOOK = {}, _wired = false, AZ = { state:"none" };
+let VULNS = { state:"none", by:{} };   // Defender's vulnerability inventory per device: none | read | error
+// Critical and High CVEs with the software that carries them, for the Defender devices on this page.
+async function readVulns(ids){
+  ids = [...new Set((ids || []).filter(Boolean))];
+  if (!ids.length) { VULNS = { state:"read", by:{} }; return; }
+  try {
+    const by = {};
+    for (let i = 0; i < ids.length; i += 200) {
+      (await EP.exposureGraph.hunt("DeviceTvmSoftwareVulnerabilities | where DeviceId in (" + ids.slice(i, i + 200).map(x => "'" + String(x).replace(/'/g, "") + "'").join(",") + ")"
+        + " | where VulnerabilitySeverityLevel in ('Critical','High') | summarize Cvss=max(CvssScore) by DeviceId, SoftwareName, CveId | order by Cvss desc | take 5000"))
+        .forEach(v => { if (v.DeviceId && v.CveId) (by[v.DeviceId] = by[v.DeviceId] || []).push({ cve: v.CveId, software: v.SoftwareName || "", cvss: v.Cvss || 0 }); });
+    }
+    VULNS = { state:"read", by: by };
+  } catch(e){ VULNS = { state:"error", err: (e && (e.message || String(e))) || "" }; }
+}
+// The port ↔ software ↔ CVE verdict for one row. Only a machine with a Defender device has an inventory to match.
+function chainFor(r){
+  if (r.kind !== "machine") return null;
+  if (!r.deviceId) return { state:"nodevice", matches:[] };
+  if (VULNS.state !== "read") return { state:"notread", matches:[] };
+  const l = LOOK[r.ip], ok = !!l && !l.error;
+  const c = EP.chainMatch((ok ? (l.ports || []) : []).concat(r.scannedPort ? [r.scannedPort] : []), VULNS.by[r.deviceId] || [], ok ? (l.cpes || []) : []);
+  c.total = (VULNS.by[r.deviceId] || []).length; return c;
+}
 const STATE = { q:"", kpi:"", open:{} };
 const SCAN = new WeakMap();
 
@@ -34816,8 +34889,13 @@ const DEMO_PIPS = [
   { name:"bastion-hub-pip", ip:"20.50.10.21", sku:"Standard", attType:"bastionHosts", attName:"bastion-hub", vmId:"", vmName:"", sub:"corp-prod" },
   { name:"old-test-pip", ip:"20.50.10.30", sku:"Basic", attType:"", attName:"", vmId:"", vmName:"", sub:"sandbox-dev" }
 ];
+const DEMO_VULNS = {
+  d1: [{ cve:"CVE-2024-6387", software:"openssh", cvss:8.1 }],                                             // web server: the CVE is in SSH, which is not open
+  d2: [{ cve:"CVE-2019-0708", software:"remote_desktop_services", cvss:9.8 }, { cve:"CVE-2023-4863", software:"chrome", cvss:8.8 }],   // jump box: RDP open and vulnerable
+  d4: [{ cve:"CVE-2024-6387", software:"openssh", cvss:8.1 }]                                              // branch firewall: SSH open and vulnerable
+};
 const DEMO_LOOK = {
-  "20.50.10.11": { ports:[80, 443], vulns:[] },
+  "20.50.10.11": { ports:[80, 443], vulns:[], cpes:["cpe:/a:microsoft:internet_information_services:10.0"] },
   "20.50.10.12": { ports:[3389], vulns:["CVE-2019-0708"] },
   "20.50.10.13": { ports:[1433, 3389], vulns:[] },
   "20.50.10.14": { ports:[22, 6379], vulns:["CVE-2022-0543", "CVE-2023-28425"] },
@@ -34842,30 +34920,31 @@ const KPI_TEST = {
   critical: r => X(r).score >= 60, high: r => X(r).score >= 35 && X(r).score < 60, medium: r => X(r).score >= 15 && X(r).score < 35,
   nosensor: r => r.kind === "machine" && r.sensor !== "onboarded",
   riskport: r => X(r).ports.concat(r.scannedPort ? [r.scannedPort] : []).some(p => RK[portRisk(p)] >= 3),
-  cves: r => X(r).vulns.length > 0, gateway: r => r.kind === "gateway", unattached: r => r.kind === "unattached"
+  confirmed: r => !!(r._c && r._c.state === "confirmed"), cves: r => X(r).vulns.length > 0, gateway: r => r.kind === "gateway", unattached: r => r.kind === "unattached"
 };
 const lookedAny = () => ROWS.some(r => X(r).lookedUp);
-const _BP = [{ l:"No Defender sensor", t: KPI_TEST.nosensor }, { l:"Risky port reachable", t: KPI_TEST.riskport }, { l:"CVEs on file", t: KPI_TEST.cves }];
+const _BP = [{ l:"Port and CVE match", t: KPI_TEST.confirmed }, { l:"No Defender sensor", t: KPI_TEST.nosensor }, { l:"Risky port reachable", t: KPI_TEST.riskport }];
 const KPI_GROUPS = [["Risk band", "by address score"], ["Exposure", "what is behind the addresses"]];
 const KPI_DEFS = [
-  { id:"critical", grp:0, label:"Critical", icon:"shield", kc:"var(--sev-crit)", parts:_BP, tip:"Addresses scoring 60 or more: a critical port is reachable from the internet, or a high-risk port on a machine Defender is not watching." },
+  { id:"critical", grp:0, label:"Critical", icon:"shield", kc:"var(--sev-crit)", parts:_BP, tip:"Addresses scoring 60 or more: an open port runs software that carries a CVE, a critical port is reachable from the internet, or a high-risk port sits on a machine Defender is not watching." },
   { id:"high", grp:0, label:"High", icon:"circle", kc:"var(--sev-high)", parts:_BP, tip:"Addresses scoring 35 to 59: a high-risk port is reachable, or an internet-facing machine has no Defender device." },
   { id:"medium", grp:0, label:"Medium", icon:"square", kc:"var(--sev-med)", parts:_BP, tip:"Addresses scoring 15 to 34: a medium port or CVEs on file, or a device that is not onboarded." },
   { id:"nosensor", grp:1, label:"No Defender sensor", sub:"internet-facing machines", icon:"eyeoff", kc:"var(--sev-crit)", parts:[{ l:"No device in Defender", t: r => r.sensor === "nodevice" }, { l:"Device not onboarded", t: r => r.sensor === "notonboarded" }],
     tip:"Machines with a public address that Microsoft Defender is not reporting from: either no device exists for it, or the device is not onboarded." },
   { id:"riskport", grp:1, label:"Risky port reachable", sub:"RDP, SMB, databases…", icon:"door", kc:"var(--sev-high)", parts:[{ l:"Seen by Shodan", t: r => X(r).ports.some(p => RK[portRisk(p)] >= 3) }, { l:"Reached by Defender's scanner", t: r => RK[portRisk(r.scannedPort)] >= 3 }],
     tip:"Addresses where a high or critical port answers from the internet, seen by Shodan or reached by Defender's own external scanner." },
-  { id:"cves", grp:1, label:"CVEs on file", sub:"from the outside view", icon:"bug", kc:"var(--sev-med)", parts:[{ l:"No Defender sensor", t: KPI_TEST.nosensor }], gate: lookedAny, needs:"The addresses have not been looked up yet.",
-    tip:"Addresses for which Shodan lists CVEs. These are inferred from the software version it saw, not verified on the machine." },
+  { id:"confirmed", grp:1, label:"Port and CVE match", sub:"open port runs the vulnerable software", icon:"bug", kc:"var(--sev-crit)", parts:[{ l:"Also seen from outside", t: r => !!(r._c && (r._c.matches || []).some(m => m.outside)) }, { l:"Risky port reachable", t: KPI_TEST.riskport }],
+    gate: () => VULNS.state === "read", needs:"Defender's vulnerability inventory was not read.",
+    tip:"Machines where an open port's service runs software that carries a Critical or High CVE, from Defender's vulnerability inventory: for example 443 and a CVE in the web server. A CVE in software the open port does not serve is not counted." },
   { id:"gateway", grp:1, label:"Gateways", sub:"WAF, bastion, load balancer", icon:"gate", kc:"var(--accent)", parts:[{ l:"Risky port reachable", t: KPI_TEST.riskport }],
     tip:"Addresses that front a gateway, firewall, bastion or load balancer. They cannot carry a Defender sensor, so they are not counted as unwatched." },
   { id:"unattached", grp:1, label:"Unattached", sub:"address with nothing on it", icon:"unlink", kc:"var(--muted)", parts:[{ l:"Something still answers", t: r => X(r).ports.length > 0 }], gate: () => AZ.state === "read", needs:"Azure public addresses were not read.",
     tip:"Azure public addresses not attached to anything. Usually leftovers: they cost money, and one that still answers is worth a look." }
 ];
-const KPI_SHORT = { critical:"Critical", high:"High", medium:"Medium", nosensor:"No Defender sensor", riskport:"Risky port reachable", cves:"CVEs on file", gateway:"Gateways", unattached:"Unattached" };
+const KPI_SHORT = { critical:"Critical", high:"High", medium:"Medium", nosensor:"No Defender sensor", riskport:"Risky port reachable", confirmed:"Port and CVE match", cves:"CVEs on file", gateway:"Gateways", unattached:"Unattached" };
 const band = n => n >= 60 ? "critical" : n >= 35 ? "high" : n >= 15 ? "medium" : "low";
 
-function rescore(){ ROWS.forEach(r => { r._x = exposureOf(r, LOOK[r.ip] === null ? undefined : LOOK[r.ip]); });
+function rescore(){ ROWS.forEach(r => { r._c = chainFor(r); r._x = exposureOf(r, LOOK[r.ip] === null ? undefined : LOOK[r.ip], r._c); });
   ROWS.sort((a,b) => (X(b).score - X(a).score) || String(a.ip).localeCompare(String(b.ip), undefined, { numeric:true })); }
 function sensorCell(r){
   if (r.kind !== "machine") return '<span class="ix-mu" title="' + (r.kind === "gateway" ? "A gateway cannot carry a Defender sensor." : "Nothing is attached to this address.") + '">n/a</span>';
@@ -34884,6 +34963,17 @@ function outsideCell(r){
   return scan + ports.slice(0, 6).map(p => '<span class="ix-port ' + portRisk(p) + '">' + p + (PORT_NAME[p] ? " " + PORT_NAME[p] : "") + '</span>').join("") + (ports.length > 6 ? '<span class="ix-mu">+' + (ports.length - 6) + '</span>' : "")
     + (x.vulns.length ? '<span class="ix-tag warn" title="Inferred by Shodan from the software version, not verified">' + x.vulns.length + ' CVE' + (x.vulns.length === 1 ? '' : 's') + '</span>' : "");
 }
+function chainCell(r){
+  const c = r._c, mu = (t, tip) => '<span class="ix-mu" title="' + esc(tip) + '">' + t + '</span>';
+  if (!c) return mu("n/a", "Only a machine has software to match.");
+  if (c.state === "nodevice") return mu("no Defender inventory", "No Defender device for this machine, so its software and CVEs are not known. Cannot be confirmed from the inside.");
+  if (c.state === "notread") return mu("not read", "Defender's vulnerability inventory was not read. Unknown, not clean.");
+  if (c.state === "confirmed") { const b = c.best, n = c.matches.length;
+    return '<span class="ix-tag bad" title="' + esc((b.port ? "Port " + b.port + " (" + b.svc + ")" : "A service seen from outside") + " runs " + b.software + ", which carries " + b.cve + ".") + '">✓ ' + esc((b.port ? b.port + " " + b.svc : "outside") + " ↔ " + b.software + " ↔ " + b.cve) + '</span>' + (n > 1 ? '<span class="ix-mu">+' + (n - 1) + '</span>' : ''); }
+  if (c.state === "unrelated") return mu(c.total + " CVE" + (c.total === 1 ? "" : "s") + ", none on an open port", "The machine has Critical or High CVEs, but none is in software that an open port serves. Weaknesses on the machine, not a way in from the internet.");
+  if (c.state === "unknown") return mu(c.total ? "not confirmed" : "—", c.total ? "The machine has CVEs, and no open port is known to match them" + (LOOK[r.ip] === undefined ? " (the address has not been looked up)." : ".") : "");
+  return mu("no match", "No Critical or High CVE in Defender's inventory for this device.");
+}
 function rowHtml(r){
   const x = X(r), open = !!STATE.open[r.ip], b = band(x.score);
   const what = r.kind === "gateway" ? esc(r.front || "Gateway") : r.kind === "unattached" ? "Unattached address" : ("Machine" + (r.os ? ' · ' + esc(r.os) : ''));
@@ -34891,14 +34981,16 @@ function rowHtml(r){
     + '<td><span class="di-risk"><span class="b rs-' + b + '">' + x.score + '</span><span class="s">' + b + '</span></span></td>'
     + '<td><div class="ix-ip">' + esc(r.ip) + '</div><div class="ix-sb">' + esc(r.name || "") + '</div></td>'
     + '<td>' + what + '<div class="ix-sb">' + r.src.map(s => '<span class="ix-tag">' + s + '</span>').join("") + (r.unproven ? '<span class="ix-tag warn" title="Defender flags this device internet-facing, but only the address it leaves through is known. It may be shared with other devices.">egress address</span>' : '') + '</div></td>'
-    + '<td>' + sensorCell(r) + '</td><td>' + outsideCell(r) + '</td></tr>';
+    + '<td>' + sensorCell(r) + '</td><td>' + outsideCell(r) + '</td><td>' + chainCell(r) + '</td></tr>';
   if (!open) return main;
   let d = '<div class="ix-kv"><b>Address:</b> ' + esc(r.ip) + (r.sku ? ' · ' + esc(r.sku) + ' SKU' : '') + (r.sub ? ' · subscription ' + esc(r.sub) : '') + '</div>';
   if (r.kind === "machine") d += '<div class="ix-kv"><b>Defender device:</b> ' + (r.device ? esc(r.device) + ' (matched on ' + esc(r.match === "defender" ? "Defender's own record" : r.match) + ')' + (r.msExposure ? ' · Defender exposure level ' + esc(r.msExposure) : '') : 'none seen in the last 30 days that matches this machine by Azure resource id or by name') + '</div>';
   if (r.scannedPort) d += '<div class="ix-kv"><b>Defender\'s scanner:</b> reached port ' + r.scannedPort + (PORT_NAME[r.scannedPort] ? ' (' + PORT_NAME[r.scannedPort] + ')' : '') + ' from the internet.</div>';
   if (x.lookedUp) d += '<div class="ix-kv"><b>Seen from outside:</b> ' + (x.ports.length ? 'ports ' + x.ports.slice().sort((a,b) => a - b).join(", ") : 'no open ports on file')
     + (x.vulns.length ? ' · CVEs on file (inferred from version, not verified): ' + esc(x.vulns.slice(0, 12).join(", ")) + (x.vulns.length > 12 ? ' +' + (x.vulns.length - 12) : '') : '') + '</div>';
+  if (r._c && r._c.state === "confirmed") d += '<div class="ix-kv"><b>Port and CVE match:</b><ul style="margin:3px 0 0;padding-left:18px">' + r._c.matches.slice(0, 6).map(m => '<li>' + (m.port ? 'port ' + m.port + ' (' + esc(m.svc) + ')' : 'a service seen from outside') + ' ↔ ' + esc(m.software) + ' ↔ ' + esc(m.cve) + (m.cvss ? ' · CVSS ' + m.cvss : '') + (m.outside ? ' · software also seen from outside' : '') + '</li>').join("") + '</ul>' + (r._c.matches.length > 6 ? '+' + (r._c.matches.length - 6) + ' more' : '') + '</div>';
   const todo = [];
+  if (r._c && r._c.state === "confirmed") todo.push("Patch " + r._c.best.software + " (" + r._c.best.cve + ") first: the port that serves it is open to the internet.");
   if (r.kind === "machine" && r.sensor === "nodevice") todo.push("Onboard this machine to Microsoft Defender for Endpoint, or remove its public address if it does not need one.");
   if (r.kind === "machine" && r.sensor === "notonboarded") todo.push("Finish onboarding this device to Microsoft Defender for Endpoint.");
   if (x.out >= 3) todo.push("Close the management or database ports to the internet: reach them through Bastion, a VPN or just-in-time access instead.");
@@ -34907,7 +34999,7 @@ function rowHtml(r){
   if (todo.length) d += '<div class="ix-kv"><b>What to do:</b></div><ol style="margin:4px 0 0;padding-left:18px;font-size:12px;line-height:1.55">' + todo.map(t => '<li>' + esc(t) + '</li>').join("") + '</ol>';
   d += '<div style="margin-top:9px">' + (r.device ? '<span class="ix-chip" data-ix-dev="' + esc(r.device) + '">Open the device →</span> ' : '')
     + '<a class="ix-chip" style="text-decoration:none" href="https://www.shodan.io/host/' + encodeURIComponent(r.ip) + '" target="_blank" rel="noopener" title="Opens shodan.io for this address in a new tab">View on Shodan ↗</a></div>';
-  return main + '<tr class="ix-det"><td></td><td colspan="5">' + d + '</td></tr>';
+  return main + '<tr class="ix-det"><td></td><td colspan="6">' + d + '</td></tr>';
 }
 function filtered(){ const q = STATE.q.trim().toLowerCase();
   return ROWS.filter(r => (!STATE.kpi || !KPI_TEST[STATE.kpi] || KPI_TEST[STATE.kpi](r)) && (!q || (r.ip + " " + r.name + " " + (r.device || "") + " " + (r.front || "") + " " + r.src.join(" ") + " " + X(r).ports.join(" ")).toLowerCase().includes(q))); }
@@ -34915,7 +35007,7 @@ function paint(){
   const host = document.getElementById("ix-body"); if (!host) return;
   const rows = filtered(), shown = rows.slice(0, MAX_ROWS), cnt = document.getElementById("ix-count");
   if (cnt) cnt.textContent = (rows.length > MAX_ROWS ? "first " + MAX_ROWS + " of " + rows.length + " matching · " : rows.length + " of ") + ROWS.length + " address" + (ROWS.length === 1 ? "" : "es");
-  host.innerHTML = shown.length ? shown.map(rowHtml).join("") : '<tr><td colspan="6" class="ix-empty">No address matches these filters.</td></tr>';
+  host.innerHTML = shown.length ? shown.map(rowHtml).join("") : '<tr><td colspan="7" class="ix-empty">No address matches these filters.</td></tr>';
 }
 function render(m){
   M = m; const root = document.getElementById("ix-root"); if (!root) return;
@@ -34946,12 +35038,14 @@ function render(m){
   let warn = "";
   if (AZ.state === "noconsent") warn += '<div class="ix-note warn"><b>Azure public addresses were not read.</b> This sign-in has no consent for Azure Resource Manager, so only the devices Defender itself flags internet-facing are listed; an Azure machine Defender has never seen cannot show up. The read is optional and read-only. <span class="ix-chip" role="button" tabindex="0" data-ix-az="1">Read Azure addresses</span></div>';
   if (AZ.state === "error") warn += '<div class="ix-note warn"><b>Azure public addresses could not be read.</b> ' + esc(AZ.err || "") + ' <span class="ix-chip" role="button" tabindex="0" data-ix-az="1">Try again</span></div>';
+  if (VULNS.state === "error") warn += '<div class="ix-note warn"><b>Defender\'s vulnerability inventory was not read.</b> ' + esc(VULNS.err || "") + ' The port and CVE match is unknown for every machine.</div>';
   if (m.devErr) warn += '<div class="ix-note warn"><b>Defender devices were not read.</b> ' + esc(m.devErr) + ' Every Azure machine shows "No device in Defender" until they are: treat that column as unknown.</div>';
   const tools = '<div class="ix-tools"><input id="ix-q" placeholder="Search address, name, port…" spellcheck="false" value="' + esc(STATE.q) + '">' + (STATE.kpi ? '<span class="ix-chip" id="ix-clr" role="button" tabindex="0">' + esc(KPI_SHORT[STATE.kpi]) + ' ✕</span>' : '') + '<span class="ix-count" id="ix-count"></span></div>';
-  const table = '<div class="ix-wrap"><table class="ix-tbl"><thead><tr><th style="width:14px"></th><th>Risk</th><th>Address</th><th>What it is</th><th>Defender</th><th>Seen from outside</th></tr></thead><tbody id="ix-body"></tbody></table></div>';
+  const table = '<div class="ix-wrap"><table class="ix-tbl"><thead><tr><th style="width:14px"></th><th>Risk</th><th>Address</th><th>What it is</th><th>Defender</th><th>Seen from outside</th><th title="Does an open port run the software that carries a CVE on this machine?">Port ↔ CVE match</th></tr></thead><tbody id="ix-body"></tbody></table></div>';
   const note = '<div class="ix-note"><b>Read-only. ' + ((window.EP && EP.DEMO) ? 'Demo data.' : 'Live.') + '</b> Addresses come from Azure Resource Graph (public IP addresses and what they are attached to) and from the devices Defender flags internet-facing. '
     + (m.egressOnly ? m.egressOnly + ' device' + (m.egressOnly === 1 ? '' : 's') + ' only report the address they leave through (office or NAT, usually shared) and are not listed. ' : '')
-    + 'Addresses outside Azure that Defender has not flagged, such as other clouds or on-premises ranges, are not in this list. CVEs from the outside view are inferred from software versions, not verified. This page does not change the Endpoint score.</div>';
+    + 'Addresses outside Azure that Defender has not flagged, such as other clouds or on-premises ranges, are not in this list. CVEs from the outside view are inferred from software versions, not verified. '
+    + '<b>Port ↔ CVE match</b> uses Defender\'s vulnerability inventory: an open port counts only when its usual service runs software that carries a Critical or High CVE on that machine. The port table is a convention, so a service on an unusual port is matched only when the outside view names the same software; software is matched by name, so check the software shown; and CVEs that Defender attributes to Windows itself are not tied to a port. This page does not change the Endpoint score.</div>';
   root.innerHTML = '<div class="ix-band">' + title + '<div class="lede">' + esc(lede) + '</div></div>' + kpis + look + warn + (ROWS.length ? '<div class="ix-h2">Public addresses · highest risk first</div>' + tools + table : '') + note;
   if (ROWS.length) paint();
   wire();
@@ -34978,25 +35072,31 @@ async function load(interactiveAzure){
   const pips = await readAzure(!!interactiveAzure);
   if (devices == null && pips == null) { render({ needsDefender: true, err: devErr }); return; }
   const b = buildRows(devices || [], pips);
+  await readVulns(b.rows.map(r => r.deviceId));
   render({ rows: b.rows, egressOnly: b.egressOnly, devErr: devices == null ? devErr : "" });
   try { if (window.EP && EP.navSync) EP.navSync(); } catch(e){}
 }
 async function analyze(){
-  if (window.EP && (EP.DEMO || EP.IMPORT)) { AZ = { state:"read", total: DEMO_PIPS.length }; const b = buildRows(DEMO_DEVICES, DEMO_PIPS); render({ rows: b.rows, egressOnly: b.egressOnly }); return; }
+  if (window.EP && (EP.DEMO || EP.IMPORT)) { AZ = { state:"read", total: DEMO_PIPS.length }; VULNS = { state:"read", by: DEMO_VULNS }; const b = buildRows(DEMO_DEVICES, DEMO_PIPS); render({ rows: b.rows, egressOnly: b.egressOnly }); return; }
   await load(false);
 }
 function __dpInetSummary(){
   if (!M || M.needsDefender) return null;
   const c = { crit:0, high:0, med:0, low:0 }; ROWS.forEach(r => { c[{ critical:"crit", high:"high", medium:"med", low:"low" }[band(X(r).score)]]++; });
-  const top = ROWS.filter(r => X(r).score >= 35).slice(0, 5).map(r => ({ title: r.ip + (r.name ? " (" + r.name + ")" : "") + " — " + (X(r).out >= 3 ? "risky port reachable from the internet" : r.sensor === "nodevice" ? "internet-facing, no Defender device" : "exposed"),
+  const top = ROWS.filter(r => X(r).score >= 35).slice(0, 5).map(r => ({ title: r.ip + (r.name ? " (" + r.name + ")" : "") + " — " + (X(r).confirmed ? "open port runs software with " + r._c.best.cve : X(r).out >= 3 ? "risky port reachable from the internet" : r.sensor === "nodevice" ? "internet-facing, no Defender device" : "exposed"),
     sev: band(X(r).score) === "critical" ? "crit" : "high", impact: r.kind === "machine" ? "machine" : (r.front || "address"), search: r.ip }));
   return { label:"Internet exposure", score:null, grade:"", lead: ROWS.length + " public addresses · " + ROWS.filter(KPI_TEST.nosensor).length + " machines without a Defender sensor", sev:c, top:top,
     totals: { addresses: ROWS.length, noSensor: ROWS.filter(KPI_TEST.nosensor).length, lookedUp: ROWS.filter(r => X(r).lookedUp).length } };
 }
+// What the outside view has for one machine, for the Attack paths page: { ports, cpes } once looked up, else null.
+function __dpInetOutside(name, ip){
+  const n = shortName(name), r = ROWS.find(x => (ip && x.ip === ip) || (n && (shortName(x.device) === n || shortName(x.name) === n)));
+  const l = r ? LOOK[r.ip] : null; return (l && !l.error) ? { ports: l.ports || [], cpes: l.cpes || [] } : null;
+}
 function __dpInetFocus(f){ try { if (!f) return; if (f.kpi && KPI_TEST[f.kpi]) STATE.kpi = f.kpi; if (f.search != null) STATE.q = String(f.search); if (M) render(M); } catch(e){} }
 if (window.EP && EP.DEMO) { try { analyze(); } catch(e){ console.error("[internet exposure demo]", e); } }
 
-;return { load: (typeof analyze === "function") ? analyze : null, summary: (typeof __dpInetSummary === 'function' ? __dpInetSummary : null), focus: (typeof __dpInetFocus === 'function' ? __dpInetFocus : null) };
+;return { load: (typeof analyze === "function") ? analyze : null, summary: (typeof __dpInetSummary === 'function' ? __dpInetSummary : null), focus: (typeof __dpInetFocus === 'function' ? __dpInetFocus : null), outside: (typeof __dpInetOutside === 'function' ? __dpInetOutside : null) };
 })());
 </script>
 <script>
