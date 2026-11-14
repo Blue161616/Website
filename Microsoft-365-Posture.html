@@ -13969,6 +13969,7 @@ function computeUserFlags(u) {
   u.isTier0 = u.writeRoles.some((r) => r.tier === 0);           // Tier-0 = GA-class WRITE role (readers are never tier 0)
   u.standingWrite = u.writeRoles.some((r) => r.kind === "active");  // a WRITE admin held permanently — the risky "standing"
   u.standingRead  = u.readRoles.some((r) => r.kind === "active");
+  u.standingTier0 = hasStandingTier0(u);             // the permanent role is ITSELF Tier-0 (not: a permanent lower role + an eligible Tier-0 one)
   u.standingAdmin = u.standingWrite;                 // "standing" now means standing WRITE admin (used by badges/filters/stats)
   u.topTier = u.writeRoles.length ? Math.min.apply(null, u.writeRoles.map((r) => r.tier)) : (u.readRoles.length ? 2 : null);
   // Approval-gated: the account's most-privileged WRITE role is PIM-eligible AND activating it requires approval (not
@@ -14023,10 +14024,13 @@ function userRisk(u) {
     d.priv += 6;   // a CONFIRMED break-glass Global Admin is standing BY DESIGN — residual target risk only, not a misconfiguration
     reasons.push({ sev: "low", t: "Tier-0 Global Admin — standing by design for a break-glass account; keep credentials offline and alert on every sign-in." });
   } else if (u.isTier0) {
-    const pts = u.standingWrite ? 30 : (u.approvalGated ? 12 : 18);
+    // Standing only when the Tier-0 role itself is permanent. An eligible Tier-0 role beside a permanent LOWER role is
+    // scored as the eligible Tier-0 role, never below what the permanent role alone would score (16).
+    const st0 = hasStandingTier0(u), elig = u.approvalGated ? 12 : 18;
+    const pts = st0 ? 30 : (u.standingWrite ? Math.max(elig, 16) : elig);
     d.priv += pts;
-    reasons.push({ sev: u.standingWrite ? "critical" : (u.approvalGated ? "high" : "critical"),
-      t: u.standingWrite ? "Standing Tier-0 role (permanent, not just-in-time)" : (u.approvalGated ? "Tier-0 role (PIM-eligible — activation requires approval)" : "Tier-0 role (PIM-eligible)") });
+    reasons.push({ sev: st0 ? "critical" : (u.approvalGated ? "high" : "critical"),
+      t: st0 ? "Standing Tier-0 role (permanent, not just-in-time)" : (u.approvalGated ? "Tier-0 role (PIM-eligible — activation requires approval)" : "Tier-0 role (PIM-eligible)") + (u.standingWrite ? ", beside a permanent lower privileged role" : "") });
   } else if (u.hasWriteRole) {
     d.priv += u.standingWrite ? 16 : (u.approvalGated ? 7 : 10);
     reasons.push({ sev: "high", t: u.standingWrite ? "Standing privileged role (permanent)" : (u.approvalGated ? "Privileged role (PIM-eligible — activation requires approval)" : "Privileged role (PIM-eligible)") });
@@ -14069,7 +14073,7 @@ function computeStats() {
     // (Microsoft's guidance), so only it is excluded from the "move to PIM" count. A *suspected* break-glass
     // (an unverified permanent cloud-only GA excluded from CA — e.g. a daily admin account) is a real standing
     // Tier-0 admin and must still count, or CIS 5.3.1 falsely passes "no standing Tier-0 admins" (review R1).
-    standingTier0: u.filter((x) => x.isTier0 && x.standingAdmin && !x.breakGlassConfirmed).length,
+    standingTier0: u.filter(isStandingTier0Exposure).length,
     weakNoMfa: u.filter((x) => x.weakOrNoMfa).length,
     risky: u.filter((x) => x.risk).length,
     notCovered: u.filter((x) => x.notCovered).length,
@@ -14265,6 +14269,14 @@ function compactNotice(html) {
 // read" notice is shown only when at least one member account is synced from on-premises.
 function tenantIsHybrid(users) { return (users || []).some(u => !!(u && u.onPrem)); }
 /* TENANT-HYBRID:END */
+// "Standing Tier-0": a GA-class WRITE role held permanently. It used to be "holds a Tier-0 role AND holds some
+// permanent write role", which also counted an account whose Tier-0 role is PIM-eligible and whose only permanent
+// role is a lower one. The tile, the attack-path funnel, the score and the Command Center total all use this.
+function hasStandingTier0(u) { return ((u && u.writeRoles) || []).some(r => r.tier === 0 && r.kind === "active"); }
+// The accounts the "Standing Tier-0" tile and the funnel's Tier-0 step count: break-glass accounts are left out,
+// because an emergency-access account is meant to hold a permanent Global Administrator role.
+function isStandingTier0Exposure(u) { return !!(u && u.standingTier0 && !u.breakGlass); }
+/* STANDING-T0:END */
 function renderNotices() {
   const n = [];
   if (!MODEL.mfaAvailable) n.push('<div class="notice notice-warn">MFA posture &amp; sign-in staleness not read — grant <code>AuditLog.Read.All</code> (admin consent) to score authentication method and last sign-in per user.' + (MODEL.mfaError ? ' <span class="mono">(' + escapeHtml(MODEL.mfaError) + ')</span>' : "") + '</div>');
@@ -14497,7 +14509,7 @@ const KPI_DEFS = [
     apply: () => { facet.band = { mode: "any", on: { medium: 1 } }; } },
   { id: "standing", grp: 1, label: "Standing Tier-0", sub: "permanent GA-class", kc: "var(--sev-crit)", dot: true,
     tip: "GA-class write roles held permanently rather than activated when needed — no activation step to notice, approve or time-bound. Break-glass accounts are excluded (they are meant to stay permanent). Click to list them.",
-    test: u => u.isTier0 && u.standingWrite && !u.breakGlass,
+    test: isStandingTier0Exposure,
     parts: [ { l: "Weak or no MFA", t: u => !!u.weakOrNoMfa },
              { l: "MFA not enforced", t: u => !!u.notCovered },
              { l: "Stale / never used", t: u => !!u.stale },
@@ -14608,15 +14620,19 @@ function comboLive(u) { return !!u.enabled; }
 const COMBO = [
   { k: "priv", title: "Privileged", icon: "badge", sev: "med",
     why: "Holds at least one privileged directory role. On its own this is an inventory fact — what it turns into depends on everything to its right.",
+    sub: "holds a privileged directory role",
     test: u => u.isAdmin },
   { k: "standing", title: "Standing write role", icon: "lock", sev: "high",
     why: "The role can change things and is held permanently rather than activated when needed. No activation step to notice, approve or time-bound: the privilege is simply always on.",
+    sub: "a write role held permanently",
     test: u => u.standingWrite },
   { k: "tier0", title: "Tier-0 · GA-class", opt: true, icon: "crown", sev: "crit",
-    why: "And that permanent role is GA-class — the top of the directory. This account\'s credential is effectively the tenant\'s credential.",
-    test: u => u.isTier0 },
+    why: "And that permanent role is GA-class — the top of the directory. This account\'s credential is effectively the tenant\'s credential. Break-glass accounts are left out, as on the Standing Tier-0 tile: they are meant to stay permanent.",
+    sub: "the permanent role is GA-class",
+    test: isStandingTier0Exposure },
   { k: "weakmfa", title: "Weak or no MFA", opt: true, icon: "keyoff", sev: "crit",
     why: "And the credential in front of all that is phishable, or is a password on its own. This is the end of the chain and the start of the incident.",
+    sub: "phishable, or a password alone",
     test: u => !!u.weakOrNoMfa }
 ];
 function comboTest(i) { const upto = COMBO.slice(0, i + 1); return u => comboLive(u) && upto.every(c => c.test(u)); }
@@ -14646,6 +14662,7 @@ function renderCombo() {
     let cohort = base;
     const steps = COMBO.map((c, i) => { cohort = cohort.filter(c.test);
       return { c, i, own: base.filter(c.test).length, n: cohort.length }; });
+    const bgOut = base.filter(u => u.isAdmin && u.standingWrite && u.standingTier0 && u.breakGlass).length;   // said on the Tier-0 card
     const width = x => (x ? Math.max(2, Math.round((x / N) * 100)) : 0) + "%";
     let deepest = null; steps.forEach(x => { if (x.n > 0) deepest = x; });
     const last = steps[steps.length - 1];
@@ -14666,7 +14683,7 @@ function renderCombo() {
         + escapeHtml(x.c.why + " — click to scope the table to the " + x.n + " " + acc(x.n) + " carrying this AND every factor to its left.") + '">'
         + '<div class="cstep-head"><span class="cstep-ico">' + CICON[x.c.icon] + '</span><div class="cstep-title">' + escapeHtml(x.c.title) + (x.c.opt ? '<span class="cstep-tag">escalator</span>' : "") + '</div><span class="cstep-n" title="' + x.n + " " + acc(x.n) + ' carry this factor AND every factor to its left (the narrowing chain)">' + x.n + "</span></div>"
         + '<div class="cstep-track"><i style="--w:' + width(x.n) + '"></i></div>'
-        + '<div class="cstep-sub" title="The big number is how many accounts pass this step AND every step to its left (the narrowing chain). This line is how many carry this one factor in total, chain aside.">' + x.own + " " + (x.own === 1 ? "has" : "have") + " this factor in total</div></div>";
+        + '<div class="cstep-sub" title="The number is how many accounts pass this step AND every step to its left (the narrowing chain). How many carry this one factor on its own is on the tiles above.">' + escapeHtml(x.c.sub || "") + (x.c.k === "tier0" && bgOut ? "<br>" + bgOut + " confirmed or suspected break-glass left out" : "") + "</div></div>";
     });
     host.innerHTML = html;
     // ---- the funnel: the same five columns as the cards, narrowing at each card's centre (x = 10 %, 30 %, 50 %,
@@ -14979,7 +14996,7 @@ function userDetailHtml(u) {
   const rem = [];
   if (u.weakOrNoMfa) rem.push("Register / enforce a phishing-resistant method (FIDO2 security key, Windows Hello, or passkey) for this account.");
   if (u.notCovered) rem.push("Bring this account into an enforcing Conditional Access policy requiring phishing-resistant MFA" + (u.caCovered === "excluded" ? " and remove it from the policy exclusion list." : "."));
-  if (u.isTier0 && u.standingWrite) rem.push("Convert the standing Tier-0 assignment to PIM-eligible (just-in-time) with approval + phishing-resistant MFA on activation.");
+  if (u.standingTier0) rem.push("Convert the standing Tier-0 assignment to PIM-eligible (just-in-time) with approval + phishing-resistant MFA on activation.");
   else if (u.standingWrite) rem.push("Move the permanent privileged assignment to PIM-eligible (just-in-time) where the role permits.");
   else if (u.standingRead) rem.push("Standing read-only role (e.g. Global Reader) — lower priority, but move to PIM-eligible if the broad read access isn't needed permanently.");
   if (u.risk) rem.push("Investigate and remediate the Identity Protection risk (" + escapeHtml(u.risk.level) + " · " + escapeHtml(u.risk.state) + ") — confirm compromise or dismiss as safe.");
@@ -16964,7 +16981,8 @@ EP.registerView("workload", (function () {
       h = '<span class="lic-chip" title="' + escHtml('Microsoft Entra Workload ID licence: ' + b.sku + ' / ' + b.plan + ', ' + String(b.status) + ', ' + b.enabled + ' unit' + (b.enabled === 1 ? '' : 's') + ' (' + b.consumed + ' assigned). Premium is tenant-level, so an unassigned unit still unlocks risky workload identities and Conditional Access for workload identities.') + '">\u2713 Workload ID licence: present</span>';
     } else if(L && L.available === false){
       var stale = L.best ? ' A <code>' + escHtml(L.best.sku) + '</code> SKU exists but is ' + escHtml(L.best.status || 'not active') + (L.best.enabled ? '' : ' with 0 units') + '.' : '';
-      h = '<div class="notice notice-warn"><b>Microsoft Entra Workload ID licence: not found</b> — no active Workload ID Premium SKU (<code>AAD_WRKLDID_P2</code>) in this tenant.' + stale + ' <b>Risky workload identities</b> read only partial data without this licence (ID Protection returns limited risk for service principals), so the "At risk" count is a floor, not the full picture. <b>Conditional Access coverage</b> of eligible single-tenant SPs is still shown from the policies you can read — but <i>creating</i> workload-identity CA policies needs this licence. Everything else on this page is built from consent and credential data and is unaffected.</div>';
+      // One sentence on the page; the SKU detail is in the tooltip.
+      h = '<div class="notice notice-warn" title="' + escHtml('No active Workload ID Premium SKU (AAD_WRKLDID_P2) in this tenant.' + stale.replace(/<[^>]+>/g, '') + ' ID Protection returns only limited risk for service principals without it. Conditional Access coverage is still shown from the policies that can be read, and everything else on this page is unaffected.') + '"><b>Workload ID Premium is not licensed</b>, so the "At risk" count is a floor and Conditional Access policies for workload identities cannot be created.</div>';
     } else {
       h = '<div class="notice notice-info"><b>Microsoft Entra Workload ID licence: not checked</b> — grant <code>Organization.Read.All</code> (admin consent) to this app registration to read the tenant\'s subscribed SKUs.' + (L && L.error ? ' <span class="mono">(' + escHtml(L.error) + ')</span>' : '') + '</div>';
     }
