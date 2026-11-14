@@ -4727,6 +4727,27 @@
 #view-data .m-fix b { color:var(--green); font-weight:700; }
 #view-data .m-src { font-size:11px; color:var(--muted); margin-top:5px; }
 #view-data .m-note { color:var(--muted); font-size:13px; padding:18px; border:1px dashed var(--border); border-radius:11px; line-height:1.55; }
+#view-data #labels { max-width:1040px; padding:0 2px 34px; }
+#view-data .lb-h { font-size:11px; font-weight:800; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); margin:6px 0 8px; }
+#view-data .lb-sum { font-size:13px; color:var(--text); margin:0 0 10px; }
+#view-data .lb-wrap { border:1px solid var(--border); border-radius:11px; overflow:hidden; }
+#view-data .lb-tbl { width:100%; border-collapse:collapse; font-size:12.5px; }
+#view-data .lb-tbl th { text-align:left; font-size:9px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); padding:8px 12px; background:rgba(127,127,127,.05); white-space:nowrap; }
+#view-data .lb-tbl td { padding:9px 12px; border-top:1px solid var(--border); vertical-align:middle; color:var(--text); }
+#view-data .lb-n { font-weight:650; }
+#view-data .lb-sub { color:var(--muted); margin:0 7px 0 10px; }
+#view-data .lb-p { font-variant-numeric:tabular-nums; color:var(--muted); }
+#view-data .lb-mu { color:var(--muted); }
+#view-data .lb-off td { opacity:.55; }
+#view-data .lb-w { display:inline-block; font-size:10.5px; padding:1px 8px; border:1px solid var(--border); border-radius:999px; margin:0 5px 0 0; color:var(--muted); white-space:nowrap; }
+#view-data .lb-enc { font-size:10.5px; font-weight:700; padding:2px 8px; border-radius:6px; white-space:nowrap; }
+#view-data .lb-enc.on { color:var(--green); background:color-mix(in srgb,var(--green) 14%,transparent); }
+#view-data .lb-enc.off { color:var(--muted); background:color-mix(in srgb,var(--muted) 12%,transparent); }
+#view-data .lb-enc.na { color:var(--muted); border:1px dashed var(--border); }
+#view-data .lb-tag { font-size:9.5px; font-weight:700; padding:1px 6px; border-radius:5px; margin-left:6px; color:var(--blue,#3FA9FF); border:1px solid color-mix(in srgb,var(--blue,#3FA9FF) 40%,transparent); white-space:nowrap; }
+#view-data .lb-tag.off { color:var(--muted); border-color:var(--border); }
+#view-data .lb-note { margin-top:10px; font-size:11.5px; color:var(--muted); border-left:2px solid var(--border); padding:4px 0 4px 12px; line-height:1.55; }
+#view-data .lb-btn { display:inline-block; margin-left:8px; padding:3px 11px; border:1px solid var(--blue,#3FA9FF); border-radius:7px; color:var(--blue,#3FA9FF); cursor:pointer; font-weight:700; white-space:nowrap; }
 /* ================= view: m365alerts ================= */
 #view-m365alerts #results { padding: 4px 2px 24px; }
 #view-m365alerts .dp-band { display:flex; align-items:center; gap:14px; margin:6px 0 16px; }
@@ -5740,6 +5761,7 @@ where:
   <section class="ep-view" id="view-data">
 <section id="results">
   <div class="m-wrap" id="content"><div class="m-note">Data &amp; Purview posture loads here.</div></div>
+  <div id="labels"></div>
 </section>
 
 </section>
@@ -6430,7 +6452,8 @@ window.EP = (function () {
     ["ThreatHunting.Read.All", "Defender device onboarding, exposure, sensor health, hardware/firmware (advanced hunting)", "endpoint: devices · hardening · vuln"],
     // Apps & Data (M365) pillar — Secure Score backbone + direct workload settings
     ["SecurityEvents.Read.All", "Microsoft Secure Score + control profiles (M365 workloads, device hardening)", "data: all · endpoint: hardening"],
-    ["SharePointTenantSettings.Read.All", "SharePoint/OneDrive tenant sharing settings", "data: sharepoint"]
+    ["SharePointTenantSettings.Read.All", "SharePoint/OneDrive tenant sharing settings", "data: sharepoint"],
+    ["SensitivityLabel.Read", "Sensitivity labels: name, scope and whether a label encrypts", "data: purview"]
     // Teams and Purview detail is not read from Graph: it comes from Secure Score + the consultant collection, so no
     // Teamwork / InformationProtectionPolicy scope is requested (least privilege — ask only for what is called).
   ];
@@ -35877,6 +35900,99 @@ EP.registerView("data", (function () {
     return out;
   }
 
+  // ── Sensitivity labels (Microsoft Graph, optional read-only scope) ──────────────────────────────────────────
+  // GET /security/dataSecurityAndGovernance/sensitivityLabels with SensitivityLabel.Read. It gives each label's name,
+  // priority, sub-labels, where it applies and WHETHER it encrypts (hasProtection). It does not give the encryption
+  // settings (who, which rights, expiry), content marking or the label policies: those are in Purview PowerShell.
+  // With a delegated sign-in Graph can return only the labels published to the signed-in account; the page says so.
+  var LBL_SCOPE = "SensitivityLabel.Read";
+  var LBL_WHERE = { file: "Files", email: "Email", teamwork: "Teams", site: "Sites", unifiedgroup: "Groups", schematizeddata: "Data assets" };
+  var _labels = { state: "none" };   // none | reading | read | noconsent | error
+  // One row per label, sub-labels right after their parent, least sensitive first (priority ascending).
+  // encrypted is true / false / null — null when Graph did not report it, never assumed.
+  function flattenLabels(list) {
+    var out = [];
+    var one = function (l, parent) {
+      var where = String(l.applicableTo || "").split(",").map(function (x) { return x.trim(); }).filter(Boolean)
+        .map(function (x) { return LBL_WHERE[x.toLowerCase()] || x; });
+      out.push({ id: l.id || "", name: l.name || l.displayName || "(unnamed label)", parent: parent || null,
+        priority: typeof l.priority === "number" ? l.priority : null, enabled: l.isEnabled !== false,
+        encrypted: l.hasProtection === true ? true : l.hasProtection === false ? false : null,
+        where: where, mode: String(l.applicationMode || l.actionSource || "").toLowerCase() || null,
+        isDefault: l.isDefault === true, endpoint: l.isEndpointProtectionEnabled === true,
+        tip: l.description || l.toolTip || "" });
+    };
+    var byPrio = function (a, b) { return ((a.priority == null ? 1e9 : a.priority) - (b.priority == null ? 1e9 : b.priority)) || String(a.name || "").localeCompare(String(b.name || "")); };
+    (list || []).slice().sort(byPrio).forEach(function (l) {
+      one(l, null);
+      (l.sublabels || []).slice().sort(byPrio).forEach(function (s) { one(s, l.name || l.displayName || ""); });
+    });
+    return out;
+  }
+  /* LABELS-FLAT:END */
+  var DEMO_LABELS = [
+    { id: "l1", name: "Public", priority: 0, isEnabled: true, hasProtection: false, applicableTo: "email,file", applicationMode: "manual", description: "Approved for anyone outside the organisation." },
+    { id: "l2", name: "General", priority: 1, isEnabled: true, hasProtection: false, isDefault: true, applicableTo: "email,teamwork,file", applicationMode: "manual", description: "Business data, not for public use." },
+    { id: "l3", name: "Confidential", priority: 2, isEnabled: true, hasProtection: false, applicableTo: "email,teamwork,file,site,unifiedGroup", applicationMode: "manual", description: "Sensitive business data.",
+      sublabels: [
+        { id: "l3a", name: "All Employees", priority: 3, isEnabled: true, hasProtection: true, applicableTo: "email,file", applicationMode: "manual", description: "Encrypted; all employees have access." },
+        { id: "l3b", name: "Recipients Only", priority: 4, isEnabled: true, hasProtection: true, applicableTo: "email", applicationMode: "manual", description: "Encrypted; only the recipients can open it." } ] },
+    { id: "l4", name: "Highly Confidential", priority: 5, isEnabled: true, hasProtection: true, isEndpointProtectionEnabled: true, applicableTo: "email,file,site", applicationMode: "automatic", description: "Regulated or board-level data." },
+    { id: "l5", name: "Legacy Restricted", priority: 6, isEnabled: false, hasProtection: true, applicableTo: "file", applicationMode: "manual", description: "Replaced by Highly Confidential." }
+  ];
+  async function readLabels(interactive) {
+    var tok = null;
+    try { tok = interactive ? await EP.token([LBL_SCOPE]) : await EP.tokenOptional([LBL_SCOPE]); }
+    catch (e) { _labels = { state: "noconsent", err: (e && e.message) || String(e) }; return; }
+    if (!tok) { _labels = { state: "noconsent" }; return; }
+    try {
+      var all = [], next = "https://graph.microsoft.com/v1.0/security/dataSecurityAndGovernance/sensitivityLabels", pages = 0;
+      while (next && pages++ < 10) {
+        if (next.indexOf("https://graph.microsoft.com/") !== 0) break;
+        var r = await fetch(next, { headers: { Authorization: "Bearer " + tok } });
+        if (!r.ok) { var m = ""; try { m = ((await r.json()).error || {}).message || ""; } catch (e2) {} throw new Error("Graph " + r.status + (m ? " — " + m : "")); }
+        var j = await r.json(); all = all.concat(j.value || []); next = j["@odata.nextLink"] || null;
+      }
+      _labels = { state: "read", rows: flattenLabels(all) };
+    } catch (e) { _labels = { state: "error", err: (e && e.message) || String(e) }; }
+  }
+  function labelsHtml() {
+    var L = _labels, head = '<div class="lb-h">Sensitivity labels</div>';
+    if (L.state === "none") return "";
+    if (L.state === "reading") return head + ((window.EP && EP.skeleton) ? EP.skeleton("Reading the sensitivity labels from Microsoft Graph…") : '<div class="m-note">Reading the sensitivity labels…</div>');
+    if (L.state === "noconsent") return head + '<div class="m-note"><b>Sensitivity labels were not read.</b> This sign-in has no consent for <code>' + LBL_SCOPE + '</code>, a read-only Microsoft Graph permission, so the labels and whether they encrypt are unknown here.'
+      + ' <span class="lb-btn" role="button" tabindex="0" data-lb-read="1">Read the labels</span>' + (L.err ? '<br><span style="color:var(--amber)">' + esc(L.err) + '</span>' : '') + '</div>';
+    if (L.state === "error") return head + '<div class="m-note"><b>Sensitivity labels could not be read.</b> ' + esc(L.err || "") + ' <span class="lb-btn" role="button" tabindex="0" data-lb-read="1">Try again</span></div>';
+    var rows = L.rows || [];
+    if (!rows.length) return head + '<div class="m-note"><b>No sensitivity labels were returned.</b> Graph lists the labels available to the signed-in account, so this means none is published to it; it does not prove the tenant has none.</div>';
+    var enc = rows.filter(function (r) { return r.encrypted === true; }).length, unk = rows.filter(function (r) { return r.encrypted === null; }).length;
+    var def = rows.filter(function (r) { return r.isDefault; })[0];
+    var sum = rows.length + ' label' + (rows.length === 1 ? '' : 's') + ' · ' + (unk === rows.length ? 'encryption not reported by Graph' : enc + ' appl' + (enc === 1 ? 'ies' : 'y') + ' encryption')
+      + (def ? ' · default: ' + esc(def.name) : '');
+    var MODE = { manual: "Applied by users", automatic: "Applied automatically", recommended: "Recommended to users" };
+    var body = rows.map(function (r) {
+      var e = r.encrypted === true ? '<span class="lb-enc on" title="The label has protection actions: content is encrypted when it is applied.">Encrypted</span>'
+            : r.encrypted === false ? '<span class="lb-enc off">No encryption</span>'
+            : '<span class="lb-enc na" title="Graph did not report whether this label has protection. Unknown, not unencrypted.">not reported</span>';
+      return '<tr' + (r.enabled ? '' : ' class="lb-off"') + '>'
+        + '<td class="lb-n"' + (r.tip ? ' title="' + esc(r.tip) + '"' : '') + '>' + (r.parent ? '<span class="lb-sub">↳</span>' : '') + esc(r.name)
+          + (r.isDefault ? ' <span class="lb-tag">default</span>' : '') + (r.enabled ? '' : ' <span class="lb-tag off">disabled</span>') + '</td>'
+        + '<td class="lb-p">' + (r.priority == null ? '—' : r.priority) + '</td>'
+        + '<td>' + (r.where.length ? r.where.map(function (w) { return '<span class="lb-w">' + esc(w) + '</span>'; }).join("") : '<span class="lb-mu">—</span>') + '</td>'
+        + '<td>' + e + (r.endpoint ? ' <span class="lb-tag" title="Endpoint data loss prevention applies to content with this label.">endpoint DLP</span>' : '') + '</td>'
+        + '<td class="lb-mu">' + esc(MODE[r.mode] || '—') + '</td></tr>';
+    }).join("");
+    return head + '<div class="lb-sum">' + sum + '</div>'
+      + '<div class="lb-wrap"><table class="lb-tbl"><thead><tr><th>Label</th><th title="Higher number = more sensitive">Priority</th><th>Applies to</th><th>Encryption</th><th>How it is applied</th></tr></thead><tbody>' + body + '</tbody></table></div>'
+      + '<div class="lb-note">' + (EP.DEMO ? '<b>Demo data.</b> ' : '<b>Read-only, from Microsoft Graph.</b> ') + 'Graph lists the labels available to the signed-in account, so labels published only to other people may be missing. '
+      + 'It says <i>whether</i> a label encrypts, not how: who gets access, which rights, expiry, content marking and the label policies are in Purview and not in this read.</div>';
+  }
+  function paintLabels() { var h = document.getElementById("labels"); if (h) h.innerHTML = labelsHtml(); }
+  document.addEventListener("click", function (e) {
+    var b = e.target && e.target.closest ? e.target.closest("[data-lb-read]") : null; if (!b) return;
+    _labels = { state: "reading" }; paintLabels(); readLabels(true).then(paintLabels);
+  });
+
   function render(list) {
     var c = document.getElementById("content"); if (!c) return;
     if (!list) {
@@ -35889,8 +36005,11 @@ EP.registerView("data", (function () {
   }
 
   async function analyze() {
-    if (EP.DEMO) { _collected = true; _dataGov = DEMO_DATAGOV; _state = DEMO.concat(_dataGovFindings()); render(_state); return; }
+    if (EP.DEMO) { _collected = true; _dataGov = DEMO_DATAGOV; _state = DEMO.concat(_dataGovFindings()); render(_state);
+      _labels = { state: "read", rows: flattenLabels(DEMO_LABELS) }; paintLabels(); return; }
     render(null);
+    // The labels are their own read: silent only, never a consent popup by itself, and it does not hold up the rest.
+    _labels = { state: "reading" }; paintLabels(); readLabels(false).then(paintLabels);
     try {
       var rows = await M365LIVE.fromSecureScore(function (n, t, c) { return c === "data" || /\bdlp\b|sensitivity label|auto.?label|information protection|purview|retention/.test(t); });
       var cr = await M365LIVE.collect("data");   // deep policy detail from the consultant PowerShell collection, if present
