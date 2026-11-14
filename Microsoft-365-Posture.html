@@ -6669,7 +6669,7 @@ window.EP = (function () {
     const g = tabGroupOf(name), parts = [];
     if (name === "suite") parts.push("Command Center");
     else {
-      parts.push((PILLARS[PILLAR] || {}).label || "");
+      parts.push((PILLARS[NAVP] || {}).label || "");
       if (g) { parts.push(g.title); parts.push((g.tabs.find(t => t[0] === name) || [])[1] || ""); }
       else parts.push(VIEW_TITLES[name] || "");
     }
@@ -6683,29 +6683,36 @@ window.EP = (function () {
     host.innerHTML = g.tabs.map(t => '<button role="tab" data-tab="' + esc(t[0]) + '" aria-selected="' + (t[0] === name) + '"' + (t[0] === name ? ' class="on"' : '') + '>' + esc(t[1]) + '</button>').join("");
     host.hidden = false;
   }
-  // Menu badges. A page's badge is its open critical + high findings, read from the page's OWN summary — only once
-  // that page has been collected (never a guess, and reading a summary collects nothing). A pillar tile carries the
-  // grade the Command Center roll-up computed for it.
+  // Menu badges. A page's badge is its critical + high findings, read from the page's OWN summary — only once that
+  // page has been collected (never a guess, and reading a summary collects nothing). Findings accepted as a risk are
+  // still counted: the badge is what the page shows, the exceptions ledger is on the Command Center. A pillar tile
+  // carries that pillar's grade, recomputed here from the same summaries (once the roll-up has run), so it follows a
+  // re-scan or a newly loaded collection. Runs when data changes — a view finished loading, an overview or the
+  // roll-up painted — not on every navigation.
   let _navT = null;
   function navSyncSoon() { clearTimeout(_navT); _navT = setTimeout(navSync, 350); }
   function navSync() {
+    const S = {};   // one summary() call per view per sync
+    const sum = name => { if (name in S) return S[name]; let r = null; const v = views[name];
+      try { if (v && typeof v.summary === "function" && (DEMO || v.loaded)) r = v.summary(); } catch (e) { r = null; }
+      return (S[name] = r); };
     document.querySelectorAll(".ep-pillar-nav button.nav[data-view]").forEach(b => {
       const name = b.dataset.view; let c = null;
-      if (name !== "overview" && name !== "suite") {
-        const v = views[name];
-        try { if (v && typeof v.summary === "function" && (DEMO || v.loaded)) c = ovCounts(v.summary()); } catch (e) { c = null; }
-      }
+      if (name !== "overview" && name !== "suite") { try { c = ovCounts(sum(name)); } catch (e) { c = null; } }
       const crit = c ? (+c.critical || 0) : 0, high = c ? (+c.high || 0) : 0, n = crit + high;
       let el = b.querySelector(".nav-n");
       if (!n) { if (el) el.remove(); return; }
       if (!el) { el = document.createElement("span"); b.appendChild(el); }
       el.className = "nav-n" + (crit ? "" : " high");
       el.textContent = n > 99 ? "99+" : String(n);
-      el.title = crit + " critical · " + high + " high open finding" + (n === 1 ? "" : "s");
+      el.title = crit + " critical · " + high + " high finding" + (n === 1 ? "" : "s") + " on this page (accepted risks included)";
     });
     SUITE_PILLARS.forEach(p => {
       const b = document.querySelector('.ep-pillar[data-pillar="' + p.key + '"]'); if (!b) return;
-      const pd = _suiteState && _suiteState.pillars && _suiteState.pillars[p.key], o = pd && pd.overall;
+      let o = null;
+      if (_suiteState && _suiteState.pillars && _suiteState.pillars[p.key]) {
+        try { const data = {}; (PILLAR_REPORT_VIEWS[p.key] || []).forEach(v => { data[v.name] = sum(v.name); }); o = pillarOverallFrom(p.key, data); } catch (e) { o = null; }
+      }
       const grade = o && o.grade && /^[A-F]$/.test(o.grade) ? o.grade : null;
       let el = b.querySelector(".pg");
       if (!grade) { if (el) el.remove(); b.title = p.label; return; }
@@ -6714,18 +6721,27 @@ window.EP = (function () {
       b.title = p.label + " — grade " + grade + " · exposure " + o.score + "/100 · " + (o.crit || 0) + " critical · " + (o.high || 0) + " high";
     });
   }
-  // usePillar switches the pillar context + menu; setPillar also lands on that pillar's first page.
-  function usePillar(p) {
-    if (!PILLARS[p]) p = "identity";
-    PILLAR = p;
-    REPORT_VIEWS = PILLAR_REPORT_VIEWS[p] || PILLAR_REPORT_VIEWS.identity;   // Overview / Fix-first / Report domains
-    OV_EXP = PILLAR_OV_EXP[p] || PILLAR_OV_EXP.identity;                      // exposure bars
-    _ovState = null; _ovRetried = 0;                                         // re-gather the overview for this pillar
+  // PILLAR is the data context (which domains the Overview, Fix-first and Report read); NAVP is the menu on screen.
+  // They differ only on the Framework tabs: those live in the Command Center menu, but each tab is one pillar's
+  // scorecard and runs in that pillar's context (so Report there is that pillar's report).
+  const FW_CTX = { framework: "identity", epframework: "endpoint", adframework: "data" };
+  let NAVP = "suite", _lastPillar = "identity";
+  function setNav(p) {
+    NAVP = p;
     document.querySelectorAll("button[data-pillar]").forEach(b => {
       const on = b.dataset.pillar === p;
       b.classList.toggle("on", on); b.setAttribute("aria-selected", on ? "true" : "false");
     });
     document.querySelectorAll(".ep-pillar-nav").forEach(n => { n.hidden = n.dataset.pillar !== p; });
+  }
+  // usePillar switches the pillar context + menu; setPillar also lands on that pillar's first page.
+  function usePillar(p) {
+    if (!PILLARS[p]) p = "identity";
+    PILLAR = p; if (PILLAR_REPORT_VIEWS[p]) _lastPillar = p;
+    REPORT_VIEWS = PILLAR_REPORT_VIEWS[p] || PILLAR_REPORT_VIEWS.identity;   // Overview / Fix-first / Report domains
+    OV_EXP = PILLAR_OV_EXP[p] || PILLAR_OV_EXP.identity;                      // exposure bars
+    _ovState = null; _ovRetried = 0;                                         // re-gather the overview for this pillar
+    setNav(p);
   }
   function setPillar(p) {
     if (!PILLARS[p]) p = "identity";
@@ -6763,13 +6779,16 @@ window.EP = (function () {
     active = name;
     try { dockSync(); } catch (e) {}   // hide the dock on the Ask page / connect screen, show it elsewhere
     try { breakGlassBarSync(); } catch (e) {}
-    const own = ownerOf(name); if (own && own !== PILLAR) usePillar(own);   // the menu follows the page
+    // The menu and the data context follow the page. The shared Overview belongs to a real pillar: reached while the
+    // context is the Command Center (Ask, Licensing), it opens the pillar last worked in instead of an empty page.
+    const own = ownerOf(name), ctx = FW_CTX[name] || own;
+    if (name === "overview") { if (!PILLAR_REPORT_VIEWS[PILLAR]) usePillar(_lastPillar); else if (NAVP !== PILLAR) setNav(PILLAR); }
+    else { if (ctx && ctx !== PILLAR) usePillar(ctx); if (own && own !== NAVP) setNav(own); }
     const navKey = navKeyOf(name);
     document.querySelectorAll(".ep-nav button.nav").forEach(b => b.classList.toggle("on", b.dataset.view === navKey));
     $("epViewTitle").innerHTML = viewCrumb(name) || "Microsoft 365 Posture";
     const signedOut = !DEMO && !account && !IMPORTED;
     tabsSync(name, !signedOut);
-    navSyncSoon();
     if (signedOut) { $("epConnect").style.display = ""; document.querySelectorAll(".ep-view").forEach(v => v.classList.remove("on")); return; }
     $("epConnect").style.display = "none";
     document.querySelectorAll(".ep-view").forEach(v => v.classList.toggle("on", v.id === "view-" + name));
@@ -12166,6 +12185,18 @@ window.M365LIVE = (function () {
     }
     return null;
   }
+  // Where a domain's DMARC policy can come from: its own record, then its parents inside the organisation's own
+  // domain — never a registry suffix (co.uk, com.au …) and never onmicrosoft.com. Same rule as the collector.
+  function _dmarcCandidates(name) {
+    const labels = String(name || "").toLowerCase().split("."), out = [labels.join(".")];
+    for (let i = 1; i < labels.length - 1; i++) {
+      const cand = labels.slice(i).join(".");
+      if (cand === "onmicrosoft.com" || /^(co|com|org|net|gov|ac|edu|or|ne|go|gv|ltd|plc|sch|nhs|mil|nom|me)\.[a-z]{2}$/.test(cand)) break;
+      out.push(cand);
+    }
+    return out;
+  }
+  /* DMARC-CAND:END */
   // Resolve SPF / DKIM / DMARC for a set of domains ({name,managed} or bare strings). ok:true/false/null (null = lookup error).
   async function emailAuth(domains) {
     const list = [];
@@ -12180,11 +12211,16 @@ window.M365LIVE = (function () {
           rec.spf = { ok: (q === "-" || q === "~"), state: q === "-" ? "-all (strict)" : q === "~" ? "~all (soft)" : (q || "no ") + "all", record: spf }; }
       } catch (e) { rec.spf = { ok: null, state: "lookup error" }; }
       try {
-        const txt = await _doh("_dmarc." + d.name, "TXT");
-        const dm = txt.find(x => /^v=DMARC1/i.test(x));
+        let dm = null, from = d.name;
+        for (const cand of _dmarcCandidates(d.name)) {
+          dm = (await _doh("_dmarc." + cand, "TXT")).find(x => /^\s*v=DMARC1/i.test(x));
+          if (dm) { from = cand; break; }
+        }
         if (!dm) rec.dmarc = { ok: false, policy: null, state: "missing" };
-        else { const p = (dm.match(/\bp\s*=\s*([a-z]+)/i) || [, "none"])[1].toLowerCase();
-          rec.dmarc = { ok: (p === "reject" || p === "quarantine"), policy: p, state: "p=" + p, record: dm }; }
+        else { const tag = k => { const m = dm.match(new RegExp("(?:^|;)\\s*" + k + "\\s*=\\s*([^;\\s]+)", "i")); return m ? m[1] : null; };
+          const p = String((from !== d.name && tag("sp")) || tag("p") || "none").toLowerCase(), pct = tag("pct");
+          rec.dmarc = { ok: (p === "reject" || p === "quarantine"), policy: p, state: "p=" + p, record: dm,
+            pct: /^\d+$/.test(pct || "") ? +pct : 100, rua: !!tag("rua"), inherited: from !== d.name ? from : null }; }
       } catch (e) { rec.dmarc = { ok: null, policy: null, state: "lookup error" }; }
       // A *.onmicrosoft.com domain is Microsoft's own zone: Microsoft signs its mail with DKIM automatically and the
       // customer cannot publish selector records there, so there is nothing to look up or to flag.
@@ -28547,7 +28583,7 @@ let STATE = { segment:"computer", view:"device", q:"", sev:"", sortCol:"sync", s
 //   Entra = identity/inventory · Intune = compliance enforcement · Defender = protection (EDR).
 const KPI_TEST = {
   unprot:    d => HASMDE && d.entra && d.mde === 0 && d.platform === "computer",   // no Defender sensor → unprotected (EDR blind) — computers only
-  sensorbad: d => HASMDE && d.entra && sensorUnhealthy(d),                         // onboarded but sensor not reporting → EDR blind
+  sensorbad: d => (HASMDE || d.mdeSrc === "intune") && d.entra && sensorUnhealthy(d),                         // onboarded but sensor not reporting → EDR blind
   unmanaged: d => d.entra && d.intune === 0,                                       // no Intune → no compliance enforcement
   excluded:  d => d.entra && isExcluded(d),                                        // excluded from TVM → missing from Hardening / Vulnerabilities
   stale:     d => !!d.stale,                                                       // posture signals too old to trust
@@ -28617,6 +28653,17 @@ function intuneDefenderEvidence(state){
   if (s === "unresponsive") return { mde: 1, sensorHealth: "Unresponsive (reported to Intune)" };
   return { mde: null, sensorHealth: "" };
 }
+// Why the advanced-hunting read failed, from the error itself — so the page never blames consent for a network
+// error or an expired session. http = Graph answered with an error; consent = the scope is not granted; token = no
+// token without a new sign-in / consent; network = the request never reached Graph.
+function huntFailKind(e){
+  if (e && e.status) return "http";
+  const s = String((e && (e.errorCode || e.name)) || "") + " " + String((e && e.message) || "");
+  if (/consent_required|AADSTS65001/i.test(s)) return "consent";
+  if (/failed to fetch|networkerror|load failed|network request/i.test(s)) return "network";
+  if (/interaction_required|login_required|no_account|silent|token|popup/i.test(s)) return "token";
+  return "unknown";
+}
 /* COV-INTUNE-EVIDENCE:END */
 // Which Defender endpoint plan the tenant holds, from its licences — only to explain WHY hunting is unavailable.
 async function defenderPlan(){
@@ -28637,7 +28684,10 @@ function mdeWhy(D){
   if (p && !p.p2 && (p.mdb || p.p1))
     return "This tenant is licensed for " + (p.mdb ? "Microsoft Defender for Business (Microsoft 365 Business Premium)" : "Defender for Endpoint Plan 1") + ", which does not include advanced hunting — the only Defender device source a browser can read." + via + " The device inventory in the Defender portal is the complete list.";
   if (w.kind === "consent") return "ThreatHunting.Read.All has not been granted to this app, so Defender device data could not be read." + via;
-  return "Advanced hunting could not be read" + (w.status ? " (HTTP " + w.status + (w.msg ? " — " + w.msg : "") + ")" : (w.msg ? " (" + w.msg + ")" : "")) + ". Defender for Business and Defender for Endpoint Plan 1 do not include it." + via;
+  if (w.kind === "token") return "A token for ThreatHunting.Read.All could not be obtained without a new sign-in or consent, so Defender device data could not be read." + via;
+  if (w.kind === "network") return "The advanced-hunting request did not reach Microsoft Graph (network error), so Defender device data could not be read this time." + via;
+  if (w.kind === "http") return "Advanced hunting could not be read (HTTP " + w.status + (w.msg ? " — " + w.msg : "") + "). Defender for Business and Defender for Endpoint Plan 1 do not include it." + via;
+  return "Advanced hunting could not be read" + (w.msg ? " (" + w.msg + ")" : "") + "." + via;
 }
 // Real device criticality from Exposure Management (ExposureGraphNodes), keyed on rawData.deviceName. Sets each
 // device's assetValue (level label) + roles (classification rules). Optional; no crowns if unavailable.
@@ -28662,7 +28712,7 @@ async function collect(){
   catch(e){ try { intune = await gGetAll(MD + "&$top=200", ["DeviceManagementManagedDevices.Read.All"]); } catch(e2){ intune = []; } }
   let machines = null, huntWhy = null, mdePlan = null;
   try { machines = await huntOnboarding(); }
-  catch(e){ machines = null; huntWhy = { kind: (e && e.status) ? "http" : "consent", status: (e && e.status) || null, msg: String((e && e.message) || "").slice(0, 160) }; mdePlan = await defenderPlan(); }
+  catch(e){ machines = null; huntWhy = { kind: huntFailKind(e), status: (e && e.status) || null, msg: String((e && e.message) || "").slice(0, 160) }; mdePlan = await defenderPlan(); }
   const inByAad = {}; intune.forEach(d => { const k = String(d.azureADDeviceId||"").toLowerCase(); if (k) inByAad[k] = d; });
   const mdeByAad = {}, mdeByName = {};
   if (machines) machines.forEach(m => { const k = String(m.AadDeviceId||"").toLowerCase(); if (k) mdeByAad[k] = m; const nk = normName(m.DeviceName); if (nk && !mdeByName[nk]) mdeByName[nk] = m; });
@@ -28704,7 +28754,7 @@ function covWeight(d){
   return w;
 }
 function buildGaps(devices, hasMde){
-  return GAPS.filter(g => hasMde || !g.mde).map(g => { const ds = devices.filter(g.test); return { key:g.key, sev:g.sev, title:g.title, fix:g.fix, devices:ds, count:ds.length }; })
+  return GAPS.filter(g => hasMde || !g.mde || (g.key === "sensorunhealthy" && devices.some(g.test))).map(g => { const ds = devices.filter(g.test); return { key:g.key, sev:g.sev, title:g.title, fix:g.fix, devices:ds, count:ds.length }; })
     .filter(g => g.count > 0);
 }
 // mobile=true uses MOBILE_COMBOS (Entra · Intune only, no Defender dimension).
@@ -29030,7 +29080,8 @@ function render(D){
   // Four risk-based KPIs, each a clickable filter into the device table. Ordered by risk:
   // unprotected (no EDR) → unmanaged (no compliance) → stale → the healthy baseline. On Mobile the EDR tile is N/A.
   const kUnprot = (HASMDE && !mobile) ? SEGDEVS.filter(KPI_TEST.unprot).length : null;
-  const kSensorBad = (HASMDE && !mobile) ? SEGDEVS.filter(KPI_TEST.sensorbad).length : null;
+  // Without advanced hunting the count covers only devices Intune reports on: show it when there is one, never as "0".
+  const kSensorBad = mobile ? null : (HASMDE ? SEGDEVS.filter(KPI_TEST.sensorbad).length : (SEGDEVS.filter(KPI_TEST.sensorbad).length || null));
   const kExcluded  = (HASMDE && !mobile) ? SEGDEVS.filter(KPI_TEST.excluded).length : null;
   const kUnmanaged = SEGDEVS.filter(KPI_TEST.unmanaged).length;
   const kStale = SEGDEVS.filter(KPI_TEST.stale).length;
@@ -33735,7 +33786,8 @@ EP.registerView("email", (function () {
         if ((_cm && _cm.length) || (domains && domains.length)) {
           var fromColl = !!(_cm && _cm.length);
           var ea = fromColl ? _cm : await M365LIVE.emailAuth(domains);
-          _eaSrc = fromColl ? "Consultant collection (public DNS via Resolve-DnsName + Get-DkimSigningConfig)" : "DNS-over-HTTPS (Cloudflare / Google)";
+          var _chk = fromColl ? _cm.map(function (r) { return r.checked; }).filter(Boolean).sort()[0] : null;   // oldest check in the set
+          _eaSrc = fromColl ? "Consultant collection (public DNS via Resolve-DnsName + Get-DkimSigningConfig)" + (_chk ? " · resolved " + String(_chk).slice(0, 10) : "") : "DNS-over-HTTPS (Cloudflare / Google)";
           _emailAuth = { assessed: true, domains: ea, source: fromColl ? "collection" : "doh" };
           rows = rows.filter(function (r) { return !/\bdkim\b|\bdmarc\b|\bspf\b|sender policy framework|domainkeys/i.test((r.title || "") + " " + (r.id || "")); });
           rows = rows.concat(_emailAuthRows(ea));
@@ -33875,6 +33927,17 @@ EP.registerView("maildomains", (function () {
   function verdicts() { return (_ea && _ea.assessed && _ea.domains) ? _ea.domains.map(function (r) { return { r: r, v: mailDomainVerdict(r) }; }) : null; }
   function srcText() {
     var s = _ea && _ea.source;
+    if (s === "collection") {
+      // A collection is a snapshot: say when it was taken, flag it when it is old, and say when the collecting machine
+      // had to use its own DNS (which can be an internal copy of the zone, not what the internet sees).
+      var ds = (_ea.domains || []), chk = ds.map(function (r) { return r.checked; }).filter(Boolean).sort()[0];
+      var days = chk ? Math.floor((Date.now() - Date.parse(chk)) / 864e5) : null;
+      var sysDns = ds.some(function (r) { return r.resolver === "system"; });
+      return "Source: consultant collection — DNS resolved by the collector" + (chk ? " on " + String(chk).slice(0, 10) : " (date not recorded)")
+        + " and the DKIM signing state from Exchange Online. The browser made no DNS call."
+        + (days != null && days > 7 ? " These records are " + days + " days old: re-run the collector, or sign in without the collection to use the live DNS check." : "")
+        + (sysDns ? " The collector could not reach a public resolver and used the collecting machine's own DNS, which can answer from an internal copy of the zone — confirm any 'missing' record against public DNS." : "");
+    }
     return s === "collection" ? "Source: consultant collection — public DNS resolved on the collecting machine (Resolve-DnsName) and the DKIM signing state from Exchange Online. The browser made no DNS call."
       : s === "doh" ? "Source: public DNS over HTTPS (Cloudflare / Google), queried live from this browser for each verified domain. DKIM is judged from the published selectors only; run the consultant collection for the signing state and the SPF lookup count."
       : "Source: demo data.";
