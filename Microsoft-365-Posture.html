@@ -35852,6 +35852,7 @@ const DEMO_USERS = { "CONTOSO-DC01":["CONTOSO\\Administrator","CONTOSO\\svc_sql"
 const DEMO = { live:false, alerts:demoAlerts(), osByName:DEMO_OS, assetByName:DEMO_ASSET, rolesByName:DEMO_ROLES, usersByName:DEMO_USERS, internetNames:["CONTOSO-WS-01","CONTOSO-SQL01","CONTOSO-DC01"] };
 const NEEDS_DEFENDER = { needsDefender:true, alerts:[], osByName:{}, assetByName:{}, rolesByName:{}, usersByName:{}, internetNames:[] };
 
+let DISCBY = new Set();   // lowercased names of discovered devices (IoT / network / unknown, not onboarded)
 let LAST = null, DEVICES = [], CATS = [], TECHS = [], ACTIVE = [], RESOLVED = 0, STATUS_KNOWN = false, _wired = false;
 let NET = new Set(), OSBY = {}, ASSETBY = {}, ROLESBY = {}, USERSBY = {};
 const INCAI = {}; let _incaiBusy = "";   // grounded AI incident summary per device name
@@ -35973,6 +35974,15 @@ const KPI_TEST = {
 };
 const KPI_SHORT = { critical:"Critical assets", highcrit:"High/Critical", internet:"Internet-facing", privuser:"Admin signed in", multi:"Multiple alerts", active:"All active" };
 
+// A discovered device Defender for Endpoint cannot be installed on: not onboarded, and classed by Defender as IoT,
+// a network device or unknown. Its alerts stay on the page; it is left out of the finding counts (menu badges and
+// the Command Center roll-up), which cover computers, mobile devices and servers. No DeviceInfo row = not discovered. Pure.
+function alertDiscovered(onboarding, category, deviceType){
+  if (String(onboarding || "").toLowerCase() === "onboarded") return false;
+  const cat = String(category || "").toLowerCase().replace(/[^a-z]/g, "");
+  return cat === "iot" || cat === "networkdevice" || cat === "unknown" || /network/.test(String(deviceType || "").toLowerCase());
+}
+/* ALERT-DISC:END */
 function buildDevices(active){
   const map = {};
   active.forEach(a => {
@@ -35985,7 +35995,7 @@ function buildDevices(active){
     const worstSev = d.worst>=4?"Critical":d.worst>=3?"High":d.worst>=2?"Medium":"Low";
     const assetValue = assetOf(d.name), roles = rolesOf(d.name), lu = usersOf(d.name);
     const o = { name:d.name, os:OSBY[d.name]||"", alerts:d.alerts.slice().sort((a,b)=>(SEV_RANK[b.severity]-SEV_RANK[a.severity])||((a.lastSeenDays||0)-(b.lastSeenDays||0))),
-      activeCount:d.alerts.length, cats:[...d.cats], techs:[...d.techs], worstSev, internet:isInet(d.name), lastSeenDays:d.lastSeenDays,
+      activeCount:d.alerts.length, discovered: DISCBY.has(String(d.name).toLowerCase()), cats:[...d.cats], techs:[...d.techs], worstSev, internet:isInet(d.name), lastSeenDays:d.lastSeenDays,
       assetValue, roles, critical:isCriticalDev(assetValue, roles), loggedOnUsers:lu, hasPrivilegedUser: lu.some(isPrivUser) };
     o.score = devThreatScore(o); return o;
   });
@@ -36035,9 +36045,9 @@ async function huntAlerts(){
 }
 // Real OS per device (DeviceInfo) + internet-facing set (the filtered query — same rule as the Devices page).
 async function huntMeta(){
-  const osBy = {}, assetBy = {}, rolesBy = {}, net = [];
-  try { (await hunt("DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, OSPlatform) by DeviceName"))
-    .forEach(r => { if (r.DeviceName) osBy[r.DeviceName] = r.OSPlatform || ""; }); } catch(e){}
+  const osBy = {}, assetBy = {}, rolesBy = {}, net = [], disc = [];
+  try { (await hunt("DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, OSPlatform, OnboardingStatus, DeviceCategory, DeviceType) by DeviceName"))
+    .forEach(r => { if (r.DeviceName){ osBy[r.DeviceName] = r.OSPlatform || ""; if (alertDiscovered(r.OnboardingStatus, r.DeviceCategory, r.DeviceType)) disc.push(r.DeviceName); } }); } catch(e){}
   // Real criticality from Exposure Management (ExposureGraphNodes), keyed on rawData.deviceName (device nodes are
   // labelled by resource type, not 'device'). criticalityLevel 0=Very high..3=Low; ruleNames = why. assetValue holds
   // the level label so the shared isCriticalDev (/high/) crowns Very high + High.
@@ -36049,7 +36059,7 @@ async function huntMeta(){
   const usersBy = {};
   try { (await hunt("DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, LoggedOnUsers) by DeviceName"))
     .forEach(r => { if (r.DeviceName){ const u = parseUsers(r.LoggedOnUsers); if (u.length) usersBy[r.DeviceName] = u; } }); } catch(e){}
-  return { osByName:osBy, assetByName:assetBy, rolesByName:rolesBy, usersByName:usersBy, internetNames:net };
+  return { osByName:osBy, assetByName:assetBy, rolesByName:rolesBy, usersByName:usersBy, internetNames:net, discoveredNames:disc };
 }
 // Entities per alert (AlertEvidence) — the nodes of the per-device attack graph: users, IPs, URLs, files,
 // processes touched by each alert. One row per entity; mapped to {type,label} and grouped by AlertId.
@@ -36077,7 +36087,7 @@ async function collect(){
   // dedup entities per alert and attach — the nodes of each device's attack graph
   const attach = a => { const seen = new Set(); a.entities = (entBy[a.alertId]||[]).filter(e => { const k = e.type+":"+e.label; if (seen.has(k)) return false; seen.add(k); return true; }).slice(0, 8); };
   alerts.forEach(attach);
-  return { live:true, alerts, osByName:meta.osByName, assetByName:meta.assetByName, rolesByName:meta.rolesByName, usersByName:meta.usersByName, internetNames:meta.internetNames };
+  return { live:true, alerts, osByName:meta.osByName, assetByName:meta.assetByName, rolesByName:meta.rolesByName, usersByName:meta.usersByName, internetNames:meta.internetNames, discoveredNames:meta.discoveredNames };
 }
 
 // ---------- device table ----------
@@ -36233,6 +36243,7 @@ function render(D){
   ROLESBY = D.rolesByName || {};
   USERSBY = D.usersByName || {};
   NET = new Set((D.internetNames||[]).map(n => String(n).toLowerCase()));
+  DISCBY = new Set((D.discoveredNames||[]).map(n => String(n).toLowerCase()));
   const all = D.alerts || [];
   // Advanced hunting (AlertInfo) carries no resolution status, so live alerts arrive with status "" and active
   // can't be told from resolved — then the page says "last 30 days", not "active". When status IS known (the
@@ -36323,7 +36334,7 @@ async function analyze(){
   try { render(await collect()); }
   catch(e){ render(Object.assign({}, NEEDS_DEFENDER, { err: e.message || String(e) })); }
 }
-function sevCounts(){ const c = { crit:0, high:0, med:0, low:0 }; DEVICES.forEach(d => { const k = d.worstSev==="Critical"?"crit":d.worstSev==="High"?"high":d.worstSev==="Medium"?"med":"low"; c[k]++; }); return c; }
+function sevCounts(){ const c = { crit:0, high:0, med:0, low:0 }; DEVICES.forEach(d => { if (d.discovered) return; const k = d.worstSev==="Critical"?"crit":d.worstSev==="High"?"high":d.worstSev==="Medium"?"med":"low"; c[k]++; }); return c; }
 function __dpThreatSummary(){
   if (!LAST) return null;
   if (LAST.needsDefender) return { label:"Alerts", score:null, grade:"–", lead:(LAST.err && EP.huntDiag && EP.huntDiag(LAST.err) || {}).lead || "Not assessed — connect Defender (MDE).", sev:{ crit:0, high:0, med:0, low:0 }, top:[] };
