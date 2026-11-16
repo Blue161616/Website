@@ -6549,6 +6549,16 @@ window.EP = (function () {
     // Teams and Purview detail is not read from Graph: it comes from Secure Score + the consultant collection, so no
     // Teamwork / InformationProtectionPolicy scope is requested (least privilege — ask only for what is called).
   ];
+  // Optional permissions that one page asks for by itself. They are in the setup script and in the Configuration
+  // list, but NOT in the "some permissions aren't granted" check: a tenant where one of them cannot be consented
+  // (no Agent ID, no Defender for Identity) would otherwise show that banner for ever.
+  const OPTIONAL_EXTRA = [
+    ["AccessReview.Read.All", "Access reviews of privileged roles and guests", "user"],
+    ["IdentityRiskyAgent.Read.All", "Risky agents (Identity Protection for agents)", "agent"],
+    ["SecurityIdentitiesHealth.Read.All", "Defender for Identity sensor health (hybrid tenants)", "user"]
+  ];
+  // Not Microsoft Graph: Azure Resource Manager, as the signed-in user. The app only reads with it.
+  const ARM_PERMISSION = ["Azure Service Management · user_impersonation", "Azure role assignments held by guests, Azure public IP addresses", "guest · endpoint: internet exposure"];
   const SIGNIN_SCOPES = REQUIRED_SCOPES.map(s => s[0]);
 
   let msalInstance = null, account = null, graphVer = "v1.0";
@@ -7069,6 +7079,26 @@ window.EP = (function () {
   }
   /* CHAIN-MATCH:END */
 
+  // Critical and High CVEs with the software that carries them, per device, from Defender's vulnerability inventory.
+  // The CVSS score is not in that table: it is joined in from the KB table, and left out if that join fails, so a
+  // missing score never costs the software names. ids: Defender DeviceIds. Throws when the inventory cannot be read.
+  async function tvmVulns(ids) {
+    ids = [...new Set((ids || []).filter(Boolean).map(x => String(x).replace(/'/g, "")))];
+    const by = {}; if (!ids.length) return by;
+    const base = chunk => "DeviceTvmSoftwareVulnerabilities | where DeviceId in (" + chunk.map(x => "'" + x + "'").join(",") + ")"
+      + " | where VulnerabilitySeverityLevel in ('Critical','High')";
+    for (let i = 0; i < ids.length; i += 200) {
+      const b = base(ids.slice(i, i + 200)); let rows;
+      try { rows = await exposureGraph.hunt(b + " | join kind=leftouter (DeviceTvmSoftwareVulnerabilitiesKB | summarize CvssScore=max(toreal(CvssScore)) by CveId) on CveId"
+        + " | summarize Cvss=max(CvssScore), Sev=take_any(VulnerabilitySeverityLevel) by DeviceId, SoftwareName, CveId | take 5000"); }
+      catch (e) { rows = await exposureGraph.hunt(b + " | summarize Sev=take_any(VulnerabilitySeverityLevel) by DeviceId, SoftwareName, CveId | take 5000"); }
+      rows.forEach(v => { if (!v.DeviceId || !v.CveId) return;
+        (by[v.DeviceId] = by[v.DeviceId] || []).push({ cve: v.CveId, software: v.SoftwareName || "", cvss: +v.Cvss || (/^critical$/i.test(v.Sev || "") ? 9 : 7), scored: !!(+v.Cvss) }); });
+    }
+    Object.keys(by).forEach(k => by[k].sort((a, c) => c.cvss - a.cvss));
+    return by;
+  }
+
   // ---- KPI change since the previous scan -------------------------------------------------------------------
   // A KPI tile shows how its count moved since the previous scan: ▲ up, ▼ down, and nothing when it did not move, so
   // a mark always means something changed. The counts of the last two scans are kept in this browser per tenant and
@@ -7498,7 +7528,7 @@ window.EP = (function () {
   // what the app actually requests; scope IDs are resolved by name at runtime (never hardcoded GUIDs).
   function appRegScript() {
     const names = [...new Set(["openid", "profile", "offline_access"]
-      .concat(REQUIRED_SCOPES.map(s => s[0])).concat(OPTIONAL_SCOPES.map(s => s[0])))];
+      .concat(REQUIRED_SCOPES.map(s => s[0])).concat(OPTIONAL_SCOPES.map(s => s[0])).concat(OPTIONAL_EXTRA.map(s => s[0])))];
     const block = [];
     for (let i = 0; i < names.length; i += 3) block.push("  " + names.slice(i, i + 3).map(s => '"' + s + '"').join(","));
     const redir = /^https?:/.test(redirectUri) ? redirectUri : "https://your-host/Microsoft-365-Posture.html";
@@ -7525,6 +7555,13 @@ window.EP = (function () {
       '}',
       '$rra = @(@{ ResourceAppId = $graphAppId; ResourceAccess = $access })',
       '',
+      '# Azure Resource Manager (optional). Lets the Guests and Internet exposure pages read Azure role assignments and',
+      '# public IP addresses as the signed-in user. The app only reads; what that user may do in Azure is the limit.',
+      '$armAppId = "797f4846-ba00-4fd7-ba43-dac1f8f63013"   # Windows Azure Service Management API',
+      '$arm = Get-MgServicePrincipal -Filter "appId eq \'$armAppId\'" | Select-Object -First 1',
+      '$armScope = if ($arm) { $arm.Oauth2PermissionScopes | Where-Object { $_.Value -eq "user_impersonation" } | Select-Object -First 1 }',
+      'if ($armScope) { $rra += @{ ResourceAppId = $armAppId; ResourceAccess = @(@{ Id = $armScope.Id; Type = "Scope" }) } } else { Write-Warning "Azure Service Management is not present in this tenant - the Azure reads stay off." }',
+      '',
       '# Re-running updates the existing app of the same name instead of creating a duplicate.',
       '$app = Get-MgApplication -Filter "displayName eq \'$DisplayName\'" | Select-Object -First 1',
       'if ($app) {',
@@ -7544,6 +7581,8 @@ window.EP = (function () {
       '$flt   = [uri]::EscapeDataString("clientId eq \'$($sp.Id)\' and resourceId eq \'$($graph.Id)\' and consentType eq \'AllPrincipals\'")',
       '$grant = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=$flt").value | Select-Object -First 1',
       'if ($grant) { Invoke-MgGraphRequest -Method PATCH -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants/$($grant.id)" -Body @{ scope = $scopeStr } | Out-Null } else { Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants" -Body @{ clientId = $sp.Id; consentType = "AllPrincipals"; resourceId = $graph.Id; scope = $scopeStr } | Out-Null }',
+      '# The same for Azure Resource Manager, when it is present. One line, as above.',
+      'if ($armScope) { $fltA = [uri]::EscapeDataString("clientId eq \'$($sp.Id)\' and resourceId eq \'$($arm.Id)\' and consentType eq \'AllPrincipals\'"); $grantA = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=$fltA").value | Select-Object -First 1; if ($grantA) { Invoke-MgGraphRequest -Method PATCH -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants/$($grantA.id)" -Body @{ scope = "user_impersonation" } | Out-Null } else { Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants" -Body @{ clientId = $sp.Id; consentType = "AllPrincipals"; resourceId = $arm.Id; scope = "user_impersonation" } | Out-Null } }',
       '',
       'Write-Host "`n[OK] App created and admin-consented." -ForegroundColor Green',
       'Write-Host "  Application (client) ID : $($app.AppId)" -ForegroundColor Cyan',
@@ -12158,8 +12197,8 @@ window.EP = (function () {
     $("epScopes").innerHTML =
       scol(scopeHead("Required · requested at sign-in (" + REQUIRED_SCOPES.length + ")", "delegated · read-only · one admin consent covers all views"),
            REQUIRED_SCOPES.map(scopeRow).join(""))
-      + scol(scopeHead("Optional · each unlocks one signal (" + OPTIONAL_SCOPES.length + ")", "read silently when granted; skipped (shown as not assessed) if not"),
-             OPTIONAL_SCOPES.map(scopeRow).join("")
+      + scol(scopeHead("Optional · each unlocks one signal (" + (OPTIONAL_SCOPES.length + OPTIONAL_EXTRA.length + 1) + ")", "read silently when granted; skipped (shown as not assessed) if not"),
+             OPTIONAL_SCOPES.concat(OPTIONAL_EXTRA).map(scopeRow).join("") + scopeRow(ARM_PERMISSION)
              + '<div class="srow"><span class="sp">openid · profile · offline_access</span><span class="sw">standard sign-in — added automatically by MSAL</span></div>');
     if (EP_HOSTED) {
       // Hosted: Blue16 owns the one multi-tenant app and its allowed-tenants list is the
@@ -12885,7 +12924,7 @@ window.EP = (function () {
       neighbors: neighbors, chokePoints: chokePoints, addOverlay: addOverlay, load: load,
       nodes: nodes, edges: edges, graph: graph, reset: reset };
   })();
-  return { registerView, viewApi, ensureLoaded, navSync: navSyncSoon, progHtml, kpiTrend, kpiDelta: kpiDeltaHtml, chainMatch, makeAsk, token, tokenSilent, tokenOptional, graphBase, exposureGraph, exceptions, critAssets, setStatus, esc, DEMO,
+  return { registerView, viewApi, ensureLoaded, navSync: navSyncSoon, progHtml, kpiTrend, kpiDelta: kpiDeltaHtml, chainMatch, tvmVulns, makeAsk, token, tokenSilent, tokenOptional, graphBase, exposureGraph, exceptions, critAssets, setStatus, esc, DEMO,
     scopedDoc, msalShim, ACCOUNT, llm, llmComplete, goto, mitre: mitreFor, scoreGauge: scoreGaugeCompact, skeleton: skeletonHtml, licenceTier, huntDiag, llmLive: () => llmState === "ok",
     estateAsk: (host) => renderSuiteAsk(host),   // the cross-estate copilot, mountable into the unified Ask page's "✦ Copilot — all domains" scope
     get account() { return account; }, get signedIn() { return !!account; },
@@ -34328,13 +34367,10 @@ async function externalChains(deviceNodesByName){
   const ids = facing.map(f => f.DeviceId).filter(Boolean);
   // Per-host vulnerable software + CVE (worst CVSS first) — keeps the software name so the chain can read
   // endpoint → software → CVE and the port→service match can be evaluated.
-  const vulnsById = {};
-  try { (await hunt("DeviceTvmSoftwareVulnerabilities | where DeviceId in " + idList(ids)
-    + " | where VulnerabilitySeverityLevel in ('Critical','High')"
-    + " | summarize Cvss=max(CvssScore) by DeviceId, SoftwareName, CveId"
-    + " | order by Cvss desc | take 1000"))
-    .forEach(v => { if (!v.DeviceId || !v.CveId) return;
-      (vulnsById[v.DeviceId] = vulnsById[v.DeviceId] || []).push({ software: v.SoftwareName || "", cve: v.CveId, cvss: v.Cvss || 0 }); }); } catch(e){}
+  // The shared reader (EP.tvmVulns). It used to ask this table for CvssScore, a column it does not have, so the query
+  // failed on a live tenant and no host ever had software for its CVEs: no port could be matched.
+  let vulnsById = {};
+  try { vulnsById = await EP.tvmVulns(ids); } catch(e){ vulnsById = {}; }
   const nodes = [], edges = [], paths = [], netId = "ext:net";
   nodes.push({ id:netId, kind:"internet", label:"Internet" });
   facing.forEach(f => {
@@ -34354,7 +34390,7 @@ async function externalChains(deviceNodesByName){
       nodes.push({ id:swId, kind:"software", label: surface.software || "software" });
       nodes.push({ id:cveNodeId, kind:"cve", label: surface.cve + more });
       edges.push({ from:hostId, to:swId, label: matched ? ("exposed via :" + matched.port) : "carries" });
-      edges.push({ from:swId, to:cveNodeId, label: "exploitable" + (surface.cvss ? (" · CVSS " + surface.cvss) : "") });
+      edges.push({ from:swId, to:cveNodeId, label: "exploitable" + (surface.scored ? (" · CVSS " + surface.cvss) : "") });
       seq.push(swId, cveNodeId);
     }
     paths.push({ id:"ext" + paths.length, sev: matched ? "crit" : "high", external:true, seq, target: hostId, portMatched: !!matched, ports: ports, vulns: vulns,
@@ -34789,17 +34825,8 @@ let M = null, ROWS = [], LOOK = {}, _wired = false, AZ = { state:"none" };
 let VULNS = { state:"none", by:{} };   // Defender's vulnerability inventory per device: none | read | error
 // Critical and High CVEs with the software that carries them, for the Defender devices on this page.
 async function readVulns(ids){
-  ids = [...new Set((ids || []).filter(Boolean))];
-  if (!ids.length) { VULNS = { state:"read", by:{} }; return; }
-  try {
-    const by = {};
-    for (let i = 0; i < ids.length; i += 200) {
-      (await EP.exposureGraph.hunt("DeviceTvmSoftwareVulnerabilities | where DeviceId in (" + ids.slice(i, i + 200).map(x => "'" + String(x).replace(/'/g, "") + "'").join(",") + ")"
-        + " | where VulnerabilitySeverityLevel in ('Critical','High') | summarize Cvss=max(CvssScore) by DeviceId, SoftwareName, CveId | order by Cvss desc | take 5000"))
-        .forEach(v => { if (v.DeviceId && v.CveId) (by[v.DeviceId] = by[v.DeviceId] || []).push({ cve: v.CveId, software: v.SoftwareName || "", cvss: v.Cvss || 0 }); });
-    }
-    VULNS = { state:"read", by: by };
-  } catch(e){ VULNS = { state:"error", err: (e && (e.message || String(e))) || "" }; }
+  try { VULNS = { state:"read", by: await EP.tvmVulns(ids) }; }
+  catch(e){ VULNS = { state:"error", err: (e && (e.message || String(e))) || "" }; }
 }
 // The port ↔ software ↔ CVE verdict for one row. Only a machine with a Defender device has an inventory to match.
 function chainFor(r){
@@ -34988,7 +35015,7 @@ function rowHtml(r){
   if (r.scannedPort) d += '<div class="ix-kv"><b>Defender\'s scanner:</b> reached port ' + r.scannedPort + (PORT_NAME[r.scannedPort] ? ' (' + PORT_NAME[r.scannedPort] + ')' : '') + ' from the internet.</div>';
   if (x.lookedUp) d += '<div class="ix-kv"><b>Seen from outside:</b> ' + (x.ports.length ? 'ports ' + x.ports.slice().sort((a,b) => a - b).join(", ") : 'no open ports on file')
     + (x.vulns.length ? ' · CVEs on file (inferred from version, not verified): ' + esc(x.vulns.slice(0, 12).join(", ")) + (x.vulns.length > 12 ? ' +' + (x.vulns.length - 12) : '') : '') + '</div>';
-  if (r._c && r._c.state === "confirmed") d += '<div class="ix-kv"><b>Port and CVE match:</b><ul style="margin:3px 0 0;padding-left:18px">' + r._c.matches.slice(0, 6).map(m => '<li>' + (m.port ? 'port ' + m.port + ' (' + esc(m.svc) + ')' : 'a service seen from outside') + ' ↔ ' + esc(m.software) + ' ↔ ' + esc(m.cve) + (m.cvss ? ' · CVSS ' + m.cvss : '') + (m.outside ? ' · software also seen from outside' : '') + '</li>').join("") + '</ul>' + (r._c.matches.length > 6 ? '+' + (r._c.matches.length - 6) + ' more' : '') + '</div>';
+  if (r._c && r._c.state === "confirmed") d += '<div class="ix-kv"><b>Port and CVE match:</b><ul style="margin:3px 0 0;padding-left:18px">' + r._c.matches.slice(0, 6).map(m => '<li>' + (m.port ? 'port ' + m.port + ' (' + esc(m.svc) + ')' : 'a service seen from outside') + ' ↔ ' + esc(m.software) + ' ↔ ' + esc(m.cve) + (m.scored ? ' · CVSS ' + m.cvss : '') + (m.outside ? ' · software also seen from outside' : '') + '</li>').join("") + '</ul>' + (r._c.matches.length > 6 ? '+' + (r._c.matches.length - 6) + ' more' : '') + '</div>';
   const todo = [];
   if (r._c && r._c.state === "confirmed") todo.push("Patch " + r._c.best.software + " (" + r._c.best.cve + ") first: the port that serves it is open to the internet.");
   if (r.kind === "machine" && r.sensor === "nodevice") todo.push("Onboard this machine to Microsoft Defender for Endpoint, or remove its public address if it does not need one.");
