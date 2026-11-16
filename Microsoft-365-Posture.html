@@ -29859,6 +29859,16 @@ async function huntSeenBy(){
   if (!r.ok){ const e2 = new Error("seen-by " + r.status); e2.status = r.status; throw e2; }
   return (await r.json()).results || [];
 }
+// The network addresses Defender holds for discovered devices (DeviceNetworkInfo). Optional: a failure leaves the
+// IP column saying "not read".
+async function huntDiscIps(){
+  const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
+  const q = "DeviceInfo | where Timestamp > ago(30d) | where OnboardingStatus != 'Onboarded' | summarize by DeviceId"
+    + " | join kind=inner (DeviceNetworkInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, IPAddresses) by DeviceId) on DeviceId | project DeviceId, IPAddresses";
+  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  if (!r.ok){ const e2 = new Error("device addresses " + r.status); e2.status = r.status; throw e2; }
+  return (await r.json()).results || [];
+}
 // Normalise a device name for matching: lowercase + strip any DNS/domain suffix (host.domain → host).
 // Lets us join a Defender machine to an Entra/Intune device by name when AAD ids don't line up
 // (e.g. Workgroup servers have no AadDeviceId, and casing differs: Entra "CONTOSO-DC01" vs Defender "contoso-dc01").
@@ -30039,6 +30049,9 @@ function discoveredDevices(active, machines, inBy, mdeBy, mdeByName, netBy, port
         internet: netBy[id] != null, internetReason: netBy[id] || "", openPorts: portsBy[id] || null,
         lastSeenDays: isNaN(ts) ? null : Math.max(0, Math.floor(((now == null ? Date.now() : now) - ts) / 864e5)) }; });
 }
+// The IPv4 addresses in a DeviceNetworkInfo IPAddresses value (a JSON array, or its text), link-local left out. Pure.
+function discIps(v){ if (v == null || v === "") return []; let t; try { t = typeof v === "string" ? v : JSON.stringify(v); } catch(e){ t = ""; }
+  return [...new Set((t.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g) || []).filter(ip => !/^(169\.254\.|127\.|0\.)/.test(ip)))]; }
 /* DISCOVERED:END */
 // ── Inbound from the internet, inferred per site ──
 // Defender only evaluates onboarded Windows devices as internet-facing, so for a discovered device the question is
@@ -30117,7 +30130,7 @@ function demoDiscovered(){
     ["DESKTOP-GUEST7","Endpoint","Workstation","","","","Windows11","Can be onboarded","",1],
     ["a41c9e07b2","Unknown","Unknown","","","","","Insufficient info","",9]
   ].map((r, ix) => ({ id: "demo-disc-" + ix, name: r[0], cls: discClass(r[1], r[2]), category: r[1], type: r[2], subtype: r[3], vendor: r[4], model: r[5], os: r[6], osVer: "",
-    onboarding: r[7], exposure: r[8], internet: false, internetReason: "", openPorts: null, lastSeenDays: r[9], siteIps: r[1] === "Unknown" ? [] : [DEMO_SITE] }));
+    onboarding: r[7], exposure: r[8], internet: false, internetReason: "", openPorts: null, lastSeenDays: r[9], siteIps: r[1] === "Unknown" ? [] : [DEMO_SITE], ips: r[1] === "Unknown" ? [] : ["10.20.0." + (10 + ix)] }));
 }
 async function collect(){
   const entra = await gGetAll("/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,approximateLastSignInDateTime,accountEnabled&$top=200", ["Device.Read.All"]);
@@ -30125,10 +30138,10 @@ async function collect(){
   try { intune = await gGetAll("/deviceManagement/managedDevices?$select=id,deviceName,azureADDeviceId,operatingSystem,osVersion,complianceState,isEncrypted,lastSyncDateTime,managedDeviceOwnerType,userPrincipalName,managementAgent&$top=200", ["DeviceManagementManagedDevices.Read.All"]); } catch(e){ intune = []; }
   let machines = null, mdeErr = null;
   try { machines = await huntDevices(); } catch(e){ mdeErr = e; machines = null; }
-  let threatRows = null, cveRows = null, cfgRows = null, netRows = null, threatErr = null, seenRows = null;
+  let threatRows = null, cveRows = null, cfgRows = null, netRows = null, threatErr = null, seenRows = null, ipRows = null;
   if (machines){
-    const [t, c, g, n, sb] = await Promise.allSettled([ huntThreat(), huntCves(), huntConfig(), huntInternetFacing(), huntSeenBy() ]);
-    seenRows = sb.status === "fulfilled" ? sb.value : null;
+    const [t, c, g, n, sb, ia] = await Promise.allSettled([ huntThreat(), huntCves(), huntConfig(), huntInternetFacing(), huntSeenBy(), huntDiscIps() ]);
+    seenRows = sb.status === "fulfilled" ? sb.value : null; ipRows = ia.status === "fulfilled" ? ia.value : null;
     threatRows = t.status === "fulfilled" ? t.value : (threatErr = (t.reason && t.reason.message) || String(t.reason), null);
     cveRows = c.status === "fulfilled" ? c.value : null;
     cfgRows = g.status === "fulfilled" ? g.value : null;
@@ -30161,6 +30174,9 @@ async function collect(){
     if (ip && netBy[id] != null) siteExplained[ip] = (siteExplained[ip] || []).concat(portsBy[id] || []); });
   const seenBy = seenRows ? (() => { const o = {}; seenRows.forEach(r => { const id = String(r.DeviceId || "").toLowerCase(); if (id) o[id] = seenByIds(r.SeenBy); }); return o; })() : null;
   discovered.forEach(x => { x.siteIps = seenBy ? siteIpsOf(seenBy[x.id], pubById) : null; });
+  // The device's own address on its network. ips stays null when the address query could not be read.
+  const ipBy = ipRows ? (() => { const o = {}; ipRows.forEach(r => { const id = String(r.DeviceId || "").toLowerCase(); if (id) o[id] = discIps(r.IPAddresses); }); return o; })() : null;
+  discovered.forEach(x => { x.ips = ipBy ? (ipBy[x.id] || []) : null; });
   const devs = active.concat(defOnly).map((d, ix) => {
     const key = String(d.deviceId||"").toLowerCase();
     const i = inBy[key];
@@ -30479,7 +30495,7 @@ async function runFixAi(id){
 // compliance result, so the list says what Defender knows and marks only the exceptions.
 function discTable(list, cls){
   const q = STATE.q.toLowerCase();
-  const rows = list.filter(x => !q || (x.name + " " + x.type + " " + x.subtype + " " + x.vendor + " " + x.model + " " + x.os).toLowerCase().indexOf(q) >= 0);
+  const rows = list.filter(x => !q || (x.name + " " + x.type + " " + x.subtype + " " + x.vendor + " " + x.model + " " + x.os + " " + (x.ips || []).join(" ")).toLowerCase().indexOf(q) >= 0);
   const ER = { High: 3, Medium: 2, Low: 1 }, onbCan = x => /can be onboarded/i.test(x.onboarding);
   const _cn = x => candidatePorts(x, siteInbound(x.siteIps, SITE_LOOK, (DALL && DALL.siteExplained) || {})).length ? 1 : 0;
   rows.sort((a, b) => ((b.internet ? 1 : 0) - (a.internet ? 1 : 0)) || (_cn(b) - _cn(a)) || ((ER[b.exposure] || 0) - (ER[a.exposure] || 0)) || ((onbCan(b) ? 1 : 0) - (onbCan(a) ? 1 : 0)) || a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
@@ -30498,7 +30514,7 @@ function discTable(list, cls){
     const nCand = list.filter(x => (x.siteIps || []).indexOf(ip) >= 0 && candidatePorts(x, inbOf(x)).length).length;
     return '<div class="di-chain gap"><div class="ch-h">⚠ Possibly reachable from the internet — ' + g.ports.length + ' port' + (g.ports.length === 1 ? '' : 's') + ' answer' + (g.ports.length === 1 ? 's' : '') + ' at site ' + esc(ip) + ' that no managed device explains</div>'
       + '<div class="ch-sub"><b>' + g.ports.map(pn).map(esc).join(' · ') + '</b>. ' + g.n.size + ' device' + (g.n.size === 1 ? '' : 's') + ' in this list ' + (g.n.size === 1 ? 'is' : 'are') + ' behind this address, and any device behind it could be the one answering. '
-      + 'Inferred: Shodan InternetDB sees the ports on the address, and Defender says which onboarded device saw each device here. This is evidence about the site, not proof for one device. ' + (nCand ? nCand + ' row' + (nCand === 1 ? ' is' : 's are') + ' marked <b>candidate</b>: a device type that normally uses one of these ports. '
+      + 'Shodan InternetDB sees the ports on the public address; nothing tested the devices themselves, and Defender only says which onboarded device saw each device here. This is evidence about the site, not about one device. ' + (nCand ? nCand + ' row' + (nCand === 1 ? ' is' : 's are') + ' marked <b>check first</b>: a device type that normally serves one of these ports. At most one device answers on a port. '
         : 'No device in this list is a likely candidate for ' + (g.ports.length === 1 ? 'this port' : 'these ports') + '; the router or firewall of the site itself is the usual answer for a web or management port. ')
       + 'Check the port forwards and remote management on the router or firewall of this site.</div></div>'; }).join("");
   const lookBox = unread ? '<div class="di-sub" style="margin:0 0 10px">Inbound exposure cannot be inferred: Defender did not return which onboarded device saw these devices (SeenBy), so their site address is not known.</div>'
@@ -30518,12 +30534,14 @@ function discTable(list, cls){
     if (b.state === "failed") return mu("lookup failed", "Shodan InternetDB did not answer for its site address. This is not a clean result.");
     if (b.state === "none") return mu("", "");
     const c = candidatePorts(x, b);
-    return c.length ? '<span class="di-pill p-warn" title="' + esc("Its site answers on " + c.map(pn).join(", ") + " and this kind of device normally uses " + (c.length === 1 ? "that port" : "those ports") + ". A candidate, not proof.") + '">candidate · ' + esc(c.join(", ")) + '</span>'
+    return c.length ? '<span class="di-pill p-warn" title="' + esc("Nothing tested this device. " + c.map(pn).join(", ") + " answer" + (c.length === 1 ? "s" : "") + " on the public address of its site, and this kind of device is what normally serves " + (c.length === 1 ? "that port" : "those ports") + ", so check it first. At most one device behind the address answers on a port.") + '">check first · ' + esc(c.map(pn).join(", ")) + '</span>'
       : '<span title="Ports answer at its site, but not ones this kind of device normally uses. See the site banner above."></span>'; };
   const row = x => { const vm = [x.vendor, x.model].filter(Boolean).join(" "), ty = x.subtype || (/^networkdevice$/i.test(x.type) ? "Network device" : x.type);
     return '<tr><td class="di-dev">' + esc(x.name)
       + (x.internet ? ' <span class="di-pill p-bad" title="' + esc("Defender flags this device internet-facing" + (x.internetReason ? " — " + x.internetReason : "") + (x.openPorts && x.openPorts.length ? " · ports " + x.openPorts.join(", ") : "")) + '">internet-facing</span>' : '')
       + (vm ? '<span class="jt">' + esc(vm) + '</span>' : '') + '</td>'
+      + '<td class="di-sub" style="font-variant-numeric:tabular-nums;white-space:nowrap">' + (x.ips == null ? '<span title="The address query could not be read in this scan.">not read</span>'
+        : x.ips.length ? '<span' + (x.ips.length > 1 ? ' title="' + esc(x.ips.join(", ")) + '"' : '') + '>' + esc(x.ips[0]) + (x.ips.length > 1 ? ' +' + (x.ips.length - 1) : '') + '</span>' : '') + '</td>'
       + '<td class="di-sub">' + esc(ty && !/^unknown$/i.test(ty) ? ty : "") + '</td>'
       + '<td class="di-sub">' + esc(x.os || "") + (x.osVer ? ' ' + esc(x.osVer) : '') + '</td>'
       + '<td>' + (onbCan(x) ? '<span class="di-pill p-warn" title="A supported device that is not onboarded to Defender for Endpoint.">can be onboarded</span>' : /^unsupported$/i.test(x.onboarding) ? '' : '<span class="di-sub">' + esc(String(x.onboarding || "—").toLowerCase()) + '</span>') + '</td>'
@@ -30532,10 +30550,10 @@ function discTable(list, cls){
       + '<td class="di-sub"' + (x.lastSeenDays != null && x.lastSeenDays > 30 ? ' style="color:var(--sev-high)"' : '') + '>' + last(x.lastSeenDays) + '</td></tr>'; };
   return '<div class="di-filters"><input id="di-q" placeholder="Search name, type, vendor…" value="' + esc(STATE.q) + '">'
     + '<span class="di-count">' + rows.length + ' of ' + list.length + ' ' + esc(label) + ' device' + (list.length === 1 ? '' : 's') + '</span></div>'
-    + '<div class="di-sub" style="margin:-4px 0 10px;line-height:1.5">' + what + ' Discovered without an agent, so they carry no risk score and are not counted in the posture score, the banners or the tiles of the managed segments. A blank cell means Defender has no value; a blank Onboarding cell is a device that cannot run the agent (unsupported). Defender only evaluates onboarded Windows devices as internet-facing, so <b>Inbound</b> is inferred from the outside view of the site a device is on; only a device whose kind normally uses a port that answers at its site is marked <b>candidate</b>. A blank Inbound cell is not a candidate; the banner above the list says what answers at the site.</div>'
+    + '<div class="di-sub" style="margin:-4px 0 10px;line-height:1.5">' + what + ' Discovered without an agent, so they carry no risk score and are not counted in the posture score, the banners or the tiles of the managed segments. A blank cell means Defender has no value; a blank Onboarding cell is a device that cannot run the agent (unsupported). Defender only evaluates onboarded Windows devices as internet-facing, so <b>Inbound</b> is inferred from the outside view of the site a device is on; no port was tested on any device here. A device is marked <b>check first</b> when a port answers on the public address of its site and its kind normally serves that port. A blank Inbound cell is not one of those; the banner above the list says what answers at the site.</div>'
     + lookBox + siteBanners
-    + '<table class="di-tbl"><thead><tr><th>Device</th><th>Type</th><th>OS</th><th>Onboarding</th><th>Exposure</th><th title="Inferred per site: ports that answer on the public address of the site this device is on and that no managed device explains.">Inbound (inferred)</th><th>Last seen</th></tr></thead><tbody>'
-    + (rows.length ? rows.map(row).join("") : '<tr><td colspan="7" style="padding:18px;color:var(--muted)">No ' + esc(label) + ' devices match this search.</td></tr>') + '</tbody></table>';
+    + '<table class="di-tbl"><thead><tr><th>Device</th><th title="The device’s own address on its network, as Defender recorded it. Blank when Defender has none.">IP</th><th>Type</th><th>OS</th><th>Onboarding</th><th>Exposure</th><th title="Inferred per site: ports that answer on the public address of the site this device is on and that no managed device explains.">Inbound (inferred)</th><th>Last seen</th></tr></thead><tbody>'
+    + (rows.length ? rows.map(row).join("") : '<tr><td colspan="8" style="padding:18px;color:var(--muted)">No ' + esc(label) + ' devices match this search.</td></tr>') + '</tbody></table>';
 }
 let DCHG = null;   // devices that moved since the previous scan: { new, worse, better: [ids], gone, t }
 function paint(){
