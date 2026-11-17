@@ -5499,6 +5499,10 @@
   @keyframes ovFlow { 0% { left: -8px; opacity: 0; } 10% { opacity: .95; } 84% { opacity: .95; } 100% { left: 100%; opacity: 0; } }
   .ov-node { font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 6px; background: var(--bg2); border: 1px solid var(--border); flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ov-node.src { border-color: var(--accent); color: var(--accent-dark); }
+  .ov-chips { flex: 0 0 auto; display: inline-flex; gap: 4px; margin-left: 5px; }
+  .ov-chip { font-size: 9.5px; font-weight: 700; color: var(--muted); white-space: nowrap; }
+  .ov-chip.hot, .ov-hop.hot { color: var(--sev-high); }
+  .ov-hop { font-size: 9.5px; font-weight: 700; }
   .ov-node.crit { border-color: var(--sev-crit); color: var(--sev-crit); background: rgba(255,77,109,.08); animation: ovCritPulse 2.6s ease-in-out infinite; }
   @keyframes ovCritPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(255,77,109,0); } 50% { box-shadow: 0 0 0 3px rgba(255,77,109,.18); } }
   @media (prefers-reduced-motion: reduce) { .ov-flowdot { animation: none; opacity: 0; } .ov-node.crit { animation: none; } }
@@ -8700,6 +8704,41 @@ window.EP = (function () {
   // bare name that collides with the account that happens to be called "Global Administrator".
   const OV_TYPEWORD = { user: "user", guest: "guest", group: "group", role: "role", app: "app", sp: "app", mi: "managed id", device: "device", agent: "agent", blueprint: "blueprint", tenant: "tenant", resource: "resource", permission: "permission", issuer: "issuer", partner: "partner", au: "admin unit", policy: "policy" };
   function ovTypeWord(n) { return (n && (OV_TYPEWORD[n.type] || n.type)) || ""; }
+  // How a hop on an identity path is held, in one word for the line between two nodes. "permanent" is only
+  // said when the PIM schedule was read — otherwise a standing assignment can't be told from a time-bound one.
+  function ovHopWord(e, pimRead) {
+    const k = e && e.k, pr = (e && e.props) || {};
+    if (k === "AssignedRole") {
+      if (pr.pim) return { t: pr.type === "Activated" ? "PIM activated" : "time-bound", hot: false };
+      return pimRead ? { t: "permanent", hot: true } : { t: "assigned", hot: false };
+    }
+    const W = { EligibleRole: "eligible (PIM)", ScopedRole: "scoped", MemberOf: "member", OwnerOf: "owns", HasApplicationPermission: "app permission",
+      HasDelegatedPermission: "delegated", CanBecome: "can act as", RunsAs: "runs as", SyncedFromAD: "synced", FederatedWith: "federated", CanControl: "controls" };
+    return { t: W[k] || String(k || ""), hot: k === "OwnerOf" };
+  }
+  // What makes the source of a path weak — only facts the graph actually holds (flags.mfa is set only when the
+  // registration report was read, so an unread report yields no chip, never a pass). A break-glass account is
+  // named as such and its expected dormancy / CA exclusion are not flagged.
+  function ovWeakChips(n) {
+    const f = (n && n.flags) || {}, out = [];
+    if (f.breakGlass) out.push({ t: "break-glass", hot: false });
+    if (f.mfa === false) out.push({ t: "no MFA", hot: true });
+    if (!f.breakGlass) {
+      if (f.caExcluded) out.push({ t: "CA excluded", hot: true });
+      else if (f.caProtected === false) out.push({ t: "no MFA policy", hot: true });
+      if (f.dormant) out.push({ t: "dormant", hot: true });
+    }
+    if (f.guest) out.push({ t: "guest", hot: true });
+    if (f.synced) out.push({ t: "synced from AD", hot: false });
+    return out;
+  }
+  // Was the PIM active-assignment schedule read? A collector state other than ok means no.
+  function ovPimRead(raw, state) {
+    const st = state && state.roleActivePim;
+    if (st && st.st !== "ok") return false;
+    return !!(raw && Array.isArray(raw.roleActivePim));
+  }
+  /* OV-HOP:END */
   let _ovMiniCy = null, _ovPathList = [], _ovPathG = null, _ovPathSel = 0;
   function ovDestroyMini() { if (_ovMiniCy) { try { _ovMiniCy.destroy(); } catch (_) {} _ovMiniCy = null; } }
   // All attack paths to Global Administrator (else to any critical / tier-0 asset), deduped, most hops first.
@@ -8787,12 +8826,17 @@ window.EP = (function () {
     // from the summary's topPaths.
     if (_ovPathList.length && _ovPathG) {
       const g = _ovPathG, N = id => g.nodes.get(id);
+      let _st = null; try { _st = EH.collector.state(); } catch (_) {}
+      const pimRead = ovPimRead(g.raw, _st);
       body = '<div class="ov-paths">' + _ovPathList.slice(0, OV_MAX).map(p => {
         const t = N(p.target), sev = (t && (t.critical || t.tier === 0)) ? "crit" : "high";
         let flow = ""; p.nodes.forEach((id, i) => { const n = N(id); if (!n) return; const last = i === p.nodes.length - 1;
           const tw = ovTypeWord(n);   // "Global Administrator (role)": an account can carry the name of the role it reaches
           flow += '<span class="ov-node' + (last ? " crit" : (i === 0 ? " src" : "")) + '" title="' + esc(n.label + (tw ? " (" + tw + ")" : "")) + '">' + esc(n.label) + (tw ? ' <i class="ov-node-t">' + esc(tw) + '</i>' : "") + '</span>';
-          if (!last) flow += '<span class="ov-edge">&rsaquo;</span>'; });
+          if (i === 0) { const ch = ovWeakChips(n); if (ch.length) flow += '<span class="ov-chips" title="' + esc(ch.map(c => c.t).join(" · ")) + '">' + ch.slice(0, 2).map(c => '<span class="ov-chip' + (c.hot ? " hot" : "") + '">' + esc(c.t) + '</span>').join("") + (ch.length > 2 ? '<span class="ov-chip">+' + (ch.length - 2) + '</span>' : "") + '</span>'; }
+          if (!last) { const e = p.edges && p.edges[i], hw = e ? ovHopWord(e, pimRead) : { t: "", hot: false };
+            if (i === 0 && n.flags && n.flags.breakGlass) hw.hot = false;   // a standing role is expected on a break-glass account
+            flow += '<span class="ov-edge"' + (e && e.via ? ' title="' + esc(e.via) + '"' : "") + '>' + (hw.t ? '<span class="ov-hop' + (hw.hot ? " hot" : "") + '">' + esc(hw.t) + '</span> ' : "") + '&rsaquo;</span>'; } });
         const q = "paths from id:" + p.source + " to id:" + p.target;
         return '<div class="ov-path ' + sev + '" data-ovgo="entrahound" data-ovfocus="' + esc(JSON.stringify({ query: q })) + '" title="Open this path in the full Attack Paths graph">' + flow + '<span class="ov-flowdot"></span></div>';
       }).join("") + '</div>'
@@ -8817,7 +8861,7 @@ window.EP = (function () {
       nodes.forEach((n, i) => {
         const last = i === nodes.length - 1;
         flow += '<span class="ov-node' + (last ? " crit" : (i === 0 ? " src" : "")) + '" title="' + esc(n) + '">' + esc(n) + '</span>';
-        if (!last) flow += '<span class="ov-edge" title="' + esc(edges[i] || "") + '">' + esc(edges[i] || "") + ' &rsaquo;</span>';
+        if (!last) flow += '<span class="ov-edge" title="' + esc(edges[i] || "") + '">' + esc(ovHopWord({ k: edges[i] || "" }, false).t) + ' &rsaquo;</span>';
       });
       return '<div class="ov-path ' + sev + '" data-ovgo="entrahound" data-ovlabel="' + esc(nodes[0] || "") + '" title="Open in Attack Paths">' + flow + '<span class="ov-flowdot"></span></div>';
     }).join("") + '</div>';
