@@ -573,7 +573,12 @@
   .sx-whatif-k { font-family:var(--label); font-size:9.5px; font-weight:800; letter-spacing:.09em; text-transform:uppercase; color:var(--accent); margin-right:4px; }
   .sx-whatif-g { color:var(--text); font-weight:700; }
   .sx-whatif-est { font-size:9.5px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); opacity:.8; }
-  .sx-plist-h { font-family:var(--label); font-size:10.5px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin-bottom:1px; } .sx-plist-h span { color:var(--accent); }
+  .sx-plist-h { font-family:var(--label); font-size:10.5px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin-bottom:1px; grid-column:1 / -1; } .sx-plist-h span { color:var(--accent); }
+  .sx-plist-h .t0 { color:var(--sev-crit,#FF4D6D); } .sx-plist-h .pv { color:var(--amber); }
+  .sx-plist-h em { font-style:normal; font-weight:500; text-transform:none; letter-spacing:0; margin-left:10px; opacity:.85; }
+  .sx-paths:not(.all) .sx-prow.more, .sx-paths.all .sx-pmore { display:none; }
+  .sx-pmore, .sx-pnote { align-items:center; color:var(--muted); font-size:11.5px; } .sx-pnote { cursor:default; } .sx-pnote:hover { border-color:var(--border); }
+  .sx-pdv:hover { color:var(--text); text-decoration:underline; }
   .sx-prow { display:flex; gap:9px; align-items:flex-start; text-align:left; border:1px solid var(--border); border-radius:9px; padding:8px 10px; background:var(--card,rgba(255,255,255,.02)); cursor:pointer; color:var(--text); }
   .sx-prow:hover { border-color:var(--accent); }
   .sx-pn { width:18px; height:18px; flex:none; border-radius:5px; background:color-mix(in srgb,var(--sev-crit,#FF4D6D) 18%,transparent); color:var(--sev-crit,#FF4D6D); font-weight:700; font-size:11px; display:grid; place-content:center; }
@@ -9941,6 +9946,27 @@ window.EP = (function () {
     return Object.keys(best).map(k => best[k]).sort((a, b) => (b.tier0 ? 1 : 0) - (a.tier0 ? 1 : 0) || (b.privileged ? 1 : 0) - (a.privileged ? 1 : 0)
       || rank(a.device.criticality) - rank(b.device.criticality) || _VIA_RANK[b.via] - _VIA_RANK[a.via]);
   }
+  // The matches that matter, one row per identity. A tenant has a match for nearly every user (their own laptop and
+  // phone), so the Command Center lists only the ones a reader has to act on — a Tier-0 or privileged identity, or
+  // any identity on a Very high / High criticality device — and counts the rest instead of listing them.
+  function suiteMatchGroups(links) {
+    const rank = { "Very high": 0, "High": 1, "Medium": 2, "Low": 3 }, rk = l => (rank[l.device.criticality] == null ? 9 : rank[l.device.criticality]);
+    const by = {}, order = [];
+    (links || []).forEach(l => {
+      if (!(l.tier0 || l.privileged || rk(l) <= 1)) return;
+      const k = String(l.identity.id || l.identity.upn || l.identity.displayName).toLowerCase();
+      let g = by[k]; if (!g) { g = by[k] = { identity: l.identity, tier0: false, privileged: false, links: [], data: null }; order.push(k); }
+      g.tier0 = g.tier0 || !!l.tier0; g.privileged = g.privileged || !!l.privileged; g.links.push(l);
+      if (!g.data && l.data) g.data = l.data;
+    });
+    const groups = order.map(k => by[k]);
+    groups.forEach(g => { g.links.sort((a, b) => rk(a) - rk(b)); g.worst = g.links[0].device.criticality || ""; });
+    const cls = g => (g.tier0 ? 0 : g.privileged ? 1 : 2);
+    groups.sort((a, b) => cls(a) - cls(b) || rk(a.links[0]) - rk(b.links[0]) || b.links.length - a.links.length);
+    const t0 = groups.filter(g => g.tier0).length, pv = groups.filter(g => !g.tier0 && g.privileged).length;
+    return { groups: groups, tier0: t0, privileged: pv, critical: groups.length - t0 - pv,
+      matches: groups.reduce((n, g) => n + g.links.length, 0), total: (links || []).length };
+  }
   function suiteWorstDomains(pd, n) {
     return (pd.list || []).map(v => ({ v, s: pd.data[v.name] })).filter(x => x.s)
       .map(x => { const c = ovCounts(x.s) || {}; const ch = (c.critical || 0) + (c.high || 0);
@@ -11487,15 +11513,30 @@ window.EP = (function () {
     if (kind === "device") return 'data-suitego="endpoint" data-fixview="devices" ' + attr({ q: String((e && e.name) || "").split(" · ")[0] });
     return 'data-suitego="identity" data-fixview="user" ' + attr({ search: (e && (e.upn || e.displayName)) || "" });
   }
+  // The strip stays a handful of chips whether the tenant has 6 matches or 6,000: one chip per identity that matters
+  // (suiteMatchGroups), the first six shown and the rest behind "+N more"; routine matches are a count in the header.
   function suitePathList(links) {
     if (!links.length) return "";
-    return '<div class="sx-plist-h" title="Privileged identities matched to a device they are signed in on or own. These are identity ↔ device matches, not the attack paths counted on the Identity and Endpoint Attack paths pages.">Identity ↔ device matches <span>' + links.length + '</span></div>' + links.slice(0, 6).map((l, i) => {
-      const t0 = l.tier0 ? '<span class="sx-t0">Tier-0</span>' : (l.privileged ? '<span class="sx-t0 priv">priv</span>' : '');
-      // A path chip opens the identity ITSELF (the User view filtered to it), and its device line opens that device
+    const m = suiteMatchGroups(links), num = n => Number(n).toLocaleString("en-US"), FIRST = 6, CAP = 48, rest = m.total - m.matches;
+    const bits = [m.tier0 ? '<span class="t0">' + num(m.tier0) + '</span> Tier-0' : "", m.privileged ? '<span class="pv">' + num(m.privileged) + '</span> privileged' : "",
+      m.critical ? '<span>' + num(m.critical) + '</span> on a critical device' : ""].filter(Boolean);
+    const head = '<div class="sx-plist-h" title="Identities matched to a device they are signed in on or own, one row per identity. Listed: Tier-0 and privileged identities, and any identity on a Very high / High criticality device. A user on their own everyday device is counted, not listed. These are identity ↔ device matches, not the attack paths counted on the Identity and Endpoint Attack paths pages.">Identity ↔ device matches'
+      + (bits.length ? ' · ' + bits.join(' · ') : '')
+      + '<em>' + (m.groups.length ? '' : 'none involve a privileged identity or a critical device' + (rest ? ' · ' : ''))
+      + (rest ? num(rest) + ' routine match' + (rest === 1 ? '' : 'es') + ' not listed' : '') + '</em></div>';
+    const dv = l => '<span class="sx-pdv" data-stop="1" ' + _entGo("device", l.device) + ' title="Open ' + esc(l.device.name) + ' in Devices">' + esc(l.device.name) + (l.device.criticality ? ' · ' + esc(l.device.criticality) : '') + '</span>';
+    const chips = m.groups.slice(0, CAP).map((g, i) => {
+      const t0 = g.tier0 ? '<span class="sx-t0">Tier-0</span>' : (g.privileged ? '<span class="sx-t0 priv">priv</span>' : ''), n = g.links.length, nm = esc(g.identity.displayName || g.identity.upn);
+      // A chip opens the identity ITSELF (the User view filtered to it), and each device name opens that device
       // in the Devices view — not the pillar overview, where the reader would have to find the entity again.
-      return '<button class="sx-prow" ' + _entGo("identity", l.identity) + ' title="Open ' + esc(l.identity.displayName || l.identity.upn) + ' in Users"><span class="sx-pn">' + (i + 1) + '</span><span class="sx-px"><span class="sx-pt">' + esc(l.identity.displayName || l.identity.upn) + ' ' + t0 + '</span>'
-        + '<span class="sx-pd" data-stop="1" ' + _entGo("device", l.device) + ' title="Open ' + esc(l.device.name) + ' in Devices">💻 ' + esc(l.device.name) + (l.device.criticality ? ' · ' + esc(l.device.criticality) : '') + (l.data ? ' → 📩 ' + esc(l.data.issue) : '') + '</span></span></button>';
+      return '<button class="sx-prow' + (i >= FIRST ? ' more' : '') + '" ' + _entGo("identity", g.identity) + ' title="Open ' + nm + ' in Users"><span class="sx-pn">' + (i + 1) + '</span><span class="sx-px"><span class="sx-pt">' + nm + ' ' + t0 + '</span>'
+        + '<span class="sx-pd">💻 ' + (n > 2 ? n + ' devices · ' : '') + g.links.slice(0, 2).map(dv).join(', ')
+        + (n > 2 ? ' <span title="' + esc(g.links.slice(2).map(l => l.device.name).join(", ")) + '">+' + (n - 2) + '</span>' : '')
+        + (g.data ? ' → 📩 ' + esc(g.data.issue) : '') + '</span></span></button>';
     }).join("");
+    const more = m.groups.length > FIRST ? '<button class="sx-prow sx-pmore" onclick="this.parentNode.classList.add(\'all\')" title="Show the other identities">+' + num(m.groups.length - FIRST) + ' more identit' + (m.groups.length - FIRST === 1 ? 'y' : 'ies') + '</button>' : '';
+    const capped = m.groups.length > CAP ? '<span class="sx-prow sx-pnote more">' + num(m.groups.length - CAP) + ' more not listed here — open Users for the full list</span>' : '';
+    return head + chips + more + capped;
   }
   function suiteSignalNote(pills) {
     const n = k => { const o = pills[k] && pills[k].overall; return o ? (o.crit || 0) + (o.high || 0) : 0; };
@@ -11997,7 +12038,8 @@ window.EP = (function () {
     const critByPillar = SUITE_PILLARS.map(p => { const o = pills[p.key] && pills[p.key].overall; return o ? (esc(p.label) + " " + (o.crit || 0)) : null; }).filter(Boolean).join(" · ");
     suiteSnapSave(suiteCurScores(pills, estScore));   // persist this scan's per-pillar scores (live) so the trend becomes real over time
     const ff = suiteFixFirst(pills, st);
-    const graphCap = links.length ? (links.length + ' correlated path' + (links.length > 1 ? "s" : "") + ' · matched by account')
+    const mgN = links.length ? suiteMatchGroups(links).matches : 0;   // the matches that matter, as the strip lists them
+    const graphCap = links.length ? (mgN ? mgN + ' correlated path' + (mgN > 1 ? "s" : "") + ' · matched by account' : 'no privileged or critical-device match')
       : nm ? (nm.confirmed + ' of 3 pillars flagged · not linked (no verified path)')
       : 'identity-axis blast radius';
     const graphSide = links.length ? ('<div class="sx-paths">' + suitePathList(links) + '</div>')
