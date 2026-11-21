@@ -684,6 +684,11 @@
   .ep-top .spacer { flex: 1; }
   .ep-top #epStatus { font-size: 12px; color: var(--muted); max-width: 440px; text-align: right; }
   .ep-top #epStatus.err { color: var(--red); }
+  .ep-net { position: relative; display: flex; gap: 8px; align-items: center; font-size: 12px; } .ep-net[hidden] { display: none; }
+  .ep-net .w { color: var(--amber); white-space: nowrap; }
+  .ep-net .p { background: color-mix(in srgb, var(--amber) 14%, transparent); color: var(--amber); border: 1px solid color-mix(in srgb, var(--amber) 45%, transparent); border-radius: 999px; padding: 4px 11px; font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  .ep-net .l { position: absolute; right: 0; top: calc(100% + 8px); width: 380px; max-height: 50vh; overflow: auto; background: #0A1630; border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; z-index: 40; color: var(--text); text-align: left; box-shadow: 0 12px 30px rgba(0,0,0,.45); }
+  .ep-net .l p { margin: 4px 0 8px; color: var(--muted); } .ep-net .l div { padding: 6px 0; border-top: 1px solid var(--border); color: var(--muted); } .ep-net .l div b { color: var(--text); display: block; }
   .ep-top #epWho { font-size: 12.5px; color: var(--muted); }
   .ep-top #epWho b { color: var(--text); font-weight: 600; }
   /* Loading bar — an indeterminate sweep shown while a view's live scan is running. */
@@ -5746,6 +5751,7 @@
     <button id="epNavToggle" class="ep-navtoggle" title="Hide menu" aria-label="Toggle menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16" stroke-linecap="round"/></svg></button>
     <span class="vtitle" id="epViewTitle">Entra Posture</span>
     <span class="spacer"></span>
+    <span id="epNet" class="ep-net" hidden></span>
     <span id="epStatus" aria-live="polite"></span>
     <span id="epWho"><em>Not signed in</em></span>
     <button id="epReportBtn" class="secondary" style="display:none;padding:6px 14px" title="Generate one management report across Identity, Endpoint and Apps &amp; Data">📄 Report</button>
@@ -6950,15 +6956,129 @@ window.EP = (function () {
   }
 
   // Token helpers the embedded views reach through the MSAL shim below.
-  async function tokenSilent(scopes) {     // silent only — lets a view's optional reads degrade gracefully
+  async function tokenSilent(scopes, force) {     // silent only — lets a view's optional reads degrade gracefully
     if (!msalInstance || !account) throw new Error("Not signed in.");
-    return (await msalInstance.acquireTokenSilent({ account, scopes })).accessToken;
+    return (await msalInstance.acquireTokenSilent(force ? { account, scopes, forceRefresh: true } : { account, scopes })).accessToken;
   }
   async function token(scopes) {           // silent, then popup (incremental consent)
     if (!msalInstance || !account) throw new Error("Not signed in.");
     try { return (await msalInstance.acquireTokenSilent({ account, scopes })).accessToken; }
     catch (e) { return (await msalInstance.acquireTokenPopup({ account, scopes })).accessToken; }
   }
+  /* NET:START */
+  // ONE network client for the live reads (EP.net). In a large tenant throttling is the normal case and a
+  // collection outlives a token, so every request made through it:
+  //   - is retried on 429 / 502 / 503 / 504, waiting for Retry-After when the service sends it, else backing off;
+  //   - takes its token per request (MSAL serves it from cache) and refreshes it once on a 401;
+  //   - shares one limit on requests in flight;
+  //   - and a read that was cut short SAYS so: the rows carry .partial and the read is listed for the top-bar chip,
+  //     so a number built on it is shown as a minimum and never mistaken for the total.
+  // deps: { fetch, token(scopes, force), sleep(ms), random(), base(), onPartial(list), onWait(ms) } — injected, so
+  // the fixture tests run it without a network.
+  function makeNet(deps) {
+    const TRIES = 5, NET_TRIES = 2, MAX_WAIT = 60000, CONC = 6, HUNT = ["ThreatHunting.Read.All"];
+    const stats = { requests: 0, retries: 0 }, partials = [];
+    const retryable = st => st === 429 || st === 502 || st === 503 || st === 504;
+    function waitMs(r, n) {
+      let ra = 0; try { ra = parseFloat(r && r.headers && r.headers.get && r.headers.get("Retry-After")) || 0; } catch (e) {}
+      const base = ra > 0 ? ra * 1000 : Math.min(30000, 1000 * Math.pow(2, n + 1));
+      return Math.min(MAX_WAIT, Math.round(base + deps.random() * 400));
+    }
+    let active = 0; const queue = [];
+    const slot = () => (active < CONC ? (active++, Promise.resolve()) : new Promise(res => queue.push(res)));
+    const free = () => { const nx = queue.shift(); if (nx) nx(); else active--; };
+    async function pause(r, n) { const ms = waitMs(r, n); stats.retries++; try { if (deps.onWait) deps.onWait(ms); } catch (e) {} await deps.sleep(ms); }
+    // → the Response (the caller reads .ok / .status / .json() as with fetch). scopes: take the token here, per
+    // request; fallbackToken: a token the caller already holds (an interactive one), used when the silent read fails.
+    async function send(url, init, scopes, fallbackToken) {
+      init = init || {}; let force = false;
+      for (let n = 0; ; n++) {
+        let at = fallbackToken || null;
+        if (scopes) { try { at = await deps.token(scopes, force); } catch (e) { if (!fallbackToken) throw e; at = fallbackToken; } }
+        const headers = Object.assign({}, init.headers || {}); if (at) headers.Authorization = "Bearer " + at;
+        await slot(); let r = null, err = null; stats.requests++;
+        try { r = await deps.fetch(url, Object.assign({}, init, { headers: headers })); } catch (e) { err = e; } finally { free(); }
+        if (err) { if (n >= NET_TRIES - 1) throw err; await pause(null, n); continue; }
+        if (retryable(r.status) && n < TRIES - 1) { await pause(r, n); continue; }
+        if (r.status === 401 && scopes && !force) { force = true; continue; }
+        return r;
+      }
+    }
+    async function fail(r, label) {
+      let d = ""; try { d = ((await r.json()).error || {}).message || ""; } catch (e) {}
+      const e2 = new Error((label || "Graph") + " " + r.status + (d ? " — " + d : "")); e2.status = e2.code = r.status; return e2;
+    }
+    function notePartial(label, detail) {
+      if (!label) return; const i = partials.findIndex(p => p.label === label), rec = { label: String(label), detail: String(detail || "") };
+      if (i >= 0) partials[i] = rec; else partials.push(rec);
+      try { if (deps.onPartial) deps.onPartial(partials.slice()); } catch (e) {}
+    }
+    function clearPartial(label) { const i = partials.findIndex(p => p.label === label); if (i < 0) return; partials.splice(i, 1); try { if (deps.onPartial) deps.onPartial(partials.slice()); } catch (e) {} }
+    const num = n => Number(n).toLocaleString("en-US");
+    // A query that ends in its own "top N" / "take N": rows at the cap mean more exists than was read.
+    function capped(rows, cap, what) {
+      rows = rows || [];
+      if (rows.length >= cap) { rows.partial = { cap: cap }; notePartial(what, "reached its row cap of " + num(cap) + " — more exists than was read"); }
+      else clearPartial(what);
+      return rows;
+    }
+    // Advanced hunting → rows. o.cap: read at most cap rows, and KNOW when there were more (one row past the cap is
+    // asked for); o.by: the order the cap keeps ("Cvss desc"), else an arbitrary cap rows. o.what names the read for
+    // the partial-data chip; o.label prefixes the error; o.token: a token already held.
+    async function hunt(q, o) {
+      o = o || {}; const cap = o.cap > 0 ? o.cap : 0;
+      const query = cap ? q + (o.by ? " | top " + (cap + 1) + " by " + o.by : " | take " + (cap + 1)) : q;
+      const r = await huntRaw(query, o.token);
+      if (!r.ok) throw await fail(r, o.label || "Advanced hunting");
+      let rows = (await r.json()).results || [];
+      if (cap && rows.length > cap) { rows = rows.slice(0, cap); rows.partial = { cap: cap };
+        if (o.what) notePartial(o.what, "more than " + num(cap) + " rows — the " + (o.by ? "top " : "first ") + num(cap) + " were read"); }
+      else if (cap && o.what) clearPartial(o.what);
+      return rows;
+    }
+    function huntRaw(q, at) {
+      return send(deps.base() + "/security/runHuntingQuery", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Query: q }) }, HUNT, at);
+    }
+    // A paged Graph list → all rows. Follows @odata.nextLink (same origin only: the token never leaves Graph) up to
+    // o.maxPages; stopping there is flagged, not silent.
+    async function getAll(path, scopes, o) {
+      o = o || {}; const max = o.maxPages || 500, out = [], abs = /^https?:\/\//.test(path);
+      let next = abs ? path : deps.base() + path, pages = 0;
+      const origin = u => { const m = /^https?:\/\/[^\/]+/i.exec(u); return m ? m[0].toLowerCase() : ""; }, home = origin(next);
+      while (next && pages < max) {
+        const r = await send(next, null, scopes, o.token);
+        if (!r.ok) throw await fail(r, o.label || "Graph");
+        const j = await r.json(), v = j.value || [];
+        for (let i = 0; i < v.length; i++) out.push(v[i]);
+        next = j["@odata.nextLink"] || null; pages++;
+        if (next && origin(next) !== home) next = null;
+        if (o.onPage) { try { o.onPage(out.length); } catch (e) {} }
+      }
+      const what = o.what || String(path).split("?")[0];
+      if (next) { out.partial = { pages: max }; notePartial(what, "stopped after " + num(out.length) + " rows (" + num(max) + " pages) — more exists than was read"); }
+      else clearPartial(what);
+      return out;
+    }
+    return { send: send, hunt: hunt, huntRaw: huntRaw, getAll: getAll, capped: capped, notePartial: notePartial, clearPartial: clearPartial,
+      partials: () => partials.slice(), stats: stats };
+  }
+  /* NET:END */
+  // Top-bar chip: shown while a read waits on throttling, and for as long as a read of this session was cut short.
+  let _netWaitUntil = 0;
+  function netChipSync() {
+    const el = document.getElementById("epNet"); if (!el) return;
+    const ps = net.partials(), waiting = Date.now() < _netWaitUntil, open = !!(el.querySelector(".l") && !el.querySelector(".l").hidden);
+    if (!ps.length && !waiting) { el.hidden = true; el.innerHTML = ""; return; }
+    el.hidden = false;
+    el.innerHTML = (waiting ? '<span class="w" title="Microsoft Graph is throttling this tenant. The read is retried automatically.">⏳ Throttled · retrying</span>' : '')
+      + (ps.length ? '<button type="button" class="p" title="Some reads were cut short. Click for the list.">◐ Partial data · ' + ps.length + '</button>'
+        + '<div class="l"' + (open ? '' : ' hidden') + '><b>These reads were cut short</b><p>The tenant holds more than was read, so a number built on one of these is a minimum, not the total.</p>'
+        + ps.map(p => '<div><b>' + esc(p.label) + '</b>' + esc(p.detail) + '</div>').join("") + '</div>' : '');
+    const b = el.querySelector(".p"); if (b) b.onclick = () => { const l = el.querySelector(".l"); if (l) l.hidden = !l.hidden; };
+  }
+  const net = makeNet({ fetch: (u, i) => fetch(u, i), token: tokenSilent, sleep: ms => new Promise(res => setTimeout(res, ms)), random: Math.random, base: graphBase,
+    onPartial: () => { try { netChipSync(); } catch (e) {} },
+    onWait: ms => { _netWaitUntil = Date.now() + ms; try { netChipSync(); } catch (e) {} setTimeout(() => { try { netChipSync(); } catch (e) {} }, ms + 60); } });
   async function tokenOptional(scopes) {    // returns null instead of throwing
     try { if (!msalInstance || !account) return null; return (await msalInstance.acquireTokenSilent({ account, scopes })).accessToken; }
     catch (e) { return null; }
@@ -7289,17 +7409,27 @@ window.EP = (function () {
   async function tvmVulns(ids) {
     ids = [...new Set((ids || []).filter(Boolean).map(x => String(x).replace(/'/g, "")))];
     const by = {}; if (!ids.length) return by;
+    const CAP = 5000, opt = o => Object.assign({ cap: CAP, label: "Exposure graph" }, o); let cut = false;
     const base = chunk => "DeviceTvmSoftwareVulnerabilities | where DeviceId in (" + chunk.map(x => "'" + x + "'").join(",") + ")"
       + " | where VulnerabilitySeverityLevel in ('Critical','High')";
-    for (let i = 0; i < ids.length; i += 200) {
-      const b = base(ids.slice(i, i + 200)); let rows;
-      try { rows = await exposureGraph.hunt(b + " | join kind=leftouter (DeviceTvmSoftwareVulnerabilitiesKB | summarize CvssScore=max(toreal(CvssScore)) by CveId) on CveId"
-        + " | summarize Cvss=max(CvssScore), Sev=take_any(VulnerabilitySeverityLevel) by DeviceId, SoftwareName, CveId | take 5000"); }
-      catch (e) { rows = await exposureGraph.hunt(b + " | summarize Sev=take_any(VulnerabilitySeverityLevel) by DeviceId, SoftwareName, CveId | take 5000"); }
+    // One read per 200 devices, highest CVSS first so a cut read keeps the worst CVEs. A read that still hits the cap
+    // is split in two and read again, so the result is complete unless ONE device alone exceeds the cap — and then
+    // it is flagged (by.partial + the partial-data chip), never passed off as the whole list.
+    async function read(chunk) {
+      const q = base(chunk); let rows;
+      try { rows = await net.hunt(q + " | join kind=leftouter (DeviceTvmSoftwareVulnerabilitiesKB | summarize CvssScore=max(toreal(CvssScore)) by CveId) on CveId"
+        + " | summarize Cvss=max(CvssScore), Sev=take_any(VulnerabilitySeverityLevel) by DeviceId, SoftwareName, CveId", opt({ by: "Cvss desc" })); }
+      catch (e) { rows = await net.hunt(q + " | summarize Sev=take_any(VulnerabilitySeverityLevel) by DeviceId, SoftwareName, CveId", opt({ by: "Sev asc" })); }   // 'Critical' sorts before 'High'
+      if (rows.partial && chunk.length > 1) { const h = chunk.length >> 1; await read(chunk.slice(0, h)); await read(chunk.slice(h)); return; }
+      if (rows.partial) cut = true;
       rows.forEach(v => { if (!v.DeviceId || !v.CveId) return;
         (by[v.DeviceId] = by[v.DeviceId] || []).push({ cve: v.CveId, software: v.SoftwareName || "", cvss: +v.Cvss || (/^critical$/i.test(v.Sev || "") ? 9 : 7), scored: !!(+v.Cvss) }); });
     }
+    for (let i = 0; i < ids.length; i += 200) await read(ids.slice(i, i + 200));
     Object.keys(by).forEach(k => by[k].sort((a, c) => c.cvss - a.cvss));
+    const WHAT = "Critical / High CVEs per device";
+    if (cut) { Object.defineProperty(by, "partial", { value: true }); net.notePartial(WHAT, "a device carries more than " + CAP.toLocaleString("en-US") + " CVE × software pairs — its highest-CVSS ones were read"); }
+    else net.clearPartial(WHAT);
     return by;
   }
 
@@ -8379,7 +8509,7 @@ window.EP = (function () {
   // the EIDSCA checks degrade to N/A rather than failing or raising a consent dialog.
   async function _eidGraph(path, scopes) {
     try { const tok = await tokenOptional(scopes || ["Policy.Read.All"]); if (!tok) return null;
-      const r = await fetch(graphBase() + path, { headers: { Authorization: "Bearer " + tok } });
+      const r = await net.send(graphBase() + path, { headers: { Authorization: "Bearer " + tok } });
       return r.ok ? await r.json() : null;
     } catch (e) { return null; }
   }
@@ -13432,13 +13562,10 @@ window.EP = (function () {
     const _overlays = [];
     let _cache = null;
 
-    async function hunt(q) {
-      const at = await tokenSilent(["ThreatHunting.Read.All"]);
-      const r = await fetch(graphBase() + "/security/runHuntingQuery", { method: "POST", headers: { Authorization: "Bearer " + at, "Content-Type": "application/json" }, body: JSON.stringify({ Query: q }) });
-      if (!r.ok) { let d = ""; try { d = ((await r.json()).error || {}).message || ""; } catch (e) {} const e2 = new Error("Exposure graph " + r.status + (d ? " — " + d : "")); e2.status = r.status; throw e2; }
-      return (await r.json()).results || [];
-    }
-    function idList(ids) { return "(" + ids.slice(0, 80).map(x => "'" + String(x).replace(/'/g, "") + "'").join(",") + ")"; }
+    function hunt(q) { return net.hunt(q, { label: "Exposure graph" }); }
+    function idList(ids) {   // at most 80 ids in one query; a longer list is read in part, and says so
+      if (ids.length > 80) net.notePartial("Exposure graph · neighbour lookup", ids.length + " assets to look up — the first 80 were read");
+      return "(" + ids.slice(0, 80).map(x => "'" + String(x).replace(/'/g, "") + "'").join(",") + ")"; }
     function isGuid(s) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(s || "").trim()); }
     function kindOf(label) {
       const s = String(label || "").toLowerCase();
@@ -13524,9 +13651,11 @@ window.EP = (function () {
       // 3) one-hop inbound edges reaching the data nodes we just added (who / what can read the data). Native → verified.
       const addedIds = addNodes.map(n => n.id);
       if (addedIds.length) {
-        try { (await hunt("ExposureGraphEdges | where TargetNodeId in " + idList(addedIds)
-          + " | project EdgeId, EdgeLabel, SourceNodeId, SourceNodeName, SourceNodeLabel, TargetNodeId, TargetNodeName, TargetNodeLabel, EdgeProperties | take 1000"))
-          .map(normEdge).filter(e => e.from && e.to && (nmap[e.from] || nmap[e.to])).forEach(e => addEdges.push(e)); } catch (e) {}
+        for (let i = 0; i < addedIds.length; i += 80) {   // idList takes 80 ids: read every chunk, not only the first
+          try { (await net.hunt("ExposureGraphEdges | where TargetNodeId in " + idList(addedIds.slice(i, i + 80))
+            + " | project EdgeId, EdgeLabel, SourceNodeId, SourceNodeName, SourceNodeLabel, TargetNodeId, TargetNodeName, TargetNodeLabel, EdgeProperties", { cap: 1000, label: "Exposure graph", what: "Exposure graph · who reaches the data stores" }))
+            .map(normEdge).filter(e => e.from && e.to && (nmap[e.from] || nmap[e.to])).forEach(e => addEdges.push(e)); } catch (e) {}
+        }
       }
       return { nodes: addNodes, edges: addEdges };
     }
@@ -13624,7 +13753,7 @@ window.EP = (function () {
       neighbors: neighbors, chokePoints: chokePoints, addOverlay: addOverlay, load: load,
       nodes: nodes, edges: edges, graph: graph, reset: reset };
   })();
-  return { registerView, viewApi, ensureLoaded, navSync: navSyncSoon, progHtml, kpiTrend, kpiDelta: kpiDeltaHtml, reasonLine, agoText, chainHtml, assetDelta, assetDeltaHtml, chainMatch, tvmVulns, tenantPref, makeAsk, token, tokenSilent, tokenOptional, graphBase, exposureGraph, exceptions, critAssets, setStatus, esc, DEMO,
+  return { registerView, viewApi, ensureLoaded, navSync: navSyncSoon, progHtml, kpiTrend, kpiDelta: kpiDeltaHtml, reasonLine, agoText, chainHtml, assetDelta, assetDeltaHtml, chainMatch, tvmVulns, tenantPref, makeAsk, token, tokenSilent, tokenOptional, graphBase, net, exposureGraph, exceptions, critAssets, setStatus, esc, DEMO,
     scopedDoc, msalShim, ACCOUNT, llm, llmComplete, goto, mitre: mitreFor, scoreGauge: scoreGaugeCompact, skeleton: skeletonHtml, licenceTier, huntDiag, llmLive: () => llmState === "ok",
     estateAsk: (host) => renderSuiteAsk(host),   // the cross-estate copilot, mountable into the unified Ask page's "✦ Copilot — all domains" scope
     get account() { return account; }, get signedIn() { return !!account; },
@@ -13738,7 +13867,7 @@ window.M365LIVE = (function () {
 
   async function graphGet(path, scopes) {
     let at; try { at = await EP.tokenSilent(scopes); } catch (e) { at = await EP.token(scopes); }
-    const r = await fetch(EP.graphBase() + path, { headers: { Authorization: "Bearer " + at } });
+    const r = await EP.net.send(EP.graphBase() + path, { headers: { Authorization: "Bearer " + at } });
     if (r.status === 403 || r.status === 401) { const e = new Error("not consented"); e.code = r.status; throw e; }
     if (!r.ok) throw new Error(path.split("?")[0] + " HTTP " + r.status);
     return r.json();
@@ -29072,7 +29201,7 @@ function graphPanelId(){
 // ---------- live collection ----------
 async function hunt(q){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok){ let d=""; try{ d=((await r.json()).error||{}).message||""; }catch(e){} const e2=new Error("Threat "+r.status+(d?" — "+d:"")); e2.status=r.status; throw e2; }
   return (await r.json()).results || [];
 }
@@ -29086,7 +29215,7 @@ async function huntIdentityAlerts(){
     + " | join kind=leftouter (AlertEvidence | where EntityType == 'User' | summarize Acct=take_any(coalesce(AccountUpn, AccountName)) by AlertId) on AlertId"
     + " | project AlertId, Title, Severity, Category, DetectionSource, ServiceSource, AttackTechniques, Timestamp, Acct"
     + " | top 300 by Timestamp";
-  return (await hunt(q)).map(x => ({ alertId:x.AlertId, title:x.Title||"(alert)", severity:normSev(x.Severity), category:x.Category||"Other",
+  return (EP.net.capped(await hunt(q), 300, "Identity alerts")).map(x => ({ alertId:x.AlertId, title:x.Title||"(alert)", severity:normSev(x.Severity), category:x.Category||"Other",
     source:x.DetectionSource || x.ServiceSource || "", status:"", account:x.Acct || "", techniques: Array.isArray(x.AttackTechniques)?x.AttackTechniques:(x.AttackTechniques?[x.AttackTechniques]:[]),
     lastSeenDays: x.Timestamp ? Math.floor((now - Date.parse(x.Timestamp))/864e5) : null }));
 }
@@ -29096,7 +29225,7 @@ async function huntEntities(){
   try {
     const q = "AlertEvidence | where Timestamp > ago(30d) | where EntityType in ('User','Ip','Url','File','Process')"
       + " | project AlertId, EntityType, AccountName, AccountUpn, RemoteIP, RemoteUrl, FileName, ProcessCommandLine | take 8000";
-    (await hunt(q)).forEach(r => {
+    (EP.net.capped(await hunt(q), 8000, "Identity alerts · evidence")).forEach(r => {
       const t = String(r.EntityType||"").toLowerCase();
       let type = t, label = "";
       if (t === "user"){ label = r.AccountUpn || r.AccountName || ""; }
@@ -30300,14 +30429,8 @@ async function ensureComplianceDetail(d){
 
 // ── live collection: Entra + Intune (Graph) + Defender machines (MDE, optional) ──
 async function gGetAll(path, scopes){
-  const at = await EP.tokenSilent(scopes);
-  let out = [], next = EP.graphBase() + path, g = 0;
-  while (next && g++ < 200){
-    const r = await fetch(next, { headers: { Authorization: "Bearer " + at } });
-    if (!r.ok){ let d=""; try{ d=((await r.json()).error||{}).message||""; }catch(e){} const e2=new Error("Graph "+r.status+(d?" — "+d:"")); e2.status=r.status; throw e2; }
-    const j = await r.json(); out = out.concat(j.value || []); next = j["@odata.nextLink"];
-  }
-  return out;
+  // The shared client: retry on throttling, a token per request, and a cut list is flagged (rows.partial), not silent.
+  return EP.net.getAll(path, scopes, { label: "Graph" });
 }
 let _mdeMode = "silent";   // flipped to "interactive" by the Connect Defender button (one consent popup)
 // IMPORTANT: the Defender for Endpoint REST API (api.securitycenter.microsoft.com) does NOT support
@@ -30319,9 +30442,7 @@ async function huntDevices(){
   const sc = ["ThreatHunting.Read.All"];
   const at = _mdeMode === "interactive" ? await EP.token(sc) : await EP.tokenSilent(sc);
   const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by DeviceId";
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", {
-    method: "POST", headers: { Authorization: "Bearer " + at, "Content-Type": "application/json" },
-    body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok){ let d=""; try{ d=((await r.json()).error||{}).message||""; }catch(e){} const e2=new Error("Defender hunting "+r.status+(d?" — "+d:"")); e2.status=r.status; throw e2; }
   const j = await r.json(); return j.results || [];
 }
@@ -30334,8 +30455,7 @@ async function huntThreat(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
   // Filter the small table (AlertInfo) first, then join to the device mapping (distinct to keep it light).
   const q = "AlertInfo | where Timestamp > ago(30d) | join kind=inner (AlertEvidence | where Timestamp > ago(30d) and isnotempty(DeviceId) | distinct AlertId, DeviceId) on AlertId | summarize Sev = max(case(Severity == 'High', 3, Severity == 'Medium', 2, Severity == 'Low', 1, 0)) by DeviceId";
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", {
-    method: "POST", headers: { Authorization: "Bearer " + at, "Content-Type": "application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok){ let body = ""; try { const j = await r.json(); body = (j && j.error && j.error.message) ? j.error.message : ""; } catch(_){} const e2 = new Error("threat " + r.status + (body ? ": " + body : "")); e2.status = r.status; throw e2; }
   return (await r.json()).results || [];
 }
@@ -30343,7 +30463,7 @@ async function huntThreat(){
 async function huntCves(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
   const q = "DeviceTvmSoftwareVulnerabilities | summarize Sev = max(case(VulnerabilitySeverityLevel == 'Critical', 4, VulnerabilitySeverityLevel == 'High', 3, VulnerabilitySeverityLevel == 'Medium', 2, VulnerabilitySeverityLevel == 'Low', 1, 0)), Crit = dcountif(CveId, VulnerabilitySeverityLevel == 'Critical'), High = dcountif(CveId, VulnerabilitySeverityLevel == 'High'), Med = dcountif(CveId, VulnerabilitySeverityLevel == 'Medium'), Cves = dcount(CveId) by DeviceId";
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok){ const e2 = new Error("cves " + r.status); e2.status = r.status; throw e2; }
   return (await r.json()).results || [];
 }
@@ -30351,7 +30471,7 @@ async function huntCves(){
 async function huntConfig(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
   const q = "DeviceTvmSecureConfigurationAssessment | where IsApplicable == 1 and IsCompliant == 0 | summarize Fails = dcount(ConfigurationId) by DeviceId";
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok){ const e2 = new Error("config " + r.status); e2.status = r.status; throw e2; }
   return (await r.json()).results || [];
 }
@@ -30371,7 +30491,7 @@ async function huntInternetFacing(){
     + " | extend PP = tostring(AF.InternetFacingPublicScannedPort), LP = tostring(AF.InternetFacingLocalPort), IFR = tostring(AF.InternetFacingReason)"
     + " | extend Port = toint(iif(isnotempty(PP), PP, LP))"
     + " | summarize Ports = make_set_if(Port, isnotempty(Port) and Port > 0, 40), IFR = take_any(IFR) by DeviceId";
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok){ const e2 = new Error("internet-facing " + r.status); e2.status = r.status; throw e2; }
   return (await r.json()).results || [];
 }
@@ -30382,9 +30502,9 @@ async function huntSeenBy(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
   const q = "DeviceInfo | where Timestamp > ago(30d) | where OnboardingStatus != 'Onboarded' | summarize arg_max(Timestamp, *) by DeviceId"
     + " | where isempty(MergedToDeviceId) | limit 1000 | invoke SeenBy() | project DeviceId, SeenBy";
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok){ const e2 = new Error("seen-by " + r.status); e2.status = r.status; throw e2; }
-  return (await r.json()).results || [];
+  return EP.net.capped((await r.json()).results || [], 1000, "Devices · seen-by enrichment");
 }
 // The network addresses Defender holds for discovered devices (DeviceNetworkInfo). Optional: a failure leaves the
 // IP column saying "not read".
@@ -30392,7 +30512,7 @@ async function huntDiscIps(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
   const q = "DeviceInfo | where Timestamp > ago(30d) | where OnboardingStatus != 'Onboarded' | summarize by DeviceId"
     + " | join kind=inner (DeviceNetworkInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, IPAddresses) by DeviceId) on DeviceId | project DeviceId, IPAddresses";
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok){ const e2 = new Error("device addresses " + r.status); e2.status = r.status; throw e2; }
   return (await r.json()).results || [];
 }
@@ -30424,7 +30544,7 @@ async function enrichExposureCrit(devices){
     const q = "ExposureGraphNodes | where NodeProperties has 'criticalityLevel' and NodeProperties has 'deviceName'"
       + " | extend L = toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), DN = tostring(NodeProperties.rawData.deviceName), Rules = tostring(NodeProperties.rawData.criticalityLevel.ruleNames)"
       + " | where isnotempty(DN) and L between (0 .. 3) | summarize L = min(L), Rules = take_any(Rules) by DN";
-    const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+    const r = await EP.net.huntRaw(q, at);
     if (!r.ok) return; rows = (await r.json()).results || [];
   } catch(e){ return; }
   const by = {};
@@ -30456,7 +30576,7 @@ function summarizeCa(pols){
 }
 async function collectCa(){
   const at = await EP.tokenSilent(["Policy.Read.All"]);
-  const r = await fetch(EP.graphBase() + "/identity/conditionalAccess/policies?$select=displayName,state,conditions,grantControls", { headers:{ Authorization:"Bearer "+at } });
+  const r = await EP.net.send(EP.graphBase() + "/identity/conditionalAccess/policies?$select=displayName,state,conditions,grantControls", { headers: { Authorization: "Bearer " + at } });
   if (!r.ok){ const e2 = new Error("Conditional Access " + r.status); e2.status = r.status; throw e2; }
   return summarizeCa((await r.json()).value || []);
 }
@@ -31499,19 +31619,13 @@ const NEEDS_COV = { needsCov:true };
 
 // ---------- live Graph collection (Entra + Intune + Defender onboarding) ----------
 async function gGetAll(path, scopes){
-  const at = await EP.tokenSilent(scopes);
-  let out = [], next = EP.graphBase() + path, guard = 0;
-  while (next && guard++ < 200){
-    const r = await fetch(next, { headers: { Authorization: "Bearer " + at } });
-    if (!r.ok){ let d=""; try{ d=((await r.json()).error||{}).message||""; }catch(e){} const err = new Error("Graph "+r.status+(d?" — "+d:"")); err.status=r.status; throw err; }
-    const j = await r.json(); out = out.concat(j.value || []); next = j["@odata.nextLink"];
-  }
-  return out;
+  // The shared client: retry on throttling, a token per request, and a cut list is flagged (rows.partial), not silent.
+  return EP.net.getAll(path, scopes, { label: "Graph" });
 }
 async function huntOnboarding(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
   const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by DeviceId | project AadDeviceId, DeviceName, OnboardingStatus, DeviceCategory, DeviceType, OSPlatform, SensorHealthState, IsExcluded, ExclusionReason";
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok){ let m = ""; try { m = ((await r.json()).error || {}).message || ""; } catch(e){} const e2 = new Error(m || ("advanced hunting HTTP " + r.status)); e2.status=r.status; throw e2; }
   return (await r.json()).results || [];
 }
@@ -31544,7 +31658,7 @@ function huntFailKind(e){
 async function defenderPlan(){
   try {
     const at = await EP.tokenSilent(["Organization.Read.All"]);
-    const r = await fetch(EP.graphBase() + "/subscribedSkus?$select=skuPartNumber,capabilityStatus,servicePlans", { headers: { Authorization: "Bearer " + at } });
+    const r = await EP.net.send(EP.graphBase() + "/subscribedSkus?$select=skuPartNumber,capabilityStatus,servicePlans", { headers: { Authorization: "Bearer " + at } });
     if (!r.ok) return null;
     const plans = {}; ((await r.json()).value || []).forEach(k => { if (String(k.capabilityStatus || "").toLowerCase() !== "enabled") return;
       (k.servicePlans || []).forEach(p => { if (String(p.provisioningStatus || "").toLowerCase() !== "disabled") plans[String(p.servicePlanName || "").toUpperCase()] = 1; }); });
@@ -31573,7 +31687,7 @@ async function enrichExposureCrit(devices){
     const q = "ExposureGraphNodes | where NodeProperties has 'criticalityLevel' and NodeProperties has 'deviceName'"
       + " | extend L=toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), DN=tostring(NodeProperties.rawData.deviceName), Rules=tostring(NodeProperties.rawData.criticalityLevel.ruleNames)"
       + " | where isnotempty(DN) and L between (0 .. 3) | summarize L=min(L), Rules=take_any(Rules) by DN";
-    const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+    const r = await EP.net.huntRaw(q, at);
     if (!r.ok) return; rows = (await r.json()).results || [];
   } catch(e){ return; }
   const by = {}; rows.forEach(x => { if (x.DN == null) return; by[String(x.DN).toLowerCase()] = { v: CRIT_LABELS[+x.L] || "", roles: parseRoles(x.Rules) }; });
@@ -32206,14 +32320,8 @@ function failingSettings(d){ return deviceSettings(d).filter(s => s.state === "n
 
 // ---------- live Graph collection (Intune) ----------
 async function gGetAll(path, scopes){
-  const at = await EP.tokenSilent(scopes);
-  let out = [], next = EP.graphBase() + path, guard = 0;
-  while (next && guard++ < 200){
-    const r = await fetch(next, { headers: { Authorization: "Bearer " + at } });
-    if (!r.ok){ let d=""; try{ d=((await r.json()).error||{}).message||""; }catch(e){} const err = new Error("Graph "+r.status+(d?" — "+d:"")); err.status=r.status; throw err; }
-    const j = await r.json(); out = out.concat(j.value || []); next = j["@odata.nextLink"];
-  }
-  return out;
+  // The shared client: retry on throttling, a token per request, and a cut list is flagged (rows.partial), not silent.
+  return EP.net.getAll(path, scopes, { label: "Graph" });
 }
 function cwWeight(d){
   if (d.jail) return 1;
@@ -32230,7 +32338,7 @@ async function enrichSettings(devices){
   let at; try { at = await EP.tokenSilent(["DeviceManagementManagedDevices.Read.All"]); } catch(e){ return; }
   for (const d of bad){
     try {
-      const r = await fetch(EP.graphBase() + "/deviceManagement/managedDevices/" + d.id + "/deviceCompliancePolicySettingStates?$select=settingName,setting,state", { headers:{ Authorization:"Bearer "+at } });
+      const r = await EP.net.send(EP.graphBase() + "/deviceManagement/managedDevices/" + d.id + "/deviceCompliancePolicySettingStates?$select=settingName,setting,state", { headers: { Authorization: "Bearer " + at } });
       if (!r.ok) continue;
       const ss = ((await r.json()).value || []).map(s => ({ name: s.settingName || s.setting || "", state: String(s.state||"").toLowerCase(), cat:"" })).filter(s => s.name);
       if (ss.length) d.settings = ss;
@@ -32246,7 +32354,7 @@ async function enrichCriticality(devices){
     const q = "ExposureGraphNodes | where NodeProperties has 'criticalityLevel' and NodeProperties has 'deviceName'"
       + " | extend L=toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), DN=tostring(NodeProperties.rawData.deviceName), Rules=tostring(NodeProperties.rawData.criticalityLevel.ruleNames)"
       + " | where isnotempty(DN) and L between (0 .. 3) | summarize L=min(L), Rules=take_any(Rules) by DN";
-    const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+    const r = await EP.net.huntRaw(q, at);
     if (!r.ok) return; rows = (await r.json()).results || [];
   } catch(e){ return; }
   const byName = {}; rows.forEach(x => { if (x.DN != null) byName[String(x.DN).toLowerCase()] = { v: CRIT_LABELS[+x.L] || "", roles: parseRoles(x.Rules) }; });
@@ -32271,7 +32379,7 @@ const POL_LABEL = { windows:"Windows", macos:"macOS", ios:"iOS / iPadOS", androi
 async function collectPolicy(){
   const P = { read:true, notRead:[], settings:null, compliance:null, rings:null, mam:null };
   const one = async (path, scopes) => { const at = await EP.tokenSilent(scopes);
-    const r = await fetch(EP.graphBase() + path, { headers:{ Authorization:"Bearer "+at } });
+    const r = await EP.net.send(EP.graphBase() + path, { headers: { Authorization: "Bearer " + at } });
     if (!r.ok){ const e = new Error("Graph " + r.status); e.status = r.status; throw e; } return r.json(); };
   const CFG = ["DeviceManagementConfiguration.Read.All"], APPS = ["DeviceManagementApps.Read.All"];
   const why = e => (e && (e.status === 403 || e.status === 401)) ? "permission not granted" : ((e && e.message) || "read failed");
@@ -32900,7 +33008,7 @@ const NEEDS_DEFENDER = { needsDefender:true,
 // ---------- live collection (Defender secure-config via advanced hunting) ----------
 async function hunt(q){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok){ let d=""; try{ d=((await r.json()).error||{}).message||""; }catch(e){} const e2=new Error("Hardening TVM "+r.status+(d?" — "+d:"")); e2.status=r.status; throw e2; }
   return (await r.json()).results || [];
 }
@@ -32921,7 +33029,7 @@ async function huntControls(){
   // Defender KB RemediationOptions / RiskDescription come back as HTML (links, <ol>, <b>…). Strip to
   // plain text so the recommendations read cleanly instead of showing raw markup.
   const plain = v => v ? String(v).replace(/<[^>]+>/g, " ").replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/\s+/g, " ").trim() : "";
-  return (await hunt(q)).map(x => {
+  return (EP.net.capped(await hunt(q), 300, "Hardening · failing configurations")).map(x => {
     const impact = x.Impact != null ? +x.Impact : (x.KbImpact != null ? +x.KbImpact : 0);
     const toArr = v => Array.isArray(v) ? v : (v ? [v] : []);
     return { id: x.ConfigurationId, name: x.Name || x.Sub || x.KbSub || x.ConfigurationId,
@@ -34119,14 +34227,9 @@ EP.registerView("asropt", (function () {
   }
 
   async function gpaged(path, scopes) {
-    let at; try { at = await EP.tokenSilent(scopes); } catch (e) { at = await EP.token(scopes); }
-    const out = []; let next = /^https?:\/\//.test(path) ? path : EP.graphBase() + path, guard = 0;
-    while (next && guard++ < 25) {
-      const r = await fetch(next, { headers: { Authorization: "Bearer " + at } });
-      if (!r.ok) throw new Error(path.split("?")[0] + " HTTP " + r.status);
-      const j = await r.json(); (j.value || []).forEach(x => out.push(x)); next = j["@odata.nextLink"] || null;
-    }
-    return out;
+    // The shared client: retry on throttling, a token per request, and a cut list is flagged (rows.partial), not silent.
+    let at = null; try { at = await EP.tokenSilent(scopes); } catch (e) { at = await EP.token(scopes); }
+    return EP.net.getAll(path, scopes, { label: String(path).split("?")[0] + " HTTP", token: at, maxPages: 200 });
   }
 
   async function collect() {
@@ -34599,7 +34702,7 @@ function paintEol(){
 async function huntTvm(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
   const q = "DeviceTvmSoftwareVulnerabilities | summarize Critical=dcountif(CveId, VulnerabilitySeverityLevel=='Critical'), High=dcountif(CveId, VulnerabilitySeverityLevel=='High'), Medium=dcountif(CveId, VulnerabilitySeverityLevel=='Medium'), Cves=dcount(CveId) by DeviceId, DeviceName";
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok){ let d=""; try{ d=((await r.json()).error||{}).message||""; }catch(e){} const e2=new Error("TVM "+r.status+(d?" — "+d:"")); e2.status=r.status; throw e2; }
   return (await r.json()).results || [];
 }
@@ -34628,9 +34731,9 @@ async function huntCves(){
     + " | join kind=leftouter (DeviceTvmSoftwareVulnerabilitiesKB | summarize Cvss=max(toreal(CvssScore)),"
     + " Exploit=max(case(IsExploitAvailable, 1, 0)), Published=max(PublishedDate) by CveId) on CveId"
     + " | top 8000 by Devices";   // effectively uncapped for a normal tenant (portal shows the full org CVE count)
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok){ let d=""; try{ d=((await r.json()).error||{}).message||""; }catch(e){} const e2=new Error("CVE rollup "+r.status+(d?" — "+d:"")); e2.status=r.status; throw e2; }
-  return ((await r.json()).results || []).map(x => ({
+  return (EP.net.capped((await r.json()).results || [], 8000, "Vulnerabilities · CVE rollup")).map(x => ({
     cve: x.CveId, sev: normSev(x.Sev), cvss: (x.Cvss != null && x.Cvss !== "") ? +x.Cvss : null,
     exploit: !!(+x.Exploit), zeroday: !!(+x.ZeroDay),
     // "Actively exploited" tier — the CVE is in the CISA Known Exploited Vulnerabilities catalogue (bundled
@@ -34648,7 +34751,7 @@ async function huntCves(){
 async function huntInternetFacing(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
   const q = "DeviceInfo | where Timestamp > ago(7d) | where IsInternetFacing | distinct DeviceName";
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok) throw new Error("internet-facing " + r.status);
   return ((await r.json()).results || []).map(x => x.DeviceName).filter(Boolean);
 }
@@ -34658,7 +34761,7 @@ async function huntInternetFacing(){
 async function huntDeviceClass(){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
   const q = "DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, DeviceCategory, DeviceType, OSPlatform, AssetValue, DeviceRoles) by DeviceName";
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok) throw new Error("device class " + r.status);
   return (await r.json()).results || [];
 }
@@ -34669,7 +34772,7 @@ async function huntExposureCrit(){
   const q = "ExposureGraphNodes | where NodeProperties has 'criticalityLevel' and NodeProperties has 'deviceName'"
     + " | extend L=toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), DN=tostring(NodeProperties.rawData.deviceName), Rules=tostring(NodeProperties.rawData.criticalityLevel.ruleNames)"
     + " | where isnotempty(DN) and L between (0 .. 3) | summarize L=min(L), Rules=take_any(Rules) by DN";
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok) throw new Error("exposure crit " + r.status);
   const by = {};
   ((await r.json()).results || []).forEach(x => { if (x.DN == null) return; by[String(x.DN).toLowerCase()] = { v: CRIT_LABELS[+x.L] || "", roles: parseRoles(x.Rules) }; });
@@ -34685,9 +34788,9 @@ async function huntEol(){
     + " | where EndOfSupportStatus in ('EOS Software','EOS Version','Upcoming EOS Software','Upcoming EOS Version')"
     + " | summarize Devices=dcount(DeviceId), DeviceNames=make_set(DeviceName, 50), EosDate=any(EndOfSupportDate) by SoftwareVendor, SoftwareName, SoftwareVersion, EndOfSupportStatus"
     + " | top 500 by Devices";
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok) throw new Error("EOL " + r.status);
-  return ((await r.json()).results || []).map(x => ({ vendor: x.SoftwareVendor || "", name: x.SoftwareName || "",
+  return (EP.net.capped((await r.json()).results || [], 500, "Vulnerabilities · end-of-support software")).map(x => ({ vendor: x.SoftwareVendor || "", name: x.SoftwareName || "",
     version: x.SoftwareVersion || "", status: x.EndOfSupportStatus || "", eosDate: x.EosDate || null,
     devices: x.Devices || 0, deviceNames: Array.isArray(x.DeviceNames) ? x.DeviceNames : [] }));
 }
@@ -35477,13 +35580,13 @@ async function collect(){
   const critById = {}; crit.forEach(c => critById[c.NodeId] = c);
   const critIds = crit.map(c => c.NodeId);
   // 2) inbound edges to the critical assets (who can reach them — one hop).
-  const e1 = await hunt("ExposureGraphEdges | where TargetNodeId in " + idList(critIds)
-    + " | project SourceNodeId, SourceNodeName, SourceNodeLabel, EdgeLabel, TargetNodeId, TargetNodeName, TargetNodeLabel | take 500");
+  const e1 = EP.net.capped(await hunt("ExposureGraphEdges | where TargetNodeId in " + idList(critIds)
+    + " | project SourceNodeId, SourceNodeName, SourceNodeLabel, EdgeLabel, TargetNodeId, TargetNodeName, TargetNodeLabel | take 500"), 500, "Device attack paths · edges to critical assets");
   // 3) a second hop back from those sources (entry → source → critical).
   const srcIds = [...new Set(e1.map(e => e.SourceNodeId).filter(Boolean))];
   let e2 = [];
-  if (srcIds.length) { try { e2 = await hunt("ExposureGraphEdges | where TargetNodeId in " + idList(srcIds)
-    + " | project SourceNodeId, SourceNodeName, SourceNodeLabel, EdgeLabel, TargetNodeId, TargetNodeName, TargetNodeLabel | take 500"); } catch(e){} }
+  if (srcIds.length) { try { e2 = EP.net.capped(await hunt("ExposureGraphEdges | where TargetNodeId in " + idList(srcIds)
+    + " | project SourceNodeId, SourceNodeName, SourceNodeLabel, EdgeLabel, TargetNodeId, TargetNodeName, TargetNodeLabel | take 500"), 500, "Device attack paths · edges to critical assets"); } catch(e){} }
   // build nodes + edges
   const nmap = {}, edges = [];
   const addNode = (id, name, label, isCriticalNode) => { if (!id) return; const ex = nmap[id];
@@ -36548,7 +36651,7 @@ function buildTechniques(active){
 // ---------- live collection ----------
 async function hunt(q){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok){ let d=""; try{ d=((await r.json()).error||{}).message||""; }catch(e){} const e2=new Error("Threat "+r.status+(d?" — "+d:"")); e2.status=r.status; throw e2; }
   return (await r.json()).results || [];
 }
@@ -36569,7 +36672,7 @@ async function huntAlerts(){
     + " | extend DeviceName = coalesce(DeviceName, DeviceId)"
     + " | top 2000 by LastSeen";
   const now = Date.now();
-  return (await hunt(q)).map(x => ({ alertId:x.AlertId, title:x.Title||"(alert)", severity:normSev(x.Severity), category:x.Category||"Other",
+  return (EP.net.capped(await hunt(q), 2000, "Device alerts (30 days)")).map(x => ({ alertId:x.AlertId, title:x.Title||"(alert)", severity:normSev(x.Severity), category:x.Category||"Other",
     source:x.DetectionSource||"", status:"", techniques: Array.isArray(x.Techniques)?x.Techniques:(x.Techniques?[x.Techniques]:[]),
     device:x.DeviceName || x.DeviceId, lastSeenDays: x.LastSeen ? Math.floor((now - Date.parse(x.LastSeen))/864e5) : null }));
 }
@@ -36598,7 +36701,7 @@ async function huntEntities(){
   try {
     const q = "AlertEvidence | where Timestamp > ago(30d) | where EntityType in ('User','Ip','Url','File','Process')"
       + " | project AlertId, EntityType, AccountName, AccountUpn, RemoteIP, RemoteUrl, FileName, ProcessCommandLine | take 8000";
-    (await hunt(q)).forEach(r => {
+    (EP.net.capped(await hunt(q), 8000, "Device alerts · evidence")).forEach(r => {
       const t = String(r.EntityType||"").toLowerCase();
       let type = t, label = "";
       if (t === "user"){ label = r.AccountUpn || r.AccountName || ""; }
@@ -37832,7 +37935,7 @@ EP.registerView("data", (function () {
       var all = [], next = "https://graph.microsoft.com/v1.0/security/dataSecurityAndGovernance/sensitivityLabels", pages = 0;
       while (next && pages++ < 10) {
         if (next.indexOf("https://graph.microsoft.com/") !== 0) break;
-        var r = await fetch(next, { headers: { Authorization: "Bearer " + tok } });
+        var r = await EP.net.send(next, { headers: { Authorization: "Bearer " + tok } });
         if (!r.ok) { var m = ""; try { m = ((await r.json()).error || {}).message || ""; } catch (e2) {} throw new Error("Graph " + r.status + (m ? " — " + m : "")); }
         var j = await r.json(); all = all.concat(j.value || []); next = j["@odata.nextLink"] || null;
       }
@@ -38010,7 +38113,7 @@ function pageScore(ents){ if(!ents.length) return 0; return Math.min(100, ents.r
 // ---------- live collection ----------
 async function hunt(q){
   const at = await EP.tokenSilent(["ThreatHunting.Read.All"]);
-  const r = await fetch(EP.graphBase() + "/security/runHuntingQuery", { method:"POST", headers:{ Authorization:"Bearer "+at, "Content-Type":"application/json" }, body: JSON.stringify({ Query: q }) });
+  const r = await EP.net.huntRaw(q, at);
   if (!r.ok){ let d=""; try{ d=((await r.json()).error||{}).message||""; }catch(e){} const e2=new Error("Hunt "+r.status+(d?" — "+d:"")); e2.status=r.status; throw e2; }
   return (await r.json()).results || [];
 }
@@ -38029,7 +38132,7 @@ async function huntAlerts(){
     + " | summarize Title=any(Title), Severity=any(Severity), Category=any(Category), ServiceSource=any(ServiceSource), Techniques=any(AttackTechniques), LastSeen=max(Timestamp) by AlertId, Ent, Kind"
     + " | top 500 by LastSeen desc";
   const now = Date.now();
-  return (await hunt(q)).map(x => ({ alertId:x.AlertId, title:x.Title||"(alert)", severity:normSev(x.Severity), category:x.Category||"Other",
+  return (EP.net.capped(await hunt(q), 500, "Apps & Data alerts (30 days)")).map(x => ({ alertId:x.AlertId, title:x.Title||"(alert)", severity:normSev(x.Severity), category:x.Category||"Other",
     service:x.ServiceSource||"", status:"", techniques: Array.isArray(x.Techniques)?x.Techniques:(x.Techniques?[x.Techniques]:[]),
     entity:x.Ent, kind:x.Kind||"data", lastSeenDays: x.LastSeen ? Math.floor((now - Date.parse(x.LastSeen))/864e5) : null }));
 }
