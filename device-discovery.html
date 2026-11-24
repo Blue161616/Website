@@ -173,6 +173,8 @@
   .chip.adm { border-color: rgba(255,122,138,.5); color: var(--red); }
   .chip.stale { border-color: rgba(255,193,94,.45); color: var(--amber); }
   .chip.tag { border-color: var(--border); color: var(--muted); }
+  .chip.expl { border-color: var(--sev-crit); color: #fff; background: var(--sev-crit); font-weight: 700; }
+  .chip.eol { border-color: rgba(255,193,94,.55); color: var(--amber); }
 
   .src { display: inline-flex; gap: 4px; }
   .src span { width: 20px; height: 20px; border-radius: 6px; display: inline-flex; align-items: center; justify-content: center; font-size: 10.5px; font-weight: 700; border: 1px solid var(--border); color: var(--muted); font-family: var(--mono); }
@@ -361,7 +363,7 @@
       <select id="fRisk"><option value="">Any risk</option><option>High</option><option>Medium</option><option>Low</option></select>
       <select id="fComp"><option value="">Any compliance</option><option value="noncompliant">Non-compliant</option><option value="compliant">Compliant</option><option value="grace">In grace</option><option value="unevaluated">Unevaluated</option></select>
       <select id="fExp"><option value="">Any exposure</option><option>High</option><option>Medium</option><option>Low</option></select>
-      <select id="fGap"><option value="">Any coverage</option><option value="noEntra">Not in Entra</option><option value="noIntune">Not in Intune</option><option value="noDefender">No Defender sensor</option><option value="stale">Stale (&gt;30d)</option><option value="inet">Internet-facing</option><option value="alert">Active alerts</option><option value="critvuln">Critical vulns</option></select>
+      <select id="fGap"><option value="">Any coverage</option><option value="noEntra">Not in Entra</option><option value="noIntune">Not in Intune</option><option value="noDefender">No Defender sensor</option><option value="stale">Stale (&gt;30d)</option><option value="inet">Internet-facing</option><option value="expinet">Exploitable + exposed</option><option value="exploit">Public exploit</option><option value="alert">Active alerts</option><option value="critvuln">Critical vulns</option><option value="eol">End-of-support</option></select>
       <span class="fsp"></span>
       <button class="btn sm" id="btnClear">Clear</button>
     </div>
@@ -501,25 +503,34 @@
   function mergeTags(a, b) { const out = []; [a, b].forEach(v => parseRoles(v).forEach(t => { const s = String(t || "").trim(); if (s && out.indexOf(s) < 0) out.push(s); })); return out; }
   function isSensitiveRole(r) { return /domain controller|certificat|\bca\b|exchange|\bdns\b|\bdhcp\b|\bsql\b|hyper-?v|identity|key vault/i.test(String(r || "")); }
 
-  // Composite risk: threat ≫ exposure ≫ compliance; internet-facing multiplies the threat+exposure surface.
+  // Composite risk: threat ≫ exposure ≫ exploit ≫ compliance.
+  //   • internet-facing multiplies the reachable attack surface (threat + exposure + exploit)
+  //   • a public exploit is scored above raw exposure — a reachable, exploitable CVE is the path
+  //   • asset criticality is a final multiplier: a DC and a kiosk with the same CVE aren't equal
   const RISK_TP = { High: 60, Medium: 35, Low: 15 };
   const RISK_XP = { High: 45, Medium: 22, Low: 8 };
+  const CRIT_MULT = { "Very high": 1.3, "High": 1.15 };
   function riskBand(score) { return score >= 45 ? "High" : score >= 20 ? "Medium" : "Low"; }
   function riskCompose(sig) {
     const tPts = RISK_TP[sig.threat] || 0, xPts = RISK_XP[sig.exposure] || 0;
+    const ePts = sig.exploitCrit ? 30 : sig.exploit ? 16 : 0;   // public exploit code available
     let cPts = 0, cWhy = "compliant";
     if (sig.compliance === "noncompliant") { cPts = sig.active ? 20 : 8; cWhy = sig.active ? "non-compliant · active" : "non-compliant · stale"; }
     else if (sig.compliance === "grace") { cPts = 10; cWhy = "in grace period"; }
     else if (sig.compliance === "unevaluated") { cPts = 12; cWhy = "no compliance result"; }
     else if (!sig.managed) { cPts = sig.active ? 12 : 8; cWhy = sig.active ? "unmanaged" : "unmanaged · stale"; }
     const mult = sig.internet === true ? 1.5 : 1;
-    const score = Math.round((tPts + xPts) * mult + cPts);
+    const critMult = CRIT_MULT[sig.criticality] || 1;
+    const score = Math.round(((tPts + xPts + ePts) * mult + cPts) * critMult);
     const drivers = [];
     if (tPts) drivers.push([tPts * mult, "active alert · " + String(sig.threat).toLowerCase()]);
+    if (ePts) drivers.push([ePts * mult, sig.exploitCrit ? "critical CVE · public exploit" : "public exploit available"]);
     if (xPts) drivers.push([xPts * mult, "Defender exposure · " + String(sig.exposure).toLowerCase()]);
     if (cPts) drivers.push([cPts, cWhy]);
     drivers.sort((a, b) => b[0] - a[0]);
-    return { score, band: riskBand(score), sub: drivers.length ? drivers[0][1] : "no elevated signals" };
+    let sub = drivers.length ? drivers[0][1] : "no elevated signals";
+    if (critMult > 1) sub += " · " + sig.criticality.toLowerCase() + " value";
+    return { score, band: riskBand(score), sub };
   }
   function riskWhyOf(d) {
     const w = [];
@@ -528,12 +539,17 @@
     else if (d.compliance === "compliant") w.push("Compliant");
     if (d.entra === 0) w.push("Not in Entra ID (Defender only)");
     if (d.intune === 0 && d.cls !== "mobile") w.push("Not managed by Intune");
-    if (d.exposure === "High" || d.exposure === "Medium") w.push("Defender exposure: " + d.exposure);
-    if (d.cveCrit > 0) w.push(d.cveCrit + " critical CVE" + (d.cveCrit > 1 ? "s" : ""));
-    else if (d.cveHigh > 0) w.push(d.cveHigh + " high CVE" + (d.cveHigh > 1 ? "s" : ""));
-    if (d.threat === "High" || d.threat === "Medium") w.push("Active alert: " + d.threat);
-    if (d.isAdminUser) w.push("Primary user holds a privileged role");
     if (d.internet === true) w.push("Internet-facing");
+    if (d.cveExploitCrit > 0) w.push(d.cveExploitCrit + " critical CVE" + (d.cveExploitCrit > 1 ? "s" : "") + " with a public exploit");
+    else if (d.cveExploit > 0) w.push(d.cveExploit + " CVE" + (d.cveExploit > 1 ? "s" : "") + " with a public exploit");
+    if (d.cveZeroDay > 0) w.push(d.cveZeroDay + " zero-day" + (d.cveZeroDay > 1 ? "s" : ""));
+    if (d.exposure === "High" || d.exposure === "Medium") w.push("Defender exposure: " + d.exposure);
+    if (!(d.cveExploit > 0) && d.cveCrit > 0) w.push(d.cveCrit + " critical CVE" + (d.cveCrit > 1 ? "s" : ""));
+    if (d.threat === "High" || d.threat === "Medium") w.push("Active alert: " + d.threat);
+    if (d.osEol) w.push("End-of-support OS");
+    else if (d.eosCount > 0) w.push(d.eosCount + " end-of-support product" + (d.eosCount > 1 ? "s" : ""));
+    if (d.critical) w.push((d.criticality || "High") + "-value asset");
+    if (d.isAdminUser) w.push("Primary user holds a privileged role");
     if (d.stale) w.push("No activity in " + d.lastSeenDays + "d");
     if (!w.length) w.push("No elevated signals");
     return w;
@@ -560,22 +576,34 @@
     try { prog("Querying Defender (device inventory)…"); machines = await hunt("DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by DeviceId", "Defender inventory"); result.caps.defender = true; }
     catch (e) { result.errors.defender = e.message; result.caps.defender = false; }
 
-    let threatRows = null, cveRows = null, cfgRows = null, netRows = null, critRows = null, discNet = null;
+    let threatRows = null, cveRows = null, cfgRows = null, netRows = null, critRows = null, eolRows = null;
     if (machines) {
-      prog("Querying Defender (alerts, CVEs, exposure)…");
+      prog("Querying Defender (alerts, exploitable CVEs, exposure, end-of-support)…");
       const Q = {
         threat: "AlertInfo | where Timestamp > ago(30d) | join kind=inner (AlertEvidence | where Timestamp > ago(30d) and isnotempty(DeviceId) | distinct AlertId, DeviceId) on AlertId | summarize Sev = max(case(Severity=='High',3,Severity=='Medium',2,Severity=='Low',1,0)) by DeviceId",
-        cve:    "DeviceTvmSoftwareVulnerabilities | summarize Sev=max(case(VulnerabilitySeverityLevel=='Critical',4,VulnerabilitySeverityLevel=='High',3,VulnerabilitySeverityLevel=='Medium',2,VulnerabilitySeverityLevel=='Low',1,0)), Crit=dcountif(CveId,VulnerabilitySeverityLevel=='Critical'), High=dcountif(CveId,VulnerabilitySeverityLevel=='High'), Cves=dcount(CveId) by DeviceId",
+        // Exploitability: join the vuln list to the KB for IsExploitAvailable, and read the ZeroDay CveTag.
+        // A reachable CVE with public exploit code is the signal that outranks raw CVSS count.
+        cve:    "DeviceTvmSoftwareVulnerabilities | extend Zero = CveTags has 'ZeroDay'"
+              + " | join kind=leftouter (DeviceTvmSoftwareVulnerabilitiesKB | distinct CveId, IsExploitAvailable) on CveId"
+              + " | summarize Sev=max(case(VulnerabilitySeverityLevel=='Critical',4,VulnerabilitySeverityLevel=='High',3,VulnerabilitySeverityLevel=='Medium',2,VulnerabilitySeverityLevel=='Low',1,0)),"
+              + " Crit=dcountif(CveId,VulnerabilitySeverityLevel=='Critical'), High=dcountif(CveId,VulnerabilitySeverityLevel=='High'), Cves=dcount(CveId),"
+              + " Exploit=dcountif(CveId, IsExploitAvailable==true), ExploitCrit=dcountif(CveId, IsExploitAvailable==true and VulnerabilitySeverityLevel=='Critical'), Zero=dcountif(CveId, Zero) by DeviceId",
         cfg:    "DeviceTvmSecureConfigurationAssessment | where IsApplicable==1 and IsCompliant==0 | summarize Fails=dcount(ConfigurationId) by DeviceId",
         net:    "DeviceInfo | where Timestamp > ago(7d) | where IsInternetFacing | extend AF=parse_json(AdditionalFields) | extend PP=tostring(AF.InternetFacingPublicScannedPort), LP=tostring(AF.InternetFacingLocalPort), IFR=tostring(AF.InternetFacingReason) | extend Port=toint(iif(isnotempty(PP),PP,LP)) | summarize Ports=make_set_if(Port, isnotempty(Port) and Port>0, 40), IFR=take_any(IFR) by DeviceId",
-        crit:   "ExposureGraphNodes | where NodeProperties has 'criticalityLevel' and NodeProperties has 'deviceName' | extend L=toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), DN=tostring(NodeProperties.rawData.deviceName), Rules=tostring(NodeProperties.rawData.criticalityLevel.ruleNames) | where isnotempty(DN) and L between (0 .. 3) | summarize L=min(L), Rules=take_any(Rules) by DN"
+        crit:   "ExposureGraphNodes | where NodeProperties has 'criticalityLevel' and NodeProperties has 'deviceName' | extend L=toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), DN=tostring(NodeProperties.rawData.deviceName), Rules=tostring(NodeProperties.rawData.criticalityLevel.ruleNames) | where isnotempty(DN) and L between (0 .. 3) | summarize L=min(L), Rules=take_any(Rules) by DN",
+        // End-of-support / end-of-life software and OS (DeviceTvmSoftwareInventory). OsEol: an EOS entry whose product is the OS itself.
+        eol:    "DeviceTvmSoftwareInventory | where EndOfSupportStatus != '' and EndOfSupportStatus != 'None'"
+              + " | extend IsOS = SoftwareName has 'windows' or SoftwareName has_any ('server','macos','rhel','ubuntu','linux')"
+              + " | summarize Eos=dcountif(strcat(SoftwareVendor,SoftwareName), EndOfSupportStatus startswith 'EOS'), Upcoming=dcountif(strcat(SoftwareVendor,SoftwareName), EndOfSupportStatus startswith 'Upcoming'),"
+              + " OsEol=countif(IsOS and EndOfSupportStatus startswith 'EOS') > 0, Names=make_set_if(strcat(SoftwareVendor,' ',SoftwareName), EndOfSupportStatus startswith 'EOS', 8) by DeviceId"
       };
-      const settled = await Promise.allSettled([hunt(Q.threat), hunt(Q.cve), hunt(Q.cfg), hunt(Q.net), hunt(Q.crit)]);
+      const settled = await Promise.allSettled([hunt(Q.threat), hunt(Q.cve), hunt(Q.cfg), hunt(Q.net), hunt(Q.crit), hunt(Q.eol)]);
       threatRows = settled[0].status === "fulfilled" ? settled[0].value : null;
       cveRows    = settled[1].status === "fulfilled" ? settled[1].value : null;
       cfgRows    = settled[2].status === "fulfilled" ? settled[2].value : null;
       netRows    = settled[3].status === "fulfilled" ? settled[3].value : null;
       critRows   = settled[4].status === "fulfilled" ? settled[4].value : null;
+      eolRows    = settled[5].status === "fulfilled" ? settled[5].value : null;
     }
 
     // Optional: privileged role holders → flag admin devices.
@@ -614,7 +642,7 @@
     const mdeBy = {}, mdeByName = {};
     if (machines) machines.forEach(m => { const k = byId(m.AadDeviceId); if (k) mdeBy[k] = m; const nk = normName(m.DeviceName); if (nk && !mdeByName[nk]) mdeByName[nk] = m; });
     const sev = (rows, key) => { const o = {}; (rows || []).forEach(x => { const id = byId(x.DeviceId); if (id) o[id] = x; }); return o; };
-    const threatBy = sev(threatRows), cveBy = sev(cveRows), cfgBy = sev(cfgRows), netByD = sev(netRows);
+    const threatBy = sev(threatRows), cveBy = sev(cveRows), cfgBy = sev(cfgRows), netByD = sev(netRows), eolBy = sev(eolRows);
     const critBy = {}; (critRows || []).forEach(x => { if (x.DN == null) return; const r = { level: +x.L, why: parseRoles(x.Rules) }; critBy[byId(x.DN)] = r; critBy[normName(x.DN)] = r; });
 
     const now = Date.now(), dd = d => d ? Math.floor((now - Date.parse(d)) / 864e5) : null;
@@ -638,7 +666,10 @@
       const threat = tsev == null ? null : tsev >= 3 ? "High" : tsev >= 2 ? "Medium" : tsev >= 1 ? "Low" : "None";
       const cv = m ? (cveBy[mid] || null) : null;
       const cveCrit = cv ? cv.Crit || 0 : null, cveHigh = cv ? cv.High || 0 : null, cveCount = cv ? cv.Cves || 0 : null;
+      const cveExploit = cv ? cv.Exploit || 0 : null, cveExploitCrit = cv ? cv.ExploitCrit || 0 : null, cveZeroDay = cv ? cv.Zero || 0 : null;
       const cve = cv == null ? null : cv.Sev >= 4 ? "Critical" : cv.Sev >= 3 ? "High" : cv.Sev >= 2 ? "Medium" : cv.Sev >= 1 ? "Low" : "None";
+      const er = m ? (eolBy[mid] || null) : null;
+      const eosCount = er ? er.Eos || 0 : null, eosUpcoming = er ? er.Upcoming || 0 : null, osEol = er ? er.OsEol === true || er.OsEol === 1 : false, eolNames = er ? (er.Names || []) : null;
       const configFail = m ? (cfgBy[mid] ? cfgBy[mid].Fails || 0 : 0) : null;
       const nrow = m ? netByD[mid] : null;
       const internet = m ? (netRows != null ? !!nrow : null) : null;
@@ -654,18 +685,22 @@
       const roles = parseRoles(mf("DeviceRoles"));
       const adm = admins ? admins[byId((i && i.userPrincipalName))] : null;
       const os = normOS(d.operatingSystem || (i && i.operatingSystem) || mf("OSPlatform"));
+      const criticality = crit ? (CRIT_LABELS[crit.level] || "—") : "—";
 
-      const rc = riskCompose({ threat, exposure, compliance, managed: !!i, active: !stale, internet: internet === true });
+      const rc = riskCompose({ threat, exposure, compliance, managed: !!i, active: !stale, internet: internet === true,
+        exploit: cveExploit > 0, exploitCrit: cveExploitCrit > 0, criticality });
       const dev = {
         id: key || ("dev" + ix), name: d.displayName || (i && i.deviceName) || "(device)", os,
-        osVer: (i && i.osVersion) || mf("OSVersion") || d.operatingSystemVersion || "—",
+        // OS version: prefer Intune, then the Defender machine's OSVersion, then OSBuild, then Entra's value.
+        osVer: (i && i.osVersion) || mf("OSVersion") || mf("OSBuild") || d.operatingSystemVersion || "—",
         cls: devClass(os), joinType: d._defOnly ? "Not in Entra" : joinMap(d.trustType),
         owner: i ? ownerMap(i.managedDeviceOwnerType) : "—", user: (i && i.userPrincipalName) || "—", managedBy: agentMap(i, m),
         entra: d._defOnly ? 0 : 1, intune: i ? 1 : 0, defender: machines ? (m ? 1 : 0) : null,
-        compliance, exposure, threat, cve, cveCount, cveCrit, cveHigh, configFail, openPorts,
+        compliance, exposure, threat, cve, cveCount, cveCrit, cveHigh, cveExploit, cveExploitCrit, cveZeroDay, configFail, openPorts,
+        eosCount, eosUpcoming, osEol, eolNames,
         internet, internetReason, sensor: m ? (mf("SensorHealthState") || "—") : null,
         onboarding: m ? (mf("OnboardingStatus") || "Onboarded") : (machines ? "Not onboarded" : "—"),
-        criticality: crit ? (CRIT_LABELS[crit.level] || "—") : "—", critWhy: crit ? crit.why : [], critical: crit ? crit.level <= 1 : false,
+        criticality, critWhy: crit ? crit.why : [], critical: crit ? crit.level <= 1 : false,
         roles, tags: mergeTags(mf("DeviceManualTags"), mf("DeviceDynamicTags")),
         adminRoles: adm ? adm.roles : null, isAdminUser: !!(adm && adm.write),
         lastSeenDays, lastSyncDays: lastSync, stale, aadId: d.deviceId || "—", intuneId: i ? i.id : null,
@@ -706,8 +741,15 @@
     const now = Date.now();
     const devices = raw.map((r, ix) => {
       const onb = !!r[7][2], exp = r[9], days = r[13], stale = days != null && days > 30, threat = onb ? r[10] : null;
-      const comp = r[8], managed = !!r[7][1];
-      const rc = riskCompose({ threat, exposure: exp, compliance: comp, managed, active: !stale, internet: r[12] === true });
+      const comp = r[8], managed = !!r[7][1], inet = r[12] === true, crit = r[11];
+      // Internet-facing demo hosts carry exploitable CVEs; a server also shows end-of-support.
+      const cveExploit = onb ? (inet ? (exp === "High" ? 3 : 1) : 0) : null;
+      const cveExploitCrit = onb ? (inet && exp === "High" ? 2 : 0) : null;
+      const cveZeroDay = onb ? (inet && exp === "High" ? 1 : 0) : null;
+      const osEol = onb && /server/i.test(r[1]) && ix % 2 === 1;   // one demo server end-of-support
+      const eosCount = onb ? (osEol ? 2 : inet ? 1 : 0) : null;
+      const rc = riskCompose({ threat, exposure: exp, compliance: comp, managed, active: !stale, internet: inet,
+        exploit: cveExploit > 0, exploitCrit: cveExploitCrit > 0, criticality: crit });
       const d = {
         id: "dev" + ix, name: r[0], os: normOS(r[1]), osVer: r[2], cls: devClass(r[1]),
         joinType: r[3], owner: r[4], user: r[5], managedBy: r[6],
@@ -715,14 +757,16 @@
         threat, cve: onb ? (exp === "High" ? "Critical" : exp === "Medium" ? "High" : "None") : null,
         cveCount: onb ? (exp === "High" ? 9 : exp === "Medium" ? 3 : 0) : null,
         cveCrit: onb ? (exp === "High" ? 2 : 0) : null, cveHigh: onb ? (exp === "High" ? 5 : exp === "Medium" ? 3 : 0) : null,
+        cveExploit, cveExploitCrit, cveZeroDay,
+        eosCount, eosUpcoming: onb ? (osEol ? 1 : 0) : null, osEol, eolNames: osEol ? ["Microsoft Windows Server 2016", "OpenSSL 1.0.2"] : (eosCount ? ["Apache Log4j 1.2"] : []),
         configFail: onb ? (comp === "noncompliant" ? 4 : 1) : null,
-        internet: onb ? r[12] : null, internetReason: r[12] === true ? "Detected by external scan" : "",
-        openPorts: r[12] === true ? [22, 80, 443, 3306] : null, sensor: onb ? "Active" : null,
+        internet: onb ? r[12] : null, internetReason: inet ? "Detected by external scan" : "",
+        openPorts: inet ? [22, 80, 443, 3306] : null, sensor: onb ? "Active" : null,
         onboarding: onb ? "Onboarded" : (r[7][0] ? "Not onboarded" : "—"),
-        criticality: r[11], critWhy: r[11] === "Very high" || r[11] === "High" ? ["Business-critical asset"] : [], critical: r[11] === "Very high" || r[11] === "High",
+        criticality: crit, critWhy: crit === "Very high" || crit === "High" ? ["Business-critical asset"] : [], critical: crit === "Very high" || crit === "High",
         roles: r[14], tags: [], adminRoles: r[15] ? ["Global Administrator"] : null, isAdminUser: !!r[15],
         lastSeenDays: days, lastSyncDays: r[7][1] ? days : null, stale, aadId: r[7][0] ? "demo-" + ix : "—", intuneId: r[7][1] ? "demo-int-" + ix : null,
-        mdeId: onb ? "demo-mde-" + ix : null, publicIp: r[12] === true ? "198.51.100." + (10 + ix) : "",
+        mdeId: onb ? "demo-mde-" + ix : null, publicIp: inet ? "198.51.100." + (10 + ix) : "",
         risk: rc.band, riskScore: rc.score, riskSub: rc.sub
       };
       d.riskWhy = riskWhyOf(d);
@@ -760,6 +804,9 @@
     if (S.gap === "inet" && d.internet !== true) return false;
     if (S.gap === "alert" && !(d.threat === "High" || d.threat === "Medium")) return false;
     if (S.gap === "critvuln" && !(d.cveCrit > 0)) return false;
+    if (S.gap === "expinet" && !(d.internet === true && d.cveExploit > 0)) return false;
+    if (S.gap === "exploit" && !(d.cveExploit > 0)) return false;
+    if (S.gap === "eol" && !(d.osEol || d.eosCount > 0)) return false;
     return true;
   }
 
@@ -782,8 +829,11 @@
   function deviceRow(d) {
     const chips = [];
     if (d.criticality === "Very high" || d.criticality === "High") chips.push(`<span class="chip crit" title="${esc(d.critWhy ? d.critWhy.join(", ") : "")}">${esc(d.criticality)}</span>`);
+    if (d.cveExploit > 0) chips.push(`<span class="chip expl" title="${d.cveExploit} CVE(s) with public exploit code${d.internet === true ? " · internet-facing" : ""}">exploit${d.internet === true ? "+net" : ""}</span>`);
     if (d.isAdminUser) chips.push(`<span class="chip adm" title="${esc((d.adminRoles || []).join(", "))}">Admin</span>`);
     if (d.internet === true) chips.push(`<span class="chip inet" title="${esc(d.internetReason || "Internet-facing")}">internet-facing</span>`);
+    if (d.osEol) chips.push(`<span class="chip eol" title="End-of-support OS">EOL OS</span>`);
+    else if (d.eosCount > 0) chips.push(`<span class="chip eol" title="${esc((d.eolNames || []).join(", ")) || "End-of-support software"}">EOL</span>`);
     if (d.stale) chips.push(`<span class="chip stale">stale</span>`);
     (d.tags || []).slice(0, 2).forEach(t => chips.push(`<span class="chip tag">${esc(t)}</span>`));
     const riskCell = d.discovered
@@ -795,7 +845,7 @@
           <div class="dsub">${esc(d.joinType || d.category || "")}${d.user && d.user !== "—" ? " · " + esc(d.user) : ""}</div></td>
       <td>${esc(d.os)}<div class="dsub">${esc(d.osVer || "")}</div></td>
       <td>${srcBadges(d)}</td>
-      <td>${d.discovered ? '<span class="muted">—</span>' : pill("c", d.compliance)}</td>
+      <td>${d.discovered ? '<span class="muted">—</span>' : (d.cls === "server" && d.compliance === "unevaluated" ? '<span class="pill c-unevaluated" title="Intune does not evaluate servers for compliance">n/a</span>' : pill("c", d.compliance))}</td>
       <td>${pill("x", d.exposure)}</td>
       <td>${d.threat == null ? '<span class="muted">—</span>' : pill("t", d.threat)}</td>
       <td class="muted">${ago(d.lastSeenDays)}</td>
@@ -832,11 +882,23 @@
     return { policies };
   }
   async function fetchCves(d) {
+    // Per-software, with exploit availability (KB join) so the list leads with what's weaponisable.
     const q = "DeviceTvmSoftwareVulnerabilities | where DeviceId == '" + safeId(d.mdeId) + "'"
-      + " | extend R = case(VulnerabilitySeverityLevel=='Critical',4,VulnerabilitySeverityLevel=='High',3,VulnerabilitySeverityLevel=='Medium',2,VulnerabilitySeverityLevel=='Low',1,0)"
-      + " | summarize Worst = max(R), N = dcount(CveId), Cves = make_set(CveId, 6) by Software = strcat(SoftwareVendor, ' ', SoftwareName)"
-      + " | order by Worst desc, N desc | take 40";
-    return (await hunt(q, "Vulnerabilities")).map(r => ({ software: String(r.Software || "").trim(), worst: +r.Worst || 0, n: +r.N || 0, cves: r.Cves || [] }));
+      + " | extend R = case(VulnerabilitySeverityLevel=='Critical',4,VulnerabilitySeverityLevel=='High',3,VulnerabilitySeverityLevel=='Medium',2,VulnerabilitySeverityLevel=='Low',1,0), Zero = CveTags has 'ZeroDay'"
+      + " | join kind=leftouter (DeviceTvmSoftwareVulnerabilitiesKB | distinct CveId, IsExploitAvailable) on CveId"
+      + " | summarize Worst = max(R), N = dcount(CveId), Exploit = dcountif(CveId, IsExploitAvailable==true), Zero = dcountif(CveId, Zero),"
+      + " ExploitCves = make_set_if(CveId, IsExploitAvailable==true, 6), Cves = make_set(CveId, 6) by Software = strcat(SoftwareVendor, ' ', SoftwareName)"
+      + " | order by Exploit desc, Worst desc, N desc | take 40";
+    return (await hunt(q, "Vulnerabilities")).map(r => ({ software: String(r.Software || "").trim(), worst: +r.Worst || 0, n: +r.N || 0,
+      exploit: +r.Exploit || 0, zero: +r.Zero || 0, cves: (r.ExploitCves && r.ExploitCves.length ? r.ExploitCves : r.Cves) || [] }));
+  }
+  async function fetchHardening(d) {
+    // Missing security controls (tamper protection, ASR, firewall, BitLocker, LSA, …) with readable names from the KB.
+    const q = "DeviceTvmSecureConfigurationAssessment | where DeviceId == '" + safeId(d.mdeId) + "' and IsApplicable==1 and IsCompliant==0"
+      + " | join kind=leftouter (DeviceTvmSecureConfigurationAssessmentKB | distinct ConfigurationId, ConfigurationName) on ConfigurationId"
+      + " | project Name = coalesce(ConfigurationName, ConfigurationSubcategory), Category = ConfigurationCategory, Impact = ConfigurationImpact"
+      + " | order by Impact desc | take 30";
+    return (await hunt(q, "Hardening")).map(r => ({ name: String(r.Name || "control").trim(), category: r.Category || "", impact: +r.Impact || 0 }));
   }
   // Port → listening service, and the software-name pattern that would be the reachable service on it.
   // Used to turn "open internet-facing port" + "device runs vulnerable software X" into an actual attack path.
@@ -899,24 +961,30 @@
     }
     if (d.defender === 1) {
       out.cves = d.internet === true ? [
-        { software: "apache tomcat", worst: 4, n: 76, cves: ["CVE-2025-24813", "CVE-2025-31650", "CVE-2025-31651"] },
-        { software: "openssl openssl", worst: 4, n: 38, cves: ["CVE-2025-15467", "CVE-2025-68160"] },
-        { software: "oracle mysql", worst: 3, n: 11, cves: ["CVE-2026-21936", "CVE-2026-22004"] },
-        { software: "openssh", worst: 2, n: 3, cves: ["CVE-2025-26465"] },
-        { software: "Microsoft Windows Server", worst: 3, n: 22, cves: ["CVE-2025-21298"] }
+        { software: "apache tomcat", worst: 4, n: 76, exploit: 3, zero: 1, cves: ["CVE-2025-24813", "CVE-2025-31650", "CVE-2025-31651"] },
+        { software: "openssl openssl", worst: 4, n: 38, exploit: 1, zero: 0, cves: ["CVE-2025-15467", "CVE-2025-68160"] },
+        { software: "oracle mysql", worst: 3, n: 11, exploit: 0, zero: 0, cves: ["CVE-2026-21936", "CVE-2026-22004"] },
+        { software: "openssh", worst: 2, n: 3, exploit: 0, zero: 0, cves: ["CVE-2025-26465"] },
+        { software: "Microsoft Windows Server", worst: 3, n: 22, exploit: 0, zero: 0, cves: ["CVE-2025-21298"] }
       ] : d.exposure === "High" ? [
-        { software: "Microsoft Windows 11", worst: 4, n: 46, cves: ["CVE-2025-21298", "CVE-2025-21333"] },
-        { software: "Oracle Java SE", worst: 4, n: 12, cves: ["CVE-2024-20932"] },
-        { software: "Google Chrome", worst: 3, n: 18, cves: ["CVE-2025-0999"] },
-        { software: "7-Zip", worst: 3, n: 4, cves: ["CVE-2024-11477"] }
+        { software: "Microsoft Windows 11", worst: 4, n: 46, exploit: 0, zero: 0, cves: ["CVE-2025-21298", "CVE-2025-21333"] },
+        { software: "Oracle Java SE", worst: 4, n: 12, exploit: 0, zero: 0, cves: ["CVE-2024-20932"] },
+        { software: "Google Chrome", worst: 3, n: 18, exploit: 0, zero: 0, cves: ["CVE-2025-0999"] },
+        { software: "7-Zip", worst: 3, n: 4, exploit: 0, zero: 0, cves: ["CVE-2024-11477"] }
       ] : d.exposure === "Medium" ? [
-        { software: "Google Chrome", worst: 3, n: 6, cves: ["CVE-2025-0999"] },
-        { software: "Microsoft Edge", worst: 2, n: 3, cves: ["CVE-2025-1111"] }
+        { software: "Google Chrome", worst: 3, n: 6, exploit: 0, zero: 0, cves: ["CVE-2025-0999"] },
+        { software: "Microsoft Edge", worst: 2, n: 3, exploit: 0, zero: 0, cves: ["CVE-2025-1111"] }
       ] : [];
       out.alerts = d.threat === "High" ? [
         { id: "demo", title: "Suspicious PowerShell command line", sev: "High", cat: "Execution", src: "EDR", ts: Date.now() - 72e5 },
         { id: "demo", title: "Possible credential theft (LSASS access)", sev: "High", cat: "CredentialAccess", src: "EDR", ts: Date.now() - 864e5 }
       ] : d.threat === "Medium" ? [{ id: "demo", title: "Anomalous sign-in from new location", sev: "Medium", cat: "InitialAccess", src: "Microsoft Defender for Identity", ts: Date.now() - 2592e5 }] : [];
+      out.hardening = (d.configFail > 0) ? [
+        { name: "Tamper Protection", category: "Security controls", impact: 9 },
+        { name: "Attack surface reduction rules", category: "Security controls", impact: 8 },
+        { name: "LSA protection (Credential Guard)", category: "OS", impact: 8 },
+        { name: "Microsoft Defender Firewall", category: "Network", impact: 6 }
+      ].slice(0, d.compliance === "noncompliant" ? 4 : 2) : [];
       if (d.internet === true) out.listeners = { 80: ["httpd.exe"], 443: ["httpd.exe"], 3306: ["mysqld.exe"], 22: ["sshd"] };
     }
     return out;
@@ -936,6 +1004,7 @@
         if (d.defender === 1 && d.mdeId) {
           jobs.push(fetchCves(d).then(r => out.cves = r).catch(e => out.cvesErr = e.message));
           jobs.push(fetchAlerts(d).then(r => out.alerts = r).catch(e => out.alertsErr = e.message));
+          jobs.push(fetchHardening(d).then(r => out.hardening = r).catch(e => out.hardeningErr = e.message));
           if (d.openPorts && d.openPorts.length) jobs.push(fetchListeners(d).then(r => out.listeners = r).catch(() => {}));
         }
         await Promise.all(jobs);
@@ -966,8 +1035,10 @@
     // ── Compliance (why compliant / why not) ──
     let compBody;
     const compBad = d.compliance === "noncompliant";
-    const compHdr = `<div style="margin-bottom:8px">Intune verdict: ${d.intune === 1 ? pill("c", d.compliance) : '<span class="muted">not enrolled</span>'}</div>`;
+    const compVerdict = d.cls === "server" && d.compliance === "unevaluated" ? '<span class="pill c-unevaluated">n/a</span>' : pill("c", d.compliance);
+    const compHdr = `<div style="margin-bottom:8px">Intune verdict: ${d.intune === 1 ? compVerdict : '<span class="muted">not enrolled</span>'}</div>`;
     if (d.intune !== 1) compBody = '<div class="muted">Not managed by Intune — no compliance evaluation.</div>';
+    else if (d.cls === "server" && d.compliance === "unevaluated") compBody = '<div class="muted">Intune doesn\'t evaluate servers for compliance — this isn\'t a gap.</div>';
     else if (loading || (det && det.compliance === undefined && !det.complianceErr && !det.error)) compBody = spin;
     else if (det && det.complianceErr) compBody = '<div class="muted">' + esc(det.complianceErr) + '</div>';
     else if (det && det.compliance) {
@@ -989,6 +1060,8 @@
       ${d.openPorts && d.openPorts.length ? kv("Open ports", `<span class="${d.internet === true ? "v-bad" : ""}">${d.openPorts.join(", ")}</span>`) : ""}
       ${d.configFail != null ? kv("Config gaps", d.configFail > 0 ? `<span class="v-warn">${d.configFail} failing checks</span>` : '<span class="v-good">none</span>') : ""}
       ${d.cveCount != null ? kv("Vulnerabilities", (d.cveCount ? `${d.cveCount} CVEs · ` + (d.cveCrit ? `<span class="v-bad">${d.cveCrit} critical</span>, ` : "") + `${d.cveHigh || 0} high` : '<span class="v-good">none</span>')) : ""}
+      ${d.cveExploit != null && d.cveExploit > 0 ? kv("Public exploit", `<span class="v-bad">${d.cveExploit} CVE${d.cveExploit > 1 ? "s" : ""} with exploit code${d.cveExploitCrit ? " · " + d.cveExploitCrit + " critical" : ""}</span>${d.cveZeroDay ? ` · <span class="v-bad">${d.cveZeroDay} zero-day</span>` : ""}`) : ""}
+      ${d.eosCount != null && (d.eosCount > 0 || d.eosUpcoming > 0) ? kv("End-of-support", (d.osEol ? '<span class="v-bad">OS end-of-support</span> · ' : "") + (d.eosCount ? `<span class="v-warn">${d.eosCount} product${d.eosCount > 1 ? "s" : ""}</span>` : "") + (d.eosUpcoming ? ` · ${d.eosUpcoming} upcoming` : "") + (d.eolNames && d.eolNames.length ? `<div class="meta">${esc(d.eolNames.slice(0, 4).join(", "))}</div>` : "")) : ""}
     </dl>`;
     if (d.defender === 1) {
       if (loading || (det && det.cves === undefined && !det.cvesErr && !det.error)) expBody += spin;
@@ -1001,15 +1074,20 @@
           if (hot.length || paths.length) {
             const li = paths.map(p => {
               const sv = SEVWORD(p.worst), reach = p.worst >= 3;
+              const expl = p.matched.reduce((s, m) => s + (m.exploit || 0), 0);   // reachable service with public exploit = the real path
               const proc = p.procs && p.procs.length ? ` <span class="meta">(${esc(p.procs.slice(0, 2).join(", "))})</span>` : "";
-              if (p.matched.length) return `<li><div class="ln"><b class="${reach ? "v-bad" : ""}">:${p.port} · ${esc(p.label)}${proc}</b><span class="sev ${sv}">${reach ? "EXPOSED · " : ""}${sv}</span></div><div class="meta">Reachable vulnerable service: ${p.matched.slice(0, 3).map(m => esc(m.software) + " <span class=\"" + (m.worst >= 4 ? "v-bad" : m.worst >= 3 ? "v-warn" : "") + "\">(" + SEVWORD(m.worst) + " · " + m.n + ")</span>").join(" · ")}</div></li>`;
+              if (p.matched.length) {
+                const tag = expl > 0 ? `<span class="sev Critical">EXPLOITABLE · ${sv}</span>` : `<span class="sev ${sv}">${reach ? "EXPOSED · " : ""}${sv}</span>`;
+                return `<li><div class="ln"><b class="${expl > 0 || reach ? "v-bad" : ""}">:${p.port} · ${esc(p.label)}${proc}</b>${tag}</div><div class="meta">Reachable vulnerable service: ${p.matched.slice(0, 3).map(m => esc(m.software) + " <span class=\"" + (m.worst >= 4 ? "v-bad" : m.worst >= 3 ? "v-warn" : "") + "\">(" + SEVWORD(m.worst) + " · " + m.n + (m.exploit ? ", exploit" : "") + ")</span>").join(" · ")}</div></li>`;
+              }
               return `<li><div class="ln"><b>:${p.port} · ${esc(p.label)}${proc}</b><span class="meta">no vulnerable service matched</span></div></li>`;
             }).join("");
-            expBody += `<div class="apath${hot.some(p => p.worst >= 3) ? " hot" : ""}"><div class="apath-h">⚠ Internet-exposed attack paths</div><ul class="dlist">${li}</ul><div class="meta apath-note">Open internet-facing port → vulnerable software on this host. Port→service is inferred from the well-known port${det.listeners ? ", confirmed by the listening process where shown" : ""}; a critical CVE in a service reachable from the internet is the highest-priority path to close.</div></div>`;
+            const anyExpl = hot.some(p => p.matched.some(m => m.exploit > 0));
+            expBody += `<div class="apath${anyExpl || hot.some(p => p.worst >= 3) ? " hot" : ""}"><div class="apath-h">⚠ Internet-exposed attack paths</div><ul class="dlist">${li}</ul><div class="meta apath-note">Open internet-facing port → vulnerable software on this host. Port→service is inferred from the well-known port${det.listeners ? ", confirmed by the listening process where shown" : ""}. A reachable service with <b>public exploit code</b> is the highest-priority path to close.</div></div>`;
           }
         }
         const top = det.cves.filter(c => c.worst >= 2).slice(0, 10);
-        if (top.length) expBody += `<div class="meta" style="margin-top:9px;margin-bottom:3px">Top vulnerable software</div><ul class="dlist">${top.map(c => `<li><div class="ln"><b>${esc(c.software)}</b><span class="sev ${SEVWORD(c.worst)}">${SEVWORD(c.worst)} · ${c.n} CVE${c.n === 1 ? "" : "s"}</span></div>${c.cves && c.cves.length ? `<div class="cvelist">${c.cves.slice(0, 6).map(id => `<a href="https://security.microsoft.com/vulnerabilities/vulnerability/${enc(id)}" target="_blank" rel="noopener">${esc(id)}</a>`).join(" · ")}</div>` : ""}</li>`).join("")}</ul>`;
+        if (top.length) expBody += `<div class="meta" style="margin-top:9px;margin-bottom:3px">Top vulnerable software</div><ul class="dlist">${top.map(c => `<li><div class="ln"><b>${esc(c.software)}</b><span>${c.exploit ? '<span class="sev Critical" title="public exploit code available">EXPLOIT</span> ' : ""}${c.zero ? '<span class="sev High" title="zero-day">0-DAY</span> ' : ""}<span class="sev ${SEVWORD(c.worst)}">${SEVWORD(c.worst)} · ${c.n} CVE${c.n === 1 ? "" : "s"}</span></span></div>${c.cves && c.cves.length ? `<div class="cvelist">${c.cves.slice(0, 6).map(id => `<a href="https://security.microsoft.com/vulnerabilities/vulnerability/${enc(id)}" target="_blank" rel="noopener">${esc(id)}</a>`).join(" · ")}</div>` : ""}</li>`).join("")}</ul>`;
         else if (!top.length && d.cveCount === 0) expBody += '<div class="v-good" style="margin-top:8px">No known software vulnerabilities.</div>';
       }
     }
@@ -1026,18 +1104,30 @@
     } else thrBody = '<div class="muted">Expand to load.</div>';
     const threat = `<div class="dcol ${d.threat === "High" || d.threat === "Medium" ? "sec-threat sec-bad" : ""}"><h4>Threat</h4>${thrBody}</div>`;
 
+    // ── Hardening (missing security controls, Defender secure-config assessment) ──
+    let hardBody;
+    if (d.defender !== 1) hardBody = '<div class="muted">No Defender sensor — no configuration assessment.</div>';
+    else if (loading || (det && det.hardening === undefined && !det.hardeningErr && !det.error)) hardBody = spin;
+    else if (det && det.hardeningErr) hardBody = '<div class="muted">Configuration detail unavailable.</div>';
+    else if (det && det.hardening) {
+      if (!det.hardening.length) hardBody = '<div class="v-good">No failing security-configuration checks.</div>';
+      else hardBody = `<div class="meta" style="margin-bottom:3px">${det.hardening.length} missing control${det.hardening.length === 1 ? "" : "s"}</div><ul class="dlist">${det.hardening.slice(0, 14).map(h => `<li><div class="ln"><b class="${h.impact >= 7 ? "v-bad" : h.impact >= 4 ? "v-warn" : ""}">${esc(h.name)}</b>${h.impact ? `<span class="meta">impact ${h.impact}/10</span>` : ""}</div>${h.category ? `<div class="meta">${esc(h.category)}</div>` : ""}</li>`).join("")}</ul>`;
+    } else hardBody = '<div class="muted">Expand to load.</div>';
+    const hardBad = det && det.hardening && det.hardening.some(h => h.impact >= 7);
+    const hardening = `<div class="dcol${hardBad ? " sec-bad" : ""}"><h4>Hardening</h4>${hardBody}</div>`;
+
     // ── Inventory + Why ──
     const inv = `<div class="dcol"><h4>Inventory</h4><dl class="kv">
       ${kv("OS", esc(d.os) + " " + esc(d.osVer || ""))}
+      ${d.osEol || d.eosCount > 0 || d.eosUpcoming > 0 ? kv("Support", (d.osEol ? '<span class="v-bad">OS end-of-support</span>' : d.eosCount ? `<span class="v-warn">${d.eosCount} EOS product${d.eosCount > 1 ? "s" : ""}</span>` : `${d.eosUpcoming} upcoming EOS`)) : ""}
       ${d.criticality && d.criticality !== "—" ? kv("Criticality", `<span class="${d.critical ? "v-bad" : ""}">${esc(d.criticality)}</span>` + (d.critWhy && d.critWhy.length ? '<div class="meta">' + esc(d.critWhy.join(", ")) + "</div>" : "")) : ""}
       ${d.roles && d.roles.length ? kv("Device roles", esc(d.roles.join(", "))) : ""}
-      ${d.vendor ? kv("Vendor", esc(d.vendor) + (d.model ? " " + esc(d.model) : "")) : ""}
       ${kv("Last activity", d.stale ? `<span class="v-warn">${ago(d.lastSeenDays)}</span>` : ago(d.lastSeenDays))}
       ${kv("AAD device id", "<code>" + esc(d.aadId || "—") + "</code>")}
     </dl>${d.intuneId && !DEMO ? `<div class="dlinks"><a class="btn sm" href="https://intune.microsoft.com/#view/Microsoft_Intune_Devices/DeviceSettingsMenuBlade/~/overview/mdmDeviceId/${enc(d.intuneId)}" target="_blank" rel="noopener">Open in Intune ↗</a>${d.mdeId && !/^demo/.test(d.mdeId) ? `<a class="btn sm" href="https://security.microsoft.com/machines/${enc(d.mdeId)}" target="_blank" rel="noopener">Open in Defender ↗</a>` : ""}</div>` : ""}</div>`;
-    const why = d.riskWhy && d.riskWhy.length ? `<div class="dcol${d.risk === "High" ? " sec-bad" : ""}"><h4>Why this risk — ${esc(d.risk)} (${d.riskScore})</h4><ul class="why">${d.riskWhy.map(w => { const bad = /non-compliant|critical|active alert|internet|not onboarded|not managed|not in entra|no activity|privileged|high/i.test(w); return `<li class="${bad ? "v-bad" : ""}">${esc(w)}</li>`; }).join("")}</ul></div>` : "";
+    const why = d.riskWhy && d.riskWhy.length ? `<div class="dcol${d.risk === "High" ? " sec-bad" : ""}"><h4>Why this risk — ${esc(d.risk)} (${d.riskScore})</h4><ul class="why">${d.riskWhy.map(w => { const bad = /non-compliant|critical|active alert|internet|not onboarded|not managed|not in entra|no activity|privileged|high|exploit|zero-day|end-of-support/i.test(w); return `<li class="${bad ? "v-bad" : ""}">${esc(w)}</li>`; }).join("")}</ul></div>` : "";
 
-    return `<tr class="detail"><td colspan="8"><div class="dwrap">${sources}${compliance}${exposure}${threat}${inv}${why}</div></td></tr>`;
+    return `<tr class="detail"><td colspan="8"><div class="dwrap">${sources}${compliance}${exposure}${threat}${hardening}${inv}${why}</div></td></tr>`;
   }
 
   function render() {
@@ -1045,21 +1135,23 @@
     const D = DATA.devices, all = allDevices();
     const highRisk = D.filter(d => d.risk === "High").length;
     const inet = all.filter(d => d.internet === true).length;
+    const expInet = D.filter(d => d.internet === true && d.cveExploit > 0).length;   // the one a CISO acts on
     const nonComp = D.filter(d => d.compliance === "noncompliant").length;
     const noDef = D.filter(d => (d.cls === "computer" || d.cls === "server") && d.defender === 0).length;
     const activeAlert = D.filter(d => d.threat === "High" || d.threat === "Medium").length;
-    const critVuln = D.filter(d => d.cveCrit > 0).length;
+    const eol = D.filter(d => d.osEol || d.eosCount > 0).length;
     const stale = all.filter(d => d.stale).length;
     const atRisk = D.filter(d => d.risk === "High" || d.risk === "Medium").length;
 
     const tiles = [
       { n: D.length, l: "Managed devices", s: "click to clear filters", f: "clear" },
+      { n: expInet, l: "Exploitable + exposed", s: "internet-facing · public exploit", f: "gap:expinet", bad: expInet > 0 },
       { n: highRisk, l: "High risk", s: "composite risk · High", f: "risk:High", bad: highRisk > 0 },
       { n: inet, l: "Internet-facing", s: "reachable from outside", f: "gap:inet", bad: inet > 0 },
       { n: activeAlert, l: "Active alerts", s: "Defender High / Medium", f: "gap:alert", bad: activeAlert > 0 },
-      { n: critVuln, l: "Critical vulns", s: "≥1 critical CVE", f: "gap:critvuln", bad: critVuln > 0 },
       { n: nonComp, l: "Non-compliant", s: "Intune policy fail", f: "comp:noncompliant", bad: nonComp > 0 },
       { n: noDef, l: "No EDR sensor", s: "computers/servers", f: "gap:noDefender", bad: noDef > 0 },
+      { n: eol, l: "End-of-support", s: "EOL OS or software", f: "gap:eol", warn: eol > 0 },
       { n: stale, l: "Stale", s: "no activity >30d", f: "gap:stale", warn: stale > 0 }
     ];
     $("tiles").innerHTML = tiles.map(t => `<div class="tile ${t.bad && t.n ? "bad" : t.warn && t.n ? "warn" : t.f === "clear" ? "" : t.n ? "" : "good"}" data-f="${t.f || ""}" data-info="${t.info || ""}" tabindex="0" role="button">
@@ -1139,11 +1231,12 @@
 
   // ── CSV export ──
   function exportCsv() {
-    const cols = ["Name", "Class", "OS", "OS version", "Join type", "Owner", "User", "Entra", "Intune", "Defender", "Compliance", "Exposure", "Risk", "Risk score", "Threat", "CVEs", "Critical CVEs", "Criticality", "Internet-facing", "Admin user", "Last seen (days)", "Stale"];
+    const cols = ["Name", "Class", "OS", "OS version", "Join type", "Owner", "User", "Entra", "Intune", "Defender", "Compliance", "Exposure", "Risk", "Risk score", "Threat", "CVEs", "Critical CVEs", "Exploit CVEs", "Zero-days", "End-of-support", "EOL OS", "Criticality", "Internet-facing", "Exploitable+exposed", "Admin user", "Last seen (days)", "Stale"];
     const rows = allDevices().map(d => [d.name, d.cls, d.os, d.osVer, d.joinType || d.category || "", d.owner || "", d.user || "",
       d.entra === 1 ? "yes" : d.entra === 0 ? "no" : "", d.intune === 1 ? "yes" : "no", d.defender === 1 ? "yes" : d.defender === 0 ? "no" : "",
       d.compliance, d.exposure, d.risk, d.riskScore != null ? d.riskScore : "", d.threat || "", d.cveCount != null ? d.cveCount : "", d.cveCrit != null ? d.cveCrit : "",
-      d.criticality || "", d.internet === true ? "yes" : "", d.isAdminUser ? "yes" : "", d.lastSeenDays != null ? d.lastSeenDays : "", d.stale ? "yes" : ""]);
+      d.cveExploit != null ? d.cveExploit : "", d.cveZeroDay != null ? d.cveZeroDay : "", d.eosCount != null ? d.eosCount : "", d.osEol ? "yes" : "",
+      d.criticality || "", d.internet === true ? "yes" : "", (d.internet === true && d.cveExploit > 0) ? "yes" : "", d.isAdminUser ? "yes" : "", d.lastSeenDays != null ? d.lastSeenDays : "", d.stale ? "yes" : ""]);
     const csv = [cols].concat(rows).map(r => r.map(v => { v = String(v == null ? "" : v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }).join(",")).join("\r\n");
     const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8" });
     const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "device-discovery-" + new Date().toISOString().slice(0, 10) + ".csv"; a.click(); URL.revokeObjectURL(a.href);
