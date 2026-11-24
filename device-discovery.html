@@ -237,6 +237,11 @@
   .src-blk .st { font-weight: 600; }
   .src-blk .sd { color: var(--muted); font-size: 11.5px; }
   .alist a { color: var(--accent); text-decoration: none; } .alist a:hover { text-decoration: underline; }
+  .apath { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: rgba(5,13,34,.5); }
+  .apath.hot { border-color: rgba(255,77,109,.55); background: rgba(255,77,109,.06); }
+  .apath-h { font-family: var(--label); font-weight: 700; letter-spacing: .05em; text-transform: uppercase; font-size: 11.5px; color: var(--red); margin-bottom: 6px; }
+  .apath .dlist > li { border-top-color: rgba(28,55,102,.4); }
+  .apath-note { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
   /* risky rows get a red (or amber) left accent */
   tr.dev.rk-High  > td:first-child { box-shadow: inset 3px 0 0 var(--red); }
   tr.dev.rk-Medium > td:first-child { box-shadow: inset 3px 0 0 var(--amber); }
@@ -374,6 +379,7 @@
     ["User.Read",                               "Sign you in and read your profile",                                         true],
     ["Device.Read.All",                         "Entra device objects — join type, compliance flag, last sign-in",           true],
     ["DeviceManagementManagedDevices.Read.All", "Intune managed devices — compliance, owner, OS, last sync, agent",          false],
+    ["DeviceManagementConfiguration.Read.All",  "Intune per-policy compliance detail — which settings failed on a device",   false],
     ["ThreatHunting.Read.All",                  "Defender advanced hunting — onboarding, exposure, alerts, CVEs, discovered IoT/network", false],
     ["RoleManagement.Read.Directory",           "Privileged role holders — to flag devices whose primary user is an admin",  false]
   ];
@@ -660,28 +666,9 @@
       return dev;
     });
 
-    // Discovered (not onboarded, not in Entra) → IoT / network / other segments.
-    const discovered = (machines || []).filter(m => !usedM.has(m) && !/^onboarded$/i.test(String(m.OnboardingStatus || "")) && !String(m.MergedToDeviceId || "").trim())
-      .map((m, ix) => {
-        const cat = String(m.DeviceCategory || "").toLowerCase(), type = String(m.DeviceType || "").toLowerCase();
-        let cls = "other";
-        if (/network/.test(cat)) cls = "network";
-        else if (/\biot\b|\bot\b/.test(cat)) cls = "iot";
-        else if ((!cat || cat === "unknown") && /network ?device|router|switch|firewall|access ?point|gateway/.test(type)) cls = "network";
-        const exp = String(m.ExposureLevel || "");
-        const raw = String(m.DeviceName || "").trim(), nm = /^\d{1,3}(\.\d{1,3}){3}$/.test(raw) || raw.indexOf(":") >= 0 ? raw : raw.split(".")[0];
-        const ts = Date.parse(m.Timestamp || "");
-        return {
-          id: "disc" + ix, name: nm || "(no name)", cls, discovered: true,
-          category: m.DeviceCategory || "", type: m.DeviceType || "", vendor: m.Vendor || "", model: m.Model || "",
-          os: normOS(m.OSPlatform), osVer: m.OSVersion || "—", onboarding: m.OnboardingStatus || "",
-          exposure: /^(high|medium|low)$/i.test(exp) ? exp.charAt(0).toUpperCase() + exp.slice(1).toLowerCase() : "—",
-          entra: 0, intune: 0, defender: 0, compliance: "—", threat: null, risk: "—", riskSub: "discovered · unmanaged",
-          lastSeenDays: isNaN(ts) ? null : Math.max(0, Math.floor((now - ts) / 864e5))
-        };
-      });
-
-    result.devices = devices; result.discovered = discovered;
+    // Only manageable endpoints are inventoried (Entra / Intune / Defender-onboarded computers, servers, mobile).
+    // Defender-discovered IoT / network gear can't run the MDE agent, so it's intentionally out of scope.
+    result.devices = devices; result.discovered = [];
     return result;
   }
 
@@ -720,7 +707,7 @@
         cveCrit: onb ? (exp === "High" ? 2 : 0) : null, cveHigh: onb ? (exp === "High" ? 5 : exp === "Medium" ? 3 : 0) : null,
         configFail: onb ? (comp === "noncompliant" ? 4 : 1) : null,
         internet: onb ? r[12] : null, internetReason: r[12] === true ? "Detected by external scan" : "",
-        openPorts: r[12] === true ? [22, 3389] : null, sensor: onb ? "Active" : null,
+        openPorts: r[12] === true ? [22, 80, 443, 3306] : null, sensor: onb ? "Active" : null,
         onboarding: onb ? "Onboarded" : (r[7][0] ? "Not onboarded" : "—"),
         criticality: r[11], critWhy: r[11] === "Very high" || r[11] === "High" ? ["Business-critical asset"] : [], critical: r[11] === "Very high" || r[11] === "High",
         roles: r[14], tags: [], adminRoles: r[15] ? ["Global Administrator"] : null, isAdminUser: !!r[15],
@@ -731,16 +718,7 @@
       d.riskWhy = riskWhyOf(d);
       return d;
     });
-    const discovered = [
-      ["core-rtr-01", "network", "Network device", "Router", "Contoso Networks", "Linux", "Medium", 0],
-      ["edge-fw-01", "network", "Network device", "Firewall", "Fabrikam", "", "High", 0],
-      ["floor2-sw-01", "network", "Network device", "Switch", "Contoso Networks", "", "—", 1],
-      ["lobby-printer", "iot", "IoT", "Printer", "Fabrikam", "", "—", 2],
-      ["meeting-room-tv", "iot", "IoT", "SmartTV", "Contoso", "Android", "—", 3],
-      ["door-cam-02", "iot", "IoT", "Camera", "Contoso Home", "Linux", "Medium", 0],
-      ["hvac-ctrl-1", "iot", "IoT", "Miscellaneous", "", "", "—", 5]
-    ].map((r, ix) => ({ id: "disc" + ix, name: r[0], cls: r[1], discovered: true, category: r[2], type: r[3], vendor: r[4], os: normOS(r[5]), osVer: "—", exposure: r[6], onboarding: "Can be onboarded", entra: 0, intune: 0, defender: 0, compliance: "—", threat: null, risk: "—", riskSub: "discovered · unmanaged", lastSeenDays: r[7] }));
-    return { devices, discovered, caps: { entra: true, intune: true, defender: true, admins: true }, errors: {} };
+    return { devices, discovered: [], caps: { entra: true, intune: true, defender: true, admins: true }, errors: {} };
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -749,10 +727,7 @@
   const SEGMENTS = [
     ["computer", "💻", "Computers", "Windows 10/11 · macOS"],
     ["server",   "🖥️", "Servers", "Windows Server · Linux"],
-    ["mobile",   "📱", "Mobile", "iOS · iPadOS · Android"],
-    ["iot",      "📡", "IoT", "Discovered, unmanaged"],
-    ["network",  "🌐", "Network", "Routers · switches · firewalls"],
-    ["other",    "❔", "Other", "Discovered, unclassified"]
+    ["mobile",   "📱", "Mobile", "iOS · iPadOS · Android"]
   ];
   const STATE = { q: "", cls: "", risk: "", comp: "", exp: "", gap: "", sortCol: "risk", sortDir: -1 };
   let DATA = null;
@@ -825,8 +800,12 @@
   const SEVWORD = n => n >= 4 ? "Critical" : n >= 3 ? "High" : n >= 2 ? "Medium" : n >= 1 ? "Low" : "None";
 
   async function fetchCompliance(d) {
-    const sc = ["DeviceManagementManagedDevices.Read.All"];
-    const states = await gGetAll("/deviceManagement/managedDevices/" + safeId(d.intuneId) + "/deviceCompliancePolicyStates", sc);
+    // deviceCompliancePolicyStates / settingStates require DeviceManagementConfiguration.Read.All (NOT the
+    // managed-devices scope). If it isn't granted, Graph returns 403 — surface a short, actionable note.
+    const sc = ["DeviceManagementConfiguration.Read.All"];
+    let states;
+    try { states = await gGetAll("/deviceManagement/managedDevices/" + safeId(d.intuneId) + "/deviceCompliancePolicyStates", sc); }
+    catch (e) { if (e.status === 403) { const err = new Error("Grant DeviceManagementConfiguration.Read.All to see which settings failed."); err.soft = true; throw err; } throw e; }
     const policies = [];
     for (const p of states) {
       const st = String(p.state || "").toLowerCase();
@@ -849,6 +828,51 @@
       + " | order by Worst desc, N desc | take 40";
     return (await hunt(q, "Vulnerabilities")).map(r => ({ software: String(r.Software || "").trim(), worst: +r.Worst || 0, n: +r.N || 0, cves: r.Cves || [] }));
   }
+  // Port → listening service, and the software-name pattern that would be the reachable service on it.
+  // Used to turn "open internet-facing port" + "device runs vulnerable software X" into an actual attack path.
+  const PORT_SVC = [
+    { ports: [80, 443, 8080, 8443, 8000, 8008, 8888, 8081, 4443], label: "Web / HTTP(S)", rx: /tomcat|nginx|apache http|httpd|\biis\b|jetty|spring|node\.?js|openssl|\bphp\b|wildfly|jboss|weblogic|websphere|struts|log4j|\bhttp server\b/i },
+    { ports: [3306], label: "MySQL / MariaDB", rx: /mysql|mariadb/i },
+    { ports: [5432], label: "PostgreSQL", rx: /postgre/i },
+    { ports: [1433, 1434], label: "MS SQL Server", rx: /sql server|mssql/i },
+    { ports: [1521], label: "Oracle DB", rx: /oracle.*(database| db)/i },
+    { ports: [27017, 27018], label: "MongoDB", rx: /mongo/i },
+    { ports: [6379], label: "Redis", rx: /redis/i },
+    { ports: [9200, 9300], label: "Elasticsearch", rx: /elastic/i },
+    { ports: [11211], label: "Memcached", rx: /memcached/i },
+    { ports: [22], label: "SSH", rx: /openssh|\bssh\b|libssh|dropbear/i },
+    { ports: [23], label: "Telnet", rx: /telnet/i },
+    { ports: [21], label: "FTP", rx: /\bftp\b|filezilla|vsftpd|proftpd/i },
+    { ports: [25, 465, 587], label: "SMTP / mail", rx: /exchange|postfix|\bexim\b|sendmail|\bsmtp\b/i },
+    { ports: [3389], label: "RDP", rx: /remote desktop|terminal serv|\brdp\b/i },
+    { ports: [445, 139], label: "SMB / file sharing", rx: /\bsmb\b|samba/i },
+    { ports: [53], label: "DNS", rx: /\bdns\b|\bbind\b|named/i },
+    { ports: [389, 636], label: "LDAP", rx: /\bldap\b/i },
+    { ports: [5900, 5901], label: "VNC", rx: /\bvnc\b/i }
+  ];
+  const portSvc = p => PORT_SVC.find(s => s.ports.indexOf(p) >= 0) || null;
+  // Join the device's internet-facing open ports to its vulnerable software. cves: [{software,worst,n,cves}].
+  function attackPaths(d, cves, listeners) {
+    if (!d.openPorts || !d.openPorts.length || !cves) return [];
+    return d.openPorts.map(port => {
+      const svc = portSvc(port);
+      const matched = svc ? cves.filter(c => svc.rx.test(c.software)) : [];
+      matched.sort((a, b) => b.worst - a.worst || b.n - a.n);
+      const worst = matched.reduce((m, c) => Math.max(m, c.worst), 0);
+      return { port, label: svc ? svc.label : "port " + port, matched, worst, procs: (listeners && listeners[port]) || null };
+    }).sort((a, b) => b.worst - a.worst || b.matched.length - a.matched.length || a.port - b.port);
+  }
+  async function fetchListeners(d) {
+    const ports = (d.openPorts || []).filter(p => Number.isInteger(p));
+    if (!ports.length) return {};
+    const q = "DeviceNetworkEvents | where DeviceId == '" + safeId(d.mdeId) + "' and Timestamp > ago(30d)"
+      + " | where ActionType in ('ListeningConnectionCreated','InboundConnectionAccepted')"
+      + " | where LocalPort in (" + ports.join(",") + ")"
+      + " | summarize Procs = make_set(InitiatingProcessFileName, 5) by LocalPort";
+    const by = {};
+    (await hunt(q, "Listening ports")).forEach(r => { by[+r.LocalPort] = (r.Procs || []).filter(Boolean); });
+    return by;
+  }
   async function fetchAlerts(d) {
     const q = "AlertInfo | where Timestamp > ago(30d)"
       + " | join kind=inner (AlertEvidence | where Timestamp > ago(30d) and DeviceId == '" + safeId(d.mdeId) + "' | distinct AlertId) on AlertId"
@@ -864,7 +888,13 @@
       else out.compliance = { policies: [{ name: "Default Device Compliance Policy", state: "compliant", settings: [] }, { name: "Minimum OS build", state: "compliant", settings: [] }] };
     }
     if (d.defender === 1) {
-      out.cves = d.exposure === "High" ? [
+      out.cves = d.internet === true ? [
+        { software: "apache tomcat", worst: 4, n: 76, cves: ["CVE-2025-24813", "CVE-2025-31650", "CVE-2025-31651"] },
+        { software: "openssl openssl", worst: 4, n: 38, cves: ["CVE-2025-15467", "CVE-2025-68160"] },
+        { software: "oracle mysql", worst: 3, n: 11, cves: ["CVE-2026-21936", "CVE-2026-22004"] },
+        { software: "openssh", worst: 2, n: 3, cves: ["CVE-2025-26465"] },
+        { software: "Microsoft Windows Server", worst: 3, n: 22, cves: ["CVE-2025-21298"] }
+      ] : d.exposure === "High" ? [
         { software: "Microsoft Windows 11", worst: 4, n: 46, cves: ["CVE-2025-21298", "CVE-2025-21333"] },
         { software: "Oracle Java SE", worst: 4, n: 12, cves: ["CVE-2024-20932"] },
         { software: "Google Chrome", worst: 3, n: 18, cves: ["CVE-2025-0999"] },
@@ -877,6 +907,7 @@
         { id: "demo", title: "Suspicious PowerShell command line", sev: "High", cat: "Execution", src: "EDR", ts: Date.now() - 72e5 },
         { id: "demo", title: "Possible credential theft (LSASS access)", sev: "High", cat: "CredentialAccess", src: "EDR", ts: Date.now() - 864e5 }
       ] : d.threat === "Medium" ? [{ id: "demo", title: "Anomalous sign-in from new location", sev: "Medium", cat: "InitialAccess", src: "Microsoft Defender for Identity", ts: Date.now() - 2592e5 }] : [];
+      if (d.internet === true) out.listeners = { 80: ["httpd.exe"], 443: ["httpd.exe"], 3306: ["mysqld.exe"], 22: ["sshd"] };
     }
     return out;
   }
@@ -891,10 +922,11 @@
         if (DEMO) { DETAIL[d.id] = demoDetail(d); return; }
         const out = {};
         const jobs = [];
-        if (d.intuneId) jobs.push(fetchCompliance(d).then(r => out.compliance = r).catch(e => out.complianceErr = e.message));
+        if (d.intuneId) jobs.push(fetchCompliance(d).then(r => out.compliance = r).catch(e => out.complianceErr = e.soft ? e.message : "Couldn't read compliance policy detail (" + (e.status || "error") + ")."));
         if (d.defender === 1 && d.mdeId) {
           jobs.push(fetchCves(d).then(r => out.cves = r).catch(e => out.cvesErr = e.message));
           jobs.push(fetchAlerts(d).then(r => out.alerts = r).catch(e => out.alertsErr = e.message));
+          if (d.openPorts && d.openPorts.length) jobs.push(fetchListeners(d).then(r => out.listeners = r).catch(() => {}));
         }
         await Promise.all(jobs);
         DETAIL[d.id] = out;
@@ -927,7 +959,7 @@
     const compHdr = `<div style="margin-bottom:8px">Intune verdict: ${d.intune === 1 ? pill("c", d.compliance) : '<span class="muted">not enrolled</span>'}</div>`;
     if (d.intune !== 1) compBody = '<div class="muted">Not managed by Intune — no compliance evaluation.</div>';
     else if (loading || (det && det.compliance === undefined && !det.complianceErr && !det.error)) compBody = spin;
-    else if (det && det.complianceErr) compBody = '<div class="muted">Couldn\'t read policy detail — ' + esc(det.complianceErr) + '</div>';
+    else if (det && det.complianceErr) compBody = '<div class="muted">' + esc(det.complianceErr) + '</div>';
     else if (det && det.compliance) {
       const pols = det.compliance.policies || [];
       const fails = pols.filter(p => p.state && p.state !== "compliant" && p.state !== "notapplicable" && p.state !== "unknown");
@@ -952,6 +984,20 @@
       if (loading || (det && det.cves === undefined && !det.cvesErr && !det.error)) expBody += spin;
       else if (det && det.cvesErr) expBody += '<div class="muted" style="margin-top:8px">Vulnerability detail unavailable.</div>';
       else if (det && det.cves) {
+        // ── internet-exposed attack paths: open port → reachable vulnerable service ──
+        if (d.internet === true && d.openPorts && d.openPorts.length) {
+          const paths = attackPaths(d, det.cves, det.listeners);
+          const hot = paths.filter(p => p.matched.length);
+          if (hot.length || paths.length) {
+            const li = paths.map(p => {
+              const sv = SEVWORD(p.worst), reach = p.worst >= 3;
+              const proc = p.procs && p.procs.length ? ` <span class="meta">(${esc(p.procs.slice(0, 2).join(", "))})</span>` : "";
+              if (p.matched.length) return `<li><div class="ln"><b class="${reach ? "v-bad" : ""}">:${p.port} · ${esc(p.label)}${proc}</b><span class="sev ${sv}">${reach ? "EXPOSED · " : ""}${sv}</span></div><div class="meta">Reachable vulnerable service: ${p.matched.slice(0, 3).map(m => esc(m.software) + " <span class=\"" + (m.worst >= 4 ? "v-bad" : m.worst >= 3 ? "v-warn" : "") + "\">(" + SEVWORD(m.worst) + " · " + m.n + ")</span>").join(" · ")}</div></li>`;
+              return `<li><div class="ln"><b>:${p.port} · ${esc(p.label)}${proc}</b><span class="meta">no vulnerable service matched</span></div></li>`;
+            }).join("");
+            expBody += `<div class="apath${hot.some(p => p.worst >= 3) ? " hot" : ""}"><div class="apath-h">⚠ Internet-exposed attack paths</div><ul class="dlist">${li}</ul><div class="meta apath-note">Open internet-facing port → vulnerable software on this host. Port→service is inferred from the well-known port${det.listeners ? ", confirmed by the listening process where shown" : ""}; a critical CVE in a service reachable from the internet is the highest-priority path to close.</div></div>`;
+          }
+        }
         const top = det.cves.filter(c => c.worst >= 2).slice(0, 10);
         if (top.length) expBody += `<div class="meta" style="margin-top:9px;margin-bottom:3px">Top vulnerable software</div><ul class="dlist">${top.map(c => `<li><div class="ln"><b>${esc(c.software)}</b><span class="sev ${SEVWORD(c.worst)}">${SEVWORD(c.worst)} · ${c.n} CVE${c.n === 1 ? "" : "s"}</span></div>${c.cves && c.cves.length ? `<div class="cvelist">${c.cves.slice(0, 6).map(id => `<a href="https://security.microsoft.com/vulnerabilities/vulnerability/${enc(id)}" target="_blank" rel="noopener">${esc(id)}</a>`).join(" · ")}</div>` : ""}</li>`).join("")}</ul>`;
         else if (!top.length && d.cveCount === 0) expBody += '<div class="v-good" style="margin-top:8px">No known software vulnerabilities.</div>';
@@ -1011,7 +1057,7 @@
 
     // compact context line (category counts live in the segment headers)
     const nComp2 = D.filter(d => d.cls === "computer").length, nSrv = D.filter(d => d.cls === "server").length, nMob = D.filter(d => d.cls === "mobile").length;
-    $("gaps").innerHTML = `<span class="gap"><b>${nComp2}</b> computers</span><span class="gap"><b>${nSrv}</b> servers</span><span class="gap"><b>${nMob}</b> mobile</span><span class="gap"><b>${DATA.discovered.length}</b> discovered (IoT · network)</span>`
+    $("gaps").innerHTML = `<span class="gap"><b>${nComp2}</b> computers</span><span class="gap"><b>${nSrv}</b> servers</span><span class="gap"><b>${nMob}</b> mobile</span>`
       + (atRisk === 0 ? `<span class="gap good"><b>✓</b> nothing at elevated risk</span>` : "");
 
     // partial / capability note
