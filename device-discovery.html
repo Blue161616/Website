@@ -1,0 +1,1016 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Device Discovery — Entra · Intune · Defender</title>
+<!--
+  Device Discovery — a free, open-source, single-file device inventory & coverage tool.
+
+  Reads, READ-ONLY and delegated (as the signed-in user), from:
+    • Microsoft Entra ID      — device objects (join type, compliance flag, last sign-in)
+    • Microsoft Intune        — managed devices (compliance state, owner, OS, last sync, agent)
+    • Microsoft Defender XDR  — advanced hunting (onboarding, exposure, sensor, alerts, CVEs,
+                                secure-config, internet-facing, criticality, discovered IoT/network)
+    • Microsoft Entra roles   — (optional) privileged-role holders, to flag admin devices
+
+  It joins them into one inventory, categorises every device
+    Computer (Win10/11, macOS) · Server (Windows Server, Linux) · Mobile (iOS/iPadOS/Android)
+    · IoT · Network
+  and shows the coverage (which of E/I/D sees it) and the security signals
+    Compliance (Intune) · Exposure (Defender) · Risk (composite) · Threat · Last seen / stale.
+
+  No backend, no data leaves the browser. Everything is a direct call to graph.microsoft.com
+  from your tenant, authorised by your own single-tenant app registration (see "First-time setup").
+
+  License: MIT. Author: starter from Blue16 (blue16.nl). Rebrand freely.
+
+  The Defender for Endpoint REST API (api.securitycenter.microsoft.com) has no CORS, so a browser
+  cannot call it. Defender data is therefore read through Microsoft Graph ADVANCED HUNTING
+  (graph.microsoft.com/v1.0/security/runHuntingQuery), which is CORS-enabled.
+-->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Cpath d='M24 4 L42 15 V33 L24 44 L6 33 V15 Z' fill='%23050d22' stroke='%233FA9FF' stroke-width='2'/%3E%3Ccircle cx='24' cy='23' r='9' fill='none' stroke='%236DA6FF' stroke-width='2.4'/%3E%3Cpath d='M30.5 29.5 L38 37' stroke='%233FA9FF' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E" />
+
+<!-- MSAL pinned with Subresource Integrity (SRI). Bump the version → recompute BOTH hashes. -->
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.28.1/lib/msal-browser.min.js"
+        integrity="sha384-B5PXeUfgiegchZiX5iMRssMrHd9NfPhFnITob1HyW1CY76udptWpBsniaDsH/+BY"
+        crossorigin="anonymous"></script>
+<script>
+  if (typeof msal === "undefined") {
+    document.write('<script src="https://unpkg.com/@azure/msal-browser@3.28.1/lib/msal-browser.min.js" integrity="sha384-B5PXeUfgiegchZiX5iMRssMrHd9NfPhFnITob1HyW1CY76udptWpBsniaDsH/+BY" crossorigin="anonymous"><\/script>');
+  }
+</script>
+<style>
+  :root {
+    --bg: #050D22; --bg2: #0C1E45; --card: #0C1E45; --border: #1C3766; --text: #EAF2FF; --muted: #93ACD3;
+    --accent: #3FA9FF; --accent-dark: #8FE3FF;
+    --green: #5EE6B0; --green-bg: rgba(94,230,176,.12);
+    --red: #FF7A8A; --red-bg: rgba(255,122,138,.14);
+    --amber: #FFC15E; --amber-bg: rgba(255,193,94,.12); --orange: #FF9A7A; --blue: #4FB8FF;
+    --sev-crit: #FF4D6D; --sev-high: #FF7A45; --sev-med: #FFC15E; --sev-low: #5EE6B0; --sev-info: #7F8C9A;
+    --input-bg: #050D22; --input-border: #1C3766; --hover: rgba(63,169,255,.07);
+    --code-bg: #0A1733;
+    --shadow: 0 10px 34px -12px rgba(0,0,0,.65), 0 2px 8px rgba(0,0,0,.35);
+    --display: "Michroma","Eurostile","Arial Black",sans-serif;
+    --label: "Rajdhani","Arial Narrow",sans-serif;
+    --body: "IBM Plex Sans","Segoe UI",system-ui,sans-serif;
+    --mono: "Cascadia Code",Consolas,monospace;
+    --grad-blue: linear-gradient(135deg,#4FB8FF 0%,#1557E0 100%);
+  }
+  * { box-sizing: border-box; }
+  html,body { margin: 0; padding: 0; }
+  body { background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(63,169,255,.10), transparent 60%),
+      radial-gradient(900px 500px at -10% 10%, rgba(21,87,224,.12), transparent 55%),
+      var(--bg);
+    color: var(--text); font-family: var(--body); font-size: 14px; line-height: 1.5; min-height: 100vh; }
+  a { color: var(--accent); }
+  h1,h2,h3 { margin: 0; }
+  button { font-family: var(--body); cursor: pointer; }
+  code { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; color: var(--accent-dark); }
+  .wrap { max-width: 1480px; margin: 0 auto; padding: 0 24px 80px; }
+
+  /* ── top bar ───────────────────────────────────────────────────────────── */
+  .top { position: sticky; top: 0; z-index: 30; display: flex; align-items: center; gap: 16px;
+    padding: 14px 24px; background: rgba(5,13,34,.78); backdrop-filter: blur(9px); border-bottom: 1px solid var(--border); }
+  .top::after { content:''; position: absolute; left:0; right:0; bottom:-1px; height:2px;
+    background: linear-gradient(90deg, transparent, var(--accent) 12%, var(--accent-dark) 50%, var(--accent) 88%, transparent); opacity:.8; }
+  .brand { display: flex; align-items: center; gap: 11px; }
+  .brand svg { width: 30px; height: 30px; }
+  .brand .t { font-family: var(--display); font-size: 15px; letter-spacing: .06em; text-transform: uppercase; }
+  .brand .t small { display:block; font-family: var(--label); font-size: 10.5px; letter-spacing:.14em; color: var(--muted); font-weight:700; margin-top:2px; }
+  .top .spacer { flex: 1; }
+  .top .tenant { font-size: 12px; color: var(--muted); font-family: var(--mono); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .top .tenant b { color: var(--text); font-family: var(--body); }
+  .btn { background: var(--bg2); border: 1px solid var(--border); color: var(--text); border-radius: 9px; padding: 8px 14px; font-weight: 600; font-size: 13px; transition: .14s; }
+  .btn:hover { border-color: var(--accent); background: var(--hover); }
+  .btn.p { background: var(--grad-blue); border: 0; color: #041026; box-shadow: var(--shadow); }
+  .btn.p:hover { filter: brightness(1.08); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.sm { padding: 5px 10px; font-size: 12px; border-radius: 7px; }
+
+  /* ── connect / sign-in screen ──────────────────────────────────────────── */
+  .hero { max-width: 880px; margin: 48px auto 0; }
+  .hero h1 { font-family: var(--display); font-size: 27px; letter-spacing: .02em; line-height: 1.25; }
+  .hero .lead { color: var(--muted); font-size: 15px; margin: 14px 0 26px; max-width: 70ch; }
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 24px; box-shadow: var(--shadow); }
+  .panel + .panel { margin-top: 18px; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 12px; font-weight: 700; letter-spacing: .04em; color: var(--muted); text-transform: uppercase; margin-bottom: 6px; }
+  .field input { width: 100%; background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text); border-radius: 9px; padding: 10px 12px; font-family: var(--mono); font-size: 13px; }
+  .field input:focus { outline: none; border-color: var(--accent); }
+  .field .hint { font-size: 12px; color: var(--muted); margin-top: 5px; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 680px) { .row2 { grid-template-columns: 1fr; } }
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
+  .status { min-height: 20px; font-size: 13px; color: var(--muted); margin-top: 12px; }
+  .status.err { color: var(--red); }
+  .spinner { display: inline-block; width: 13px; height: 13px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -2px; margin-right: 7px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  details.disc { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px; }
+  details.disc > summary { cursor: pointer; list-style: none; user-select: none; font-size: 14px; font-weight: 600; }
+  details.disc > summary::-webkit-details-marker { display: none; }
+  details.disc > summary::before { content: "\25B8"; display: inline-block; width: 16px; color: var(--accent); transition: transform .15s; }
+  details.disc[open] > summary::before { transform: rotate(90deg); }
+  details.disc .body { margin-top: 12px; color: var(--muted); font-size: 13px; }
+  details.disc .body ol { padding-left: 20px; } details.disc .body li { margin: 7px 0; }
+  pre.code { background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px; overflow: auto; font-family: var(--mono); font-size: 12px; color: #CFE3FF; line-height: 1.55; position: relative; }
+  .copy { position: absolute; top: 8px; right: 8px; }
+  .scopes { margin-top: 10px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .scopes .srow { display: grid; grid-template-columns: 260px 1fr; gap: 10px; padding: 8px 13px; border-top: 1px solid var(--border); font-size: 12.5px; }
+  .scopes .srow:first-child { border-top: 0; }
+  .scopes .sp { font-family: var(--mono); color: var(--accent-dark); }
+  .scopes .sw { color: var(--muted); }
+  .tag-opt { font-size: 10px; color: var(--amber); border: 1px solid rgba(255,193,94,.4); border-radius: 999px; padding: 0 6px; margin-left: 6px; vertical-align: 1px; }
+
+  /* ── summary tiles ─────────────────────────────────────────────────────── */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 12px; margin: 22px 0 18px; }
+  .tile { background: var(--card); border: 1px solid var(--border); border-radius: 13px; padding: 14px 16px; }
+  .tile .n { font-family: var(--display); font-size: 26px; line-height: 1; }
+  .tile .l { font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-top: 7px; font-weight: 700; font-family: var(--label); }
+  .tile .s { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+  .tile.warn .n { color: var(--amber); } .tile.bad .n { color: var(--red); } .tile.good .n { color: var(--green); }
+
+  .gaps { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+  .gap { font-size: 12.5px; padding: 6px 11px; border-radius: 999px; border: 1px solid var(--border); background: var(--bg2); color: var(--muted); cursor: pointer; }
+  .gap b { color: var(--text); }
+  .gap.bad { border-color: rgba(255,122,138,.4); } .gap.bad b { color: var(--red); }
+  .gap.warn { border-color: rgba(255,193,94,.4); } .gap.warn b { color: var(--amber); }
+  .gap:hover { border-color: var(--accent); }
+
+  /* ── filter bar ────────────────────────────────────────────────────────── */
+  .filters { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; margin-bottom: 14px; }
+  .filters input[type=search] { background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text); border-radius: 9px; padding: 8px 12px; font-size: 13px; min-width: 210px; }
+  .filters select { background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text); border-radius: 9px; padding: 8px 10px; font-size: 12.5px; }
+  .filters input:focus, .filters select:focus { outline: none; border-color: var(--accent); }
+  .filters .fsp { flex: 1; }
+
+  /* ── device table ──────────────────────────────────────────────────────── */
+  .seg { margin-top: 20px; }
+  .seg-h { display: flex; align-items: center; gap: 10px; font-family: var(--label); font-weight: 700; letter-spacing: .08em; text-transform: uppercase; font-size: 13px; color: var(--text); padding: 6px 2px; border-bottom: 1px solid var(--border); }
+  .seg-h .ic { font-size: 15px; }
+  .seg-h .ct { color: var(--muted); font-weight: 600; letter-spacing: .02em; text-transform: none; font-family: var(--body); font-size: 12.5px; }
+  .seg-h .hr { color: var(--red); } .seg-h .hr b { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th { text-align: left; font-family: var(--label); font-weight: 700; letter-spacing: .05em; text-transform: uppercase; font-size: 11px; color: var(--muted); padding: 9px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  thead th.sortable { cursor: pointer; user-select: none; }
+  thead th.sortable:hover { color: var(--text); }
+  thead th .arrow { opacity: .5; font-size: 9px; }
+  tbody td { padding: 9px 10px; border-bottom: 1px solid rgba(28,55,102,.5); vertical-align: top; }
+  tbody tr.dev { cursor: pointer; }
+  tbody tr.dev:hover { background: var(--hover); }
+  .dname { font-weight: 600; }
+  .dsub { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+  .chips { display: inline-flex; gap: 5px; flex-wrap: wrap; margin-left: 7px; vertical-align: 1px; }
+  .chip { font-size: 10px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+  .chip.crit { border-color: rgba(255,77,109,.5); color: var(--sev-crit); }
+  .chip.inet { border-color: rgba(255,154,122,.5); color: var(--orange); }
+  .chip.adm { border-color: rgba(255,122,138,.5); color: var(--red); }
+  .chip.stale { border-color: rgba(255,193,94,.45); color: var(--amber); }
+  .chip.tag { border-color: var(--border); color: var(--muted); }
+
+  .src { display: inline-flex; gap: 4px; }
+  .src span { width: 20px; height: 20px; border-radius: 6px; display: inline-flex; align-items: center; justify-content: center; font-size: 10.5px; font-weight: 700; border: 1px solid var(--border); color: var(--muted); font-family: var(--mono); }
+  .src span.on { color: #041026; }
+  .src span.E.on { background: #6DA6FF; border-color: #6DA6FF; }
+  .src span.I.on { background: #8FE3FF; border-color: #8FE3FF; }
+  .src span.D.on { background: #5EE6B0; border-color: #5EE6B0; }
+  .src span.off { opacity: .4; border-style: dashed; }
+  .src span.na { opacity: .25; }
+
+  .pill { display: inline-block; font-size: 11.5px; font-weight: 700; padding: 2px 9px; border-radius: 999px; white-space: nowrap; }
+  .pill.r-High, .pill.c-noncompliant, .pill.x-High, .pill.t-High { background: var(--red-bg); color: var(--red); }
+  .pill.r-Medium, .pill.c-grace, .pill.x-Medium, .pill.t-Medium { background: var(--amber-bg); color: var(--amber); }
+  .pill.r-Low, .pill.x-Low, .pill.t-Low { background: var(--green-bg); color: var(--green); }
+  .pill.c-compliant { background: var(--green-bg); color: var(--green); }
+  .pill.c-unevaluated { background: rgba(127,140,154,.16); color: var(--sev-info); }
+  .pill.r-Healthy, .pill.x---, .pill.t-None, .pill.r-None { background: rgba(127,140,154,.14); color: var(--muted); }
+  .muted { color: var(--muted); }
+  .rsub { font-size: 11px; color: var(--muted); margin-top: 3px; }
+
+  /* detail row */
+  tr.detail td { background: rgba(5,13,34,.55); padding: 0; }
+  .dwrap { padding: 16px 18px; display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 18px; }
+  .dcol h4 { font-family: var(--label); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin-bottom: 8px; }
+  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 3px 10px; font-size: 12.5px; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0; }
+  .why { list-style: none; padding: 0; margin: 0; font-size: 12.5px; }
+  .why li { padding: 3px 0 3px 16px; position: relative; }
+  .why li::before { content: "▸"; position: absolute; left: 0; color: var(--accent); }
+  .dlinks { margin-top: 10px; display:flex; gap:8px; flex-wrap:wrap; }
+
+  .empty { text-align: center; color: var(--muted); padding: 60px 20px; }
+  .foot { margin-top: 40px; padding-top: 18px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; }
+  .hidden { display: none !important; }
+  .note { font-size: 12px; color: var(--muted); background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 11px 14px; margin-bottom: 16px; }
+  .note b { color: var(--text); }
+</style>
+</head>
+<body>
+
+<div class="top">
+  <div class="brand">
+    <svg viewBox="0 0 48 48"><path d="M24 4 L42 15 V33 L24 44 L6 33 V15 Z" fill="#071530" stroke="#3FA9FF" stroke-width="2"/><circle cx="24" cy="23" r="9" fill="none" stroke="#6DA6FF" stroke-width="2.4"/><path d="M30.5 29.5 L38 37" stroke="#3FA9FF" stroke-width="3" stroke-linecap="round"/></svg>
+    <div class="t">Device Discovery<small>Entra · Intune · Defender</small></div>
+  </div>
+  <div class="spacer"></div>
+  <div class="tenant hidden" id="tenantLbl"></div>
+  <button class="btn sm hidden" id="btnRefresh">↻ Refresh</button>
+  <button class="btn sm hidden" id="btnExport">⇩ CSV</button>
+  <button class="btn sm hidden" id="btnSignout">Sign out</button>
+</div>
+
+<div class="wrap">
+
+  <!-- ══ CONNECT SCREEN ══ -->
+  <section id="connect" class="hero">
+    <h1>See every device — and who's actually watching it.</h1>
+    <p class="lead">One read-only inventory across Microsoft Entra ID, Intune and Defender XDR. Every
+      device is categorised and lined up against its coverage (which tools see it) and its security
+      signals — compliance, exposure, risk and staleness — so the gaps are obvious at a glance.</p>
+
+    <div class="panel">
+      <div class="row2">
+        <div class="field">
+          <label for="inTenant">Tenant</label>
+          <input id="inTenant" value="organizations" spellcheck="false" autocomplete="off" />
+          <div class="hint">Your tenant ID or domain (e.g. <code>contoso.onmicrosoft.com</code>). Leave as <code>organizations</code> to pick at sign-in.</div>
+        </div>
+        <div class="field">
+          <label for="inClient">Application (client) ID</label>
+          <input id="inClient" placeholder="00000000-0000-0000-0000-000000000000" spellcheck="false" autocomplete="off" />
+          <div class="hint">From your own single-tenant app registration. No app yet? See <b>First-time setup</b> below.</div>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn p" id="btnConnect">Sign in &amp; discover</button>
+        <button class="btn" id="btnDemo">Explore with demo data</button>
+      </div>
+      <div class="status" id="status"></div>
+
+      <details class="disc" id="discSetup">
+        <summary>First-time setup — register the read-only app (one time, ~2 min)</summary>
+        <div class="body">
+          <p>This tool is a static page that talks to Microsoft Graph <b>as you</b>. It needs a single-tenant
+          app registration in your tenant so Entra ID knows to trust this page as a sign-in client. It's
+          read-only — no secrets, no backend. Run the PowerShell below (needs the
+          <code>Microsoft.Graph.Applications</code> module and a privileged role to consent), then paste the
+          Application ID it prints into the field above.</p>
+          <p class="hint">Change <code>$RedirectUri</code> to wherever you host this file. For local testing, host it
+          over <code>http://localhost:&lt;port&gt;/device-discovery.html</code> and use that exact URL.</p>
+          <pre class="code" id="psScript"><button class="btn sm copy" data-copy="psScript">Copy</button><code id="psCode"></code></pre>
+          <p>Prefer the portal? Create an app registration → <b>Single tenant</b> → add a <b>Single-page application</b>
+          redirect URI equal to this page's URL → under API permissions add the delegated Microsoft Graph scopes
+          below → <b>Grant admin consent</b>. Verify a sign-in token in <a href="https://jwt.ms" target="_blank" rel="noopener">jwt.ms</a>
+          carries the <code>scp</code> claims you expect.</p>
+
+          <div class="scopes" id="scopeList"></div>
+          <p class="hint" style="margin-top:10px">Only <b>User.Read</b> and <b>Device.Read.All</b> are required. The rest are optional —
+          each unlocks a column or a device class, and the tool degrades cleanly (shows "not read") when a scope
+          isn't granted. Least privilege: grant only what you want this tool to see.</p>
+        </div>
+      </details>
+
+      <details class="disc" id="discAbout">
+        <summary>What it reads, and how (privacy)</summary>
+        <div class="body">
+          <p>Everything runs in your browser. Each call goes straight from your machine to
+          <code>graph.microsoft.com</code>, authorised by a token MSAL holds in <code>sessionStorage</code> (gone when
+          you close the tab). No data is sent anywhere else and there is no server.</p>
+          <p>Defender device data is read through Microsoft Graph <b>advanced hunting</b>
+          (<code>/security/runHuntingQuery</code>) because the Defender REST API has no CORS and can't be called from a
+          browser. The hunting queries are read-only KQL over <code>DeviceInfo</code>, <code>AlertInfo</code>,
+          <code>DeviceTvm*</code> and <code>ExposureGraphNodes</code>.</p>
+          <p>The only optional outbound call to a non-Microsoft host is disabled by default and not used by this tool.</p>
+        </div>
+      </details>
+    </div>
+
+    <div class="foot">
+      Free &amp; open source (MIT). A single self-contained HTML file — read it, host it, fork it.
+      Starter from <a href="https://blue16.nl" target="_blank" rel="noopener">Blue16</a>.
+    </div>
+  </section>
+
+  <!-- ══ APP SCREEN ══ -->
+  <section id="app" class="hidden">
+    <div id="tiles" class="tiles"></div>
+    <div id="gaps" class="gaps"></div>
+    <div id="partial" class="note hidden"></div>
+
+    <div class="filters">
+      <input type="search" id="fQ" placeholder="Search name, OS, user…" />
+      <select id="fCls"><option value="">All classes</option></select>
+      <select id="fRisk"><option value="">Any risk</option><option>High</option><option>Medium</option><option>Low</option></select>
+      <select id="fComp"><option value="">Any compliance</option><option value="noncompliant">Non-compliant</option><option value="compliant">Compliant</option><option value="grace">In grace</option><option value="unevaluated">Unevaluated</option></select>
+      <select id="fExp"><option value="">Any exposure</option><option>High</option><option>Medium</option><option>Low</option></select>
+      <select id="fGap"><option value="">Any coverage</option><option value="noEntra">Not in Entra</option><option value="noIntune">Not in Intune</option><option value="noDefender">No Defender sensor</option><option value="stale">Stale (&gt;30d)</option><option value="inet">Internet-facing</option></select>
+      <span class="fsp"></span>
+      <button class="btn sm" id="btnClear">Clear</button>
+    </div>
+
+    <div id="segs"></div>
+    <div id="emptyMsg" class="empty hidden">No devices match these filters.</div>
+
+    <div class="foot" id="appFoot"></div>
+  </section>
+
+</div>
+
+<script>
+/* ════════════════════════════════════════════════════════════════════════════
+   Device Discovery — logic. MIT licensed. Single file, no dependencies but MSAL.
+   ════════════════════════════════════════════════════════════════════════════ */
+(function () {
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+  const enc = encodeURIComponent;
+
+  // ── Scopes (delegated, read-only) ──────────────────────────────────────────
+  const SCOPES = [
+    ["User.Read",                               "Sign you in and read your profile",                                         true],
+    ["Device.Read.All",                         "Entra device objects — join type, compliance flag, last sign-in",           true],
+    ["DeviceManagementManagedDevices.Read.All", "Intune managed devices — compliance, owner, OS, last sync, agent",          false],
+    ["ThreatHunting.Read.All",                  "Defender advanced hunting — onboarding, exposure, alerts, CVEs, discovered IoT/network", false],
+    ["RoleManagement.Read.Directory",           "Privileged role holders — to flag devices whose primary user is an admin",  false]
+  ];
+  const REQUIRED = SCOPES.filter(s => s[2]).map(s => s[0]);
+  const GRAPH = "https://graph.microsoft.com/v1.0";
+
+  // ── MSAL ───────────────────────────────────────────────────────────────────
+  const redirectUri = window.location.origin + window.location.pathname;
+  let msalApp = null, account = null, tenantName = "";
+  let DEMO = false;
+
+  function buildMsal(clientId, tenant) {
+    msalApp = new msal.PublicClientApplication({
+      auth: { clientId, authority: "https://login.microsoftonline.com/" + (tenant || "organizations"), redirectUri },
+      cache: { cacheLocation: "sessionStorage", storeAuthStateInCookie: false }
+    });
+    return msalApp.initialize ? msalApp.initialize() : Promise.resolve();
+  }
+  async function token(scopes, interactive) {
+    if (DEMO) return "demo";
+    const req = { account, scopes };
+    try {
+      if (interactive) return (await msalApp.acquireTokenPopup({ scopes })).accessToken;
+      return (await msalApp.acquireTokenSilent(req)).accessToken;
+    } catch (e) {
+      if (!interactive && (e instanceof msal.InteractionRequiredAuthError || /interaction_required|consent_required|login_required/i.test(e.errorCode || e.message || ""))) {
+        return (await msalApp.acquireTokenPopup({ scopes })).accessToken;
+      }
+      throw e;
+    }
+  }
+  async function tokenSilent(scopes) { return token(scopes, false); }
+
+  // ── Network helpers: paged Graph + advanced hunting, with throttle retry ────
+  const RETRY = [429, 500, 502, 503, 504];
+  const partials = [];
+  function notePartial(label, detail) { if (partials.findIndex(p => p.label === label) < 0) partials.push({ label, detail }); }
+  async function send(url, init, scopes, at) {
+    let force = false;
+    for (let n = 0; n < 5; n++) {
+      const t = at || await token(scopes, force);
+      const r = await fetch(url, Object.assign({}, init, { headers: Object.assign({ Authorization: "Bearer " + t }, (init && init.headers) || {}) }));
+      if (RETRY.includes(r.status) && n < 4) {
+        const ra = +(r.headers.get("Retry-After") || 0);
+        await new Promise(res => setTimeout(res, (ra ? ra * 1000 : Math.min(8000, 600 * Math.pow(2, n))) + Math.random() * 300));
+        continue;
+      }
+      if (r.status === 401 && scopes && !force && !at) { force = true; continue; }
+      return r;
+    }
+  }
+  async function failMsg(r, label) {
+    let d = ""; try { d = ((await r.json()).error || {}).message || ""; } catch (e) {}
+    const e = new Error((label || "Graph") + " " + r.status + (d ? " — " + d : "")); e.status = r.status; return e;
+  }
+  async function gGetAll(path, scopes, onPage) {
+    const out = []; let next = /^https?:/.test(path) ? path : GRAPH + path, pages = 0;
+    const home = (next.match(/^https?:\/\/[^\/]+/i) || [""])[0].toLowerCase();
+    while (next && pages < 400) {
+      const r = await send(next, null, scopes);
+      if (!r.ok) throw await failMsg(r, "Graph");
+      const j = await r.json();
+      (j.value || []).forEach(v => out.push(v));
+      next = j["@odata.nextLink"] || null; pages++;
+      if (next && (next.match(/^https?:\/\/[^\/]+/i) || [""])[0].toLowerCase() !== home) next = null;
+      if (onPage) try { onPage(out.length); } catch (e) {}
+    }
+    return out;
+  }
+  async function huntRaw(q) {
+    const at = await tokenSilent(["ThreatHunting.Read.All"]);
+    return send(GRAPH + "/security/runHuntingQuery", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Query: q }) }, ["ThreatHunting.Read.All"], at);
+  }
+  async function hunt(q, label) {
+    const r = await huntRaw(q);
+    if (!r.ok) throw await failMsg(r, label || "Advanced hunting");
+    return (await r.json()).results || [];
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  CLASSIFICATION & RISK  (shared by live + demo)
+  // ════════════════════════════════════════════════════════════════════════
+  function normOS(s) {
+    s = String(s || "").toLowerCase();
+    if (s.includes("server")) return "Windows Server";
+    if (s.includes("windows") || s === "win" || /^win(10|11|dows)/.test(s)) return "Windows";
+    if (s.includes("ipad")) return "iPadOS";
+    if (s.includes("iphone") || s === "ios") return "iOS";
+    if (s.includes("mac")) return "macOS";
+    if (s.includes("android")) return "Android";
+    if (/linux|ubuntu|red ?hat|rhel|centos|debian|suse|rocky|alma|oracle/.test(s)) return "Linux";
+    return s ? s.charAt(0).toUpperCase() + s.slice(1) : "Other";
+  }
+  // Managed-device class (EDR applies to computers AND servers).
+  function devClassBroad(os) { return (os === "iOS" || os === "iPadOS" || os === "Android") ? "mobile" : "computer"; }
+  // Display class — the 5 segments the user asked for.
+  function devClass(os, discCls) {
+    if (discCls) return discCls;                 // discovered IoT / network keep their Defender class
+    const o = normOS(os);
+    if (o === "iOS" || o === "iPadOS" || o === "Android") return "mobile";
+    if (o === "Windows Server" || o === "Linux") return "server";
+    return "computer";
+  }
+  function normName(s) { s = String(s || "").trim().toLowerCase(); const d = s.indexOf("."); return d > 0 ? s.slice(0, d) : s; }
+  function joinMap(t) { t = String(t || "").toLowerCase(); return t === "azuread" ? "Entra joined" : t === "workplace" ? "Entra registered" : t === "serverad" ? "Hybrid joined" : t ? t.charAt(0).toUpperCase() + t.slice(1) : "—"; }
+  function ownerMap(o) { o = String(o || "").toLowerCase(); return o === "company" ? "Corporate" : o === "personal" ? "Personal" : o ? "Unknown" : "—"; }
+  function agentMap(i, m) { if (i) { return String(i.managementAgent || "").toLowerCase().includes("configurationmanager") ? "Co-managed" : "Intune"; } return m ? "MDE" : "—"; }
+  function parseRoles(v) { try { let a = typeof v === "string" ? JSON.parse(v) : v; if (!Array.isArray(a)) return []; return a.map(x => typeof x === "string" ? x : (x && (x.Name || x.Role || x.name || x.role) || "")).filter(Boolean); } catch (e) { return (typeof v === "string" && v) ? [v] : []; } }
+  function mergeTags(a, b) { const out = []; [a, b].forEach(v => parseRoles(v).forEach(t => { const s = String(t || "").trim(); if (s && out.indexOf(s) < 0) out.push(s); })); return out; }
+  function isSensitiveRole(r) { return /domain controller|certificat|\bca\b|exchange|\bdns\b|\bdhcp\b|\bsql\b|hyper-?v|identity|key vault/i.test(String(r || "")); }
+
+  // Composite risk: threat ≫ exposure ≫ compliance; internet-facing multiplies the threat+exposure surface.
+  const RISK_TP = { High: 60, Medium: 35, Low: 15 };
+  const RISK_XP = { High: 45, Medium: 22, Low: 8 };
+  function riskBand(score) { return score >= 45 ? "High" : score >= 20 ? "Medium" : "Low"; }
+  function riskCompose(sig) {
+    const tPts = RISK_TP[sig.threat] || 0, xPts = RISK_XP[sig.exposure] || 0;
+    let cPts = 0, cWhy = "compliant";
+    if (sig.compliance === "noncompliant") { cPts = sig.active ? 20 : 8; cWhy = sig.active ? "non-compliant · active" : "non-compliant · stale"; }
+    else if (sig.compliance === "grace") { cPts = 10; cWhy = "in grace period"; }
+    else if (sig.compliance === "unevaluated") { cPts = 12; cWhy = "no compliance result"; }
+    else if (!sig.managed) { cPts = sig.active ? 12 : 8; cWhy = sig.active ? "unmanaged" : "unmanaged · stale"; }
+    const mult = sig.internet === true ? 1.5 : 1;
+    const score = Math.round((tPts + xPts) * mult + cPts);
+    const drivers = [];
+    if (tPts) drivers.push([tPts * mult, "active alert · " + String(sig.threat).toLowerCase()]);
+    if (xPts) drivers.push([xPts * mult, "Defender exposure · " + String(sig.exposure).toLowerCase()]);
+    if (cPts) drivers.push([cPts, cWhy]);
+    drivers.sort((a, b) => b[0] - a[0]);
+    return { score, band: riskBand(score), sub: drivers.length ? drivers[0][1] : "no elevated signals" };
+  }
+  function riskWhyOf(d) {
+    const w = [];
+    if (d.compliance === "noncompliant") w.push(d.stale ? "Non-compliant (stale)" : "Non-compliant (active)");
+    else if (d.compliance === "unevaluated") w.push("No compliance result");
+    else if (d.compliance === "compliant") w.push("Compliant");
+    if (d.entra === 0) w.push("Not in Entra ID (Defender only)");
+    if (d.intune === 0 && d.cls !== "mobile") w.push("Not managed by Intune");
+    if (d.exposure === "High" || d.exposure === "Medium") w.push("Defender exposure: " + d.exposure);
+    if (d.cveCrit > 0) w.push(d.cveCrit + " critical CVE" + (d.cveCrit > 1 ? "s" : ""));
+    else if (d.cveHigh > 0) w.push(d.cveHigh + " high CVE" + (d.cveHigh > 1 ? "s" : ""));
+    if (d.threat === "High" || d.threat === "Medium") w.push("Active alert: " + d.threat);
+    if (d.isAdminUser) w.push("Primary user holds a privileged role");
+    if (d.internet === true) w.push("Internet-facing");
+    if (d.stale) w.push("No activity in " + d.lastSeenDays + "d");
+    if (!w.length) w.push("No elevated signals");
+    return w;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  LIVE COLLECTION
+  // ════════════════════════════════════════════════════════════════════════
+  const DEV_SEL = "id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,approximateLastSignInDateTime,accountEnabled";
+  const INT_SEL = "id,deviceName,azureADDeviceId,operatingSystem,osVersion,complianceState,isEncrypted,lastSyncDateTime,managedDeviceOwnerType,userPrincipalName,managementAgent";
+
+  async function collectLive(prog) {
+    const result = { devices: [], discovered: [], caps: {}, errors: {} };
+    prog("Reading Entra ID devices…");
+    const entra = await gGetAll("/devices?$top=200&$select=" + DEV_SEL, ["Device.Read.All"], n => prog("Reading Entra ID devices… " + n));
+    result.caps.entra = true;
+
+    let intune = [];
+    try { prog("Reading Intune managed devices…"); intune = await gGetAll("/deviceManagement/managedDevices?$top=200&$select=" + INT_SEL, ["DeviceManagementManagedDevices.Read.All"], n => prog("Reading Intune… " + n)); result.caps.intune = true; }
+    catch (e) { result.errors.intune = e.message; result.caps.intune = false; }
+
+    // Defender advanced hunting (all optional, independent, parallel).
+    let machines = null;
+    try { prog("Querying Defender (device inventory)…"); machines = await hunt("DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by DeviceId", "Defender inventory"); result.caps.defender = true; }
+    catch (e) { result.errors.defender = e.message; result.caps.defender = false; }
+
+    let threatRows = null, cveRows = null, cfgRows = null, netRows = null, critRows = null, discNet = null;
+    if (machines) {
+      prog("Querying Defender (alerts, CVEs, exposure)…");
+      const Q = {
+        threat: "AlertInfo | where Timestamp > ago(30d) | join kind=inner (AlertEvidence | where Timestamp > ago(30d) and isnotempty(DeviceId) | distinct AlertId, DeviceId) on AlertId | summarize Sev = max(case(Severity=='High',3,Severity=='Medium',2,Severity=='Low',1,0)) by DeviceId",
+        cve:    "DeviceTvmSoftwareVulnerabilities | summarize Sev=max(case(VulnerabilitySeverityLevel=='Critical',4,VulnerabilitySeverityLevel=='High',3,VulnerabilitySeverityLevel=='Medium',2,VulnerabilitySeverityLevel=='Low',1,0)), Crit=dcountif(CveId,VulnerabilitySeverityLevel=='Critical'), High=dcountif(CveId,VulnerabilitySeverityLevel=='High'), Cves=dcount(CveId) by DeviceId",
+        cfg:    "DeviceTvmSecureConfigurationAssessment | where IsApplicable==1 and IsCompliant==0 | summarize Fails=dcount(ConfigurationId) by DeviceId",
+        net:    "DeviceInfo | where Timestamp > ago(7d) | where IsInternetFacing | extend AF=parse_json(AdditionalFields) | extend PP=tostring(AF.InternetFacingPublicScannedPort), LP=tostring(AF.InternetFacingLocalPort), IFR=tostring(AF.InternetFacingReason) | extend Port=toint(iif(isnotempty(PP),PP,LP)) | summarize Ports=make_set_if(Port, isnotempty(Port) and Port>0, 40), IFR=take_any(IFR) by DeviceId",
+        crit:   "ExposureGraphNodes | where NodeProperties has 'criticalityLevel' and NodeProperties has 'deviceName' | extend L=toint(NodeProperties.rawData.criticalityLevel.criticalityLevel), DN=tostring(NodeProperties.rawData.deviceName), Rules=tostring(NodeProperties.rawData.criticalityLevel.ruleNames) | where isnotempty(DN) and L between (0 .. 3) | summarize L=min(L), Rules=take_any(Rules) by DN"
+      };
+      const settled = await Promise.allSettled([hunt(Q.threat), hunt(Q.cve), hunt(Q.cfg), hunt(Q.net), hunt(Q.crit)]);
+      threatRows = settled[0].status === "fulfilled" ? settled[0].value : null;
+      cveRows    = settled[1].status === "fulfilled" ? settled[1].value : null;
+      cfgRows    = settled[2].status === "fulfilled" ? settled[2].value : null;
+      netRows    = settled[3].status === "fulfilled" ? settled[3].value : null;
+      critRows   = settled[4].status === "fulfilled" ? settled[4].value : null;
+    }
+
+    // Optional: privileged role holders → flag admin devices.
+    let admins = null;
+    try {
+      prog("Reading privileged role holders…");
+      const ras = await gGetAll("/roleManagement/directory/roleAssignments?$expand=principal&$top=400", ["RoleManagement.Read.Directory"]);
+      admins = {};
+      const PRIV = /global admin|privileged|security admin|intune admin|conditional access|exchange admin|sharepoint admin|application admin|cloud application|helpdesk|password admin|authentication admin|user admin/i;
+      ras.forEach(a => {
+        const p = a.principal || {}; if (String(p["@odata.type"] || "").toLowerCase().indexOf("user") < 0) return;
+        const upn = String(p.userPrincipalName || "").toLowerCase(); if (!upn) return;
+        const roleName = a.roleDefinitionId; // name not expanded; mark any directory role as privileged-ish via role template lookup below
+        (admins[upn] = admins[upn] || { roles: [], write: true });
+      });
+      // Resolve role display names cheaply
+      try {
+        const defs = await gGetAll("/roleManagement/directory/roleDefinitions?$select=id,displayName", ["RoleManagement.Read.Directory"]);
+        const byId = {}; defs.forEach(d => byId[d.id] = d.displayName);
+        admins = {};
+        ras.forEach(a => {
+          const p = a.principal || {}; if (String(p["@odata.type"] || "").toLowerCase().indexOf("user") < 0) return;
+          const upn = String(p.userPrincipalName || "").toLowerCase(); if (!upn) return;
+          const nm = byId[a.roleDefinitionId] || "Directory role";
+          const e = admins[upn] = admins[upn] || { roles: [], write: false };
+          if (e.roles.indexOf(nm) < 0) e.roles.push(nm);
+          if (PRIV.test(nm)) e.write = true;
+        });
+      } catch (e) {}
+      result.caps.admins = true;
+    } catch (e) { result.caps.admins = false; }
+
+    // ── index ──
+    const byId = x => String(x || "").toLowerCase();
+    const inBy = {}; intune.forEach(d => { const k = byId(d.azureADDeviceId); if (k) inBy[k] = d; });
+    const mdeBy = {}, mdeByName = {};
+    if (machines) machines.forEach(m => { const k = byId(m.AadDeviceId); if (k) mdeBy[k] = m; const nk = normName(m.DeviceName); if (nk && !mdeByName[nk]) mdeByName[nk] = m; });
+    const sev = (rows, key) => { const o = {}; (rows || []).forEach(x => { const id = byId(x.DeviceId); if (id) o[id] = x; }); return o; };
+    const threatBy = sev(threatRows), cveBy = sev(cveRows), cfgBy = sev(cfgRows), netByD = sev(netRows);
+    const critBy = {}; (critRows || []).forEach(x => { if (x.DN == null) return; const r = { level: +x.L, why: parseRoles(x.Rules) }; critBy[byId(x.DN)] = r; critBy[normName(x.DN)] = r; });
+
+    const now = Date.now(), dd = d => d ? Math.floor((now - Date.parse(d)) / 864e5) : null;
+    const active = entra.filter(d => d.accountEnabled !== false);
+
+    // Defender-only onboarded machines (no Entra object) → pseudo rows.
+    const usedM = new Set();
+    active.forEach(d => { const k = byId(d.deviceId), i = inBy[k], nk = normName(d.displayName || (i && i.deviceName)); const m = mdeBy[k] || (nk ? mdeByName[nk] : null); if (m) usedM.add(m); });
+    const defOnly = (machines || []).filter(m => !usedM.has(m) && /^onboarded$/i.test(String(m.OnboardingStatus || "")) && String(m.DeviceName || "").trim() && !String(m.MergedToDeviceId || "").trim())
+      .map(m => ({ _defOnly: true, _m: m, deviceId: "", displayName: String(m.DeviceName).trim().split(".")[0], operatingSystem: m.OSPlatform || "" }));
+
+    const CRIT_LABELS = ["Very high", "High", "Medium", "Low"];
+    const devices = active.concat(defOnly).map((d, ix) => {
+      const key = byId(d.deviceId), i = inBy[key], nk = normName(d.displayName || (i && i.deviceName));
+      const m = d._m || mdeBy[key] || (nk ? mdeByName[nk] : null);
+      const mid = m ? byId(m.DeviceId) : null;
+      const mf = k => m ? (m[k] != null ? m[k] : null) : null;
+      const mExp = mf("ExposureLevel");
+      const exposure = /^(high|medium|low)$/i.test(String(mExp)) ? String(mExp).charAt(0).toUpperCase() + String(mExp).slice(1).toLowerCase() : "—";
+      const tsev = (m && threatRows != null) ? (threatBy[mid] ? threatBy[mid].Sev || 0 : 0) : null;
+      const threat = tsev == null ? null : tsev >= 3 ? "High" : tsev >= 2 ? "Medium" : tsev >= 1 ? "Low" : "None";
+      const cv = m ? (cveBy[mid] || null) : null;
+      const cveCrit = cv ? cv.Crit || 0 : null, cveHigh = cv ? cv.High || 0 : null, cveCount = cv ? cv.Cves || 0 : null;
+      const cve = cv == null ? null : cv.Sev >= 4 ? "Critical" : cv.Sev >= 3 ? "High" : cv.Sev >= 2 ? "Medium" : cv.Sev >= 1 ? "Low" : "None";
+      const configFail = m ? (cfgBy[mid] ? cfgBy[mid].Fails || 0 : 0) : null;
+      const nrow = m ? netByD[mid] : null;
+      const internet = m ? (netRows != null ? !!nrow : null) : null;
+      const internetReason = nrow ? String(nrow.IFR || "").trim() : "";
+      const openPorts = nrow ? (nrow.Ports || []).map(Number).filter(p => p > 0).sort((a, b) => a - b) : null;
+      const cs = String((i && i.complianceState) || "").toLowerCase();
+      const compliance = !i ? "—" : cs === "compliant" ? "compliant" : (cs === "noncompliant" || cs === "error" || cs === "conflict") ? "noncompliant" : cs === "ingraceperiod" ? "grace" : (cs === "unknown" || cs === "notapplicable") ? "unevaluated" : cs || "—";
+      const lastMde = dd(mf("Timestamp")), lastSync = dd(i && i.lastSyncDateTime), lastSign = dd(d.approximateLastSignInDateTime);
+      const seenArr = [lastMde, lastSync, lastSign].filter(x => x != null);
+      const lastSeenDays = seenArr.length ? Math.min.apply(null, seenArr) : null;
+      const stale = lastSeenDays != null && lastSeenDays > 30;
+      const crit = critBy[byId(d.displayName || (i && i.deviceName))] || critBy[nk] || null;
+      const roles = parseRoles(mf("DeviceRoles"));
+      const adm = admins ? admins[byId((i && i.userPrincipalName))] : null;
+      const os = normOS(d.operatingSystem || (i && i.operatingSystem) || mf("OSPlatform"));
+
+      const rc = riskCompose({ threat, exposure, compliance, managed: !!i, active: !stale, internet: internet === true });
+      const dev = {
+        id: key || ("dev" + ix), name: d.displayName || (i && i.deviceName) || "(device)", os,
+        osVer: (i && i.osVersion) || mf("OSVersion") || d.operatingSystemVersion || "—",
+        cls: devClass(os), joinType: d._defOnly ? "Not in Entra" : joinMap(d.trustType),
+        owner: i ? ownerMap(i.managedDeviceOwnerType) : "—", user: (i && i.userPrincipalName) || "—", managedBy: agentMap(i, m),
+        entra: d._defOnly ? 0 : 1, intune: i ? 1 : 0, defender: machines ? (m ? 1 : 0) : null,
+        compliance, exposure, threat, cve, cveCount, cveCrit, cveHigh, configFail, openPorts,
+        internet, internetReason, sensor: m ? (mf("SensorHealthState") || "—") : null,
+        onboarding: m ? (mf("OnboardingStatus") || "Onboarded") : (machines ? "Not onboarded" : "—"),
+        criticality: crit ? (CRIT_LABELS[crit.level] || "—") : "—", critWhy: crit ? crit.why : [], critical: crit ? crit.level <= 1 : false,
+        roles, tags: mergeTags(mf("DeviceManualTags"), mf("DeviceDynamicTags")),
+        adminRoles: adm ? adm.roles : null, isAdminUser: !!(adm && adm.write),
+        lastSeenDays, lastSyncDays: lastSync, stale, aadId: d.deviceId || "—", intuneId: i ? i.id : null,
+        risk: rc.band, riskScore: rc.score, riskSub: rc.sub
+      };
+      dev.riskWhy = riskWhyOf(dev);
+      return dev;
+    });
+
+    // Discovered (not onboarded, not in Entra) → IoT / network / other segments.
+    const discovered = (machines || []).filter(m => !usedM.has(m) && !/^onboarded$/i.test(String(m.OnboardingStatus || "")) && !String(m.MergedToDeviceId || "").trim())
+      .map((m, ix) => {
+        const cat = String(m.DeviceCategory || "").toLowerCase(), type = String(m.DeviceType || "").toLowerCase();
+        let cls = "other";
+        if (/network/.test(cat)) cls = "network";
+        else if (/\biot\b|\bot\b/.test(cat)) cls = "iot";
+        else if ((!cat || cat === "unknown") && /network ?device|router|switch|firewall|access ?point|gateway/.test(type)) cls = "network";
+        const exp = String(m.ExposureLevel || "");
+        const raw = String(m.DeviceName || "").trim(), nm = /^\d{1,3}(\.\d{1,3}){3}$/.test(raw) || raw.indexOf(":") >= 0 ? raw : raw.split(".")[0];
+        const ts = Date.parse(m.Timestamp || "");
+        return {
+          id: "disc" + ix, name: nm || "(no name)", cls, discovered: true,
+          category: m.DeviceCategory || "", type: m.DeviceType || "", vendor: m.Vendor || "", model: m.Model || "",
+          os: normOS(m.OSPlatform), osVer: m.OSVersion || "—", onboarding: m.OnboardingStatus || "",
+          exposure: /^(high|medium|low)$/i.test(exp) ? exp.charAt(0).toUpperCase() + exp.slice(1).toLowerCase() : "—",
+          entra: 0, intune: 0, defender: 0, compliance: "—", threat: null, risk: "—", riskSub: "discovered · unmanaged",
+          lastSeenDays: isNaN(ts) ? null : Math.max(0, Math.floor((now - ts) / 864e5))
+        };
+      });
+
+    result.devices = devices; result.discovered = discovered;
+    return result;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  DEMO DATA  (the exact shape the live join produces)
+  // ════════════════════════════════════════════════════════════════════════
+  function collectDemo() {
+    // name, os, osVer, join, owner, user, agent, [E,I,D], compliance, exposure, threat, crit, internet, days, roles, admin
+    const raw = [
+      ["BLUE16-I9-64GB", "Windows", "10.0.26300.9911", "Entra joined", "Corporate", "derk@blue16.nl", "Co-managed", [1,1,1], "noncompliant", "High", "High", "Very high", true, 0, [], true],
+      ["BLUE16-MstLpt02", "Windows", "10.0.26200.9911", "Entra joined", "Corporate", "derk@blue16.nl", "Intune", [1,1,1], "compliant", "High", "None", "High", false, 12, [], true],
+      ["EDEN-INUC", "Windows", "10.0.26100.9974", "Entra registered", "Personal", "eden@blue16.nl", "Intune", [1,1,1], "noncompliant", "Medium", "None", "Normal", false, 6, [], false],
+      ["Miranda-Medion", "Windows", "10.0.26300.9911", "Entra joined", "Corporate", "miranda@blue16.nl", "Intune", [1,1,1], "compliant", "Medium", "None", "Normal", false, 0, [], false],
+      ["BLUE16-ATOMMAN", "Windows", "10.0.26300.9911", "Entra joined", "Corporate", "atom@blue16.nl", "Intune", [1,1,1], "compliant", "Medium", "None", "Normal", false, 0, [], true],
+      ["NEDSCAPER-97507", "Windows", "10.0.22631.4317", "Entra registered", "Personal", "guest@blue16.nl", "—", [1,0,0], "—", "—", null, "—", null, 49, [], false],
+      ["MacBook-Pro-Derk", "macOS", "15.1", "Entra registered", "Personal", "derk@blue16.nl", "Intune", [1,1,1], "compliant", "Low", "None", "Normal", false, 1, [], true],
+      ["win-i3oa1c8bv5i", "Windows Server", "10.0", "Not in Entra", "—", "None", "MDE", [0,0,1], "—", "High", "None", "High", true, 0, ["SQL Server"], false],
+      ["SRV000", "Windows Server", "10.0.14393.9688", "—", "—", "None", "MDE", [1,0,1], "unevaluated", "High", "None", "High", true, 0, ["Domain Controller"], false],
+      ["ubuntu-build-01", "Linux", "22.04", "Not in Entra", "—", "None", "MDE", [0,0,1], "—", "Medium", "None", "Normal", false, 2, [], false],
+      ["iPhone 13 Derk", "iOS", "26.7", "Entra registered", "Personal", "derk@blue16.nl", "Intune", [1,1,1], "compliant", "—", "None", "—", false, 0, [], true],
+      ["iPhone Miranda", "iOS", "26.6.1", "Entra registered", "Personal", "miranda@blue16.nl", "Intune", [1,1,1], "compliant", "—", "None", "—", false, 0, [], false],
+      ["iPhone van Miranda", "iOS", "16.3.1", "Entra registered", "Personal", "miranda@blue16.nl", "—", [1,0,0], "—", "—", null, "—", null, 23, [], false],
+      ["Galaxy-S24-Eden", "Android", "14", "Entra registered", "Personal", "eden@blue16.nl", "Intune", [1,1,0], "compliant", "—", null, "—", null, 4, [], false]
+    ];
+    const now = Date.now();
+    const devices = raw.map((r, ix) => {
+      const onb = !!r[7][2], exp = r[9], days = r[13], stale = days != null && days > 30, threat = onb ? r[10] : null;
+      const comp = r[8], managed = !!r[7][1];
+      const rc = riskCompose({ threat, exposure: exp, compliance: comp, managed, active: !stale, internet: r[12] === true });
+      const d = {
+        id: "dev" + ix, name: r[0], os: normOS(r[1]), osVer: r[2], cls: devClass(r[1]),
+        joinType: r[3], owner: r[4], user: r[5], managedBy: r[6],
+        entra: r[7][0], intune: r[7][1], defender: r[7][2], compliance: comp, exposure: exp,
+        threat, cve: onb ? (exp === "High" ? "Critical" : exp === "Medium" ? "High" : "None") : null,
+        cveCount: onb ? (exp === "High" ? 9 : exp === "Medium" ? 3 : 0) : null,
+        cveCrit: onb ? (exp === "High" ? 2 : 0) : null, cveHigh: onb ? (exp === "High" ? 5 : exp === "Medium" ? 3 : 0) : null,
+        configFail: onb ? (comp === "noncompliant" ? 4 : 1) : null,
+        internet: onb ? r[12] : null, internetReason: r[12] === true ? "Detected by external scan" : "",
+        openPorts: r[12] === true ? [22, 3389] : null, sensor: onb ? "Active" : null,
+        onboarding: onb ? "Onboarded" : (r[7][0] ? "Not onboarded" : "—"),
+        criticality: r[11], critWhy: r[11] === "Very high" || r[11] === "High" ? ["Business-critical asset"] : [], critical: r[11] === "Very high" || r[11] === "High",
+        roles: r[14], tags: [], adminRoles: r[15] ? ["Global Administrator"] : null, isAdminUser: !!r[15],
+        lastSeenDays: days, lastSyncDays: r[7][1] ? days : null, stale, aadId: r[7][0] ? "demo-" + ix : "—", intuneId: r[7][1] ? "demo-int-" + ix : null,
+        risk: rc.band, riskScore: rc.score, riskSub: rc.sub
+      };
+      d.riskWhy = riskWhyOf(d);
+      return d;
+    });
+    const discovered = [
+      ["core-rtr-01", "network", "Network device", "Router", "Contoso Networks", "Linux", "Medium", 0],
+      ["edge-fw-01", "network", "Network device", "Firewall", "Fabrikam", "", "High", 0],
+      ["floor2-sw-01", "network", "Network device", "Switch", "Contoso Networks", "", "—", 1],
+      ["lobby-printer", "iot", "IoT", "Printer", "Fabrikam", "", "—", 2],
+      ["meeting-room-tv", "iot", "IoT", "SmartTV", "Contoso", "Android", "—", 3],
+      ["door-cam-02", "iot", "IoT", "Camera", "Contoso Home", "Linux", "Medium", 0],
+      ["hvac-ctrl-1", "iot", "IoT", "Miscellaneous", "", "", "—", 5]
+    ].map((r, ix) => ({ id: "disc" + ix, name: r[0], cls: r[1], discovered: true, category: r[2], type: r[3], vendor: r[4], os: normOS(r[5]), osVer: "—", exposure: r[6], onboarding: "Can be onboarded", entra: 0, intune: 0, defender: 0, compliance: "—", threat: null, risk: "—", riskSub: "discovered · unmanaged", lastSeenDays: r[7] }));
+    return { devices, discovered, caps: { entra: true, intune: true, defender: true, admins: true }, errors: {} };
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  RENDER
+  // ════════════════════════════════════════════════════════════════════════
+  const SEGMENTS = [
+    ["computer", "💻", "Computers", "Windows 10/11 · macOS"],
+    ["server",   "🖥️", "Servers", "Windows Server · Linux"],
+    ["mobile",   "📱", "Mobile", "iOS · iPadOS · Android"],
+    ["iot",      "📡", "IoT", "Discovered, unmanaged"],
+    ["network",  "🌐", "Network", "Routers · switches · firewalls"],
+    ["other",    "❔", "Other", "Discovered, unclassified"]
+  ];
+  const STATE = { q: "", cls: "", risk: "", comp: "", exp: "", gap: "", sortCol: "risk", sortDir: -1 };
+  let DATA = null;
+  const EXPANDED = {};
+
+  function allDevices() { return DATA ? DATA.devices.concat(DATA.discovered) : []; }
+  function ago(d) { return d == null ? "never" : d < 1 ? "today" : d + "d ago"; }
+
+  function matches(d) {
+    const S = STATE, q = S.q.toLowerCase();
+    if (q && !((d.name || "").toLowerCase().includes(q) || (d.os || "").toLowerCase().includes(q) || (d.user || "").toLowerCase().includes(q))) return false;
+    if (S.cls && d.cls !== S.cls) return false;
+    if (S.risk && d.risk !== S.risk) return false;
+    if (S.comp && d.compliance !== S.comp) return false;
+    if (S.exp && d.exposure !== S.exp) return false;
+    if (S.gap === "noEntra" && d.entra !== 0) return false;
+    if (S.gap === "noIntune" && !(d.intune === 0 && d.cls !== "iot" && d.cls !== "network" && d.cls !== "other")) return false;
+    if (S.gap === "noDefender" && !(d.defender === 0 && (d.cls === "computer" || d.cls === "server"))) return false;
+    if (S.gap === "stale" && !d.stale) return false;
+    if (S.gap === "inet" && d.internet !== true) return false;
+    return true;
+  }
+
+  const SORTK = {
+    risk: d => d.riskScore != null ? d.riskScore : -1,
+    device: d => (d.name || "").toLowerCase(),
+    os: d => (d.os || "").toLowerCase(),
+    compliance: d => ({ noncompliant: 4, grace: 3, unevaluated: 2, "—": 1, compliant: 0 }[d.compliance] ?? 1),
+    exposure: d => ({ High: 4, Medium: 3, Low: 2, "—": 0 }[d.exposure] ?? 0),
+    threat: d => ({ High: 4, Medium: 3, Low: 2, None: 1 }[d.threat] ?? 0),
+    lastseen: d => d.lastSeenDays == null ? 1e9 : d.lastSeenDays
+  };
+
+  function srcBadges(d) {
+    const cell = (k, on) => `<span class="${k} ${on === 1 ? "on" : on === 0 ? "off" : "na"}" title="${k === "E" ? "Entra ID" : k === "I" ? "Intune" : "Defender"}: ${on === 1 ? "yes" : on === 0 ? "no" : "not read"}">${k}</span>`;
+    return `<span class="src">${cell("E", d.entra)}${cell("I", d.intune)}${cell("D", d.defender)}</span>`;
+  }
+  function pill(cls, val, label) { return val == null || val === "" || val === "—" ? '<span class="muted">—</span>' : `<span class="pill ${cls}-${String(val).replace(/[^A-Za-z]/g, "")}">${esc(label != null ? label : val)}</span>`; }
+
+  function deviceRow(d) {
+    const chips = [];
+    if (d.criticality === "Very high" || d.criticality === "High") chips.push(`<span class="chip crit" title="${esc(d.critWhy ? d.critWhy.join(", ") : "")}">${esc(d.criticality)}</span>`);
+    if (d.isAdminUser) chips.push(`<span class="chip adm" title="${esc((d.adminRoles || []).join(", "))}">Admin</span>`);
+    if (d.internet === true) chips.push(`<span class="chip inet" title="${esc(d.internetReason || "Internet-facing")}">internet-facing</span>`);
+    if (d.stale) chips.push(`<span class="chip stale">stale</span>`);
+    (d.tags || []).slice(0, 2).forEach(t => chips.push(`<span class="chip tag">${esc(t)}</span>`));
+    const riskCell = d.discovered
+      ? `<span class="muted">—</span><div class="rsub">discovered</div>`
+      : `${pill("r", d.risk)}<div class="rsub">${esc(d.riskSub || "")}</div>`;
+    return `<tr class="dev" data-id="${esc(d.id)}">
+      <td>${riskCell}</td>
+      <td><div class="dname">${esc(d.name)}${chips.length ? `<span class="chips">${chips.join("")}</span>` : ""}</div>
+          <div class="dsub">${esc(d.joinType || d.category || "")}${d.user && d.user !== "—" ? " · " + esc(d.user) : ""}</div></td>
+      <td>${esc(d.os)}<div class="dsub">${esc(d.osVer || "")}</div></td>
+      <td>${srcBadges(d)}</td>
+      <td>${d.discovered ? '<span class="muted">—</span>' : pill("c", d.compliance)}</td>
+      <td>${pill("x", d.exposure)}</td>
+      <td>${d.threat == null ? '<span class="muted">—</span>' : pill("t", d.threat)}</td>
+      <td class="muted">${ago(d.lastSeenDays)}</td>
+    </tr>`;
+  }
+
+  function detailRow(d) {
+    const kv = (label, val) => `<dt>${esc(label)}</dt><dd>${val}</dd>`;
+    const cov = `<div class="dcol"><h4>Coverage</h4><dl class="kv">
+      ${kv("Entra ID", d.entra === 1 ? "Yes · " + esc(d.joinType) : "No")}
+      ${kv("Intune", d.intune === 1 ? "Yes · " + esc(d.managedBy) : "No")}
+      ${kv("Defender", d.defender === 1 ? "Onboarded · sensor " + esc(d.sensor || "—") : d.defender === 0 ? (d.discovered ? esc(d.onboarding || "Discovered") : "Not onboarded") : "Not read")}
+      ${kv("Owner", esc(d.owner || "—"))}${kv("Primary user", esc(d.user || "—"))}
+      ${d.adminRoles && d.adminRoles.length ? kv("Admin roles", esc(d.adminRoles.join(", "))) : ""}
+    </dl></div>`;
+    const sec = `<div class="dcol"><h4>Security</h4><dl class="kv">
+      ${kv("Risk", d.discovered ? "—" : esc(d.risk) + " (" + d.riskScore + ")")}
+      ${kv("Compliance", esc(d.compliance))}
+      ${kv("Exposure", esc(d.exposure))}
+      ${d.threat != null ? kv("Active alert", esc(d.threat)) : ""}
+      ${d.cveCount != null ? kv("Vulnerabilities", d.cveCount + " CVEs · " + (d.cveCrit || 0) + " critical, " + (d.cveHigh || 0) + " high") : ""}
+      ${d.configFail != null ? kv("Config gaps", d.configFail + " failing checks") : ""}
+      ${d.criticality && d.criticality !== "—" ? kv("Criticality", esc(d.criticality) + (d.critWhy && d.critWhy.length ? " · " + esc(d.critWhy.join(", ")) : "")) : ""}
+      ${d.internet === true ? kv("Internet-facing", esc(d.internetReason || "yes") + (d.openPorts && d.openPorts.length ? " · ports " + d.openPorts.join(", ") : "")) : ""}
+    </dl></div>`;
+    const inv = `<div class="dcol"><h4>Inventory</h4><dl class="kv">
+      ${kv("OS", esc(d.os) + " " + esc(d.osVer || ""))}
+      ${d.roles && d.roles.length ? kv("Device roles", esc(d.roles.join(", "))) : ""}
+      ${d.vendor ? kv("Vendor", esc(d.vendor) + (d.model ? " " + esc(d.model) : "")) : ""}
+      ${kv("Last activity", ago(d.lastSeenDays))}
+      ${d.lastSyncDays != null ? kv("Last Intune sync", ago(d.lastSyncDays)) : ""}
+      ${kv("AAD device id", "<code>" + esc(d.aadId || "—") + "</code>")}
+    </dl></div>`;
+    const why = d.riskWhy && d.riskWhy.length ? `<div class="dcol"><h4>Why this risk</h4><ul class="why">${d.riskWhy.map(w => `<li>${esc(w)}</li>`).join("")}</ul>
+      ${d.intuneId && !DEMO ? `<div class="dlinks"><a class="btn sm" href="https://intune.microsoft.com/#view/Microsoft_Intune_Devices/DeviceSettingsMenuBlade/~/overview/mdmDeviceId/${enc(d.intuneId)}" target="_blank" rel="noopener">Open in Intune ↗</a></div>` : ""}</div>` : "";
+    return `<tr class="detail"><td colspan="8"><div class="dwrap">${cov}${sec}${inv}${why}</div></td></tr>`;
+  }
+
+  function render() {
+    // tiles
+    const D = DATA.devices, all = allDevices();
+    const nComp = D.filter(d => d.cls === "computer").length, nSrv = D.filter(d => d.cls === "server").length, nMob = D.filter(d => d.cls === "mobile").length;
+    const nDisc = DATA.discovered.length;
+    const highRisk = D.filter(d => d.risk === "High").length;
+    const noDef = D.filter(d => (d.cls === "computer" || d.cls === "server") && d.defender === 0).length;
+    const noInt = D.filter(d => d.intune === 0 && d.cls !== "iot").length;
+    const stale = all.filter(d => d.stale).length;
+    const nonComp = D.filter(d => d.compliance === "noncompliant").length;
+    const inet = D.filter(d => d.internet === true).length;
+
+    $("tiles").innerHTML = [
+      { n: D.length, l: "Managed devices", s: "in Entra / Intune / Defender" },
+      { n: nComp, l: "Computers", s: "Win · macOS" },
+      { n: nSrv, l: "Servers", s: "Windows Server · Linux" },
+      { n: nMob, l: "Mobile", s: "iOS · Android" },
+      { n: nDisc, l: "Discovered", s: "IoT · network · unmanaged" },
+      { n: highRisk, l: "High risk", s: "need attention", cls: highRisk ? "bad" : "good" }
+    ].map(t => `<div class="tile ${t.cls || ""}"><div class="n">${t.n}</div><div class="l">${esc(t.l)}</div><div class="s">${esc(t.s)}</div></div>`).join("");
+
+    // coverage gaps
+    const gaps = [];
+    if (noDef) gaps.push(["noDefender", "bad", noDef, "computers/servers with no Defender sensor"]);
+    if (noInt) gaps.push(["noIntune", "warn", noInt, "devices not managed by Intune"]);
+    if (nonComp) gaps.push(["noncompliantFilter", "bad", nonComp, "non-compliant"]);
+    if (inet) gaps.push(["inet", "warn", inet, "internet-facing"]);
+    if (stale) gaps.push(["stale", "warn", stale, "stale (&gt;30 days)"]);
+    $("gaps").innerHTML = gaps.map(g => `<button class="gap ${g[1]}" data-gap="${g[0]}"><b>${g[2]}</b> ${g[3]}</button>`).join("")
+      || `<span class="gap good"><b>✓</b> no coverage gaps detected</span>`;
+
+    // partial / capability note
+    const miss = [];
+    if (DATA.caps.intune === false) miss.push("Intune (compliance, owner) not read — grant DeviceManagementManagedDevices.Read.All");
+    if (DATA.caps.defender === false) miss.push("Defender (exposure, alerts, CVEs, discovered devices) not read — grant ThreatHunting.Read.All / check Defender licensing");
+    if (DATA.caps.admins === false) miss.push("Privileged-role flags not shown — grant RoleManagement.Read.Directory");
+    const pEl = $("partial");
+    if (miss.length) { pEl.classList.remove("hidden"); pEl.innerHTML = "<b>Partial coverage.</b> " + miss.map(esc).join(" · "); }
+    else pEl.classList.add("hidden");
+
+    // filtered + grouped
+    const filtered = all.filter(matches);
+    const bySeg = {}; filtered.forEach(d => (bySeg[d.cls] = bySeg[d.cls] || []).push(d));
+    const cmp = (a, b) => { const k = SORTK[STATE.sortCol] || SORTK.risk; const av = k(a), bv = k(b); if (av < bv) return -STATE.sortDir; if (av > bv) return STATE.sortDir; return (a.name || "").localeCompare(b.name || ""); };
+
+    const arrow = c => STATE.sortCol === c ? (STATE.sortDir < 0 ? " ▼" : " ▲") : "";
+    const head = `<thead><tr>
+      <th class="sortable" data-sort="risk">Risk<span class="arrow">${arrow("risk")}</span></th>
+      <th class="sortable" data-sort="device">Device<span class="arrow">${arrow("device")}</span></th>
+      <th class="sortable" data-sort="os">OS<span class="arrow">${arrow("os")}</span></th>
+      <th>Sources</th>
+      <th class="sortable" data-sort="compliance">Compliance<span class="arrow">${arrow("compliance")}</span></th>
+      <th class="sortable" data-sort="exposure">Exposure<span class="arrow">${arrow("exposure")}</span></th>
+      <th class="sortable" data-sort="threat">Threat<span class="arrow">${arrow("threat")}</span></th>
+      <th class="sortable" data-sort="lastseen">Last seen<span class="arrow">${arrow("lastseen")}</span></th>
+    </tr></thead>`;
+
+    let html = "";
+    SEGMENTS.forEach(seg => {
+      const list = (bySeg[seg[0]] || []).sort(cmp);
+      if (!list.length) return;
+      const hr = list.filter(d => d.risk === "High").length;
+      html += `<div class="seg"><div class="seg-h"><span class="ic">${seg[1]}</span> ${esc(seg[2])}
+        <span class="ct">${list.length} device${list.length === 1 ? "" : "s"}${hr ? ` · <span class="hr"><b>${hr}</b> high-risk</span>` : ""} · <span class="muted">${esc(seg[3])}</span></span></div>
+        <table>${head}<tbody>${list.map(d => deviceRow(d) + (EXPANDED[d.id] ? detailRow(d) : "")).join("")}</tbody></table></div>`;
+    });
+    $("segs").innerHTML = html;
+    $("emptyMsg").classList.toggle("hidden", filtered.length > 0);
+
+    // wire row expand + sort
+    $("segs").querySelectorAll("tr.dev").forEach(tr => tr.addEventListener("click", () => { const id = tr.getAttribute("data-id"); EXPANDED[id] = !EXPANDED[id]; render(); }));
+    $("segs").querySelectorAll("th.sortable").forEach(th => th.addEventListener("click", () => {
+      const c = th.getAttribute("data-sort");
+      if (STATE.sortCol === c) STATE.sortDir *= -1; else { STATE.sortCol = c; STATE.sortDir = (c === "device" || c === "os" || c === "lastseen") ? 1 : -1; }
+      render();
+    }));
+
+    $("appFoot").innerHTML = `${all.length} devices · ${DEMO ? "Demo data" : "Live, read-only — Microsoft Graph"} · generated ${new Date().toLocaleString()}`;
+  }
+
+  // ── CSV export ──
+  function exportCsv() {
+    const cols = ["Name", "Class", "OS", "OS version", "Join type", "Owner", "User", "Entra", "Intune", "Defender", "Compliance", "Exposure", "Risk", "Risk score", "Threat", "CVEs", "Critical CVEs", "Criticality", "Internet-facing", "Admin user", "Last seen (days)", "Stale"];
+    const rows = allDevices().map(d => [d.name, d.cls, d.os, d.osVer, d.joinType || d.category || "", d.owner || "", d.user || "",
+      d.entra === 1 ? "yes" : d.entra === 0 ? "no" : "", d.intune === 1 ? "yes" : "no", d.defender === 1 ? "yes" : d.defender === 0 ? "no" : "",
+      d.compliance, d.exposure, d.risk, d.riskScore != null ? d.riskScore : "", d.threat || "", d.cveCount != null ? d.cveCount : "", d.cveCrit != null ? d.cveCrit : "",
+      d.criticality || "", d.internet === true ? "yes" : "", d.isAdminUser ? "yes" : "", d.lastSeenDays != null ? d.lastSeenDays : "", d.stale ? "yes" : ""]);
+    const csv = [cols].concat(rows).map(r => r.map(v => { v = String(v == null ? "" : v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }).join(",")).join("\r\n");
+    const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8" });
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "device-discovery-" + new Date().toISOString().slice(0, 10) + ".csv"; a.click(); URL.revokeObjectURL(a.href);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  WIRING
+  // ════════════════════════════════════════════════════════════════════════
+  function setStatus(msg, busy, err) { const s = $("status"); s.className = "status" + (err ? " err" : ""); s.innerHTML = (busy ? '<span class="spinner"></span>' : "") + (msg || ""); }
+
+  function showApp() {
+    $("connect").classList.add("hidden"); $("app").classList.remove("hidden");
+    ["btnRefresh", "btnExport", "btnSignout"].forEach(b => $(b).classList.remove("hidden"));
+    $("tenantLbl").classList.remove("hidden");
+    $("tenantLbl").innerHTML = DEMO ? "<b>Demo mode</b>" : ("<b>" + esc(tenantName || (account && account.username) || "Signed in") + "</b>");
+    // fill class filter
+    $("fCls").innerHTML = '<option value="">All classes</option>' + SEGMENTS.map(s => `<option value="${s[0]}">${s[2]}</option>`).join("");
+    if (DATA) render();   // first render happens after runCollection() loads DATA
+  }
+
+  async function runCollection() {
+    try {
+      $("segs").innerHTML = `<div class="empty"><span class="spinner"></span> Collecting inventory…</div>`;
+      DATA = DEMO ? collectDemo() : await collectLive(m => { $("segs").innerHTML = `<div class="empty"><span class="spinner"></span> ${esc(m)}</div>`; });
+      render();
+    } catch (e) {
+      $("segs").innerHTML = `<div class="empty">Couldn't load devices — ${esc(e.message || String(e))}</div>`;
+    }
+  }
+
+  async function connect() {
+    const clientId = $("inClient").value.trim(), tenant = $("inTenant").value.trim() || "organizations";
+    if (!/^[0-9a-fA-F-]{36}$/.test(clientId)) { setStatus("Enter your app registration's Application (client) ID. See First-time setup.", false, true); return; }
+    setStatus("Opening sign-in…", true);
+    try {
+      await buildMsal(clientId, tenant);
+      const res = await msalApp.loginPopup({ scopes: REQUIRED, prompt: "select_account" });
+      account = res.account; msalApp.setActiveAccount(account);
+      tenantName = account.username || "";
+      DEMO = false;
+      setStatus("");
+      showApp();
+      await runCollection();
+    } catch (e) {
+      setStatus("Sign-in failed — " + (e.message || String(e)), false, true);
+    }
+  }
+
+  function demo() { DEMO = true; account = null; setStatus(""); showApp(); runCollection(); }
+
+  function signout() {
+    try { if (msalApp && account) msalApp.logoutPopup({ account }); } catch (e) {}
+    DATA = null; DEMO = false; account = null;
+    $("app").classList.add("hidden"); $("connect").classList.remove("hidden");
+    ["btnRefresh", "btnExport", "btnSignout", "tenantLbl"].forEach(b => $(b).classList.add("hidden"));
+  }
+
+  // filters
+  const bind = (id, key, ev) => $(id).addEventListener(ev || "change", e => { STATE[key] = e.target.value; render(); });
+  bind("fQ", "q", "input"); bind("fCls", "cls"); bind("fRisk", "risk"); bind("fComp", "comp"); bind("fExp", "exp"); bind("fGap", "gap");
+  $("btnClear").addEventListener("click", () => { Object.assign(STATE, { q: "", cls: "", risk: "", comp: "", exp: "", gap: "" }); ["fQ", "fCls", "fRisk", "fComp", "fExp", "fGap"].forEach(id => $(id).value = ""); render(); });
+  $("gaps").addEventListener("click", e => { const b = e.target.closest(".gap"); if (!b) return; const g = b.getAttribute("data-gap"); if (g === "noncompliantFilter") { STATE.comp = "noncompliant"; $("fComp").value = "noncompliant"; } else if (g) { STATE.gap = g; $("fGap").value = g; } render(); });
+
+  $("btnConnect").addEventListener("click", connect);
+  $("btnDemo").addEventListener("click", demo);
+  $("btnRefresh").addEventListener("click", runCollection);
+  $("btnExport").addEventListener("click", exportCsv);
+  $("btnSignout").addEventListener("click", signout);
+  $("inClient").addEventListener("keydown", e => { if (e.key === "Enter") connect(); });
+
+  // setup screen content
+  (function fillSetup() {
+    $("scopeList").innerHTML = SCOPES.map(s => `<div class="srow"><div class="sp">${esc(s[0])}${s[2] ? "" : '<span class="tag-opt">optional</span>'}</div><div class="sw">${esc(s[1])}</div></div>`).join("");
+    const scopeNames = SCOPES.map(s => '"' + s[0] + '"').join(", ");
+    const ps =
+`# Device Discovery — register the read-only single-tenant app (run once).
+# Requires: Install-Module Microsoft.Graph.Applications  (and a role that can consent).
+$RedirectUri = "${redirectUri}"   # <-- the exact URL where you host this page
+$Scopes      = @(${scopeNames})
+
+Connect-MgGraph -Scopes "Application.ReadWrite.All","DelegatedPermissionGrant.ReadWrite.All","AppRoleAssignment.ReadWrite.All"
+
+# Resolve each delegated scope to its id on the Microsoft Graph service principal.
+$graphSp = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
+$access  = $Scopes | ForEach-Object {
+  $n = $_; $p = $graphSp.Oauth2PermissionScopes | Where-Object Value -eq $n
+  if (-not $p) { Write-Warning "Scope $n not found"; return }
+  @{ Id = $p.Id; Type = "Scope" }
+}
+
+$app = New-MgApplication -DisplayName "Device Discovery (read-only)" \`
+  -SignInAudience "AzureADMyOrg" \`
+  -Spa @{ RedirectUris = @($RedirectUri) } \`
+  -RequiredResourceAccess @(@{ ResourceAppId = "00000003-0000-0000-c000-000000000000"; ResourceAccess = $access })
+
+# Create the service principal and grant tenant-wide admin consent for the delegated scopes.
+$sp = New-MgServicePrincipal -AppId $app.AppId
+Start-Sleep 5
+foreach ($s in $Scopes) {
+  $perm = $graphSp.Oauth2PermissionScopes | Where-Object Value -eq $s
+  if ($perm) {
+    New-MgOauth2PermissionGrant -ClientId $sp.Id -ConsentType "AllPrincipals" \`
+      -ResourceId $graphSp.Id -Scope $s -ErrorAction SilentlyContinue | Out-Null
+  }
+}
+
+Write-Host ""
+Write-Host "Application (client) ID:  $($app.AppId)" -ForegroundColor Cyan
+Write-Host "Paste that into Device Discovery. Redirect URI: $RedirectUri"`;
+    $("psCode").textContent = ps;
+  })();
+
+  // copy buttons
+  document.addEventListener("click", e => {
+    const b = e.target.closest("[data-copy]"); if (!b) return;
+    const el = $(b.getAttribute("data-copy")).querySelector("code") || $(b.getAttribute("data-copy"));
+    navigator.clipboard.writeText(el.textContent).then(() => { const o = b.textContent; b.textContent = "Copied ✓"; setTimeout(() => b.textContent = o, 1400); });
+  });
+
+})();
+</script>
+</body>
+</html>
