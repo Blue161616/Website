@@ -3,9 +3,10 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Device Discovery — Entra · Intune · Defender</title>
+<title>Device Security Posture — Entra · Intune · Defender</title>
 <!--
-  Device Discovery — a free, open-source, single-file device inventory & coverage tool.
+  Device Security Posture — a free, open-source, single-file tool that discovers and scores
+  every device across Entra ID, Intune and Defender.
 
   Reads, READ-ONLY and delegated (as the signed-in user), from:
     • Microsoft Entra ID      — device objects (join type, compliance flag, last sign-in)
@@ -270,7 +271,7 @@
 <div class="top">
   <div class="brand">
     <svg viewBox="0 0 48 48"><path d="M24 4 L42 15 V33 L24 44 L6 33 V15 Z" fill="#071530" stroke="#3FA9FF" stroke-width="2"/><circle cx="24" cy="23" r="9" fill="none" stroke="#6DA6FF" stroke-width="2.4"/><path d="M30.5 29.5 L38 37" stroke="#3FA9FF" stroke-width="3" stroke-linecap="round"/></svg>
-    <div class="t">Device Discovery<small>Entra · Intune · Defender</small></div>
+    <div class="t">Device Security Posture<small>Discover &amp; score · Entra · Intune · Defender</small></div>
   </div>
   <div class="spacer"></div>
   <div class="tenant hidden" id="tenantLbl"></div>
@@ -363,7 +364,7 @@
       <select id="fRisk"><option value="">Any risk</option><option>High</option><option>Medium</option><option>Low</option></select>
       <select id="fComp"><option value="">Any compliance</option><option value="noncompliant">Non-compliant</option><option value="compliant">Compliant</option><option value="grace">In grace</option><option value="unevaluated">Unevaluated</option></select>
       <select id="fExp"><option value="">Any exposure</option><option>High</option><option>Medium</option><option>Low</option></select>
-      <select id="fGap"><option value="">Any coverage</option><option value="noEntra">Not in Entra</option><option value="noIntune">Not in Intune</option><option value="noDefender">No Defender sensor</option><option value="stale">Stale (&gt;30d)</option><option value="inet">Internet-facing</option><option value="expinet">Exploitable + exposed</option><option value="exploit">Public exploit</option><option value="alert">Active alerts</option><option value="critvuln">Critical vulns</option><option value="eol">End-of-support</option></select>
+      <select id="fGap"><option value="">Any coverage</option><option value="noEntra">Not in Entra</option><option value="noIntune">Not in Intune</option><option value="noDefender">No Defender sensor</option><option value="stale">Stale (&gt;30d)</option><option value="inet">Internet-facing</option><option value="expinet">Exploitable + exposed</option><option value="exploit">Public exploit</option><option value="alert">Active alerts</option><option value="critvuln">Critical vulns</option><option value="eol">End-of-support</option><option value="unblocked">Unblocked (getting tokens)</option><option value="privrisky">Admin on risky device</option><option value="nobitlocker">No BitLocker key</option></select>
       <span class="fsp"></span>
       <button class="btn sm" id="btnClear">Clear</button>
     </div>
@@ -392,8 +393,11 @@
     ["Device.Read.All",                         "Entra device objects — join type, compliance flag, last sign-in",           true],
     ["DeviceManagementManagedDevices.Read.All", "Intune managed devices — compliance, owner, OS, last sync, agent",          false],
     ["DeviceManagementConfiguration.Read.All",  "Intune per-policy compliance detail — which settings failed on a device",   false],
-    ["ThreatHunting.Read.All",                  "Defender advanced hunting — onboarding, exposure, alerts, CVEs, discovered IoT/network", false],
-    ["RoleManagement.Read.Directory",           "Privileged role holders — to flag devices whose primary user is an admin",  false]
+    ["ThreatHunting.Read.All",                  "Defender advanced hunting — onboarding, exposure, alerts, CVEs, exploitability, sign-in enforcement", false],
+    ["RoleManagement.Read.Directory",           "Privileged role holders — to flag admin primary users and admin sessions",  false],
+    ["IdentityRiskyUser.Read.All",              "Identity Protection risky users — to flag a risky user on a risky device",   false],
+    ["BitlockerKey.ReadBasic.All",              "BitLocker key escrow (metadata only, not the keys) — recovery hygiene",      false],
+    ["DeviceLocalCredential.ReadBasic.All",     "Windows LAPS backup status (metadata only, not the passwords) — recovery hygiene", false]
   ];
   const REQUIRED = SCOPES.filter(s => s[2]).map(s => s[0]);
   const GRAPH = "https://graph.microsoft.com/v1.0";
@@ -519,13 +523,17 @@
     else if (sig.compliance === "grace") { cPts = 10; cWhy = "in grace period"; }
     else if (sig.compliance === "unevaluated") { cPts = 12; cWhy = "no compliance result"; }
     else if (!sig.managed) { cPts = sig.active ? 12 : 8; cWhy = sig.active ? "unmanaged" : "unmanaged · stale"; }
+    // Identity on the box: a privileged session, or a risky user, on an already-exposed device is where the path ends.
+    const iPts = (sig.privSession ? 22 : 0) + (sig.riskyUser ? 14 : 0);
     const mult = sig.internet === true ? 1.5 : 1;
     const critMult = CRIT_MULT[sig.criticality] || 1;
-    const score = Math.round(((tPts + xPts + ePts) * mult + cPts) * critMult);
+    const score = Math.round(((tPts + xPts + ePts) * mult + cPts + iPts) * critMult);
     const drivers = [];
     if (tPts) drivers.push([tPts * mult, "active alert · " + String(sig.threat).toLowerCase()]);
     if (ePts) drivers.push([ePts * mult, sig.exploitCrit ? "critical CVE · public exploit" : "public exploit available"]);
     if (xPts) drivers.push([xPts * mult, "Defender exposure · " + String(sig.exposure).toLowerCase()]);
+    if (sig.privSession) drivers.push([22, "privileged session"]);
+    if (sig.riskyUser) drivers.push([14, "risky user present"]);
     if (cPts) drivers.push([cPts, cWhy]);
     drivers.sort((a, b) => b[0] - a[0]);
     let sub = drivers.length ? drivers[0][1] : "no elevated signals";
@@ -549,7 +557,11 @@
     if (d.osEol) w.push("End-of-support OS");
     else if (d.eosCount > 0) w.push(d.eosCount + " end-of-support product" + (d.eosCount > 1 ? "s" : ""));
     if (d.critical) w.push((d.criticality || "High") + "-value asset");
-    if (d.isAdminUser) w.push("Primary user holds a privileged role");
+    if (d.privSession) w.push("Privileged session on this device" + (d.adminSessions && d.adminSessions.length ? " (" + d.adminSessions[0] + ")" : ""));
+    else if (d.isAdminUser) w.push("Primary user holds a privileged role");
+    if (d.riskyUser) w.push("Risky user present (Identity Protection)");
+    if (d.unblocked) w.push("Still getting tokens while non-compliant — not blocked");
+    if (d.bitlocker === "no") w.push("No BitLocker key escrowed");
     if (d.stale) w.push("No activity in " + d.lastSeenDays + "d");
     if (!w.length) w.push("No elevated signals");
     return w;
@@ -576,7 +588,7 @@
     try { prog("Querying Defender (device inventory)…"); machines = await hunt("DeviceInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by DeviceId", "Defender inventory"); result.caps.defender = true; }
     catch (e) { result.errors.defender = e.message; result.caps.defender = false; }
 
-    let threatRows = null, cveRows = null, cfgRows = null, netRows = null, critRows = null, eolRows = null;
+    let threatRows = null, cveRows = null, cfgRows = null, netRows = null, critRows = null, eolRows = null, signinRows = null;
     if (machines) {
       prog("Querying Defender (alerts, exploitable CVEs, exposure, end-of-support)…");
       const Q = {
@@ -595,15 +607,22 @@
         eol:    "DeviceTvmSoftwareInventory | where EndOfSupportStatus != '' and EndOfSupportStatus != 'None'"
               + " | extend IsOS = SoftwareName has 'windows' or SoftwareName has_any ('server','macos','rhel','ubuntu','linux')"
               + " | summarize Eos=dcountif(strcat(SoftwareVendor,SoftwareName), EndOfSupportStatus startswith 'EOS'), Upcoming=dcountif(strcat(SoftwareVendor,SoftwareName), EndOfSupportStatus startswith 'Upcoming'),"
-              + " OsEol=countif(IsOS and EndOfSupportStatus startswith 'EOS') > 0, Names=make_set_if(strcat(SoftwareVendor,' ',SoftwareName), EndOfSupportStatus startswith 'EOS', 8) by DeviceId"
+              + " OsEol=countif(IsOS and EndOfSupportStatus startswith 'EOS') > 0, Names=make_set_if(strcat(SoftwareVendor,' ',SoftwareName), EndOfSupportStatus startswith 'EOS', 8) by DeviceId",
+        // #6 — does a drifted device still get tokens? Successful Entra sign-ins (ErrorCode==0) in 30d, per device,
+        // counting those the device was non-compliant or unmanaged at. Successful sign-ins while non-compliant = CA isn't blocking.
+        signin: "EntraIdSignInEvents | where Timestamp > ago(30d) and ErrorCode == 0"
+              + " | extend DevId = tostring(column_ifexists('EntraIdDeviceId', column_ifexists('AadDeviceId','')))"
+              + " | where isnotempty(DevId)"
+              + " | summarize Signins=count(), Last=max(Timestamp), NonComp=countif(IsCompliant==0), Unmanaged=countif(IsManaged==0), Interactive=countif(LogonType in ('interactive','remoteInteractive')) by DevId"
       };
-      const settled = await Promise.allSettled([hunt(Q.threat), hunt(Q.cve), hunt(Q.cfg), hunt(Q.net), hunt(Q.crit), hunt(Q.eol)]);
+      const settled = await Promise.allSettled([hunt(Q.threat), hunt(Q.cve), hunt(Q.cfg), hunt(Q.net), hunt(Q.crit), hunt(Q.eol), hunt(Q.signin)]);
       threatRows = settled[0].status === "fulfilled" ? settled[0].value : null;
       cveRows    = settled[1].status === "fulfilled" ? settled[1].value : null;
       cfgRows    = settled[2].status === "fulfilled" ? settled[2].value : null;
       netRows    = settled[3].status === "fulfilled" ? settled[3].value : null;
       critRows   = settled[4].status === "fulfilled" ? settled[4].value : null;
       eolRows    = settled[5].status === "fulfilled" ? settled[5].value : null;
+      signinRows = settled[6].status === "fulfilled" ? settled[6].value : null;
     }
 
     // Optional: privileged role holders → flag admin devices.
@@ -636,6 +655,23 @@
       result.caps.admins = true;
     } catch (e) { result.caps.admins = false; }
 
+    // #2 — Identity Protection risky users (optional). Keyed by UPN; used for primary user and logged-on sessions.
+    let risky = null;
+    try {
+      const ru = await gGetAll("/identityProtection/riskyUsers?$select=userPrincipalName,riskLevel,riskState&$top=500", ["IdentityRiskyUser.Read.All"]);
+      risky = {}; ru.forEach(u => { const upn = String(u.userPrincipalName || "").toLowerCase(); const st = String(u.riskState || "").toLowerCase();
+        if (upn && /high|medium|low/i.test(u.riskLevel || "") && st !== "remediated" && st !== "dismissed") risky[upn] = String(u.riskLevel); });
+      result.caps.risky = true;
+    } catch (e) { result.caps.risky = false; }
+
+    // #7 — recovery hygiene (optional, metadata only). Sets of device ids/names that have an escrowed key / LAPS backup.
+    let blSet = null, lapsSet = null, lapsNameSet = null;
+    try { const bl = await gGetAll("/informationProtection/bitlocker/recoveryKeys?$select=id,deviceId", ["BitlockerKey.ReadBasic.All"]); blSet = new Set(); bl.forEach(k => { const d = String(k.deviceId || "").toLowerCase(); if (d) blSet.add(d); }); result.caps.bitlocker = true; }
+    catch (e) { result.caps.bitlocker = false; }
+    try { const lc = await gGetAll("/directory/deviceLocalCredentials?$select=deviceName,id", ["DeviceLocalCredential.ReadBasic.All"]); lapsSet = new Set(); lapsNameSet = new Set();
+      lc.forEach(c => { const id = String(c.id || "").toLowerCase(); if (id) lapsSet.add(id); const nm = normName(c.deviceName); if (nm) lapsNameSet.add(nm); }); result.caps.laps = true; }
+    catch (e) { result.caps.laps = false; }
+
     // ── index ──
     const byId = x => String(x || "").toLowerCase();
     const inBy = {}; intune.forEach(d => { const k = byId(d.azureADDeviceId); if (k) inBy[k] = d; });
@@ -643,7 +679,14 @@
     if (machines) machines.forEach(m => { const k = byId(m.AadDeviceId); if (k) mdeBy[k] = m; const nk = normName(m.DeviceName); if (nk && !mdeByName[nk]) mdeByName[nk] = m; });
     const sev = (rows, key) => { const o = {}; (rows || []).forEach(x => { const id = byId(x.DeviceId); if (id) o[id] = x; }); return o; };
     const threatBy = sev(threatRows), cveBy = sev(cveRows), cfgBy = sev(cfgRows), netByD = sev(netRows), eolBy = sev(eolRows);
+    const signinBy = {}; (signinRows || []).forEach(x => { const id = byId(x.DevId); if (id) signinBy[id] = x; });
     const critBy = {}; (critRows || []).forEach(x => { if (x.DN == null) return; const r = { level: +x.L, why: parseRoles(x.Rules) }; critBy[byId(x.DN)] = r; critBy[normName(x.DN)] = r; });
+    // #2 — admin roles indexed by UPN local-part, so a logged-on sAMAccountName can match a UPN-keyed admin/risky entry.
+    const adminByLocal = {}; if (admins) Object.keys(admins).forEach(upn => { adminByLocal[upn.split("@")[0]] = admins[upn]; });
+    const riskyByLocal = {}; if (risky) Object.keys(risky).forEach(upn => { riskyByLocal[upn.split("@")[0]] = risky[upn]; });
+    // LoggedOnUsers (DeviceInfo) → array of account names. Tolerates JSON array of {UserName}, or a plain string.
+    function loggedOn(v) { if (v == null || v === "") return []; let a; try { a = typeof v === "string" ? JSON.parse(v) : v; } catch (e) { return []; }
+      if (!Array.isArray(a)) return []; return a.map(x => String((x && (x.UserName || x.AccountName || x.userName)) || x || "").trim()).filter(Boolean); }
 
     const now = Date.now(), dd = d => d ? Math.floor((now - Date.parse(d)) / 864e5) : null;
     const active = entra.filter(d => d.accountEnabled !== false);
@@ -686,9 +729,34 @@
       const adm = admins ? admins[byId((i && i.userPrincipalName))] : null;
       const os = normOS(d.operatingSystem || (i && i.operatingSystem) || mf("OSPlatform"));
       const criticality = crit ? (CRIT_LABELS[crit.level] || "—") : "—";
+      const isClient = devClass(os) === "computer" || devClass(os) === "server";
+
+      // #2 — privileged / risky identities on the device: the primary user + any logged-on session.
+      const userUpn = byId(i && i.userPrincipalName);
+      const seenNames = loggedOn(mf("LoggedOnUsers"));
+      const adminSessions = []; const riskyUsersOn = [];
+      const addIf = (label, isAdm, riskLvl) => { if (isAdm && adminSessions.indexOf(label) < 0) adminSessions.push(label); if (riskLvl && riskyUsersOn.indexOf(label) < 0) riskyUsersOn.push(label + " (" + riskLvl + ")"); };
+      if (userUpn) addIf(userUpn, !!(adm && adm.write), risky && risky[userUpn]);
+      seenNames.forEach(nm2 => { const lp = String(nm2).toLowerCase().split("@")[0]; const a2 = adminByLocal[lp]; const r2 = riskyByLocal[lp]; if (a2 || r2) addIf(nm2, !!(a2 && a2.write), r2); });
+      const privSession = adminSessions.length > 0, riskyUserHere = riskyUsersOn.length > 0;
+
+      // #6 — enforcement: successful sign-ins while the device was non-compliant / unmanaged = CA isn't blocking it.
+      const sr = m ? (signinBy[mid] || null) : (key ? signinBy[key] : null);   // keyed by Entra device id
+      const sr2 = sr || (key ? signinBy[key] : null);
+      const signins30 = sr2 ? sr2.Signins || 0 : null;
+      const signinsNonComp = sr2 ? sr2.NonComp || 0 : 0, signinsUnmanaged = sr2 ? sr2.Unmanaged || 0 : 0;
+      const lastSigninDays = sr2 ? dd(sr2.Last) : null;
+      // "Unblocked" = a drifted device that is still getting tokens: successful sign-ins while non-compliant,
+      // or successful unmanaged sign-ins on a device not enrolled in Intune.
+      const unblocked = (compliance === "noncompliant" && signinsNonComp > 0) || (!i && signins30 > 0 && signinsUnmanaged > 0);
+
+      // #7 — recovery hygiene (Windows clients/servers). Escrow set keyed by device id; LAPS by id or name.
+      const aad = byId(d.deviceId);
+      const bitlocker = blSet ? (isClient && /windows/i.test(os) ? (blSet.has(aad) ? "yes" : "no") : "n/a") : null;
+      const laps = lapsSet ? (isClient && /windows/i.test(os) ? (lapsSet.has(aad) || (lapsNameSet && lapsNameSet.has(nk)) ? "yes" : "no") : "n/a") : null;
 
       const rc = riskCompose({ threat, exposure, compliance, managed: !!i, active: !stale, internet: internet === true,
-        exploit: cveExploit > 0, exploitCrit: cveExploitCrit > 0, criticality });
+        exploit: cveExploit > 0, exploitCrit: cveExploitCrit > 0, criticality, privSession, riskyUser: riskyUserHere });
       const dev = {
         id: key || ("dev" + ix), name: d.displayName || (i && i.deviceName) || "(device)", os,
         // OS version: prefer Intune, then the Defender machine's OSVersion, then OSBuild, then Entra's value.
@@ -703,6 +771,9 @@
         criticality, critWhy: crit ? crit.why : [], critical: crit ? crit.level <= 1 : false,
         roles, tags: mergeTags(mf("DeviceManualTags"), mf("DeviceDynamicTags")),
         adminRoles: adm ? adm.roles : null, isAdminUser: !!(adm && adm.write),
+        adminSessions, riskyUsersOn, privSession, riskyUser: riskyUserHere,
+        signins30, signinsNonComp, signinsUnmanaged, lastSigninDays, unblocked,
+        bitlocker, laps,
         lastSeenDays, lastSyncDays: lastSync, stale, aadId: d.deviceId || "—", intuneId: i ? i.id : null,
         mdeId: m ? String(m.DeviceId || "") : null, publicIp: m ? (mf("PublicIP") || "") : "",
         risk: rc.band, riskScore: rc.score, riskSub: rc.sub
@@ -748,8 +819,19 @@
       const cveZeroDay = onb ? (inet && exp === "High" ? 1 : 0) : null;
       const osEol = onb && /server/i.test(r[1]) && ix % 2 === 1;   // one demo server end-of-support
       const eosCount = onb ? (osEol ? 2 : inet ? 1 : 0) : null;
+      const isWinClient = /windows/i.test(r[1]);
+      const isAdmin = !!r[15];
+      // #2 session/risky-user, #6 sign-in enforcement, #7 recovery hygiene — synthetic
+      const riskyUser = comp === "noncompliant" && r[5] === "eden@blue16.nl";
+      const adminSessions = isAdmin ? [r[5]] : [];
+      const signins30 = r[7][0] ? (stale ? 0 : (comp === "noncompliant" ? 23 : 48)) : null;
+      const signinsNonComp = comp === "noncompliant" ? (signins30 || 0) : 0;
+      const signinsUnmanaged = !managed && r[7][0] ? (signins30 || 0) : 0;
+      const unblocked = (comp === "noncompliant" && signinsNonComp > 0) || (!managed && signins30 > 0 && signinsUnmanaged > 0);
+      const bitlocker = isWinClient ? (["EDEN-INUC", "win-i3oa1c8bv5i"].includes(r[0]) ? "no" : "yes") : "n/a";
+      const laps = isWinClient && /server/i.test(r[1]) ? (r[0] === "SRV000" ? "no" : "yes") : (isWinClient ? "yes" : "n/a");
       const rc = riskCompose({ threat, exposure: exp, compliance: comp, managed, active: !stale, internet: inet,
-        exploit: cveExploit > 0, exploitCrit: cveExploitCrit > 0, criticality: crit });
+        exploit: cveExploit > 0, exploitCrit: cveExploitCrit > 0, criticality: crit, privSession: adminSessions.length > 0, riskyUser });
       const d = {
         id: "dev" + ix, name: r[0], os: normOS(r[1]), osVer: r[2], cls: devClass(r[1]),
         joinType: r[3], owner: r[4], user: r[5], managedBy: r[6],
@@ -765,6 +847,9 @@
         onboarding: onb ? "Onboarded" : (r[7][0] ? "Not onboarded" : "—"),
         criticality: crit, critWhy: crit === "Very high" || crit === "High" ? ["Business-critical asset"] : [], critical: crit === "Very high" || crit === "High",
         roles: r[14], tags: [], adminRoles: r[15] ? ["Global Administrator"] : null, isAdminUser: !!r[15],
+        adminSessions, riskyUsersOn: riskyUser ? [r[5] + " (high)"] : [], privSession: adminSessions.length > 0, riskyUser,
+        signins30, signinsNonComp, signinsUnmanaged, lastSigninDays: signins30 ? (stale ? null : 0) : null, unblocked,
+        bitlocker, laps,
         lastSeenDays: days, lastSyncDays: r[7][1] ? days : null, stale, aadId: r[7][0] ? "demo-" + ix : "—", intuneId: r[7][1] ? "demo-int-" + ix : null,
         mdeId: onb ? "demo-mde-" + ix : null, publicIp: inet ? "198.51.100." + (10 + ix) : "",
         risk: rc.band, riskScore: rc.score, riskSub: rc.sub
@@ -772,7 +857,7 @@
       d.riskWhy = riskWhyOf(d);
       return d;
     });
-    return { devices, discovered: [], caps: { entra: true, intune: true, defender: true, admins: true }, errors: {} };
+    return { devices, discovered: [], caps: { entra: true, intune: true, defender: true, admins: true, risky: true, bitlocker: true, laps: true }, errors: {} };
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -807,6 +892,9 @@
     if (S.gap === "expinet" && !(d.internet === true && d.cveExploit > 0)) return false;
     if (S.gap === "exploit" && !(d.cveExploit > 0)) return false;
     if (S.gap === "eol" && !(d.osEol || d.eosCount > 0)) return false;
+    if (S.gap === "unblocked" && !d.unblocked) return false;
+    if (S.gap === "privrisky" && !(d.privSession && (d.risk === "High" || d.risk === "Medium"))) return false;
+    if (S.gap === "nobitlocker" && d.bitlocker !== "no") return false;
     return true;
   }
 
@@ -830,7 +918,10 @@
     const chips = [];
     if (d.criticality === "Very high" || d.criticality === "High") chips.push(`<span class="chip crit" title="${esc(d.critWhy ? d.critWhy.join(", ") : "")}">${esc(d.criticality)}</span>`);
     if (d.cveExploit > 0) chips.push(`<span class="chip expl" title="${d.cveExploit} CVE(s) with public exploit code${d.internet === true ? " · internet-facing" : ""}">exploit${d.internet === true ? "+net" : ""}</span>`);
-    if (d.isAdminUser) chips.push(`<span class="chip adm" title="${esc((d.adminRoles || []).join(", "))}">Admin</span>`);
+    if (d.privSession) chips.push(`<span class="chip adm" title="Privileged session: ${esc((d.adminSessions || []).join(", "))}">admin session</span>`);
+    else if (d.isAdminUser) chips.push(`<span class="chip adm" title="${esc((d.adminRoles || []).join(", "))}">Admin</span>`);
+    if (d.riskyUser) chips.push(`<span class="chip expl" title="Identity Protection risky user: ${esc((d.riskyUsersOn || []).join(", "))}">risky user</span>`);
+    if (d.unblocked) chips.push(`<span class="chip expl" title="Still getting tokens while non-compliant/unmanaged — CA not blocking">unblocked</span>`);
     if (d.internet === true) chips.push(`<span class="chip inet" title="${esc(d.internetReason || "Internet-facing")}">internet-facing</span>`);
     if (d.osEol) chips.push(`<span class="chip eol" title="End-of-support OS">EOL OS</span>`);
     else if (d.eosCount > 0) chips.push(`<span class="chip eol" title="${esc((d.eolNames || []).join(", ")) || "End-of-support software"}">EOL</span>`);
@@ -866,17 +957,29 @@
     let states;
     try { states = await gGetAll("/deviceManagement/managedDevices/" + safeId(d.intuneId) + "/deviceCompliancePolicyStates", sc); }
     catch (e) { if (e.status === 403) { const err = new Error("Grant DeviceManagementConfiguration.Read.All to see which settings failed."); err.soft = true; throw err; } throw e; }
-    const policies = [];
+    // deviceCompliancePolicyStates returns a row per policy target/platform, so the same policy name repeats.
+    // Collapse by name, keeping the worst state and the id of a failing instance (to read its settingStates once).
+    const RANK = { noncompliant: 5, error: 5, conflict: 5, ingraceperiod: 3, unknown: 2, notapplicable: 1, compliant: 0 };
+    const byName = new Map();
     for (const p of states) {
-      const st = String(p.state || "").toLowerCase();
-      const entry = { name: p.displayName || "Compliance policy", state: st, settings: [] };
+      const name = p.displayName || "Compliance policy", st = String(p.state || "").toLowerCase();
+      const prev = byName.get(name);
+      if (!prev || (RANK[st] || 0) > (RANK[prev.state] || 0)) byName.set(name, { name, state: st, id: p.id });
+    }
+    const policies = [];
+    for (const entry of byName.values()) {
+      const st = entry.state; entry.settings = [];
       if (st && st !== "compliant" && st !== "notapplicable" && st !== "unknown") {
         try {
-          const ss = await gGetAll("/deviceManagement/managedDevices/" + safeId(d.intuneId) + "/deviceCompliancePolicyStates/" + safeId(p.id) + "/settingStates", sc);
+          const ss = await gGetAll("/deviceManagement/managedDevices/" + safeId(d.intuneId) + "/deviceCompliancePolicyStates/" + safeId(entry.id) + "/settingStates", sc);
+          const seen = new Set();
           entry.settings = ss.filter(s => { const x = String(s.state || "").toLowerCase(); return x && x !== "compliant" && x !== "notapplicable"; })
-            .map(s => ({ setting: humanizeSetting(s.setting || s.settingName || s.settingInstanceId || ""), state: s.state || "" }));
+            .map(s => humanizeSetting(s.setting || s.settingName || s.settingInstanceId || ""))
+            .filter(name2 => name2 && !seen.has(name2) && seen.add(name2))
+            .map(name2 => ({ setting: name2, state: st }));
         } catch (e) {}
       }
+      delete entry.id;
       policies.push(entry);
     }
     return { policies };
@@ -1045,6 +1148,7 @@
       const pols = det.compliance.policies || [];
       const fails = pols.filter(p => p.state && p.state !== "compliant" && p.state !== "notapplicable" && p.state !== "unknown");
       if (!pols.length) compBody = '<div class="muted">No compliance policy assigned.</div>';
+      else if (!fails.length && compBad) compBody = `<div class="v-warn">Intune reports non-compliant, but no failing policy is exposed per-device — usually a built-in/default policy or an evaluation still settling.</div><ul class="dlist">${pols.map(p => `<li><span class="v-good">✓</span> ${esc(p.name)}</li>`).join("")}</ul>`;
       else if (!fails.length) compBody = `<div class="v-good">All ${pols.length} assigned ${pols.length === 1 ? "policy" : "policies"} pass.</div><ul class="dlist">${pols.map(p => `<li><span class="v-good">✓</span> ${esc(p.name)}</li>`).join("")}</ul>`;
       else compBody = `<ul class="dlist">${fails.map(p => `<li><div class="ln"><b class="v-bad">${esc(p.name)}</b><span class="sev High">${esc(p.state)}</span></div>${p.settings.length ? `<div class="meta">Failing: ${p.settings.map(s => esc(s.setting)).join(", ")}</div>` : '<div class="meta">Policy reported non-compliant</div>'}</li>`).join("")}</ul>`;
     } else compBody = '<div class="muted">Expand to load.</div>';
@@ -1116,6 +1220,27 @@
     const hardBad = det && det.hardening && det.hardening.some(h => h.impact >= 7);
     const hardening = `<div class="dcol${hardBad ? " sec-bad" : ""}"><h4>Hardening</h4>${hardBody}</div>`;
 
+    // ── Access & recovery (#2 sessions / risky users, #6 sign-in enforcement, #7 BitLocker + LAPS escrow) ──
+    const yn = (v, goodVal) => v == null ? '<span class="muted">not read</span>' : v === "n/a" ? '<span class="muted">n/a</span>' : v === goodVal ? `<span class="v-good">${esc(v)}</span>` : `<span class="v-bad">${esc(v)}</span>`;
+    const accParts = [];
+    accParts.push(`<dl class="kv">
+      ${kv("Admin session", d.privSession ? `<span class="v-bad">${esc((d.adminSessions || []).slice(0, 2).join(", ")) || "yes"}</span>` : (d.isAdminUser ? '<span class="v-warn">primary user is admin</span>' : '<span class="muted">none</span>'))}
+      ${kv("Risky user", d.riskyUser ? `<span class="v-bad">${esc((d.riskyUsersOn || []).slice(0, 2).join(", ")) || "yes"}</span>` : (DATA.caps.risky === false ? '<span class="muted">not read</span>' : '<span class="muted">none</span>'))}
+      ${kv("BitLocker key", yn(d.bitlocker, "yes"))}
+      ${kv("Windows LAPS", d.laps === "no" ? '<span class="v-warn">no</span>' : yn(d.laps, "yes"))}
+    </dl>`);
+    // #6 sign-in enforcement
+    if (d.signins30 == null) accParts.push('<div class="meta" style="margin-top:9px">Sign-in enforcement: <span class="muted">not read</span></div>');
+    else if (d.signins30 === 0) accParts.push(`<div class="meta" style="margin-top:9px">No successful sign-ins in 30 days${d.compliance === "noncompliant" || !d.intune ? ' — <span class="v-good">drift not being used</span>' : ""}.</div>`);
+    else {
+      const enf = d.unblocked
+        ? `<span class="v-bad">${d.signinsNonComp || d.signinsUnmanaged} sign-in${(d.signinsNonComp || d.signinsUnmanaged) === 1 ? "" : "s"} while ${d.compliance === "noncompliant" ? "non-compliant" : "unmanaged"} — Conditional Access is NOT blocking this</span>`
+        : `<span class="v-good">compliant/managed sign-ins — enforcement holding</span>`;
+      accParts.push(`<div class="meta" style="margin-top:9px"><b>${d.signins30}</b> successful sign-in${d.signins30 === 1 ? "" : "s"} · last ${ago(d.lastSigninDays)}<br>${enf}</div>`);
+    }
+    const accBad = d.privSession || d.riskyUser || d.unblocked || d.bitlocker === "no";
+    const access = `<div class="dcol${accBad ? " sec-bad" : ""}"><h4>Access &amp; recovery</h4>${accParts.join("")}</div>`;
+
     // ── Inventory + Why ──
     const inv = `<div class="dcol"><h4>Inventory</h4><dl class="kv">
       ${kv("OS", esc(d.os) + " " + esc(d.osVer || ""))}
@@ -1127,7 +1252,7 @@
     </dl>${d.intuneId && !DEMO ? `<div class="dlinks"><a class="btn sm" href="https://intune.microsoft.com/#view/Microsoft_Intune_Devices/DeviceSettingsMenuBlade/~/overview/mdmDeviceId/${enc(d.intuneId)}" target="_blank" rel="noopener">Open in Intune ↗</a>${d.mdeId && !/^demo/.test(d.mdeId) ? `<a class="btn sm" href="https://security.microsoft.com/machines/${enc(d.mdeId)}" target="_blank" rel="noopener">Open in Defender ↗</a>` : ""}</div>` : ""}</div>`;
     const why = d.riskWhy && d.riskWhy.length ? `<div class="dcol${d.risk === "High" ? " sec-bad" : ""}"><h4>Why this risk — ${esc(d.risk)} (${d.riskScore})</h4><ul class="why">${d.riskWhy.map(w => { const bad = /non-compliant|critical|active alert|internet|not onboarded|not managed|not in entra|no activity|privileged|high|exploit|zero-day|end-of-support/i.test(w); return `<li class="${bad ? "v-bad" : ""}">${esc(w)}</li>`; }).join("")}</ul></div>` : "";
 
-    return `<tr class="detail"><td colspan="8"><div class="dwrap">${sources}${compliance}${exposure}${threat}${hardening}${inv}${why}</div></td></tr>`;
+    return `<tr class="detail"><td colspan="8"><div class="dwrap">${sources}${compliance}${exposure}${threat}${hardening}${access}${inv}${why}</div></td></tr>`;
   }
 
   function render() {
@@ -1140,12 +1265,16 @@
     const noDef = D.filter(d => (d.cls === "computer" || d.cls === "server") && d.defender === 0).length;
     const activeAlert = D.filter(d => d.threat === "High" || d.threat === "Medium").length;
     const eol = D.filter(d => d.osEol || d.eosCount > 0).length;
+    const unblocked = D.filter(d => d.unblocked).length;              // #6 — drift that still gets tokens
+    const privRisky = D.filter(d => d.privSession && (d.risk === "High" || d.risk === "Medium")).length;   // #2 — admin session on a risky box
     const stale = all.filter(d => d.stale).length;
     const atRisk = D.filter(d => d.risk === "High" || d.risk === "Medium").length;
 
     const tiles = [
       { n: D.length, l: "Managed devices", s: "click to clear filters", f: "clear" },
       { n: expInet, l: "Exploitable + exposed", s: "internet-facing · public exploit", f: "gap:expinet", bad: expInet > 0 },
+      { n: privRisky, l: "Admin on risky device", s: "privileged session · risky host", f: "gap:privrisky", bad: privRisky > 0 },
+      { n: unblocked, l: "Unblocked", s: "drift still getting tokens", f: "gap:unblocked", bad: unblocked > 0 },
       { n: highRisk, l: "High risk", s: "composite risk · High", f: "risk:High", bad: highRisk > 0 },
       { n: inet, l: "Internet-facing", s: "reachable from outside", f: "gap:inet", bad: inet > 0 },
       { n: activeAlert, l: "Active alerts", s: "Defender High / Medium", f: "gap:alert", bad: activeAlert > 0 },
@@ -1167,6 +1296,9 @@
     if (DATA.caps.intune === false) miss.push("Intune (compliance, owner) not read — grant DeviceManagementManagedDevices.Read.All");
     if (DATA.caps.defender === false) miss.push("Defender (exposure, alerts, CVEs, discovered devices) not read — grant ThreatHunting.Read.All / check Defender licensing");
     if (DATA.caps.admins === false) miss.push("Privileged-role flags not shown — grant RoleManagement.Read.Directory");
+    if (DATA.caps.risky === false) miss.push("Risky-user flags not shown — grant IdentityRiskyUser.Read.All");
+    if (DATA.caps.bitlocker === false) miss.push("BitLocker escrow not read — grant BitlockerKey.ReadBasic.All");
+    if (DATA.caps.laps === false) miss.push("Windows LAPS status not read — grant DeviceLocalCredential.ReadBasic.All");
     const pEl = $("partial");
     if (miss.length) { pEl.classList.remove("hidden"); pEl.innerHTML = "<b>Partial coverage.</b> " + miss.map(esc).join(" · "); }
     else pEl.classList.add("hidden");
@@ -1231,12 +1363,14 @@
 
   // ── CSV export ──
   function exportCsv() {
-    const cols = ["Name", "Class", "OS", "OS version", "Join type", "Owner", "User", "Entra", "Intune", "Defender", "Compliance", "Exposure", "Risk", "Risk score", "Threat", "CVEs", "Critical CVEs", "Exploit CVEs", "Zero-days", "End-of-support", "EOL OS", "Criticality", "Internet-facing", "Exploitable+exposed", "Admin user", "Last seen (days)", "Stale"];
+    const cols = ["Name", "Class", "OS", "OS version", "Join type", "Owner", "User", "Entra", "Intune", "Defender", "Compliance", "Exposure", "Risk", "Risk score", "Threat", "CVEs", "Critical CVEs", "Exploit CVEs", "Zero-days", "End-of-support", "EOL OS", "Criticality", "Internet-facing", "Exploitable+exposed", "Admin user", "Admin session", "Risky user", "Unblocked (tokens)", "Successful sign-ins 30d", "BitLocker key", "Windows LAPS", "Last seen (days)", "Stale"];
     const rows = allDevices().map(d => [d.name, d.cls, d.os, d.osVer, d.joinType || d.category || "", d.owner || "", d.user || "",
       d.entra === 1 ? "yes" : d.entra === 0 ? "no" : "", d.intune === 1 ? "yes" : "no", d.defender === 1 ? "yes" : d.defender === 0 ? "no" : "",
       d.compliance, d.exposure, d.risk, d.riskScore != null ? d.riskScore : "", d.threat || "", d.cveCount != null ? d.cveCount : "", d.cveCrit != null ? d.cveCrit : "",
       d.cveExploit != null ? d.cveExploit : "", d.cveZeroDay != null ? d.cveZeroDay : "", d.eosCount != null ? d.eosCount : "", d.osEol ? "yes" : "",
-      d.criticality || "", d.internet === true ? "yes" : "", (d.internet === true && d.cveExploit > 0) ? "yes" : "", d.isAdminUser ? "yes" : "", d.lastSeenDays != null ? d.lastSeenDays : "", d.stale ? "yes" : ""]);
+      d.criticality || "", d.internet === true ? "yes" : "", (d.internet === true && d.cveExploit > 0) ? "yes" : "", d.isAdminUser ? "yes" : "",
+      d.privSession ? "yes" : "", d.riskyUser ? "yes" : "", d.unblocked ? "yes" : "", d.signins30 != null ? d.signins30 : "", d.bitlocker || "", d.laps || "",
+      d.lastSeenDays != null ? d.lastSeenDays : "", d.stale ? "yes" : ""]);
     const csv = [cols].concat(rows).map(r => r.map(v => { v = String(v == null ? "" : v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }).join(",")).join("\r\n");
     const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8" });
     const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "device-discovery-" + new Date().toISOString().slice(0, 10) + ".csv"; a.click(); URL.revokeObjectURL(a.href);
@@ -1312,7 +1446,7 @@
     $("scopeList").innerHTML = SCOPES.map(s => `<div class="srow"><div class="sp">${esc(s[0])}${s[2] ? "" : '<span class="tag-opt">optional</span>'}</div><div class="sw">${esc(s[1])}</div></div>`).join("");
     const scopeNames = SCOPES.map(s => '"' + s[0] + '"').join(", ");
     const ps =
-`# Device Discovery — register the read-only single-tenant app (run once).
+`# Device Security Posture — register the read-only single-tenant app (run once).
 # Requires: Install-Module Microsoft.Graph.Applications  (and a role that can consent).
 $RedirectUri = "${redirectUri}"   # <-- the exact URL where you host this page
 $Scopes      = @(${scopeNames})
@@ -1327,7 +1461,7 @@ $access  = $Scopes | ForEach-Object {
   @{ Id = $p.Id; Type = "Scope" }
 }
 
-$app = New-MgApplication -DisplayName "Device Discovery (read-only)" \`
+$app = New-MgApplication -DisplayName "Device Security Posture (read-only)" \`
   -SignInAudience "AzureADMyOrg" \`
   -Spa @{ RedirectUris = @($RedirectUri) } \`
   -RequiredResourceAccess @(@{ ResourceAppId = "00000003-0000-0000-c000-000000000000"; ResourceAccess = $access })
@@ -1346,12 +1480,12 @@ try {
   Write-Warning "Couldn't grant consent from PowerShell: $($_.Exception.Message)"
   Write-Host "Grant it in one click (sign in as an admin), then you're done:" -ForegroundColor Yellow
   Write-Host "  https://login.microsoftonline.com/$((Get-MgContext).TenantId)/adminconsent?client_id=$($app.AppId)"
-  Write-Host "  (or: App registrations -> Device Discovery (read-only) -> API permissions -> Grant admin consent)"
+  Write-Host "  (or: App registrations -> Device Security Posture (read-only) -> API permissions -> Grant admin consent)"
 }
 
 Write-Host ""
 Write-Host "Application (client) ID:  $($app.AppId)" -ForegroundColor Cyan
-Write-Host "Paste that into Device Discovery. Redirect URI: $RedirectUri"`;
+Write-Host "Paste that into Device Security Posture. Redirect URI: $RedirectUri"`;
     $("psCode").textContent = ps;
   })();
 
