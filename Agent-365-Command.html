@@ -181,6 +181,14 @@
   .subsec:first-of-type { border-top: 0; padding-top: 0; margin-top: 2px; }
   .subh { font-family: var(--label); font-size: 11.5px; letter-spacing: .05em; text-transform: uppercase; color: var(--text); font-weight: 700; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .feeds { font-size: 11px; color: var(--accent); text-align: center; margin-top: 9px; letter-spacing: .05em; text-transform: uppercase; font-family: var(--label); font-weight: 700; opacity: .85; }
+  /* portal-style stat strip (ID Protection risk breakdown) */
+  .statrow { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+  @media (max-width: 560px) { .statrow { grid-template-columns: repeat(3, 1fr); } }
+  .statcell { background: var(--bg2); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 8px; padding: 8px 10px; }
+  .statcell.high { border-left-color: var(--sev-crit); } .statcell.med { border-left-color: var(--sev-high); } .statcell.low { border-left-color: var(--amber); }
+  .statcell .sv { font-family: var(--display); font-size: 18px; line-height: 1; }
+  .statcell.high .sv { color: var(--red); }
+  .statcell .sl { font-size: 9.5px; color: var(--muted); margin-top: 5px; text-transform: uppercase; letter-spacing: .04em; font-family: var(--label); font-weight: 700; }
 
   /* platform / risk bar lists */
   .barlist { list-style: none; padding: 0; margin: 0; }
@@ -658,8 +666,17 @@
       return spInc || filt || risk || !!agentsNonEmpty;
     };
     const agentPols = enabled.filter(targets).map(p => {
+      const c = p.conditions || {}, cap = c.clientApplications || {};
       const bic = (p.grantControls && p.grantControls.builtInControls) || [];
-      return { name: p.displayName || "(policy)", grant: bic, requiresCompliant: bic.some(c => /compliantDevice|compliant/i.test(c)), block: bic.some(c => /^block$/i.test(c)) };
+      const via = [];
+      if (Array.isArray(c.servicePrincipalRiskLevels) && c.servicePrincipalRiskLevels.length) via.push("risk: " + c.servicePrincipalRiskLevels.join("/").toLowerCase());
+      if (cap.servicePrincipalFilter || cap.includeServicePrincipalFilter || cap.filter || cap.includeAgentFilter || cap.agentFilter) via.push("custom security attributes");
+      const sp = cap.includeServicePrincipals || cap.servicePrincipals || [];
+      if (Array.isArray(sp) && sp.length && !(sp.length === 1 && /none/i.test(String(sp[0])))) via.push(/all|ServicePrincipalsInMyTenant/i.test(String(sp[0] || "")) ? "all agent identities" : sp.length + " agent identit" + (sp.length === 1 ? "y" : "ies"));
+      const agentsInc = cap.includeAgents || cap.agents || cap.includeAgentIdentities || c.agents;
+      if (agentsInc && (Array.isArray(agentsInc) ? agentsInc.length : Object.keys(agentsInc || {}).length)) via.push("agent identities");
+      if (!via.length) via.push("agents");
+      return { name: p.displayName || "(policy)", grant: bic, requiresCompliant: bic.some(x => /compliantDevice|compliant/i.test(x)), block: bic.some(x => /^block$/i.test(x)), via };
     });
     return { total: (policies || []).length, enabled: enabled.length, agentPolicies: agentPols, coversAgents: agentPols.length > 0 };
   }
@@ -728,7 +745,10 @@
     const out = { agents, caps: { inventory: true, blueprints: true, owners: true, licence: true, ca: true }, errors: {},
       licence: { agent365: false, e5: true, mdeP2: true, raw: ["SPE_E5"] },
       ca: { total: 9, enabled: 7, coversAgents: true,
-        agentPolicies: [{ name: "Agents — block high risk (AllResources)", grant: ["block"], requiresCompliant: false, block: true }] } };
+        agentPolicies: [
+          { name: "CA-A90-Agents-Risk-AllResources-BlockHighRisk", grant: ["block"], requiresCompliant: false, block: true, via: ["risk: high", "all agent identities"] },
+          { name: "CA-Agents-Tier0-RequireCompliant", grant: ["compliantDevice"], requiresCompliant: true, block: false, via: ["custom security attributes"] }
+        ] } };
     mergeEntraIdentities(out, [
       { id: "a1b2c3d4-0000-0000-0000-000000000001", appId: "app-hr", displayName: "Contoso HR Helper" },
       { id: "a1b2c3d4-0000-0000-0000-000000000002", appId: "app-fin", displayName: "Finance Forecaster (Microsoft Foundry)" },
@@ -1062,18 +1082,24 @@
     const shadow = A.filter(a => a.shadow).length;
     const findings = buildFindings(A, ca, lic);
     const rr = riskRollup(A);
+    const compliantCA = ca ? ca.agentPolicies.some(p => p.requiresCompliant) : null;
 
     let html = `<div class="hero-head"><div><h2>Security controls</h2>
       <div class="hero-sub">Agent posture across Entra · Defender · Purview · Intune — read-only, from signals a browser can reach. Enforcement needs the Agent 365 licence.</div></div></div>`;
 
-    const tiles = [
-      { n: atRisk, l: "At-risk agents", s: "High / Medium risk", f: "flag:risk", bad: atRisk > 0 },
-      { n: noOwner, l: "Unsponsored", s: "cloud, no owner", f: "flag:noowner", bad: noOwner > 0 },
-      { n: ext, l: "External endpoint", s: "outbound reach", f: "flag:ext", warn: ext > 0 },
-      { n: ca ? ca.agentPolicies.length : "—", l: "CA for agents", s: ca ? (ca.coversAgents ? "policies target agents" : "none target agents") : "not read", f: "", bad: !!(ca && !ca.coversAgents) }
+    // Four pillar KPIs — a check when the pillar is configured (from the reachable signal). Purview has no
+    // browser API to verify, so it stays neutral ("portal") rather than claiming a pass or fail.
+    const kpis = [
+      { key: "entra", name: "Entra", ok: !!(ca && ca.coversAgents), s: ca ? (ca.coversAgents ? "CA targets agents" : "no agent CA") : "not read" },
+      { key: "defender", name: "Defender", ok: rr.length > 0, s: rr.length ? "Security for AI active" : (lic.agent365 ? "no indicators" : "needs Agent 365") },
+      { key: "purview", name: "Purview", ok: null, s: "portal / limited API" },
+      { key: "intune", name: "Intune", ok: !!compliantCA, s: compliantCA ? "compliant-device CA" : (shadow ? shadow + " shadow to govern" : "device trust") }
     ];
-    html += `<div class="tiles">` + tiles.map(t => `<div class="tile ${t.bad ? "bad" : t.warn ? "warn" : ""}" ${t.f ? `data-f="${t.f}"` : ""} ${t.f ? 'tabindex="0" role="button"' : ""}>
-        <div class="n">${t.n}</div><div><div class="l">${esc(t.l)}</div><div class="s">${esc(t.s)}</div></div></div>`).join("") + `</div>`;
+    html += `<div class="tiles">` + kpis.map(k => {
+      const mark = k.ok === true ? "✓" : k.ok === false ? "✗" : "–";
+      const cls = k.ok === true ? "good" : k.ok === false ? "bad" : "";
+      return `<div class="tile ${cls}"><div class="n">${mark}</div><div><div class="l">${pillarIcon(k.key, 13)} ${esc(k.name)}</div><div class="s">${esc(k.s)}</div></div></div>`;
+    }).join("") + `</div>`;
 
     // four pillar cards
     // row helper for the custom two-section cards
@@ -1082,17 +1108,39 @@
     // Entra — two sections: ID Protection computes the agent risk that FEEDS Conditional Access, which blocks risky agents.
     const ar = DATA.agentRisk || null;
     const caBlock = ca ? ca.agentPolicies.filter(p => p.block) : [];
+    const prot = ar && ar.protected != null ? ar.protected : (DATA.entraIdentityCount != null ? DATA.entraIdentityCount : null);
+    const noRisk = (ar && prot != null) ? Math.max(0, prot - (ar.high + ar.med + ar.low)) : null;
+    const idpStat = ar
+      ? `<div class="statrow">`
+        + `<div class="statcell"><div class="sv">${prot != null ? prot : "—"}</div><div class="sl">Total protected</div></div>`
+        + `<div class="statcell high"><div class="sv">${ar.high}</div><div class="sl">High risk</div></div>`
+        + `<div class="statcell med"><div class="sv">${ar.med}</div><div class="sl">Medium risk</div></div>`
+        + `<div class="statcell low"><div class="sv">${ar.low}</div><div class="sl">Low risk</div></div>`
+        + `<div class="statcell"><div class="sv">${noRisk != null ? noRisk : "—"}</div><div class="sl">No risk</div></div>`
+        + `</div>`
+      : `<div class="muted">Agent risk not read — grant IdentityRiskyServicePrincipal.Read.All. Agents protected: ${DATA.entraIdentityCount != null ? DATA.entraIdentityCount : "—"}.</div>`;
+    // CA "block risky agents" enforcement card: gauge + scope + at-risk-flagged + policy chips.
+    const agentPols = ca ? ca.agentPolicies : [];
+    const riskBlock = agentPols.filter(p => p.block && (p.via || []).some(v => /risk/i.test(v)));
+    const enforced = riskBlock.length > 0;
+    const caCov = enforced ? 100 : (agentPols.length ? 55 : 0);
+    const scopeTags = Array.from(new Set(agentPols.flatMap(p => (p.via || []).filter(v => !/^risk/i.test(v)))));
+    const scopeText = scopeTags.length ? scopeTags.join(" · ") : (agentPols.length ? "agents" : "no agents");
+    const riskyN = ar ? (ar.high + ar.med + ar.low) : null;
+    const gauge = (pct, ok) => { const r = 26, cir = 2 * Math.PI * r, off = cir * (1 - pct / 100); const col = ok ? "var(--green)" : pct > 0 ? "var(--amber)" : "var(--red)"; return `<svg viewBox="0 0 64 64" width="62" height="62" style="flex:0 0 auto"><circle cx="32" cy="32" r="${r}" fill="none" stroke="var(--border)" stroke-width="6"/><circle cx="32" cy="32" r="${r}" fill="none" stroke="${col}" stroke-width="6" stroke-linecap="round" stroke-dasharray="${cir.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" transform="rotate(-90 32 32)"/><text x="32" y="38" text-anchor="middle" font-family="var(--display)" font-size="15" fill="${col}">${pct}</text></svg>`; };
     const entra = `<div class="card"><h3>${pillarIcon("entra")} Entra — access &amp; governance</h3>`
-      + `<div class="subsec"><div class="subh">ID Protection for agents <span class="pill ${ar ? "Low" : (lic.agent365 ? "Low" : "na")}">${ar ? "risk engine" : (lic.agent365 ? "in licence" : "needs Agent 365")}</span></div><ul class="dlist">`
-        + li("Agents protected", ar && ar.protected != null ? ar.protected : (DATA.entraIdentityCount != null ? DATA.entraIdentityCount : "—"), "", "Monitored by Identity Protection.")
-        + li("Risky agents", ar ? `<span class="${ar.high ? "v-bad" : ""}">${ar.high} high</span> · ${ar.med} med · ${ar.low} low` : '<span class="muted">needs IdentityRiskyServicePrincipal.Read.All</span>', "", "Dynamic agent risk.")
-      + `</ul><div class="feeds">feeds risk into ↓</div></div>`
-      + `<div class="subsec"><div class="subh">Conditional Access — block risky agents <span class="pill ${ca ? (ca.coversAgents ? "Low" : "High") : "na"}">${ca ? (ca.coversAgents ? "covered" : "no policy") : "not read"}</span></div><ul class="dlist">`
-        + li("CA policies", ca ? ca.enabled + " of " + ca.total + " enabled" : "not read")
-        + li("Policies targeting agents", ca ? ca.agentPolicies.length : "—", ca && ca.coversAgents ? "v-good" : "v-bad", ca && ca.agentPolicies.length ? esc(ca.agentPolicies.slice(0, 3).map(p => p.name).join(", ")) : "Agent sign-ins are unconditioned.")
-        + li("Risk-based block policies", ca ? caBlock.length : "—", caBlock.length ? "v-good" : "", "Block access for high-risk agents.")
-        + li("Cloud agents with no owner", noOwner, noOwner ? "v-warn" : "v-good", "Governance accountability gap.")
-      + `</ul></div></div>`;
+      + `<div class="subsec"><div class="subh">ID Protection for agents <span class="pill ${ar ? "Low" : (lic.agent365 ? "Low" : "na")}">${ar ? "risk engine" : (lic.agent365 ? "in licence" : "needs Agent 365")}</span></div>`
+        + idpStat
+        + `<div class="meta" style="margin-top:7px">Dynamic agent risk from Identity Protection.</div>`
+      + `<div class="feeds">feeds risk into ↓</div></div>`
+      + `<div class="subsec"><div class="subh">Conditional Access — block risky agents <span class="pill ${ca ? (ca.coversAgents ? "Low" : "High") : "na"}">${ca ? (ca.coversAgents ? ca.agentPolicies.length + " targeting agents" : "no policy") : "not read"}</span></div>`
+        + `<div class="meta" style="margin-bottom:8px">${ca ? ca.enabled + " of " + ca.total + " CA policies enabled" : "CA not read — grant Policy.Read.All"}</div>`
+        + `<ul class="dlist">`
+          + (ca ? (ca.agentPolicies.length
+              ? ca.agentPolicies.map(p => `<li><div class="ln"><b>${esc(p.name)}</b><span class="pill ${p.block ? "High" : "Low"}">${p.block ? "block" : (p.grant.length ? esc(p.grant.join(" + ")) : "grant")}</span></div><div class="meta">${esc((p.via || ["agents"]).join(" · "))}${p.requiresCompliant ? " · compliant device" : ""}</div></li>`).join("")
+              : `<li><div class="ln"><b class="v-bad">No CA policy targets agents</b></div><div class="meta">Agent sign-ins are unconditioned.</div></li>`)
+             : `<li><span class="muted">—</span></li>`)
+        + `</ul></div></div>`;
 
     // Defender — Security for AI: enablement (connectors), real-time protection, prompt evidence, then risk indicators.
     const defender = `<div class="card"><h3>${pillarIcon("defender")} Defender — Security for AI</h3>`
@@ -1112,13 +1160,22 @@
         { t: "AI compliance assessment", v: "portal", d: "Shown here as N/A rather than a false pass." }
       ]);
 
-    const intune = pillarCard("Intune — device & blocking", pillarIcon("intune"),
-      shadow ? { cls: "Medium", text: shadow + " shadow agent(s)" } : { cls: "Low", text: "no shadow agents" },
-      [
-        { t: "Shadow (unmanaged local) agents", v: shadow, cls: shadow ? "v-warn" : "v-good", d: "Block common ones (e.g. OpenClaw) on managed Windows via Intune." },
-        { t: "CA requires compliant device for agents", v: ca ? (ca.agentPolicies.some(p => p.requiresCompliant) ? "yes" : "no") : "not read", cls: ca && ca.agentPolicies.some(p => p.requiresCompliant) ? "v-good" : "", d: "Device-compliance grant on an agent-targeting CA policy." },
-        { t: "Auto-enroll Windows 365 for Agents", v: lic.agent365 ? "in licence" : "needs Agent 365", d: "Continuous policy enforcement for agent endpoints." }
-      ]);
+    // Intune — two sections: governing LOCAL AI agents (shadow → governed) and device trust for agents.
+    // Most Intune policy config has no browser API, so those rows are marked "portal"; reachable signals
+    // (shadow count from AgentsInfo, compliant-device requirement from CA — computed above) show real values.
+    const intune = `<div class="card"><h3>${pillarIcon("intune")} Intune — device &amp; blocking</h3>`
+      + `<div class="subsec"><div class="subh">Local AI agent governance <span class="pill ${shadow ? "Medium" : "Low"}">${shadow} shadow</span></div><ul class="dlist">`
+        + li("Shadow (unmanaged local) agents", shadow, shadow ? "v-warn" : "v-good", "Discovered by Defender; govern on managed Windows via Intune.")
+        + li("Software compliance policy", '<span class="muted">portal</span>', "", "Preview (Win): restrict a local-agent host app by MSI / package id → device non-compliant → CA blocks.")
+        + li("Defender AI agent runtime protection", (lic.agent365 || lic.mdeP2) ? '<span class="v-good">Audit→Block</span>' : "needs MDE P2", "", "Endpoint-security policy; block/audit results in Monitoring → BehaviorInfo.")
+        + li("OpenClaw baseline (WSL / Node.js)", '<span class="muted">portal</span>', "", "Local AI Agent Baseline — pilot first; can disrupt dev workflows.")
+        + li("App protection (mobile AI apps)", '<span class="muted">portal</span>', "", "iOS / Android only: cut/copy/paste, PIN, conditional launch.")
+      + `</ul></div>`
+      + `<div class="subsec"><div class="subh">Device trust for agents <span class="pill ${compliantCA ? "Low" : (ca ? "Medium" : "na")}">${compliantCA ? "compliant-device CA" : (ca ? "not required" : "not read")}</span></div><ul class="dlist">`
+        + li("CA requires compliant device", ca ? (compliantCA ? '<span class="v-good">yes</span>' : '<span class="v-warn">no</span>') : "not read", "", "Device-compliance grant on an agent-targeting CA policy.")
+        + li("Auto-enroll Windows 365 for Agents", lic.agent365 ? '<span class="v-good">in licence</span>' : "needs Agent 365", "", "Continuous policy enforcement for agent Cloud PCs.")
+        + li("Windows 365 for Agents baseline", '<span class="muted">portal</span>', "", "Security baseline for agent Cloud PCs.")
+      + `</ul></div></div>`;
 
     html += `<div class="cols2">${entra}${defender}</div><div class="cols2">${purview}${intune}</div>`;
 
