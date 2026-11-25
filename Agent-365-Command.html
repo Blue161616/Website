@@ -1,0 +1,969 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Agent 365 Command Center — Stealth4</title>
+<!--
+  Agent 365 Command Center — a single-file, read-only control plane for the AI agents in a
+  Microsoft 365 tenant. Three layers:
+    1. IT control plane  — the agent registry (available / with-identity / without-identity / local / shadow)
+    2. Security controls  — Entra · Defender · Purview · Intune posture for agents  (needs Agent 365 licence)  [v1: stub]
+    3. Security monitoring — agent activity, alerts & behaviours via the Agent 365 signal   [v1: stub]
+
+  Reads, READ-ONLY and delegated (as the signed-in user), from CORS-enabled Microsoft endpoints only:
+    • Microsoft Graph advanced hunting (/security/runHuntingQuery) — AgentsInfo (the unified agent inventory
+      for every platform: Copilot Studio, Foundry, Agent Builder, M365 Copilot, third-party & endpoint-discovered
+      local agents), CloudAppEvents, AlertInfo/AlertEvidence, BehaviorInfo/BehaviorEntities.
+    • Microsoft Graph REST — Entra agent identities / blueprints / owners+sponsors (beta), Conditional Access
+      policies, subscribedSkus (licence awareness), directory objects (resolve owner GUIDs → names).
+
+  NOT reachable from a browser (by design, stated honestly rather than faked):
+    • UnifiedAgentObservability — that is a Microsoft Sentinel / Log Analytics data-lake table fed by the
+      Agent 365 Sentinel connector; Log Analytics has no browser CORS, so it needs a backend. The in-tenant
+      agent-activity signal that IS reachable is CloudAppEvents (Defender advanced hunting) — used for Layer 3.
+    • Defender REST API (securitycenter), most Purview compliance APIs, the M365-admin Shadow-AI traffic
+      tiles (GSA-sourced) — portal-only. Shadow-AI DETECTION is reachable (Defender-discovered local agents in
+      AgentsInfo); the GSA traffic/users tiles are marked portal-only.
+
+  No backend, no data leaves the browser. Every call goes straight from your machine to graph.microsoft.com,
+  authorised by a token MSAL holds in sessionStorage (gone when you close the tab).
+
+  Licence-aware: the inventory reads with Defender for Endpoint P2 + ThreatHunting.Read.All; Defender risk
+  indicators and the Agent-365 security/monitoring layers need Microsoft Agent 365 (E7, or an add-on to
+  E5 / Business Premium / Defender+Purview suites). Where a signal can't be read, the tool shows "N/A", not a
+  false negative.
+
+  Author: Stealth4 / Blue16 (blue16.nl).  Product/file name is a placeholder — rename freely.
+-->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 2 28 6v9c0 7.5-5.2 13.3-12 15C9.2 28.3 4 22.5 4 15V6z' fill='%233FA9FF'/%3E%3Cpath d='M16 13.8v3.7M10 17.5h12M10 17.5v2M16 17.5v2M22 17.5v2' stroke='%23050d22' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='16' cy='11' r='2.9' fill='%23050d22'/%3E%3Ccircle cx='10' cy='21.6' r='2.1' fill='%23050d22'/%3E%3Ccircle cx='16' cy='21.6' r='2.1' fill='%23050d22'/%3E%3Ccircle cx='22' cy='21.6' r='2.1' fill='%23050d22'/%3E%3C/svg%3E" />
+<!-- MSAL pinned with Subresource Integrity (SRI). Bump the version → recompute the hash on BOTH tags. -->
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.28.1/lib/msal-browser.min.js"
+        integrity="sha384-B5PXeUfgiegchZiX5iMRssMrHd9NfPhFnITob1HyW1CY76udptWpBsniaDsH/+BY"
+        crossorigin="anonymous"></script>
+<script>
+  if (typeof msal === "undefined") {
+    document.write('<script src="https://unpkg.com/@azure/msal-browser@3.28.1/lib/msal-browser.min.js" integrity="sha384-B5PXeUfgiegchZiX5iMRssMrHd9NfPhFnITob1HyW1CY76udptWpBsniaDsH/+BY" crossorigin="anonymous"><\/script>');
+  }
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Michroma&family=Rajdhani:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  /* ---- Stealth4 theme (shared with the SightLine / Entra-Posture suite) ---------------------- */
+  :root {
+    --bg: #050D22; --bg2: #0C1E45; --card: #0C1E45; --border: #1C3766; --text: #EAF2FF; --muted: #93ACD3;
+    --accent: #3FA9FF; --accent-dark: #8FE3FF;
+    --green: #5EE6B0; --green-bg: rgba(94,230,176,.12);
+    --red: #FF7A8A; --red-bg: rgba(255,122,138,.14);
+    --amber: #FFC15E; --amber-bg: rgba(255,193,94,.12); --orange: #FF9A7A; --blue: #4FB8FF;
+    --sev-crit: #FF4D6D; --sev-high: #FF7A45; --sev-med: #FFC15E; --sev-low: #5EE6B0; --sev-info: #7F8C9A;
+    --input-bg: #050D22; --input-border: #1C3766; --hover: rgba(63,169,255,.07); --code-bg: #0A1733;
+    --shadow: 0 10px 34px -12px rgba(0,0,0,.65), 0 2px 8px rgba(0,0,0,.35);
+    --display: "Michroma","Eurostile","Arial Black",sans-serif;
+    --label: "Rajdhani","Arial Narrow",sans-serif;
+    --body: "IBM Plex Sans","Segoe UI",system-ui,sans-serif;
+    --mono: "Cascadia Code",Consolas,monospace;
+    --grad-blue: linear-gradient(135deg,#4FB8FF 0%,#1557E0 100%);
+  }
+  * { box-sizing: border-box; }
+  html,body { margin: 0; padding: 0; }
+  body { color: var(--text); font-family: var(--body); font-size: 14px; line-height: 1.5; min-height: 100vh;
+    background: radial-gradient(1200px 700px at 50% 0%, #10306A 0%, rgba(16,48,106,0) 60%),
+      linear-gradient(180deg, #0A1C42 0%, var(--bg) 460px);
+    background-color: var(--bg); }
+  body::before { content:''; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background-image: linear-gradient(rgba(63,127,208,.06) 1px, transparent 1px), linear-gradient(90deg, rgba(63,127,208,.06) 1px, transparent 1px);
+    background-size: 40px 40px; -webkit-mask-image: radial-gradient(ellipse at 50% 15%, #000 30%, transparent 80%);
+    mask-image: radial-gradient(ellipse at 50% 15%, #000 30%, transparent 80%); }
+  a { color: var(--accent); }
+  h1,h2,h3,h4 { margin: 0; }
+  button { font-family: var(--body); cursor: pointer; }
+  code { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; color: var(--accent-dark); }
+  header, main { position: relative; z-index: 1; }
+
+  /* ---- header ---- */
+  header { background: rgba(5,13,34,.72); backdrop-filter: blur(8px); color: #fff; padding: 13px 26px;
+    display: flex; align-items: center; gap: 16px; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 900; }
+  header::after { content:''; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent) 18%, var(--accent-dark) 50%, var(--accent) 82%, transparent); opacity: .8; }
+  .brand { display: flex; align-items: center; gap: 11px; }
+  .brand svg { width: 27px; height: 27px; flex-shrink: 0; }
+  .brand .t { font-family: var(--display); font-size: 15px; letter-spacing: .07em; text-transform: uppercase; line-height: 1.1; }
+  .brand .t small { display:block; font-family: var(--label); font-size: 10px; letter-spacing:.12em; color: var(--muted); font-weight:700; margin-top:3px; }
+  .pv { font-size: 9.5px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; background: rgba(255,255,255,.18);
+    border: 1px solid rgba(255,255,255,.38); padding: 2px 7px; border-radius: 10px; }
+  .spacer { flex: 1; }
+  #status { font-size: 12.5px; color: rgba(255,255,255,.9); max-width: 420px; text-align: right; }
+  #status.err { color: #ffdcdc; }
+  .tenant { font-size: 12px; color: var(--muted); font-family: var(--mono); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tenant b { color: var(--text); font-family: var(--body); }
+  .btn { background: var(--bg2); border: 1px solid var(--border); color: var(--text); border-radius: 9px; padding: 8px 14px; font-weight: 600; font-size: 13px; transition: .14s; }
+  .btn:hover { border-color: var(--accent); background: var(--hover); }
+  .btn.p { background: var(--grad-blue); border: 0; color: #041026; box-shadow: var(--shadow); }
+  .btn.p:hover { filter: brightness(1.08); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.sm { padding: 5px 10px; font-size: 12px; border-radius: 7px; }
+  .spinner { display: inline-block; width: 13px; height: 13px; border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -2px; margin-right: 7px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  main { max-width: 1560px; margin: 0 auto; padding: 22px 26px 70px; }
+
+  /* ---- connect screen ---- */
+  .hero { max-width: 900px; margin: 44px auto 0; }
+  .hero h1 { font-family: var(--display); font-size: 25px; letter-spacing: .02em; line-height: 1.3; }
+  .hero .lead { color: var(--muted); font-size: 15px; margin: 14px 0 24px; max-width: 76ch; }
+  .panel { background: linear-gradient(180deg, rgba(20,46,94,.45), rgba(10,28,66,.55)); border: 1px solid var(--border); border-radius: 16px; padding: 24px; box-shadow: var(--shadow); }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 680px) { .row2 { grid-template-columns: 1fr; } }
+  .field label { display: block; font-size: 12px; font-weight: 700; letter-spacing: .04em; color: var(--muted); text-transform: uppercase; margin-bottom: 6px; }
+  .field input { width: 100%; background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text); border-radius: 9px; padding: 10px 12px; font-family: var(--mono); font-size: 13px; }
+  .field input:focus { outline: none; border-color: var(--accent); }
+  .field .hint { font-size: 12px; color: var(--muted); margin-top: 5px; }
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 16px; }
+  details.disc { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px; }
+  details.disc > summary { cursor: pointer; list-style: none; user-select: none; font-size: 14px; font-weight: 600; }
+  details.disc > summary::-webkit-details-marker { display: none; }
+  details.disc > summary::before { content: "\25B8"; display: inline-block; width: 16px; color: var(--accent); transition: transform .15s; }
+  details.disc[open] > summary::before { transform: rotate(90deg); }
+  details.disc .body { margin-top: 12px; color: var(--muted); font-size: 13px; }
+  pre.code { background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px; overflow: auto; font-family: var(--mono); font-size: 12px; color: #CFE3FF; line-height: 1.55; position: relative; }
+  .copy { position: absolute; top: 8px; right: 8px; }
+  .scopes { margin-top: 10px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .scopes .srow { display: grid; grid-template-columns: 290px 1fr; gap: 10px; padding: 8px 13px; border-top: 1px solid var(--border); font-size: 12.5px; }
+  .scopes .srow:first-child { border-top: 0; }
+  .scopes .sp { font-family: var(--mono); color: var(--accent-dark); }
+  .scopes .sw { color: var(--muted); }
+  .tag-opt { font-size: 10px; color: var(--amber); border: 1px solid rgba(255,193,94,.4); border-radius: 999px; padding: 0 6px; margin-left: 6px; vertical-align: 1px; }
+  .foot { margin-top: 36px; padding-top: 18px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; }
+
+  /* ---- nav tabs ---- */
+  .nav { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 18px; border-bottom: 1px solid var(--border); }
+  .nav button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted); padding: 10px 15px; font-size: 13px; font-weight: 600; font-family: var(--label); letter-spacing: .04em; text-transform: uppercase; }
+  .nav button:hover { color: var(--text); }
+  .nav button.on { color: var(--accent); border-bottom-color: var(--accent); }
+  .nav button .soon { font-size: 9px; color: var(--amber); border: 1px solid rgba(255,193,94,.4); border-radius: 999px; padding: 0 5px; margin-left: 6px; vertical-align: 1px; text-transform: none; letter-spacing: 0; }
+
+  /* ---- hero head ---- */
+  .hero-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 20px; margin: 0 0 14px; }
+  .hero-head h2 { font-size: 19px; font-weight: 700; }
+  .hero-sub { font-size: 12.5px; color: var(--muted); }
+
+  /* ---- overview: platform breakdown + tiles ---- */
+  .overview { display: flex; align-items: stretch; gap: 0; margin: 0 0 14px; border: 1px solid var(--border); border-radius: 13px;
+    background: linear-gradient(160deg, rgba(63,169,255,.06), transparent 70%); overflow: hidden; }
+  .ov-item { flex: 1; display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-left: 1px solid var(--border); }
+  .ov-item:first-child { border-left: 0; }
+  .ov-ic { font-size: 20px; line-height: 1; opacity: .9; }
+  .ov-n { font-family: var(--display); font-size: 22px; line-height: 1; }
+  .ov-l { font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); font-weight: 700; font-family: var(--label); margin-top: 3px; }
+  .ov-item.total { background: rgba(63,169,255,.08); } .ov-item.total .ov-n { color: var(--accent-dark); }
+  .ov-item[data-f] { cursor: pointer; transition: background .14s; } .ov-item[data-f]:hover { background: var(--hover); }
+  @media (max-width: 860px) { .overview { flex-wrap: wrap; } .ov-item { flex: 1 1 45%; border-left: 0; } }
+
+  .tiles { display: flex; flex-wrap: wrap; gap: 9px; margin: 0 0 18px; }
+  .tile { flex: 1 1 0; min-width: 142px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 10px 13px; display: flex; align-items: baseline; gap: 10px; }
+  .tile .n { font-family: var(--display); font-size: 19px; line-height: 1; flex: 0 0 auto; }
+  .tile .l { font-size: 10.5px; letter-spacing: .03em; text-transform: uppercase; color: var(--text); font-weight: 700; font-family: var(--label); line-height: 1.15; }
+  .tile .s { font-size: 10px; color: var(--muted); margin-top: 2px; line-height: 1.2; }
+  .tile.warn .n { color: var(--amber); } .tile.bad .n { color: var(--red); } .tile.good .n { color: var(--green); }
+  .tile[data-f] { cursor: pointer; transition: border-color .14s, transform .08s; } .tile[data-f]:hover { border-color: var(--accent); } .tile[data-f]:active { transform: translateY(1px); }
+  .tile.bad { border-color: rgba(255,122,138,.35); } .tile.warn { border-color: rgba(255,193,94,.3); }
+  @media (max-width: 1100px) { .tile { flex: 1 1 30%; } } @media (max-width: 680px) { .tile { flex: 1 1 45%; } }
+
+  .cols2 { display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px; margin-bottom: 18px; }
+  @media (max-width: 920px) { .cols2 { grid-template-columns: 1fr; } }
+  .card { background: linear-gradient(180deg, rgba(20,46,94,.4), rgba(10,28,66,.5)); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); padding: 18px 20px; }
+  .card h3 { font-family: var(--label); font-size: 12.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin-bottom: 12px; display:flex; align-items:center; gap:8px; }
+  .card h3::before { content:""; width: 4px; height: 13px; border-radius: 2px; background: var(--accent); }
+
+  /* platform / risk bar lists */
+  .barlist { list-style: none; padding: 0; margin: 0; }
+  .barlist li { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; align-items: center; padding: 7px 0; border-top: 1px solid rgba(28,55,102,.5); }
+  .barlist li:first-child { border-top: 0; }
+  .barlist .lab { font-size: 13px; } .barlist .val { font-family: var(--display); font-size: 14px; }
+  .barlist .track { grid-column: 1 / -1; height: 5px; background: rgba(28,55,102,.6); border-radius: 3px; overflow: hidden; }
+  .barlist .fill { height: 100%; background: var(--grad-blue); border-radius: 3px; }
+  .barlist .fill.red { background: linear-gradient(90deg,#FF7A45,#FF4D6D); }
+  .barlist .fill.amber { background: linear-gradient(90deg,#FFC15E,#FF9A7A); }
+
+  /* ---- filters ---- */
+  .filters { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; margin-bottom: 14px; }
+  .filters input[type=search] { background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text); border-radius: 9px; padding: 8px 12px; font-size: 13px; min-width: 220px; }
+  .filters select { background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text); border-radius: 9px; padding: 8px 10px; font-size: 12.5px; }
+  .filters input:focus, .filters select:focus { outline: none; border-color: var(--accent); }
+  .filters .fsp { flex: 1; }
+
+  /* ---- segment tables ---- */
+  .seg { margin-top: 18px; }
+  .seg-h { display: flex; align-items: center; gap: 10px; font-family: var(--label); font-weight: 700; letter-spacing: .07em; text-transform: uppercase; font-size: 13px; color: var(--text); padding: 6px 2px; border-bottom: 1px solid var(--border); }
+  .seg-h .ic { font-size: 15px; }
+  .seg-h .ct { color: var(--muted); font-weight: 600; letter-spacing: .02em; text-transform: none; font-family: var(--body); font-size: 12.5px; }
+  .seg-h .hr b { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th { text-align: left; font-family: var(--label); font-weight: 700; letter-spacing: .05em; text-transform: uppercase; font-size: 11px; color: var(--muted); padding: 9px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  thead th.sortable { cursor: pointer; user-select: none; } thead th.sortable:hover { color: var(--text); }
+  tbody td { padding: 9px 10px; border-bottom: 1px solid rgba(28,55,102,.5); vertical-align: top; }
+  tbody tr.ag { cursor: pointer; } tbody tr.ag:hover { background: var(--hover); }
+  .aname { font-weight: 600; } .asub { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+  .chips { display: inline-flex; gap: 5px; flex-wrap: wrap; margin-left: 7px; vertical-align: 1px; }
+  .chip { font-size: 10px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+  .chip.plat { border-color: rgba(63,169,255,.4); color: var(--accent-dark); }
+  .chip.noown { border-color: rgba(255,193,94,.5); color: var(--amber); }
+  .chip.ext { border-color: rgba(255,154,122,.5); color: var(--orange); }
+  .chip.mcp { border-color: rgba(143,227,255,.4); color: var(--accent-dark); }
+  .chip.shadow { border-color: rgba(255,122,138,.5); color: var(--red); background: var(--red-bg); font-weight:600; }
+  .chip.local { border-color: rgba(127,140,154,.5); color: var(--muted); }
+  .pill { display: inline-block; font-size: 11.5px; font-weight: 700; padding: 2px 9px; border-radius: 999px; white-space: nowrap; }
+  .pill.High, .pill.Critical { background: var(--red-bg); color: var(--red); }
+  .pill.Medium { background: var(--amber-bg); color: var(--amber); }
+  .pill.Low { background: var(--green-bg); color: var(--green); }
+  .pill.None, .pill.na { background: rgba(127,140,154,.14); color: var(--muted); }
+  .pill.yes { background: var(--green-bg); color: var(--green); } .pill.no { background: var(--red-bg); color: var(--red); }
+  .muted { color: var(--muted); }
+
+  /* detail flyout row */
+  tr.detail td { background: linear-gradient(180deg, rgba(3,9,24,.75), rgba(5,13,34,.5)); padding: 0; box-shadow: inset 0 3px 0 var(--accent); }
+  .dwrap { padding: 18px; display: grid; grid-template-columns: repeat(auto-fit,minmax(250px,1fr)); gap: 14px; align-items: start; }
+  .dcol { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 0 15px 14px; }
+  .dcol h4 { background: var(--card); margin: 0 -15px 11px; padding: 13px 15px 9px; border-bottom: 1px solid var(--border); font-family: var(--label); font-size: 11.5px; letter-spacing: .09em; text-transform: uppercase; color: var(--accent); display: flex; align-items: center; gap: 7px; }
+  .dcol h4::before { content: ""; width: 4px; height: 13px; border-radius: 2px; background: var(--accent); }
+  .dcol.span2 { grid-column: span 2; } @media (max-width: 760px) { .dcol.span2 { grid-column: span 1; } }
+  .kv { display: grid; grid-template-columns: 120px 1fr; gap: 3px 10px; font-size: 12.5px; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0; word-break: break-word; }
+  .dlist { list-style: none; padding: 0; margin: 0; font-size: 12.5px; }
+  .dlist > li { padding: 6px 0; border-top: 1px solid rgba(28,55,102,.45); } .dlist > li:first-child { border-top: 0; }
+  .dlist .ln { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+  .dlist .meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .v-bad { color: var(--red); font-weight: 600; } .v-warn { color: var(--amber); font-weight: 600; } .v-good { color: var(--green); }
+  .dlinks { margin-top: 10px; display:flex; gap:8px; flex-wrap:wrap; }
+  .empty { text-align: center; color: var(--muted); padding: 50px 20px; }
+  .note { font-size: 12px; color: var(--muted); background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 11px 14px; margin-bottom: 16px; }
+  .note b { color: var(--text); }
+  .note.warn { border-color: rgba(255,193,94,.4); } .note.warn b { color: var(--amber); }
+  .stub { text-align:center; color: var(--muted); padding: 50px 24px; border: 1px dashed var(--border); border-radius: 14px; }
+  .stub h3 { color: var(--text); font-size: 16px; margin-bottom: 10px; }
+  .stub ul { display: inline-block; text-align: left; margin: 12px auto 0; color: var(--muted); font-size: 13px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <svg viewBox="0 0 32 32"><path d="M16 2 28 6v9c0 7.5-5.2 13.3-12 15C9.2 28.3 4 22.5 4 15V6z" fill="rgba(255,255,255,.18)" stroke="#fff" stroke-width="1.6"/><path d="M16 13.8v3.7M10 17.5h12M10 17.5v2M16 17.5v2M22 17.5v2" stroke="#fff" stroke-width="1.5" fill="none" stroke-linecap="round"/><circle cx="16" cy="11" r="2.9" fill="#fff"/><circle cx="10" cy="21.6" r="2.1" fill="#fff"/><circle cx="16" cy="21.6" r="2.1" fill="#fff"/><circle cx="22" cy="21.6" r="2.1" fill="#fff"/></svg>
+    <div class="t">Agent 365 Command<small>Control plane · Security · Monitoring</small></div>
+  </div>
+  <span class="pv">Preview</span>
+  <div class="spacer"></div>
+  <div class="tenant hidden" id="tenantLbl"></div>
+  <div id="status"></div>
+  <button class="btn sm hidden" id="btnRefresh">↻ Refresh</button>
+  <button class="btn sm hidden" id="btnSignout">Sign out</button>
+</header>
+
+<main>
+  <!-- ══ CONNECT ══ -->
+  <section id="connect" class="hero">
+    <h1>One control plane for every agent in your tenant.</h1>
+    <p class="lead">A read-only view across the Microsoft Agent 365 estate — the agent registry (available,
+      with identity, without identity, local and shadow), each agent's owner, blueprint, tools, MCP servers and
+      Defender risk indicators — built on Microsoft's own <code>AgentsInfo</code> inventory and Entra Agent ID.
+      Nothing leaves your browser.</p>
+    <div class="panel">
+      <div class="row2">
+        <div class="field">
+          <label for="inTenant">Tenant</label>
+          <input id="inTenant" value="organizations" spellcheck="false" autocomplete="off" />
+          <div class="hint">Tenant ID or domain (e.g. <code>contoso.onmicrosoft.com</code>). Leave as <code>organizations</code> to pick at sign-in.</div>
+        </div>
+        <div class="field">
+          <label for="inClient">Application (client) ID</label>
+          <input id="inClient" placeholder="00000000-0000-0000-0000-000000000000" spellcheck="false" autocomplete="off" />
+          <div class="hint">From your own single-tenant app registration. No app yet? See <b>First-time setup</b>.</div>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn p" id="btnConnect">Sign in &amp; load agents</button>
+        <button class="btn" id="btnDemo">Explore with demo data</button>
+        <span id="cStatus" class="hint"></span>
+      </div>
+
+      <details class="disc" id="discSetup">
+        <summary>First-time setup — register the read-only app (one time, ~2 min)</summary>
+        <div class="body">
+          <p>This tool talks to Microsoft Graph <b>as you</b>. It needs a single-tenant app registration so Entra
+          trusts this page as a sign-in client. Read-only — no secret, no backend. Run the PowerShell below
+          (needs the <code>Microsoft.Graph.Applications</code> module and a role that can consent), then paste the
+          Application ID it prints above.</p>
+          <p class="hint">Change <code>$RedirectUri</code> to wherever you host this file (for local testing, serve it
+          over <code>http://localhost:&lt;port&gt;/Agent-365-Command.html</code> and use that exact URL).</p>
+          <pre class="code" id="psScript"><button class="btn sm copy" data-copy="psCode">Copy</button><code id="psCode"></code></pre>
+          <div class="scopes" id="scopeList"></div>
+          <p class="hint" style="margin-top:10px">Only <b>User.Read</b> and <b>ThreatHunting.Read.All</b> are required (the
+          agent inventory). The rest are optional — each adds owners/sponsors, blueprints, licence context or CA
+          posture, and the tool degrades cleanly to "not read" when a scope isn't granted.</p>
+        </div>
+      </details>
+      <details class="disc" id="discAbout">
+        <summary>What it reads, and the one thing it can't (honesty)</summary>
+        <div class="body">
+          <p>Everything runs in your browser against <code>graph.microsoft.com</code>. The agent inventory is the
+          Defender advanced-hunting <b>AgentsInfo</b> table (every platform — Copilot Studio, Foundry, Agent Builder,
+          M365 Copilot, third-party and endpoint-discovered local agents). Owners, sponsors and blueprints come from
+          Entra Agent ID; licence context from <code>subscribedSkus</code>.</p>
+          <p><b>It cannot read <code>UnifiedAgentObservability</code>.</b> That is a Microsoft <b>Sentinel</b> /
+          Log Analytics data-lake table (fed by the Agent 365 Sentinel connector), and Log Analytics has no browser
+          CORS — it needs a backend. The agent-activity signal that <i>is</i> reachable in-browser is
+          <b>CloudAppEvents</b> (Defender hunting), which the Monitoring layer will use. Shadow-AI <i>detection</i> is
+          read from AgentsInfo; the admin-center Shadow-AI traffic tiles are GSA/portal-only.</p>
+        </div>
+      </details>
+    </div>
+    <div class="foot">Single self-contained HTML file · read-only · Stealth4 / <a href="https://blue16.nl" target="_blank" rel="noopener">Blue16</a>.</div>
+  </section>
+
+  <!-- ══ APP ══ -->
+  <section id="app" class="hidden">
+    <div class="nav" id="nav">
+      <button data-view="overview" class="on">Overview</button>
+      <button data-view="control">Control plane</button>
+      <button data-view="security">Security controls <span class="soon">soon</span></button>
+      <button data-view="monitoring">Monitoring <span class="soon">soon</span></button>
+    </div>
+    <div id="licenceNote"></div>
+    <div id="partial" class="note warn hidden"></div>
+    <div id="view"></div>
+  </section>
+</main>
+
+<script>
+/* ════════════════════════════════════════════════════════════════════════════
+   Agent 365 Command Center — logic. Single file, read-only. MIT-style starter.
+   ════════════════════════════════════════════════════════════════════════════ */
+(function () {
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+  const enc = encodeURIComponent;
+
+  // ── Scopes (delegated, read-only) ───────────────────────────────────────────
+  const SCOPES = [
+    ["User.Read",                         "Sign you in and read your profile",                                                 true],
+    ["ThreatHunting.Read.All",            "Defender advanced hunting — AgentsInfo (the agent inventory), CloudAppEvents, alerts, behaviours", true],
+    ["AgentIdentity.Read.All",            "Entra agent identities — the governed agents' identity objects",                     false],
+    ["AgentIdentityBlueprint.Read.All",   "Entra agent identity blueprints — template, publisher, inheritable permissions",    false],
+    ["Directory.Read.All",                "Resolve owner / sponsor object IDs to names",                                        false],
+    ["Policy.Read.All",                   "Conditional Access policies — which ones target agents (security-controls layer)",   false],
+    ["Organization.Read.All",             "subscribedSkus — licence awareness (E5 / E7 / Agent 365)",                           false]
+  ];
+  const REQUIRED = SCOPES.filter(s => s[2]).map(s => s[0]);
+  const GRAPH = "https://graph.microsoft.com/v1.0";
+
+  // ── MSAL ─────────────────────────────────────────────────────────────────────
+  const redirectUri = window.location.origin + window.location.pathname;
+  let msalApp = null, account = null, tenantName = "";
+  let DEMO = false;
+
+  function buildMsal(clientId, tenant) {
+    msalApp = new msal.PublicClientApplication({
+      auth: { clientId, authority: "https://login.microsoftonline.com/" + (tenant || "organizations"), redirectUri },
+      cache: { cacheLocation: "sessionStorage", storeAuthStateInCookie: false }
+    });
+    return msalApp.initialize ? msalApp.initialize() : Promise.resolve();
+  }
+  async function token(scopes, interactive) {
+    if (DEMO) return "demo";
+    try {
+      if (interactive) return (await msalApp.acquireTokenPopup({ scopes })).accessToken;
+      return (await msalApp.acquireTokenSilent({ account, scopes })).accessToken;
+    } catch (e) {
+      if (!interactive && (e instanceof msal.InteractionRequiredAuthError || /interaction_required|consent_required|login_required/i.test(e.errorCode || e.message || ""))) {
+        return (await msalApp.acquireTokenPopup({ scopes })).accessToken;
+      }
+      throw e;
+    }
+  }
+  const tokenSilent = scopes => token(scopes, false);
+
+  // ── Network: paged Graph + advanced hunting, with throttle retry & 401 refresh ──
+  const RETRY = [429, 500, 502, 503, 504];
+  const partials = [];
+  function notePartial(label, detail) { if (partials.findIndex(p => p.label === label) < 0) partials.push({ label, detail }); }
+  async function send(url, init, scopes, at) {
+    let force = false;
+    for (let n = 0; n < 5; n++) {
+      const t = at || await token(scopes, force);
+      const r = await fetch(url, Object.assign({}, init, { headers: Object.assign({ Authorization: "Bearer " + t }, (init && init.headers) || {}) }));
+      if (RETRY.includes(r.status) && n < 4) {
+        const ra = +(r.headers.get("Retry-After") || 0);
+        await new Promise(res => setTimeout(res, (ra ? ra * 1000 : Math.min(8000, 600 * Math.pow(2, n))) + Math.random() * 300));
+        continue;
+      }
+      if (r.status === 401 && scopes && !force && !at) { force = true; continue; }
+      return r;
+    }
+  }
+  async function failMsg(r, label) {
+    let d = ""; try { d = ((await r.json()).error || {}).message || ""; } catch (e) {}
+    const e = new Error((label || "Graph") + " " + r.status + (d ? " — " + d : "")); e.status = r.status; return e;
+  }
+  async function gGetAll(path, scopes) {
+    const out = []; let next = /^https?:/.test(path) ? path : GRAPH + path, pages = 0;
+    const home = (next.match(/^https?:\/\/[^\/]+/i) || [""])[0].toLowerCase();
+    while (next && pages < 200) {
+      const r = await send(next, null, scopes);
+      if (!r.ok) throw await failMsg(r, "Graph");
+      const j = await r.json();
+      (j.value || []).forEach(v => out.push(v));
+      next = j["@odata.nextLink"] || null; pages++;
+      if (next && (next.match(/^https?:\/\/[^\/]+/i) || [""])[0].toLowerCase() !== home) next = null;
+    }
+    return out;
+  }
+  async function hunt(q, label) {
+    const at = await tokenSilent(["ThreatHunting.Read.All"]);
+    const r = await send(GRAPH + "/security/runHuntingQuery", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Query: q }) }, ["ThreatHunting.Read.All"], at);
+    if (!r.ok) throw await failMsg(r, label || "Advanced hunting");
+    return (await r.json()).results || [];
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  PARSE & CLASSIFY  (shared by live + demo)
+  // ════════════════════════════════════════════════════════════════════════
+  function jp(v) { if (v == null) return null; if (typeof v !== "string") return v; const s = v.trim(); if (!s) return null; try { return JSON.parse(s); } catch (e) { return v; } }
+  function arr(v) { const p = jp(v); return Array.isArray(p) ? p : (p == null || p === "" ? [] : [p]); }
+  function cnt(v) { const p = jp(v); if (Array.isArray(p)) return p.length; if (p && typeof p === "object") return Object.keys(p).length; return 0; }
+
+  // Known consumer / standalone apps Defender surfaces as local "shadow AI".
+  const SHADOW_RX = /openclaw|zeroclaw|\bclaw\b|chatgpt|ollama|poe\b|opencode|claude desktop|cursor|warp|goose|lm ?studio|jan\b/i;
+
+  function riskList(v) {
+    const p = jp(v); const out = [];
+    if (p && typeof p === "object" && !Array.isArray(p)) {
+      Object.keys(p).forEach(k => { const o = p[k] || {}; out.push({ id: k, title: o.title || o.name || k, desc: o.description || "" }); });
+    } else if (Array.isArray(p)) {
+      p.forEach(o => { if (typeof o === "string") out.push({ id: o, title: o, desc: "" }); else if (o) out.push({ id: o.id || o.title || "", title: o.title || o.name || o.id || "risk", desc: o.description || "" }); });
+    }
+    return out;
+  }
+  function endpointInfo(v) {
+    const a = arr(v); let ext = false; const urls = [];
+    a.forEach(e => { if (!e) return; const o = typeof e === "string" ? { url: e } : e;
+      if (o.url || o.Url || o.endpoint) urls.push(o.url || o.Url || o.endpoint);
+      if (o.externalConnectivity === true || o.external === true || /true/i.test(String(o.ExternalConnectivity || "")) ) ext = true; });
+    return { urls, ext };
+  }
+
+  // One normalized agent record from an AgentsInfo row (defensive about column case).
+  function normAgent(r) {
+    const name = r.Name || r.AgentName || r.DisplayName || "(agent)";
+    const platform = r.Platform || "Other";
+    const local = /local/i.test(platform);
+    const entraId = r.EntraAgentID || r.EntraAgentId || null;
+    const bpId = r.EntraBlueprintID || r.EntraBlueprintId || null;
+    const owners = arr(r.Owners).map(o => (o && (o.objectId || o.id || o.Id)) || o).filter(Boolean);
+    const risks = riskList(r.RiskIndicators);
+    const ep = endpointInfo(r.Endpoints);
+    const raw = jp(r.RawAgentInfo) || {};
+    const vendor = (raw.localAgentMetadata && raw.localAgentMetadata.vendor) || (raw.aiAgentMetadata && raw.aiAgentMetadata.vendor) || "";
+    const managed = !!entraId;
+    const shadow = local && !managed && (SHADOW_RX.test(name) || SHADOW_RX.test(vendor) || true); // any unmanaged local = shadow per GSA definition
+    const category = managed ? "identity" : local ? "local" : "registry";
+    return {
+      id: r.AgentId || r.SourceAgentId || (name + ":" + platform),
+      name, platform, local, shadow, managed, category,
+      entraId, bpId, vendor,
+      model: r.Model || (raw.aiAgentMetadata && raw.aiAgentMetadata.model) || null,
+      version: r.Version || null,
+      owners, ownerCount: owners.length,
+      lifecycle: r.LifecycleStatus || "", published: r.PublishedStatus || r.PublishedState || "",
+      tools: cnt(r.DeclaredTools), toolList: arr(r.DeclaredTools),
+      mcp: cnt(r.McpServers), mcpList: arr(r.McpServers),
+      connected: cnt(r.ConnectedAgents), connectedList: arr(r.ConnectedAgents),
+      dataSources: cnt(r.DeclaredDataSources), dataList: arr(r.DeclaredDataSources),
+      skills: cnt(r.Skills), capabilities: arr(r.Capabilities), channels: arr(r.Channels),
+      endpoints: ep.urls, externalEndpoint: ep.ext,
+      created: r.CreatedDateTime || null, availability: r.Availability || "", sharedWith: r.SharedWith || "",
+      description: r.AgentDescription || r.Description || "",
+      risks, riskLevel: risks.length ? (risks.length >= 3 ? "High" : risks.length >= 2 ? "Medium" : "Low") : "None",
+      sourceId: r.SourceAgentId || null
+    };
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  LIVE COLLECTION
+  // ════════════════════════════════════════════════════════════════════════
+  async function collectLive() {
+    partials.length = 0;
+    const out = { agents: [], caps: {}, licence: null, errors: {} };
+    // Agent inventory — AgentsInfo, latest state, all platforms. Gotchas (from the field):
+    //   • 30-day window (local agents report infrequently; a 7-day default drops them)
+    //   • LifecycleStatus can be EMPTY for local agents → KQL null semantics drop them with "!= 'Deleted'"
+    const q = "AgentsInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by AgentId"
+            + " | where isempty(LifecycleStatus) or LifecycleStatus != 'Deleted'";
+    let rows;
+    try { rows = await hunt(q, "AgentsInfo"); out.caps.inventory = true; }
+    catch (e) { out.errors.inventory = e.message; out.caps.inventory = false; return out; }
+    out.agents = rows.map(normAgent);
+
+    // Optional enrich: blueprints (name/publisher) keyed by id — beta endpoint, tolerate absence.
+    try {
+      const bps = await gGetAll("https://graph.microsoft.com/beta/directory/agentIdentityBlueprints?$select=id,displayName,verifiedPublisher", ["AgentIdentityBlueprint.Read.All"]);
+      const byId = {}; bps.forEach(b => byId[String(b.id).toLowerCase()] = b);
+      out.agents.forEach(a => { if (a.bpId && byId[String(a.bpId).toLowerCase()]) { const b = byId[String(a.bpId).toLowerCase()]; a.blueprintName = b.displayName; a.publisher = (b.verifiedPublisher && b.verifiedPublisher.displayName) || null; } });
+      out.caps.blueprints = true;
+    } catch (e) { out.caps.blueprints = false; notePartial("Blueprints", "Blueprint names/publishers not read — grant AgentIdentityBlueprint.Read.All (beta)."); }
+
+    // Optional enrich: resolve owner object IDs → display names (batch-ish, capped).
+    try {
+      const ids = Array.from(new Set(out.agents.flatMap(a => a.owners))).slice(0, 200);
+      if (ids.length) {
+        const map = {};
+        for (let i = 0; i < ids.length; i += 20) {
+          const chunk = ids.slice(i, i + 20);
+          const r = await send(GRAPH + "/directoryObjects/getByIds", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids: chunk, types: ["user", "servicePrincipal", "group"] }) }, ["Directory.Read.All"]);
+          if (!r.ok) throw await failMsg(r, "Directory");
+          (await r.json()).value.forEach(o => map[String(o.id).toLowerCase()] = o.displayName || o.userPrincipalName || o.id);
+        }
+        out.agents.forEach(a => a.ownerNames = a.owners.map(o => map[String(o).toLowerCase()] || o));
+        out.caps.owners = true;
+      }
+    } catch (e) { out.caps.owners = false; notePartial("Owners", "Owner names not resolved — grant Directory.Read.All. (Owner counts still shown.)"); }
+
+    // Optional: licence context.
+    try {
+      const skus = await gGetAll("/subscribedSkus?$select=skuPartNumber,skuId,prepaidUnits,consumedUnits", ["Organization.Read.All"]);
+      out.licence = classifyLicence(skus); out.caps.licence = true;
+    } catch (e) { out.caps.licence = false; }
+    return out;
+  }
+
+  function classifyLicence(skus) {
+    const parts = (skus || []).map(s => String(s.skuPartNumber || "").toUpperCase());
+    const has = rx => parts.some(p => rx.test(p));
+    const agent365 = has(/AGENT_?365|AGENT365/) || has(/_E7|FRONTIER/);
+    const e5 = has(/E5|A5|SPE_E5|ENTERPRISEPREMIUM/);
+    const mdeP2 = has(/MDATP|DEFENDER|WIN_?DEF_?ATP|THREAT_?INT|E5|E7/);
+    return { agent365, e5, mdeP2, raw: parts };
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  DEMO DATA  (grounded in a real tenant's shape: ~403 cloud, Platform "Other" ~401,
+  //  a couple of governed agents with Entra identity, almost none with an owner, plus a
+  //  few transient local/shadow agents. Matches the "empty-tenant registry ≈ 401" baseline.)
+  // ════════════════════════════════════════════════════════════════════════
+  function collectDemo() {
+    const agents = [];
+    const push = o => agents.push(normAgent(o));
+
+    // The published / available registry catalogue (Platform "Other") — ~401 rows, a handful named.
+    const named = ["Canva", "Datasite Dealmaker", "Morningstar Research", "FactSet Insights", "Jira Assistant",
+      "ServiceNow Now Assist", "Adobe Express", "Workday Advisor", "SAP Joule", "Zoom AI Companion"];
+    named.forEach((n, i) => push({ AgentId: "reg-named-" + i, Name: n, Platform: "Other", PublishedStatus: "Published",
+      DeclaredTools: JSON.stringify([{ type: "API", name: n + " API" }]), RiskIndicators: i < 3 ? JSON.stringify({ "pub": { title: "Published Agent", description: "Third-party published agent available to users." } }) : "" }));
+    for (let i = 0; i < 391; i++) push({ AgentId: "reg-" + i, Name: "Marketplace agent " + (i + 1), Platform: "Other", PublishedStatus: "Published" });
+
+    // Governed agents WITH an Entra identity (blueprint) — the small managed subset.
+    push({ AgentId: "gov-1", Name: "Contoso HR Helper", Platform: "Copilot Studio", Model: "gpt-4o",
+      EntraAgentID: "a1b2c3d4-0000-0000-0000-000000000001", EntraBlueprintID: "25664c89-cea5-4ab6-b924-a54fd8a19ae0",
+      Owners: JSON.stringify([{ objectId: "11111111-1111-1111-1111-111111111111" }]), LifecycleStatus: "Active", PublishedStatus: "Published",
+      DeclaredTools: JSON.stringify([{ type: "MCP Server", name: "SharePoint" }, { type: "Knowledge Source", name: "HR Policies" }]),
+      McpServers: JSON.stringify([{ name: "SharePoint MCP", server: "spo.contoso.com" }]),
+      ConnectedAgents: JSON.stringify([{ name: "IT Helpdesk Agent" }]),
+      DeclaredDataSources: JSON.stringify([{ name: "HR SharePoint" }]),
+      Endpoints: JSON.stringify([{ url: "https://hr.contoso.com/agent", externalConnectivity: true }]),
+      RiskIndicators: JSON.stringify({ priv: { title: "Privileged Business-system Access", description: "Has write access to a key business system." }, pub: { title: "Published Agent", description: "Available to all users." } }) });
+    push({ AgentId: "gov-2", Name: "Finance Forecaster", Platform: "Foundry", Model: "gpt-4.1",
+      EntraAgentID: "a1b2c3d4-0000-0000-0000-000000000002", EntraBlueprintID: "bp-foundry-01",
+      Owners: "[]", LifecycleStatus: "Active",
+      DeclaredTools: JSON.stringify([{ type: "code_interpreter", name: "Python" }, { type: "bing_grounding", name: "Web" }]),
+      RiskIndicators: JSON.stringify({ weak: { title: "Weak Instructions", description: "System prompt lacks guardrails." }, high: { title: "High-usage Agent", description: "Invoked at high volume." } }) });
+
+    // Agents WITHOUT identity (registry-only) built with Agent Builder — no Entra id, no owner.
+    push({ AgentId: "nb-1", Name: "Sales Deck Drafter", Platform: "Agent Builder", LifecycleStatus: "",
+      DeclaredTools: JSON.stringify([{ type: "Knowledge Source", name: "Deck templates" }]) });
+    push({ AgentId: "nb-2", Name: "Meeting Notes Bot", Platform: "Agent Builder", LifecycleStatus: "" });
+
+    // One more governed Copilot Studio agent that happens to have an owner (so "with owner" > 0).
+    push({ AgentId: "gov-3", Name: "IT Helpdesk Agent", Platform: "Copilot Studio", Model: "gpt-4o",
+      EntraAgentID: "a1b2c3d4-0000-0000-0000-000000000003", EntraBlueprintID: "25664c89-cea5-4ab6-b924-a54fd8a19ae0",
+      Owners: JSON.stringify([{ objectId: "11111111-1111-1111-1111-111111111111" }]), LifecycleStatus: "Active",
+      McpServers: JSON.stringify([{ name: "ServiceNow MCP" }]),
+      DeclaredTools: JSON.stringify([{ type: "MCP Server", name: "ServiceNow" }]) });
+
+    // Local / shadow AI (Defender-discovered on user devices) — transient, unmanaged, no Entra id.
+    [["Claude Desktop", "Anthropic"], ["Ollama Desktop", "Ollama"], ["OpenClaw", "Community"], ["ChatGPT Desktop", "OpenAI"]].forEach((v, i) =>
+      push({ AgentId: "loc-" + i, Name: v[0], Platform: "LocalAgents", LifecycleStatus: "",
+        RawAgentInfo: JSON.stringify({ localAgentMetadata: { vendor: v[1], localMcps: i % 2 ? [{ name: "filesystem" }] : [] } }),
+        McpServers: i % 2 ? JSON.stringify([{ name: "filesystem" }]) : "",
+        RiskIndicators: v[0] === "OpenClaw" ? JSON.stringify({ crit: { title: "Running on a critical device", description: "Detected on a device flagged critical." } }) : "" }));
+
+    // demo blueprint + owner-name enrichment
+    const out = { agents, caps: { inventory: true, blueprints: true, owners: true, licence: true }, errors: {},
+      licence: { agent365: false, e5: true, mdeP2: true, raw: ["SPE_E5"] } };
+    out.agents.forEach(a => {
+      if (a.bpId === "25664c89-cea5-4ab6-b924-a54fd8a19ae0") { a.blueprintName = "Copilot Studio (global)"; a.publisher = "Microsoft"; }
+      else if (a.bpId) { a.blueprintName = "Foundry blueprint"; a.publisher = null; }
+      a.ownerNames = a.owners.map(() => "Derk van der Woude");
+    });
+    return out;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  STATE + RENDER
+  // ════════════════════════════════════════════════════════════════════════
+  let DATA = null, VIEW = "overview";
+  const STATE = { q: "", cat: "", plat: "", risk: "", flag: "", sortCol: "risk", sortDir: -1 };
+  const EXPANDED = {};
+  const PLAT_ICON = { "Copilot Studio": "🟦", "Foundry": "🧪", "Agent Builder": "🧩", "Other": "🏪", "LocalAgents": "💻" };
+
+  const SEGMENTS = [
+    ["identity", "🪪", "With identity (blueprint)", "Governed agents — an Entra Agent ID + blueprint"],
+    ["registry", "🏪", "Registry — without identity", "Registered / available, no Entra agent identity"],
+    ["local", "💻", "Local & shadow agents", "Endpoint-discovered agents (Defender)"]
+  ];
+
+  function all() { return DATA ? DATA.agents : []; }
+  function matches(a) {
+    const S = STATE, q = S.q.toLowerCase();
+    if (q && !((a.name || "").toLowerCase().includes(q) || (a.platform || "").toLowerCase().includes(q) || (a.vendor || "").toLowerCase().includes(q))) return false;
+    if (S.cat && a.category !== S.cat) return false;
+    if (S.plat && a.platform !== S.plat) return false;
+    if (S.risk && a.riskLevel !== S.risk) return false;
+    if (S.flag === "noowner" && a.ownerCount > 0) return false;
+    if (S.flag === "risk" && !a.risks.length) return false;
+    if (S.flag === "ext" && !a.externalEndpoint) return false;
+    if (S.flag === "mcp" && !a.mcp) return false;
+    if (S.flag === "shadow" && !a.shadow) return false;
+    if (S.flag === "connected" && !a.connected) return false;
+    return true;
+  }
+
+  function platformCounts(list) { const m = {}; list.forEach(a => m[a.platform] = (m[a.platform] || 0) + 1); return m; }
+  function riskRollup(list) { const m = {}; list.forEach(a => a.risks.forEach(r => m[r.title] = (m[r.title] || 0) + 1)); return Object.entries(m).sort((x, y) => y[1] - x[1]); }
+
+  // ── OVERVIEW ──
+  function renderOverview() {
+    const A = all();
+    const total = A.length;
+    const identity = A.filter(a => a.category === "identity").length;
+    const registry = A.filter(a => a.category === "registry").length;
+    const local = A.filter(a => a.local).length;
+    const shadow = A.filter(a => a.shadow).length;
+    const noOwner = A.filter(a => a.ownerCount === 0 && !a.local).length;
+    const withRisk = A.filter(a => a.risks.length).length;
+    const ext = A.filter(a => a.externalEndpoint).length;
+    const withMcp = A.filter(a => a.mcp > 0).length;
+    const connected = A.filter(a => a.connected > 0).length;
+
+    const ov = [
+      { ic: "🤖", n: total, l: "Agents total", total: true, f: "clear" },
+      { ic: "🪪", n: identity, l: "With identity", f: "cat:identity" },
+      { ic: "🏪", n: registry, l: "Registry only", f: "cat:registry" },
+      { ic: "💻", n: local, l: "Local agents", f: "cat:local" },
+      { ic: "👁", n: shadow, l: "Shadow AI", f: "flag:shadow" }
+    ];
+    const tiles = [
+      { n: noOwner, l: "No owner", s: "cloud agents, unowned", f: "flag:noowner", bad: noOwner > 0 },
+      { n: withRisk, l: "Risk indicators", s: "Defender-flagged", f: "flag:risk", bad: withRisk > 0 },
+      { n: ext, l: "External endpoint", s: "outbound connectivity", f: "flag:ext", warn: ext > 0 },
+      { n: withMcp, l: "MCP servers", s: "tool connections", f: "flag:mcp", warn: withMcp > 0 },
+      { n: connected, l: "Multi-agent", s: "connected agents", f: "flag:connected" }
+    ];
+    const plats = platformCounts(A);
+    const platMax = Math.max(1, ...Object.values(plats));
+    const rr = riskRollup(A);
+    const rrMax = Math.max(1, ...rr.map(x => x[1]));
+
+    let html = `<div class="hero-head"><div><h2>Agent estate overview</h2>
+      <div class="hero-sub">Every agent across the tenant — registry, identity, local and shadow — from Defender's <code>AgentsInfo</code> inventory.</div></div></div>`;
+    html += `<div class="overview">` + ov.map(o => `<div class="ov-item ${o.total ? "total" : ""}" data-f="${o.f}" tabindex="0" role="button">
+        <span class="ov-ic">${o.ic}</span><div><div class="ov-n">${o.n}</div><div class="ov-l">${esc(o.l)}</div></div></div>`).join("") + `</div>`;
+    html += `<div class="tiles">` + tiles.map(t => `<div class="tile ${t.bad && t.n ? "bad" : t.warn && t.n ? "warn" : t.n ? "" : "good"}" data-f="${t.f}" tabindex="0" role="button">
+        <div class="n">${t.n}</div><div><div class="l">${esc(t.l)}</div><div class="s">${esc(t.s)}</div></div></div>`).join("") + `</div>`;
+
+    html += `<div class="cols2">
+      <div class="card"><h3>By platform</h3><ul class="barlist">` +
+        Object.entries(plats).sort((a, b) => b[1] - a[1]).map(([p, n]) => `<li><span class="lab">${PLAT_ICON[p] || "•"} ${esc(p)}</span><span class="val">${n}</span><span class="track"><span class="fill" style="width:${Math.round(n / platMax * 100)}%"></span></span></li>`).join("") +
+        `</ul></div>
+      <div class="card"><h3>Defender risk indicators</h3>` +
+        (rr.length ? `<ul class="barlist">` + rr.map(([t, n]) => `<li><span class="lab">${esc(t)}</span><span class="val">${n}</span><span class="track"><span class="fill ${n >= rrMax * 0.6 ? "red" : "amber"}" style="width:${Math.round(n / rrMax * 100)}%"></span></span></li>`).join("") + `</ul>`
+          : (DATA.licence && DATA.licence.agent365 === false ? `<div class="muted">No risk indicators. These are Defender-assessed and need <b>Microsoft Agent 365</b> (or MDE P2 + security for AI). Inventory is shown regardless.</div>` : `<div class="v-good">No risk indicators flagged on any agent.</div>`)) +
+        `</div>
+    </div>`;
+
+    // Shadow AI honesty note
+    html += `<div class="note"><b>Shadow AI:</b> ${shadow} unmanaged local agent${shadow === 1 ? "" : "s"} discovered by Defender (shown in <b>Local &amp; shadow</b>). The admin-center Shadow-AI <i>traffic / users / devices</i> tiles are sourced from Global Secure Access and the M365 admin portal, which have no browser API — those are portal-only.</div>`;
+    $("view").innerHTML = html;
+    wireFilters();
+  }
+
+  // ── CONTROL PLANE (table) ──
+  const SORTK = {
+    risk: a => ({ High: 3, Medium: 2, Low: 1, None: 0 }[a.riskLevel] || 0),
+    name: a => (a.name || "").toLowerCase(),
+    platform: a => (a.platform || "").toLowerCase(),
+    owner: a => a.ownerCount,
+    tools: a => a.tools + a.mcp + a.connected
+  };
+  function agentRow(a) {
+    const chips = [];
+    chips.push(`<span class="chip plat">${PLAT_ICON[a.platform] || "•"} ${esc(a.platform)}</span>`);
+    if (a.shadow) chips.push(`<span class="chip shadow" title="Unmanaged local agent (shadow AI)">shadow</span>`);
+    else if (a.local) chips.push(`<span class="chip local">local</span>`);
+    if (!a.local && a.ownerCount === 0) chips.push(`<span class="chip noown" title="No owner assigned">no owner</span>`);
+    if (a.externalEndpoint) chips.push(`<span class="chip ext" title="Runtime endpoint with external connectivity">external</span>`);
+    if (a.mcp) chips.push(`<span class="chip mcp" title="${a.mcp} MCP server(s)">MCP ${a.mcp}</span>`);
+    const idCell = a.managed
+      ? `<span class="pill yes">identity</span><div class="asub">${a.blueprintName ? esc(a.blueprintName) : (a.bpId ? "blueprint" : "no blueprint")}</div>`
+      : a.local ? `<span class="muted">local</span>` : `<span class="pill no">none</span><div class="asub">registry only</div>`;
+    const owner = a.local ? '<span class="muted">—</span>'
+      : a.ownerCount === 0 ? '<span class="v-warn">none</span>'
+      : esc((a.ownerNames && a.ownerNames[0]) || (a.ownerCount + " owner" + (a.ownerCount > 1 ? "s" : "")));
+    const cap = [a.tools ? a.tools + " tools" : "", a.mcp ? a.mcp + " MCP" : "", a.connected ? a.connected + " linked" : ""].filter(Boolean).join(" · ") || '<span class="muted">—</span>';
+    return `<tr class="ag" data-id="${esc(a.id)}">
+      <td><div class="aname">${esc(a.name)}<span class="chips">${chips.join("")}</span></div>${a.model ? `<div class="asub">${esc(a.model)}</div>` : ""}</td>
+      <td>${idCell}</td>
+      <td>${owner}</td>
+      <td>${cap}</td>
+      <td>${a.risks.length ? `<span class="pill ${a.riskLevel}">${a.risks.length} · ${a.riskLevel}</span>` : '<span class="pill None">none</span>'}</td>
+      <td class="muted">${esc(a.lifecycle || (a.local ? "—" : "—"))}</td>
+    </tr>`;
+  }
+  function detailRow(a) {
+    const kv = (l, v) => `<dt>${esc(l)}</dt><dd>${v}</dd>`;
+    const listCard = (title, items, fmt) => `<div class="dcol"><h4>${esc(title)}</h4>` +
+      (items && items.length ? `<ul class="dlist">${items.slice(0, 20).map(fmt).join("")}</ul>` : `<div class="muted">None.</div>`) + `</div>`;
+    const idc = `<div class="dcol"><h4>Identity &amp; governance</h4><dl class="kv">
+      ${kv("Category", a.managed ? "Agent identity (blueprint)" : a.local ? "Local / shadow" : "Registry-only (no identity)")}
+      ${kv("Platform", esc(a.platform))}
+      ${a.managed ? kv("Entra agent id", "<code>" + esc(a.entraId) + "</code>") : ""}
+      ${a.bpId ? kv("Blueprint", (a.blueprintName ? esc(a.blueprintName) + " · " : "") + "<code>" + esc(a.bpId) + "</code>") : ""}
+      ${a.publisher ? kv("Publisher", esc(a.publisher)) : ""}
+      ${kv("Owner(s)", a.local ? '<span class="muted">n/a (endpoint agent)</span>' : a.ownerCount === 0 ? '<span class="v-warn">none — unsponsored</span>' : esc((a.ownerNames || a.owners).join(", ")))}
+      ${a.lifecycle ? kv("Lifecycle", esc(a.lifecycle)) : ""}
+      ${a.published ? kv("Published", esc(a.published)) : ""}
+      ${a.availability ? kv("Availability", esc(a.availability)) : ""}
+      ${a.vendor ? kv("Vendor", esc(a.vendor)) : ""}
+    </dl></div>`;
+    const riskc = `<div class="dcol"><h4>Risk indicators</h4>` +
+      (a.risks.length ? `<ul class="dlist">${a.risks.map(r => `<li><div class="ln"><b class="v-bad">${esc(r.title)}</b></div>${r.desc ? `<div class="meta">${esc(r.desc)}</div>` : ""}</li>`).join("")}</ul>`
+        : `<div class="muted">${DATA.licence && DATA.licence.agent365 === false ? "Needs Agent 365 / Defender security for AI." : "No risk indicators."}</div>`) + `</div>`;
+    const toolc = listCard("Declared tools", a.toolList, t => { const o = typeof t === "string" ? { name: t } : t; return `<li><div class="ln"><b>${esc(o.name || o.type || "tool")}</b>${o.type ? `<span class="meta">${esc(o.type)}</span>` : ""}</div>${o.endpoint ? `<div class="meta">${esc(o.endpoint)}</div>` : ""}</li>`; });
+    const mcpc = listCard("MCP servers", a.mcpList, m => { const o = typeof m === "string" ? { name: m } : m; return `<li><b>${esc(o.name || o.server || "MCP")}</b>${o.server ? `<div class="meta">${esc(o.server)}</div>` : ""}</li>`; });
+    const connc = listCard("Connected agents", a.connectedList, c => { const o = typeof c === "string" ? { name: c } : c; return `<li>${esc(o.name || o.id || "agent")}</li>`; });
+    const datac = `<div class="dcol"><h4>Data &amp; endpoints</h4>
+      ${a.dataList.length ? `<div class="meta" style="margin-bottom:4px">Data sources</div><ul class="dlist">${a.dataList.slice(0, 10).map(d => { const o = typeof d === "string" ? { name: d } : d; return `<li>${esc(o.name || o.type || "source")}</li>`; }).join("")}</ul>` : '<div class="muted">No declared data sources.</div>'}
+      ${a.endpoints.length ? `<div class="meta" style="margin:8px 0 4px">Endpoints ${a.externalEndpoint ? '<span class="v-warn">· external</span>' : ""}</div><ul class="dlist">${a.endpoints.slice(0, 6).map(u => `<li><code>${esc(u)}</code></li>`).join("")}</ul>` : ""}
+    </div>`;
+    // deep links (live only)
+    let links = "";
+    if (!DEMO) {
+      const l = [];
+      l.push(`<a class="btn sm" href="https://admin.microsoft.com/#/agents" target="_blank" rel="noopener">M365 admin ↗</a>`);
+      if (a.entraId) l.push(`<a class="btn sm" href="https://entra.microsoft.com/#view/Microsoft_AAD_IAM/ServicePrincipalMenuBlade/~/Overview/objectId/${enc(a.entraId)}" target="_blank" rel="noopener">Entra ↗</a>`);
+      l.push(`<a class="btn sm" href="https://security.microsoft.com/ai-agents" target="_blank" rel="noopener">Defender ↗</a>`);
+      links = `<div class="dlinks">${l.join("")}</div>`;
+    }
+    const metac = `<div class="dcol"><h4>Inventory</h4><dl class="kv">
+      ${a.version ? kv("Version", esc(a.version)) : ""}
+      ${a.created ? kv("Created", esc(String(a.created).slice(0, 10))) : ""}
+      ${a.channels.length ? kv("Channels", esc(a.channels.map(c => typeof c === "string" ? c : (c.name || c.type || "")).filter(Boolean).join(", "))) : ""}
+      ${a.skills ? kv("Skills", a.skills) : ""}
+      ${kv("Agent id", "<code>" + esc(a.id) + "</code>")}
+      ${a.description ? kv("Description", esc(a.description)) : ""}
+    </dl>${links}</div>`;
+    return `<tr class="detail"><td colspan="6"><div class="dwrap">${idc}${riskc}${toolc}${mcpc}${connc}${datac}${metac}</div></td></tr>`;
+  }
+
+  function renderControl() {
+    let html = `<div class="hero-head"><div><h2>Control plane</h2>
+      <div class="hero-sub">Every registered agent with its identity, owner, tools, MCP servers and Defender risk — expand a row for the full record.</div></div></div>`;
+    html += `<div class="filters">
+      <input type="search" id="fQ" placeholder="Search name, platform, vendor…" value="${esc(STATE.q)}" />
+      <select id="fPlat"><option value="">All platforms</option></select>
+      <select id="fRisk"><option value="">Any risk</option><option>High</option><option>Medium</option><option>Low</option><option value="None">None</option></select>
+      <select id="fFlag"><option value="">Any flag</option><option value="noowner">No owner</option><option value="risk">Has risk indicator</option><option value="ext">External endpoint</option><option value="mcp">Has MCP server</option><option value="connected">Multi-agent</option><option value="shadow">Shadow AI</option></select>
+      <span class="fsp"></span><button class="btn sm" id="fClear">Clear</button></div>`;
+    html += `<div id="segs"></div><div id="emptyMsg" class="empty hidden">No agents match these filters.</div>`;
+    $("view").innerHTML = html;
+
+    // platform options
+    const platSel = $("fPlat"); Object.keys(platformCounts(all())).sort().forEach(p => { const o = document.createElement("option"); o.value = p; o.textContent = p; if (STATE.plat === p) o.selected = true; platSel.appendChild(o); });
+    $("fRisk").value = STATE.risk; $("fFlag").value = STATE.flag;
+    renderSegs();
+    wireControl();
+  }
+  function renderSegs() {
+    const filtered = all().filter(matches);
+    const cmp = (a, b) => { const k = SORTK[STATE.sortCol] || SORTK.risk; const av = k(a), bv = k(b); if (av < bv) return -STATE.sortDir; if (av > bv) return STATE.sortDir; return (a.name || "").localeCompare(b.name || ""); };
+    const head = `<thead><tr>
+      <th class="sortable" data-sort="name">Agent</th>
+      <th class="sortable" data-sort="platform">Identity</th>
+      <th class="sortable" data-sort="owner">Owner</th>
+      <th class="sortable" data-sort="tools">Capabilities</th>
+      <th class="sortable" data-sort="risk">Risk</th>
+      <th>Lifecycle</th></tr></thead>`;
+    const bySeg = {}; filtered.forEach(a => (bySeg[a.category] = bySeg[a.category] || []).push(a));
+    let html = "";
+    SEGMENTS.forEach(seg => {
+      const list = (bySeg[seg[0]] || []).sort(cmp);
+      if (!list.length) return;
+      const risky = list.filter(a => a.riskLevel === "High" || a.riskLevel === "Medium").length;
+      const cap = seg[0] === "registry" && list.length > 60 ? 60 : 1e9;
+      const shown = list.slice(0, cap);
+      html += `<div class="seg"><div class="seg-h"><span class="ic">${seg[1]}</span> ${esc(seg[2])}
+        <span class="ct">${list.length} agent${list.length === 1 ? "" : "s"}${risky ? ` · <span class="hr"><b>${risky}</b> with risk</span>` : ""} · <span class="muted">${esc(seg[3])}</span></span></div>
+        <table>${head}<tbody>${shown.map(a => agentRow(a) + (EXPANDED[a.id] ? detailRow(a) : "")).join("")}</tbody></table>
+        ${list.length > cap ? `<div class="meta" style="padding:8px 2px;color:var(--muted)">Showing first ${cap} of ${list.length} — use search / filters to narrow the registry.</div>` : ""}</div>`;
+    });
+    $("segs").innerHTML = html || "";
+    $("emptyMsg").classList.toggle("hidden", filtered.length > 0);
+    $("segs").querySelectorAll("tr.ag").forEach(tr => tr.addEventListener("click", () => {
+      const id = tr.getAttribute("data-id"); EXPANDED[id] = !EXPANDED[id]; renderSegs();
+    }));
+    $("segs").querySelectorAll("th.sortable").forEach(th => th.addEventListener("click", () => {
+      const c = th.getAttribute("data-sort");
+      if (STATE.sortCol === c) STATE.sortDir *= -1; else { STATE.sortCol = c; STATE.sortDir = (c === "name" || c === "platform") ? 1 : -1; }
+      renderSegs();
+    }));
+  }
+  function wireControl() {
+    $("fQ").addEventListener("input", e => { STATE.q = e.target.value; renderSegs(); });
+    $("fPlat").addEventListener("change", e => { STATE.plat = e.target.value; renderSegs(); });
+    $("fRisk").addEventListener("change", e => { STATE.risk = e.target.value; renderSegs(); });
+    $("fFlag").addEventListener("change", e => { STATE.flag = e.target.value; renderSegs(); });
+    $("fClear").addEventListener("click", () => { Object.assign(STATE, { q: "", plat: "", risk: "", flag: "" }); renderControl(); });
+  }
+
+  // ── STUB VIEWS ──
+  function renderStub(which) {
+    const map = {
+      security: { h: "Security controls", p: "The Entra · Defender · Purview · Intune posture for agents.",
+        items: ["Conditional Access policies that target agents (Graph — Policy.Read.All)",
+          "Defender risk indicators & recommendations per agent (AgentsInfo — already collected)",
+          "Licence map: who can apply controls (subscribedSkus — E5 / E7 / Agent 365)",
+          "Purview DLP / audit / compliance posture — portal/limited-API, shown as read-where-possible",
+          "Intune device-compliance requirement for agent CA — noted where no browser API"] },
+      monitoring: { h: "Security monitoring", p: "Agent activity, alerts and behaviours — the reachable signal.",
+        items: ["CloudAppEvents — agent actions, tool invocations, data access (Defender hunting)",
+          "AlertInfo / AlertEvidence — alerts naming an agent",
+          "BehaviorInfo / BehaviorEntities — real-time protection block/audit",
+          "UnifiedAgentObservability — Sentinel-only (no browser CORS); needs a backend, noted not faked"] }
+    };
+    const m = map[which];
+    $("view").innerHTML = `<div class="stub"><h3>${esc(m.h)} — coming next</h3><p>${esc(m.p)}</p>
+      <ul>${m.items.map(i => `<li>${esc(i)}</li>`).join("")}</ul>
+      <p class="muted" style="margin-top:14px">v1 ships Overview + Control plane. This layer is scoped and reachable; say the word to build it.</p></div>`;
+  }
+
+  function renderView() {
+    $("nav").querySelectorAll("button").forEach(b => b.classList.toggle("on", b.getAttribute("data-view") === VIEW));
+    if (VIEW === "overview") renderOverview();
+    else if (VIEW === "control") renderControl();
+    else renderStub(VIEW);
+  }
+  function wireFilters() {
+    document.querySelectorAll("#view .ov-item, #view .tile").forEach(t => {
+      const f = t.getAttribute("data-f"); if (!f) return;
+      t.addEventListener("click", () => {
+        Object.assign(STATE, { cat: "", plat: "", risk: "", flag: "" });
+        if (f !== "clear") { const [k, v] = f.split(":"); if (k === "cat") STATE.cat = v; else if (k === "flag") STATE.flag = v; }
+        VIEW = "control"; renderView();
+      });
+    });
+  }
+
+  // ── chrome: licence note + partials ──
+  function renderChrome() {
+    const ln = $("licenceNote");
+    if (DATA.licence) {
+      const l = DATA.licence;
+      if (l.agent365) ln.innerHTML = `<div class="note"><b>Microsoft Agent 365 detected.</b> Inventory, risk indicators and the security/monitoring layers are all in licence.</div>`;
+      else ln.innerHTML = `<div class="note warn"><b>Agent 365 licence not detected${l.e5 ? " (E5 present)" : ""}.</b> The agent <b>inventory</b> reads fine (Defender for Endpoint P2 + ThreatHunting.Read.All). Defender <b>risk indicators</b> and the Agent-365 security/monitoring layers need <b>Microsoft Agent 365</b> (E7, or add-on) — shown as N/A rather than a false negative.</div>`;
+    } else ln.innerHTML = "";
+    const pEl = $("partial");
+    if (partials.length) { pEl.classList.remove("hidden"); pEl.innerHTML = "<b>Partial coverage.</b> " + partials.map(p => esc(p.detail)).join(" · "); }
+    else pEl.classList.add("hidden");
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  BOOT
+  // ════════════════════════════════════════════════════════════════════════
+  function setStatus(msg, err) { const s = $("status"); s.textContent = msg || ""; s.classList.toggle("err", !!err); }
+  function showApp() { $("connect").classList.add("hidden"); $("app").classList.remove("hidden"); }
+
+  async function load() {
+    setStatus(""); $("btnRefresh").disabled = true;
+    try {
+      setStatus("Reading the agent inventory…");
+      DATA = DEMO ? collectDemo() : await collectLive();
+      if (!DATA.caps.inventory) {
+        $("view") && ($("view").innerHTML = `<div class="stub"><h3>Couldn't read the agent inventory</h3>
+          <p class="muted">${esc(DATA.errors.inventory || "")}</p>
+          <p class="muted">Grant <b>ThreatHunting.Read.All</b> and enable Microsoft Defender security for AI agents (Defender for Endpoint P2). On a tenant with no agents, the AgentsInfo table may simply be empty.</p></div>`);
+        $("app").classList.remove("hidden"); $("connect").classList.add("hidden");
+        renderChrome(); setStatus(""); return;
+      }
+      showApp(); renderChrome(); renderView();
+      setStatus(DEMO ? "Demo data" : DATA.agents.length + " agents");
+    } catch (e) {
+      setStatus(e.message || String(e), true);
+    } finally { $("btnRefresh").disabled = false; }
+  }
+
+  // first-time setup script + scope list
+  function fillSetup() {
+    const scopeArr = SCOPES.map(s => '"' + s[0] + '"').join(", ");
+    const ps = [
+      '# Read-only app registration for Agent 365 Command Center. Needs Microsoft.Graph.Applications + consent rights.',
+      'Connect-MgGraph -Scopes "Application.ReadWrite.All","DelegatedPermissionGrant.ReadWrite.All"',
+      '$RedirectUri = "' + redirectUri + '"   # <-- where you host this file',
+      '$graph = Get-MgServicePrincipal -Filter "appId eq ' + "'00000003-0000-0000-c000-000000000000'" + '"',
+      '$scopes = @(' + scopeArr + ')',
+      '$ras = $graph.Oauth2PermissionScopes | Where-Object { $_.Value -in $scopes } |',
+      '       ForEach-Object { @{ Id = $_.Id; Type = "Scope" } }',
+      '$app = New-MgApplication -DisplayName "Agent 365 Command Center" -SignInAudience "AzureADMyOrg" `',
+      '  -Spa @{ RedirectUris = @($RedirectUri) } `',
+      '  -RequiredResourceAccess @(@{ ResourceAppId = "00000003-0000-0000-c000-000000000000"; ResourceAccess = $ras })',
+      'Write-Host "Application (client) ID:" $app.AppId',
+      '# Then grant admin consent for the delegated scopes in Entra > App registrations > API permissions.'
+    ].join("\n");
+    $("psCode").textContent = ps;
+    $("scopeList").innerHTML = SCOPES.map(s => `<div class="srow"><div class="sp">${esc(s[0])}${s[2] ? "" : '<span class="tag-opt">optional</span>'}</div><div class="sw">${esc(s[1])}</div></div>`).join("");
+  }
+
+  // wire
+  window.addEventListener("DOMContentLoaded", () => {
+    fillSetup();
+    const saved = { client: localStorage.getItem("a365_client") || "", tenant: localStorage.getItem("a365_tenant") || "organizations" };
+    if (saved.client) $("inClient").value = saved.client;
+    if (saved.tenant) $("inTenant").value = saved.tenant;
+
+    $("btnDemo").addEventListener("click", () => { DEMO = true; $("tenantLbl").classList.remove("hidden"); $("tenantLbl").innerHTML = "<b>Demo</b> tenant"; $("btnRefresh").classList.remove("hidden"); $("btnSignout").classList.remove("hidden"); load(); });
+    $("btnConnect").addEventListener("click", async () => {
+      const clientId = $("inClient").value.trim(), tenant = $("inTenant").value.trim() || "organizations";
+      if (!/^[0-9a-f-]{36}$/i.test(clientId)) { $("cStatus").textContent = "Enter a valid Application (client) ID."; return; }
+      localStorage.setItem("a365_client", clientId); localStorage.setItem("a365_tenant", tenant);
+      $("cStatus").innerHTML = '<span class="spinner"></span>Signing in…';
+      try {
+        await buildMsal(clientId, tenant);
+        const res = await msalApp.loginPopup({ scopes: REQUIRED });
+        account = res.account; msalApp.setActiveAccount(account);
+        tenantName = (account && (account.username || account.name)) || "";
+        $("tenantLbl").classList.remove("hidden"); $("tenantLbl").innerHTML = "<b>" + esc((account.username || "").split("@")[1] || tenant) + "</b>";
+        $("btnRefresh").classList.remove("hidden"); $("btnSignout").classList.remove("hidden");
+        $("cStatus").textContent = "";
+        load();
+      } catch (e) { $("cStatus").textContent = "Sign-in failed: " + (e.message || e); }
+    });
+    $("btnRefresh").addEventListener("click", load);
+    $("btnSignout").addEventListener("click", async () => { try { if (msalApp && account) await msalApp.logoutPopup({ account }); } catch (e) {} location.reload(); });
+    $("nav").addEventListener("click", e => { const b = e.target.closest("button[data-view]"); if (!b) return; VIEW = b.getAttribute("data-view"); renderView(); });
+    document.querySelectorAll("[data-copy]").forEach(btn => btn.addEventListener("click", () => { const el = $(btn.getAttribute("data-copy")); if (el) { navigator.clipboard && navigator.clipboard.writeText(el.textContent); btn.textContent = "Copied"; setTimeout(() => btn.textContent = "Copy", 1200); } }));
+  });
+})();
+</script>
+</body>
+</html>
