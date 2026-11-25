@@ -313,6 +313,11 @@
   .mon-tablewrap th { padding: 8px 10px; position: sticky; top: 0; z-index: 1; background: #0B1C40; }
   .mon-tablewrap td { padding: 7px 10px; font-family: var(--mono); font-size: 11.5px; white-space: nowrap; }
   @media (prefers-reduced-motion: reduce) { .snode { animation: none; opacity: 1; } .story::before { animation: none; display: none; } }
+  /* posture: left query list */
+  .postlist { display: flex; flex-direction: column; gap: 7px; }
+  .pitem { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 9px 11px; cursor: pointer; transition: .14s; }
+  .pitem:hover { border-color: var(--accent); }
+  .pitem.on { border-color: var(--accent); background: rgba(63,169,255,.08); box-shadow: inset 2px 0 0 var(--accent); }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -398,6 +403,7 @@
       <button data-view="overview" class="on">Overview</button>
       <button data-view="control">Control plane</button>
       <button data-view="security">Security controls</button>
+      <button data-view="posture">Posture</button>
       <button data-view="monitoring">Monitoring</button>
     </div>
     <div id="licenceNote"></div>
@@ -1178,16 +1184,15 @@
       + `<div class="feeds">feeds risk into ↓</div></div>`
       + `<div class="subsec">${caCard}</div></div>`;
 
-    // Defender — Security for AI: enablement (connectors), real-time protection, prompt evidence, then risk indicators.
+    // Defender — Security for AI: enablement (connectors), real-time protection, prompt evidence.
+    // (Risk-indicator breakdown moved out — the dedicated Posture menu carries the community-query detections.)
     const defender = `<div class="card"><h3>${pillarIcon("defender")} Defender — Security for AI</h3>`
       + `<div class="subsec"><div class="subh">Enablement <span class="pill ${A.length ? "Low" : "na"}">${A.length ? "agent data flowing" : "not detected"}</span></div><ul class="dlist">`
         + li("Agent inventory (AgentsInfo)", '<span class="v-good">connected</span>', "", "Fed by the Microsoft 365 connector + Agent 365.")
         + li("Real-time protection", lic.agent365 ? '<span class="v-good">in licence</span>' : "needs Agent 365", "", "Rules set in Defender; block/audit results in Monitoring → BehaviorInfo.")
         + li("Prompt evidence collection", '<span class="muted">portal</span>', "", "Toggle in Defender; not exposed to a browser API.")
-      + `</ul></div>`
-      + `<div class="subsec"><div class="subh">Risk indicators <span class="pill ${rr.length ? (atRisk ? "Medium" : "Low") : "na"}">${rr.length ? rr.length + " type(s)" : "none"}</span></div>`
-        + (rr.length ? `<ul class="dlist">` + rr.slice(0, 7).map(([t, n]) => li(esc(t), n, n >= 2 ? "v-warn" : "")).join("") + `</ul>` : `<div class="muted">${lic.agent365 ? "No agent flagged." : "Need Agent 365 / security for AI (MDE P2)."}</div>`)
-      + `</div></div>`;
+        + li("Risk detections", '<span class="v-good">see Posture</span>', "", "Agent risk/misconfiguration detections run on the Posture page.")
+      + `</ul></div></div>`;
 
     const purview = pillarCard("Purview — data & compliance", pillarIcon("purview"), { cls: "na", text: "portal / limited API" },
       [
@@ -1322,6 +1327,9 @@
     out.innerHTML = `<div class="meta" style="margin-bottom:6px">${rows.length} row${rows.length === 1 ? "" : "s"}${rows.length >= 300 ? " · capped at 300" : ""}</div>
       <div class="mon-tablewrap"><table><thead><tr>${cols.map(c2 => `<th>${esc(c2)}</th>`).join("")}</tr></thead>
       <tbody>${rows.slice(0, 300).map(r => `<tr>${cols.map(c2 => `<td>${fmt(c2, r[c2])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+    // cap the scroll area so the right pane ends level with the left story pane (not taller)
+    const leftEl = document.querySelector("#view .mon-left"), rightEl = document.querySelector("#view .mon-right"), wrapEl = out.querySelector(".mon-tablewrap");
+    if (leftEl && rightEl && wrapEl) { const avail = leftEl.getBoundingClientRect().height - (wrapEl.getBoundingClientRect().top - rightEl.getBoundingClientRect().top) - 16; if (avail > 180) wrapEl.style.maxHeight = Math.round(avail) + "px"; }
   }
   function demoMonRows(key, d) {
     const now = Date.now(), H = 36e5, D = 864e5;
@@ -1356,6 +1364,104 @@
     return [];
   }
 
+  // ── POSTURE (community "AI Agents" detections, AgentsInfo-native) ──
+  // The Defender "Community queries › AI Agents" pack is written for the retiring AIAgentsInfo table and breaks on
+  // AgentsInfo; these are AgentsInfo-native equivalents (best-effort — the drift checks approximate without a stored
+  // baseline). Each runs latest-state over 30d. Read-only via Defender advanced hunting.
+  const POS_BASE = "AgentsInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by AgentId | where isempty(LifecycleStatus) or LifecycleStatus != 'Deleted'";
+  const POSTURE_QUERIES = [
+    { key: "hardcoded-creds", title: "Hard-coded credentials in Tools or Configuration", cols: ["Name", "Platform", "EntraAgentID"],
+      desc: "Agents whose declared tools or raw config embed secret-like values.",
+      q: () => POS_BASE + " | where tostring(DeclaredTools) has_any ('password','passwd','pwd','secret','api_key','apikey','client_secret','access_token','bearer ','connectionstring') or tostring(RawAgentInfo) has_any ('password','client_secret','api_key','access_token','connectionstring') | project Name, Platform, EntraAgentID | take 300" },
+    { key: "instructions-changed", title: "Instructions changed on previously published agent", cols: ["Name", "Platform", "Changes"],
+      desc: "Published agents whose instructions changed within the window (drift — approximate).",
+      q: () => "AgentsInfo | where Timestamp > ago(30d) | where PublishedStatus =~ 'Published' | summarize Changes = dcount(Instructions), Name = take_any(Name), Platform = take_any(Platform) by AgentId | where Changes > 1 | project Name, Platform, Changes | take 300" },
+    { key: "mcp-configured", title: "MCP Tool Configured", cols: ["Name", "Platform", "McpServers"],
+      desc: "Agents with one or more MCP servers configured.",
+      q: () => POS_BASE + " | where isnotempty(McpServers) and tostring(McpServers) !in ('', '[]', '{}') | project Name, Platform, McpServers = tostring(McpServers) | take 300" },
+    { key: "missing-tools", title: "Missing Tools in Instructions", cols: ["Name", "Platform"],
+      desc: "Agents with instructions but no declared tools (approximate).",
+      q: () => POS_BASE + " | where isnotempty(Instructions) and (isempty(DeclaredTools) or tostring(DeclaredTools) in ('[]', '{}')) | project Name, Platform | take 300" },
+    { key: "new-mcp-server", title: "Newly observed MCP server on existing agent", cols: ["Name", "Platform"],
+      desc: "Agents whose MCP-server set changed within the window (drift — approximate).",
+      q: () => "AgentsInfo | where Timestamp > ago(30d) | summarize Mcp = make_set(McpServers), Name = take_any(Name), Platform = take_any(Platform) by AgentId | where array_length(Mcp) > 1 | project Name, Platform | take 300" },
+    { key: "org-wide-shared", title: "Organization-wide Shared", cols: ["Name", "Platform", "SharedWith"],
+      desc: "Agents shared with the whole organization.",
+      q: () => POS_BASE + " | where tostring(SharedWith) has_any ('Everyone','Organization','AllUsers','Tenant','organization') | project Name, Platform, SharedWith = tostring(SharedWith) | take 300" },
+    { key: "orphaned", title: "Orphaned Agents with Disabled Owners", cols: ["Name", "Platform"],
+      desc: "Published agents with no owner (disabled-owner needs an IdentityInfo join — shown as no-owner).",
+      q: () => POS_BASE + " | where PublishedStatus =~ 'Published' and (isempty(tostring(Owners)) or tostring(Owners) in ('[]', '{}') or array_length(todynamic(Owners)) == 0) | project Name, Platform | take 300" },
+    { key: "owner-added-mcp", title: "Owner added to MCP-enabled agent", cols: ["Name", "Platform"],
+      desc: "MCP-enabled agents whose owner set changed within the window (drift — approximate).",
+      q: () => "AgentsInfo | where Timestamp > ago(30d) | where isnotempty(McpServers) and tostring(McpServers) !in ('', '[]') | summarize Owners = make_set(Owners), Name = take_any(Name), Platform = take_any(Platform) by AgentId | where array_length(Owners) > 1 | project Name, Platform | take 300" },
+    { key: "short-instructions", title: "Published Agents with Short Instructions", cols: ["Name", "Platform", "Length"],
+      desc: "Published agents whose instructions are under 100 characters.",
+      q: () => POS_BASE + " | where PublishedStatus =~ 'Published' and isnotempty(Instructions) and strlen(tostring(Instructions)) < 100 | project Name, Platform, Length = strlen(tostring(Instructions)) | take 300" },
+    { key: "no-instructions", title: "Published Agents without Instructions", cols: ["Name", "Platform"],
+      desc: "Published agents with no instructions at all.",
+      q: () => POS_BASE + " | where PublishedStatus =~ 'Published' and isempty(tostring(Instructions)) | project Name, Platform | take 300" },
+    { key: "sharing-expanded", title: "Sharing expanded to organization-wide", cols: ["Name", "Platform"],
+      desc: "Agents whose sharing changed to organization-wide within the window (drift — approximate).",
+      q: () => "AgentsInfo | where Timestamp > ago(30d) | summarize Shares = make_set(SharedWith), Name = take_any(Name), Platform = take_any(Platform) by AgentId | where array_length(Shares) > 1 and tostring(Shares) has_any ('Everyone','Organization','Tenant') | project Name, Platform | take 300" }
+  ];
+  let POS_SEL = "no-instructions";
+  const POS_CACHE = {};
+  function renderPosture() {
+    const q = POSTURE_QUERIES.find(x => x.key === POS_SEL) || POSTURE_QUERIES[0];
+    let html = `<div class="hero-head"><div><h2>Posture</h2>
+      <div class="hero-sub">Community agent-risk detections over AgentsInfo — pick a check to see the agents it flags.</div></div></div>`;
+    html += `<div class="mon-wrap"><div class="mon-left"><div class="postlist">`
+      + POSTURE_QUERIES.map(x => `<div class="pitem ${x.key === POS_SEL ? "on" : ""}" data-pos="${x.key}"><div class="mt-name">${esc(x.title)}</div><div class="mt-desc">${esc(x.desc)}</div></div>`).join("")
+      + `</div></div><div class="mon-right"><div class="mon-rhead"><div class="mon-rtitle">${esc(q.title)}</div></div><div class="mon-rdesc">${esc(q.desc)}</div><div id="posOut" class="mon-out"></div></div></div>`;
+    html += `<div class="note" style="margin-top:16px"><b>Community posture checks.</b> These mirror the Defender “Community queries › AI Agents” pack. That pack targets the retiring <code>AIAgentsInfo</code> table and breaks on <code>AgentsInfo</code>, so these are <b>AgentsInfo-native equivalents</b> (best-effort; drift checks approximate without a stored baseline). Read-only.</div>`;
+    $("view").innerHTML = html;
+    $("view").querySelectorAll(".pitem").forEach(el => el.addEventListener("click", () => {
+      POS_SEL = el.getAttribute("data-pos");
+      $("view").querySelectorAll(".pitem").forEach(n => n.classList.toggle("on", n.getAttribute("data-pos") === POS_SEL));
+      const t = POSTURE_QUERIES.find(x => x.key === POS_SEL);
+      const rt = $("view").querySelector(".mon-rtitle"), rd = $("view").querySelector(".mon-rdesc");
+      if (rt) rt.textContent = t.title; if (rd) rd.textContent = t.desc;
+      renderPosOut();
+    }));
+    renderPosOut();
+  }
+  function renderPosOut() {
+    const q = POSTURE_QUERIES.find(x => x.key === POS_SEL) || POSTURE_QUERIES[0];
+    const out = $("posOut"); if (!out) return;
+    if (DEMO) { if (!POS_CACHE[q.key]) POS_CACHE[q.key] = { rows: demoPosRows(q.key) }; paintPosOut(q); return; }
+    if (POS_CACHE[q.key] && !POS_CACHE[q.key].loading) { paintPosOut(q); return; }
+    POS_CACHE[q.key] = { loading: true };
+    out.innerHTML = `<div class="dloading" style="color:var(--muted);display:flex;align-items:center;gap:8px"><span class="spinner" style="border-color:var(--border);border-top-color:var(--accent)"></span>Running ${esc(q.title)}…</div>`;
+    hunt(q.q(), q.title).then(rows => { POS_CACHE[q.key] = { rows }; if (POS_SEL === q.key) paintPosOut(q); }).catch(e => { POS_CACHE[q.key] = { err: e.message }; if (POS_SEL === q.key) paintPosOut(q); });
+  }
+  function paintPosOut(q) {
+    const out = $("posOut"); if (!out) return;
+    const c = POS_CACHE[q.key] || {}; if (c.loading) return;
+    if (c.err) { out.innerHTML = `<div class="muted">Query unavailable — ${esc(c.err)}</div>`; return; }
+    const rows = c.rows || [], cols = q.cols;
+    if (!rows.length) { out.innerHTML = `<div class="v-good">No agents flagged by this check.</div>`; return; }
+    const fmt = (col, v) => { if (v == null || v === "") return '<span class="muted">—</span>'; const s = typeof v === "object" ? JSON.stringify(v) : String(v); return esc(s.length > 160 ? s.slice(0, 160) + "…" : s); };
+    out.innerHTML = `<div class="meta" style="margin-bottom:6px">${rows.length} agent${rows.length === 1 ? "" : "s"} flagged${rows.length >= 300 ? " · capped at 300" : ""}</div><div class="mon-tablewrap"><table><thead><tr>${cols.map(c2 => `<th>${esc(c2)}</th>`).join("")}</tr></thead><tbody>${rows.slice(0, 300).map(r => `<tr>${cols.map(c2 => `<td>${fmt(c2, r[c2])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+    const leftEl = document.querySelector("#view .mon-left"), rightEl = document.querySelector("#view .mon-right"), wrapEl = out.querySelector(".mon-tablewrap");
+    if (leftEl && rightEl && wrapEl) { const avail = leftEl.getBoundingClientRect().height - (wrapEl.getBoundingClientRect().top - rightEl.getBoundingClientRect().top) - 16; if (avail > 180) wrapEl.style.maxHeight = Math.round(avail) + "px"; }
+  }
+  function demoPosRows(key) {
+    const m = {
+      "hardcoded-creds": [{ Name: "Weather Agent High Risk", Platform: "Agent Builder in Microsoft 365 Copilot", EntraAgentID: "—" }, { Name: "Block image and URL Test", Platform: "Copilot Studio", EntraAgentID: "41014193-…-5d2895" }],
+      "instructions-changed": [{ Name: "Prompt Evidence Agent", Platform: "Copilot Studio", Changes: 3 }, { Name: "Sales03", Platform: "Copilot Studio", Changes: 2 }],
+      "mcp-configured": [{ Name: "Contoso HR Helper", Platform: "Copilot Studio", McpServers: '[{"name":"SharePoint MCP"}]' }, { Name: "IT Helpdesk Agent", Platform: "Copilot Studio", McpServers: '[{"name":"ServiceNow MCP"}]' }],
+      "missing-tools": [{ Name: "Plan My Day", Platform: "Agent Builder in Microsoft 365 Copilot" }, { Name: "Career Coach", Platform: "Agent Builder in Microsoft 365 Copilot" }],
+      "new-mcp-server": [{ Name: "IT Helpdesk Agent", Platform: "Copilot Studio" }],
+      "org-wide-shared": [{ Name: "Agent Builder Shared Agent", Platform: "Agent Builder in Microsoft 365 Copilot", SharedWith: "Everyone" }, { Name: "Shared Agent", Platform: "Agent Builder in Microsoft 365 Copilot", SharedWith: "Organization" }],
+      "orphaned": [{ Name: "New Agent without ID", Platform: "Agent Builder in Microsoft 365 Copilot" }, { Name: "Agent No Owner", Platform: "Agent Builder in Microsoft 365 Copilot" }],
+      "owner-added-mcp": [{ Name: "Contoso HR Helper", Platform: "Copilot Studio" }],
+      "short-instructions": [{ Name: "New Agent", Platform: "Agent Builder in Microsoft 365 Copilot", Length: 42 }, { Name: "Light Agent", Platform: "Agent Builder in Microsoft 365 Copilot", Length: 71 }],
+      "no-instructions": [{ Name: "Quick Task Helper", Platform: "Agent Builder in Microsoft 365 Copilot" }, { Name: "Mailbox Assistent", Platform: "Agent Builder in Microsoft 365 Copilot" }, { Name: "New CPS Agent", Platform: "Copilot Studio" }],
+      "sharing-expanded": [{ Name: "Agent Builder Shared Agent", Platform: "Agent Builder in Microsoft 365 Copilot" }]
+    };
+    return m[key] || [];
+  }
+
   // ── STUB VIEWS ──
   function renderStub(which) {
     const map = {
@@ -1382,6 +1488,7 @@
     if (VIEW === "overview") renderOverview();
     else if (VIEW === "control") renderControl();
     else if (VIEW === "security") renderSecurity();
+    else if (VIEW === "posture") renderPosture();
     else if (VIEW === "monitoring") renderMonitoring();
     else renderStub(VIEW);
   }
