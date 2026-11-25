@@ -665,9 +665,13 @@
       out.licence = classifyLicence(skus); out.caps.licence = true;
     } catch (e) { out.caps.licence = false; }
 
-    // Optional: Conditional Access posture for agents (security-controls layer).
+    // Optional: Conditional Access posture for agents (security-controls layer). Use the BETA endpoint and the
+    // full conditions object — the preview agent-targeting fields (agentRiskLevels / includeAgentIdServicePrincipals)
+    // are not reliably returned by v1.0 with a $select, which otherwise makes agent policies look invisible.
     try {
-      const pol = await gGetAll("/identity/conditionalAccess/policies?$select=id,displayName,state,conditions,grantControls", ["Policy.Read.All"]);
+      let pol;
+      try { pol = await gGetAll("https://graph.microsoft.com/beta/identity/conditionalAccess/policies", ["Policy.Read.All"]); }
+      catch (e2) { pol = await gGetAll("/identity/conditionalAccess/policies?$select=id,displayName,state,conditions,grantControls", ["Policy.Read.All"]); }
       out.ca = summarizeCA(pol); out.caps.ca = true;
     } catch (e) { out.caps.ca = false; notePartial("Conditional Access", "CA posture for agents not read — grant Policy.Read.All."); }
     return out;
@@ -685,6 +689,9 @@
     const agentList = cap => cap.includeAgentIdServicePrincipals || cap.includeAgents || cap.includeAgentIdentities || null;
     const hasFilter = cap => !!(cap.servicePrincipalFilter || cap.includeServicePrincipalFilter || cap.filter || cap.includeAgentFilter || cap.agentFilter);
     const isAll = v => Array.isArray(v) && v.some(x => /all|ServicePrincipalsInMyTenant|AllAgent/i.test(String(x)));
+    // Name fallback: agent CA policies are conventionally named "…-Agents-…". The structured preview fields are
+    // not always returned, so a name match keeps such policies visible (the via is then inferred from the name).
+    const byName = p => /\bagents?\b/i.test(p.displayName || "");
     const targets = p => {
       const c = p.conditions || {}, cap = c.clientApplications || {};
       const al = agentList(cap);
@@ -692,22 +699,26 @@
       const sp = cap.includeServicePrincipals || cap.servicePrincipals || [];
       const spInc = Array.isArray(sp) ? (sp.length > 0 && !(sp.length === 1 && /none/i.test(String(sp[0])))) : !!sp;
       const risk = !!(agentRisk(c) && agentRisk(c).length) || (Array.isArray(c.servicePrincipalRiskLevels) && c.servicePrincipalRiskLevels.length > 0);
-      return !!alN || spInc || hasFilter(cap) || risk;
+      return !!alN || spInc || hasFilter(cap) || risk || byName(p);
     };
     const agentPols = live.filter(targets).map(p => {
       const c = p.conditions || {}, cap = c.clientApplications || {};
+      const nm = p.displayName || "(policy)";
       const bic = (p.grantControls && p.grantControls.builtInControls) || [];
       const rl = agentRisk(c) || (Array.isArray(c.servicePrincipalRiskLevels) ? c.servicePrincipalRiskLevels : null);
       const al = agentList(cap), sp = cap.includeServicePrincipals || cap.servicePrincipals || [];
-      const all = isAll(al) || isAll(sp);
+      const all = isAll(al) || isAll(sp) || /baseline|allresources|all[- ]?agent/i.test(nm);
+      const isRisk = !!(rl && rl.length) || /risk|highrisk/i.test(nm);
       const via = [];
       if (rl && rl.length) via.push("risk: " + rl.join("/").toLowerCase());
+      else if (/risk|highrisk/i.test(nm)) via.push("risk-based");
       if (hasFilter(cap)) via.push("custom security attributes");
       if (all) via.push("all agent identities");
       else if ((al && (Array.isArray(al) ? al.length : 1)) || (Array.isArray(sp) && sp.length)) via.push("scoped agent identities");
-      if (!via.length) via.push("agent identities");
+      if (!via.length) via.push(/approv/i.test(nm) ? "require approval" : "agent identities");
       const reportOnly = String(p.state).toLowerCase() === "enabledforreportingbutnotenforced";
-      return { name: p.displayName || "(policy)", grant: bic, block: bic.some(x => /^block$/i.test(x)), requiresCompliant: bic.some(x => /compliant/i.test(x)), risk: !!(rl && rl.length), all, reportOnly, via };
+      const block = bic.some(x => /^block$/i.test(x)) || /\bblock/i.test(nm);
+      return { name: nm, grant: bic, block, requiresCompliant: bic.some(x => /compliant/i.test(x)), risk: isRisk, all, reportOnly, via };
     });
     const riskBlock = agentPols.filter(p => p.block && p.risk);
     const enforced = riskBlock.some(p => !p.reportOnly);
@@ -781,10 +792,12 @@
     // demo blueprint + owner-name enrichment
     const out = { agents, caps: { inventory: true, blueprints: true, owners: true, licence: true, ca: true }, errors: {},
       licence: { agent365: false, e5: true, mdeP2: true, raw: ["SPE_E5"] },
-      ca: { total: 9, enabled: 7, coversAgents: true, available: true, enforced: true, reportOnly: false, allAgents: true,
+      ca: { total: 24, enabled: 7, coversAgents: true, available: true, enforced: true, reportOnly: false, allAgents: true,
         agentPolicies: [
           { name: "CA-A90-Agents-Risk-AllResources-BlockHighRisk", grant: ["block"], block: true, requiresCompliant: false, risk: true, all: true, reportOnly: false, via: ["risk: high", "all agent identities"] },
-          { name: "CA-Agents-Tier0-RequireCompliant", grant: ["compliantDevice"], block: false, requiresCompliant: true, risk: false, all: false, reportOnly: false, via: ["custom security attributes", "scoped agent identities"] }
+          { name: "CA-A00-Agents-Baseline-AllResources-BlockUnlessApproved", grant: ["block"], block: true, requiresCompliant: false, risk: false, all: true, reportOnly: true, via: ["all agent identities", "require approval"] },
+          { name: "CA-A10-Agents-HR-HRAPI-BlockUnlessHRApproved", grant: ["block"], block: true, requiresCompliant: false, risk: false, all: false, reportOnly: true, via: ["scoped agent identities", "require approval"] },
+          { name: "CA-A11-Agents-Finance-FinanceAPI-BlockUnlessFinanceApproved", grant: ["block"], block: true, requiresCompliant: false, risk: false, all: false, reportOnly: true, via: ["scoped agent identities", "require approval"] }
         ] } };
     mergeEntraIdentities(out, [
       { id: "a1b2c3d4-0000-0000-0000-000000000001", appId: "app-hr", displayName: "Contoso HR Helper" },
@@ -1368,41 +1381,354 @@
   // The Defender "Community queries › AI Agents" pack is written for the retiring AIAgentsInfo table and breaks on
   // AgentsInfo; these are AgentsInfo-native equivalents (best-effort — the drift checks approximate without a stored
   // baseline). Each runs latest-state over 30d. Read-only via Defender advanced hunting.
-  const POS_BASE = "AgentsInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by AgentId | where isempty(LifecycleStatus) or LifecycleStatus != 'Deleted'";
+  // The 11 community "AI Agents" hunting queries, verbatim from Azure-Sentinel (Hunting Queries/AI Agents),
+  // already written for the current AgentsInfo table. String.raw keeps the credential regex's backslashes intact.
   const POSTURE_QUERIES = [
-    { key: "hardcoded-creds", title: "Hard-coded credentials in Tools or Configuration", cols: ["Name", "Platform", "EntraAgentID"],
-      desc: "Agents whose declared tools or raw config embed secret-like values.",
-      q: () => POS_BASE + " | where tostring(DeclaredTools) has_any ('password','passwd','pwd','secret','api_key','apikey','client_secret','access_token','bearer ','connectionstring') or tostring(RawAgentInfo) has_any ('password','client_secret','api_key','access_token','connectionstring') | project Name, Platform, EntraAgentID | take 300" },
-    { key: "instructions-changed", title: "Instructions changed on previously published agent", cols: ["Name", "Platform", "Changes"],
-      desc: "Published agents whose instructions changed within the window (drift — approximate).",
-      q: () => "AgentsInfo | where Timestamp > ago(30d) | where PublishedStatus =~ 'Published' | summarize Changes = dcount(Instructions), Name = take_any(Name), Platform = take_any(Platform) by AgentId | where Changes > 1 | project Name, Platform, Changes | take 300" },
-    { key: "mcp-configured", title: "MCP Tool Configured", cols: ["Name", "Platform", "McpServers"],
-      desc: "Agents with one or more MCP servers configured.",
-      q: () => POS_BASE + " | where isnotempty(McpServers) and tostring(McpServers) !in ('', '[]', '{}') | project Name, Platform, McpServers = tostring(McpServers) | take 300" },
-    { key: "missing-tools", title: "Missing Tools in Instructions", cols: ["Name", "Platform"],
-      desc: "Agents with instructions but no declared tools (approximate).",
-      q: () => POS_BASE + " | where isnotempty(Instructions) and (isempty(DeclaredTools) or tostring(DeclaredTools) in ('[]', '{}')) | project Name, Platform | take 300" },
-    { key: "new-mcp-server", title: "Newly observed MCP server on existing agent", cols: ["Name", "Platform"],
-      desc: "Agents whose MCP-server set changed within the window (drift — approximate).",
-      q: () => "AgentsInfo | where Timestamp > ago(30d) | summarize Mcp = make_set(McpServers), Name = take_any(Name), Platform = take_any(Platform) by AgentId | where array_length(Mcp) > 1 | project Name, Platform | take 300" },
-    { key: "org-wide-shared", title: "Organization-wide Shared", cols: ["Name", "Platform", "SharedWith"],
-      desc: "Agents shared with the whole organization.",
-      q: () => POS_BASE + " | where tostring(SharedWith) has_any ('Everyone','Organization','AllUsers','Tenant','organization') | project Name, Platform, SharedWith = tostring(SharedWith) | take 300" },
-    { key: "orphaned", title: "Orphaned Agents with Disabled Owners", cols: ["Name", "Platform"],
-      desc: "Published agents with no owner (disabled-owner needs an IdentityInfo join — shown as no-owner).",
-      q: () => POS_BASE + " | where PublishedStatus =~ 'Published' and (isempty(tostring(Owners)) or tostring(Owners) in ('[]', '{}') or array_length(todynamic(Owners)) == 0) | project Name, Platform | take 300" },
-    { key: "owner-added-mcp", title: "Owner added to MCP-enabled agent", cols: ["Name", "Platform"],
-      desc: "MCP-enabled agents whose owner set changed within the window (drift — approximate).",
-      q: () => "AgentsInfo | where Timestamp > ago(30d) | where isnotempty(McpServers) and tostring(McpServers) !in ('', '[]') | summarize Owners = make_set(Owners), Name = take_any(Name), Platform = take_any(Platform) by AgentId | where array_length(Owners) > 1 | project Name, Platform | take 300" },
-    { key: "short-instructions", title: "Published Agents with Short Instructions", cols: ["Name", "Platform", "Length"],
-      desc: "Published agents whose instructions are under 100 characters.",
-      q: () => POS_BASE + " | where PublishedStatus =~ 'Published' and isnotempty(Instructions) and strlen(tostring(Instructions)) < 100 | project Name, Platform, Length = strlen(tostring(Instructions)) | take 300" },
-    { key: "no-instructions", title: "Published Agents without Instructions", cols: ["Name", "Platform"],
-      desc: "Published agents with no instructions at all.",
-      q: () => POS_BASE + " | where PublishedStatus =~ 'Published' and isempty(tostring(Instructions)) | project Name, Platform | take 300" },
-    { key: "sharing-expanded", title: "Sharing expanded to organization-wide", cols: ["Name", "Platform"],
-      desc: "Agents whose sharing changed to organization-wide within the window (drift — approximate).",
-      q: () => "AgentsInfo | where Timestamp > ago(30d) | summarize Shares = make_set(SharedWith), Name = take_any(Name), Platform = take_any(Platform) by AgentId | where array_length(Shares) > 1 and tostring(Shares) has_any ('Everyone','Organization','Tenant') | project Name, Platform | take 300" }
+    { key: "hardcoded-creds", title: "Hard-coded credentials in Tools or Configuration", cols: ["Name", "Platform", "OwnerUpn"],
+      desc: "Secret-like patterns in tools, triggers, MCP, skills, capabilities, instructions or raw config.",
+      q: () => String.raw`let suspicious_patterns = @"(AKIA[0-9A-Z]{16})|(AIza[0-9A-Za-z_\-]{35})|(xox[baprs]-[0-9a-zA-Z]{10,48})|(ghp_[A-Za-z0-9]{36,59})|(sk_(live|test)_[A-Za-z0-9]{24})|(SG\.[A-Za-z0-9]{22}\.[A-Za-z0-9]{43})|(\d{8}:[\w\-]{35})|(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)|(Authorization\s*:\s*Basic\s+[A-Za-z0-9=:+]+)|([A-Za-z]+:\/\/[^\/\s""']+:[^\/\s""']+@[^\/\s""']+)";
+let IdentityIdtoUPN = materialize (
+    IdentityInfo
+    | where isnotempty(AccountObjectId) and isnotempty(AccountUpn)
+    | summarize arg_max(Timestamp, AccountUpn) by AccountObjectId
+    | project AccountObjectId = tostring(AccountObjectId), AccountUpn);
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| where LifecycleStatus != "Deleted"
+| extend ToolsStr = tostring(DeclaredTools), TriggersStr = tostring(Triggers), McpStr = tostring(McpServers), SkillsStr = tostring(Skills), CapsStr = tostring(Capabilities), RawStr = tostring(RawAgentInfo)
+| where ToolsStr matches regex suspicious_patterns
+    or TriggersStr matches regex suspicious_patterns
+    or McpStr matches regex suspicious_patterns
+    or SkillsStr matches regex suspicious_patterns
+    or CapsStr matches regex suspicious_patterns
+    or RawStr matches regex suspicious_patterns
+    or Instructions matches regex suspicious_patterns
+| extend OwnerId = tostring(Owners[0])
+| join kind=leftouter IdentityIdtoUPN on $left.OwnerId == $right.AccountObjectId
+| project-rename OwnerUpn = AccountUpn
+| project-away OwnerId, AccountObjectId, RawStr
+| project-reorder CreatedDateTime, AgentId, Name, Platform,Instructions, ToolsStr, TriggersStr, McpStr, SkillsStr,CapsStr, OwnerUpn` },
+    { key: "instructions-changed", title: "Instructions changed on previously published agent", cols: ["Name", "Platform", "InstructionsLengthDelta", "OwnerUpn"],
+      desc: "Published agents whose instructions changed vs a 2–14 day baseline (run within 2 days of a change).",
+      q: () => String.raw`let lookback = 14d;
+let recent = 2d;
+let IdentityIdtoUPN = materialize(
+    IdentityInfo
+    | extend ResolvedAccountUpn = tostring(column_ifexists("AccountUpn", column_ifexists("AccountUPN", ""))),
+             IdentityTimestamp = todatetime(column_ifexists("Timestamp", column_ifexists("TimeGenerated", datetime(null))))
+    | where IdentityTimestamp >= ago(lookback)
+    | where isnotempty(AccountObjectId) and isnotempty(ResolvedAccountUpn)
+    | summarize arg_max(IdentityTimestamp, ResolvedAccountUpn) by AccountObjectId
+    | project AccountObjectId = tostring(AccountObjectId), AccountUpn = ResolvedAccountUpn);
+let CurrentState =
+    AgentsInfo
+    | where Timestamp > ago(recent)
+    | summarize arg_max(Timestamp, *) by AgentId
+    | where LifecycleStatus != "Deleted"
+    | where PublishedStatus == "Published"
+    | where isnotempty(Instructions) and Instructions != "N/A"
+    | project AgentId, Timestamp, Name, Platform, CreatedDateTime, Owners,
+              CurrentInstructions = Instructions;
+let BaselineState =
+    AgentsInfo
+    | where Timestamp between (ago(lookback) .. ago(recent))
+    | where LifecycleStatus != "Deleted"
+    | summarize arg_max(Timestamp, *) by AgentId
+    | where PublishedStatus == "Published"
+    | where isnotempty(Instructions) and Instructions != "N/A"
+    | project AgentId, PreviousTimestamp = Timestamp,
+              PreviousInstructions = Instructions;
+CurrentState
+| join kind=inner BaselineState on AgentId
+| where CurrentInstructions != PreviousInstructions
+| extend PreviousInstructionsHash = hash_sha256(PreviousInstructions),
+         CurrentInstructionsHash = hash_sha256(CurrentInstructions),
+         InstructionsLengthDelta = strlen(CurrentInstructions) - strlen(PreviousInstructions)
+| extend OwnerIds = iff(array_length(coalesce(Owners, dynamic([]))) > 0, Owners, dynamic([""]))
+| mv-expand OwnerId = OwnerIds to typeof(string)
+| join kind=leftouter IdentityIdtoUPN on $left.OwnerId == $right.AccountObjectId
+| project-rename OwnerUpn = AccountUpn
+| extend OwnerAccountName = tostring(split(OwnerUpn, "@")[0]),
+         OwnerAccountUPNSuffix = tostring(split(OwnerUpn, "@")[1])
+| project Timestamp, PreviousTimestamp, AgentId, Name, Platform, CreatedDateTime,
+         PreviousInstructionsHash, CurrentInstructionsHash, InstructionsLengthDelta,
+         OwnerId, OwnerUpn, OwnerAccountName, OwnerAccountUPNSuffix
+| sort by Timestamp desc` },
+    { key: "mcp-configured", title: "MCP Tool Configured", cols: ["Name", "Platform", "McpServersConfigured", "OwnerUpn"],
+      desc: "Agents with Model Context Protocol (MCP) tools configured.",
+      q: () => String.raw`let IdentityIdtoUPN = materialize (
+    IdentityInfo
+    | where isnotempty(AccountObjectId) and isnotempty(AccountUpn)
+    | summarize arg_max(Timestamp, AccountUpn) by AccountObjectId
+    | project AccountObjectId = tostring(AccountObjectId), AccountUpn);
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| where LifecycleStatus != "Deleted"
+| where array_length(McpServers) > 0
+| extend OwnerId = tostring(Owners[0])
+| join kind=leftouter IdentityIdtoUPN on $left.OwnerId == $right.AccountObjectId
+| project-rename OwnerUpn = AccountUpn
+| mv-expand Mcp = McpServers
+| extend McpName = tostring(Mcp.name)
+| where isnotempty(McpName)
+| summarize McpServersConfigured = make_set(McpName) by AgentId, Name, Platform, CreatedDateTime, OwnerUpn
+| project-reorder CreatedDateTime, AgentId, Name, Platform, McpServersConfigured, OwnerUpn` },
+    { key: "missing-tools", title: "Missing Tools in Instructions", cols: ["Name", "Platform", "MissingTools", "OwnerUpn"],
+      desc: "Agents with configured tools not referenced in their instructions.",
+      q: () => String.raw`let IdentityIdtoUPN = materialize (
+    IdentityInfo
+    | where isnotempty(AccountObjectId) and isnotempty(AccountUpn)
+    | summarize arg_max(Timestamp, AccountUpn) by AccountObjectId
+    | project AccountObjectId = tostring(AccountObjectId), AccountUpn);
+let LatestAgents = materialize (
+    AgentsInfo
+    | summarize arg_max(Timestamp, *) by AgentId
+    | where LifecycleStatus != "Deleted");
+let AgentToolNames =
+    LatestAgents
+    | where array_length(DeclaredTools) > 0
+    | mv-expand Tool = DeclaredTools
+    | extend ToolName = tostring(Tool.name)
+    | where isnotempty(ToolName)
+    | summarize ToolNames = make_set(ToolName) by AgentId;
+LatestAgents
+| where isnotempty(Instructions) and Instructions != "N/A"
+| join kind=inner AgentToolNames on AgentId
+| mv-apply ToolName = ToolNames to typeof(string) on (
+    where Instructions !has ToolName
+    | summarize MissingTools = make_list(ToolName))
+| where array_length(MissingTools) > 0
+| extend OwnerId = tostring(Owners[0])
+| join kind=leftouter IdentityIdtoUPN on $left.OwnerId == $right.AccountObjectId
+| project-rename OwnerUpn = AccountUpn
+| project-away AgentId1, ToolNames, OwnerId, AccountObjectId
+| project-reorder CreatedDateTime, AgentId, Name, Platform, Instructions, MissingTools, OwnerUpn` },
+    { key: "new-mcp-server", title: "Newly observed MCP server on existing agent", cols: ["Name", "Platform", "AddedMcpServers", "OwnerUpn"],
+      desc: "MCP server names newly observed on an existing agent vs baseline (run within 2 days of a change).",
+      q: () => String.raw`let lookback = 14d;
+let recent = 2d;
+let IdentityIdtoUPN = materialize(
+    IdentityInfo
+    | extend ResolvedAccountUpn = tostring(column_ifexists("AccountUpn", column_ifexists("AccountUPN", ""))),
+             IdentityTimestamp = todatetime(column_ifexists("Timestamp", column_ifexists("TimeGenerated", datetime(null))))
+    | where IdentityTimestamp >= ago(lookback)
+    | where isnotempty(AccountObjectId) and isnotempty(ResolvedAccountUpn)
+    | summarize arg_max(IdentityTimestamp, ResolvedAccountUpn) by AccountObjectId
+    | project AccountObjectId = tostring(AccountObjectId), AccountUpn = ResolvedAccountUpn);
+let CurrentRaw = materialize(
+    AgentsInfo
+    | where Timestamp > ago(recent)
+    | summarize arg_max(Timestamp, *) by AgentId
+    | where LifecycleStatus != "Deleted");
+let CurrentMcp =
+    CurrentRaw
+    | mv-expand Mcp = McpServers
+    | extend McpName = tostring(Mcp.name)
+    | where isnotempty(McpName)
+    | summarize CurrentMcpServers = make_set(McpName) by AgentId;
+let BaselineRaw = materialize(
+    AgentsInfo
+    | where Timestamp between (ago(lookback) .. ago(recent))
+    | where LifecycleStatus != "Deleted"
+    | summarize arg_max(Timestamp, *) by AgentId);
+let BaselineMcp =
+    BaselineRaw
+    | mv-expand Mcp = McpServers
+    | extend McpName = tostring(Mcp.name)
+    | where isnotempty(McpName)
+    | summarize KnownMcpServers = make_set(McpName) by AgentId;
+let Baseline =
+    BaselineRaw
+    | join kind=leftouter BaselineMcp on AgentId
+    | extend BaselineMcpServers = coalesce(KnownMcpServers, dynamic([]))
+    | project AgentId, PreviousTimestamp = Timestamp, BaselineMcpServers;
+CurrentRaw
+| join kind=inner CurrentMcp on AgentId
+| join kind=inner Baseline on AgentId
+| extend AddedMcpServers = set_difference(CurrentMcpServers, BaselineMcpServers)
+| where array_length(AddedMcpServers) > 0
+| extend OwnerIds = iff(array_length(coalesce(Owners, dynamic([]))) > 0, Owners, dynamic([""]))
+| mv-expand OwnerId = OwnerIds to typeof(string)
+| join kind=leftouter IdentityIdtoUPN on $left.OwnerId == $right.AccountObjectId
+| project-rename OwnerUpn = AccountUpn
+| extend OwnerAccountName = tostring(split(OwnerUpn, "@")[0]),
+         OwnerAccountUPNSuffix = tostring(split(OwnerUpn, "@")[1])
+| project Timestamp, PreviousTimestamp, AgentId, Name, Platform, CreatedDateTime,
+         AddedMcpServers, BaselineMcpServers, CurrentMcpServers, OwnerId, OwnerUpn,
+         OwnerAccountName, OwnerAccountUPNSuffix
+| sort by Timestamp desc` },
+    { key: "org-wide-shared", title: "Organization-wide Shared", cols: ["Name", "Platform", "SharedWith", "OwnerUpn"],
+      desc: "Agents shared with the entire organization (SharedWith contains \"*\").",
+      q: () => String.raw`let IdentityIdtoUPN = materialize (
+    IdentityInfo
+    | where isnotempty(AccountObjectId) and isnotempty(AccountUpn)
+    | summarize arg_max(Timestamp, AccountUpn) by AccountObjectId
+    | project AccountObjectId = tostring(AccountObjectId), AccountUpn);
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| where LifecycleStatus != "Deleted"
+| where array_length(SharedWith) > 0
+| mv-expand Shared = SharedWith to typeof(string)
+| where tostring(Shared) == "*"
+| extend OwnerId = tostring(Owners[0])
+| join kind=leftouter IdentityIdtoUPN on $left.OwnerId == $right.AccountObjectId
+| project-rename OwnerUpn = AccountUpn
+| project-away Shared, OwnerId, AccountObjectId
+| project-reorder CreatedDateTime, AgentId, Name, Platform, SharedWith, OwnerUpn` },
+    { key: "orphaned", title: "Orphaned Agents with Disabled Owners", cols: ["Name", "Platform", "DisabledOwnerUpn"],
+      desc: "Agents whose owners are all disabled or removed from the organization.",
+      q: () => String.raw`let EnabledAccountIds = materialize (
+    IdentityInfo
+    | where IsAccountEnabled == 1
+    | distinct AccountObjectId = tostring(AccountObjectId));
+let IdentityIdtoUPN = materialize (
+    IdentityInfo
+    | where isnotempty(AccountObjectId) and isnotempty(AccountUpn)
+    | summarize arg_max(Timestamp, AccountUpn) by AccountObjectId
+    | project AccountObjectId = tostring(AccountObjectId), AccountUpn);
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| where LifecycleStatus != "Deleted"
+| where array_length(Owners) > 0
+| mv-expand Owner = Owners to typeof(string)
+| extend OwnerId = tostring(Owner)
+| where isnotempty(OwnerId)
+| summarize OwnerIds = make_set(OwnerId) by AgentId, Name, Platform, CreatedDateTime
+| mv-apply OwnerId = OwnerIds to typeof(string) on (
+    where OwnerId !in (EnabledAccountIds)
+    | summarize DisabledOrMissingOwners = make_list(OwnerId))
+| where array_length(DisabledOrMissingOwners) == array_length(OwnerIds)
+| mv-expand DisabledOwnerId = DisabledOrMissingOwners to typeof(string)
+| join kind=leftouter IdentityIdtoUPN on $left.DisabledOwnerId == $right.AccountObjectId
+| extend ResolvedOwner = coalesce(AccountUpn, DisabledOwnerId)
+| summarize DisabledOwnerUpns = make_set(ResolvedOwner), DisabledOrMissingOwners = take_any(DisabledOrMissingOwners) by AgentId, Name, Platform, CreatedDateTime
+| extend DisabledOwnerUpn = tostring(DisabledOwnerUpns[0])
+| project-reorder CreatedDateTime, AgentId, Name, Platform, DisabledOrMissingOwners, DisabledOwnerUpns, DisabledOwnerUpn` },
+    { key: "owner-added-mcp", title: "Owner added to MCP-enabled agent", cols: ["Name", "Platform", "AddedOwnerUpn", "McpServersConfigured"],
+      desc: "Owners newly observed on MCP-enabled agents vs baseline (run within 2 days of a change).",
+      q: () => String.raw`let lookback = 14d;
+let recent = 2d;
+let IdentityIdtoUPN = materialize(
+    IdentityInfo
+    | extend ResolvedAccountUpn = tostring(column_ifexists("AccountUpn", column_ifexists("AccountUPN", ""))),
+             IdentityTimestamp = todatetime(column_ifexists("Timestamp", column_ifexists("TimeGenerated", datetime(null))))
+    | where IdentityTimestamp >= ago(lookback)
+    | where isnotempty(AccountObjectId) and isnotempty(ResolvedAccountUpn)
+    | summarize arg_max(IdentityTimestamp, ResolvedAccountUpn) by AccountObjectId
+    | project AccountObjectId = tostring(AccountObjectId), AccountUpn = ResolvedAccountUpn);
+let CurrentState = materialize(
+    AgentsInfo
+    | where Timestamp > ago(recent)
+    | summarize arg_max(Timestamp, *) by AgentId
+    | where LifecycleStatus != "Deleted"
+    | where array_length(coalesce(McpServers, dynamic([]))) > 0
+    | project AgentId, Timestamp, Name, Platform, CreatedDateTime,
+              CurrentOwners = coalesce(Owners, dynamic([])), McpServers);
+let CurrentMcp =
+    CurrentState
+    | mv-expand Mcp = McpServers
+    | extend McpName = tostring(Mcp.name)
+    | summarize McpServersConfigured = make_set_if(McpName, isnotempty(McpName)) by AgentId;
+let BaselineState =
+    AgentsInfo
+    | where Timestamp between (ago(lookback) .. ago(recent))
+    | where LifecycleStatus != "Deleted"
+    | summarize arg_max(Timestamp, *) by AgentId
+    | project AgentId, PreviousTimestamp = Timestamp,
+              PreviousOwners = coalesce(Owners, dynamic([]));
+CurrentState
+| join kind=inner CurrentMcp on AgentId
+| join kind=inner BaselineState on AgentId
+| extend AddedOwners = set_difference(CurrentOwners, PreviousOwners)
+| where array_length(AddedOwners) > 0
+| mv-expand AddedOwnerId = AddedOwners to typeof(string)
+| join kind=leftouter IdentityIdtoUPN on $left.AddedOwnerId == $right.AccountObjectId
+| extend AddedOwnerUpn = AccountUpn,
+         UnresolvedAddedOwnerId = iff(isempty(AccountUpn), AddedOwnerId, "")
+| extend AddedOwnerAccountName = tostring(split(AddedOwnerUpn, "@")[0]),
+         AddedOwnerAccountUPNSuffix = tostring(split(AddedOwnerUpn, "@")[1])
+| project Timestamp, PreviousTimestamp, AgentId, Name, Platform, CreatedDateTime,
+         PreviousOwners, CurrentOwners, AddedOwners, AddedOwnerId,
+         UnresolvedAddedOwnerId, AddedOwnerUpn, AddedOwnerAccountName,
+         AddedOwnerAccountUPNSuffix, McpServersConfigured
+| sort by Timestamp desc` },
+    { key: "short-instructions", title: "Published Agents with Short Instructions", cols: ["Name", "Platform", "Instructions", "OwnerUpn"],
+      desc: "Published agents with instructions under 100 characters.",
+      q: () => String.raw`let IdentityIdtoUPN = materialize (
+    IdentityInfo
+    | where isnotempty(AccountObjectId) and isnotempty(AccountUpn)
+    | summarize arg_max(Timestamp, AccountUpn) by AccountObjectId
+    | project AccountObjectId = tostring(AccountObjectId), AccountUpn);
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| where LifecycleStatus != "Deleted"
+| where PublishedStatus == "Published"
+| where isnotempty(Instructions) and Instructions != "N/A"
+| where strlen(Instructions) < 100
+| extend OwnerId = tostring(Owners[0])
+| join kind=leftouter IdentityIdtoUPN on $left.OwnerId == $right.AccountObjectId
+| project-rename OwnerUpn = AccountUpn
+| project-away OwnerId, AccountObjectId
+| project-reorder CreatedDateTime, AgentId, Name, Platform, Instructions, OwnerUpn` },
+    { key: "no-instructions", title: "Published Agents without Instructions", cols: ["Name", "Platform", "OwnerUpn"],
+      desc: "Published agents with no instructions configured.",
+      q: () => String.raw`let IdentityIdtoUPN = materialize (
+    IdentityInfo
+    | where isnotempty(AccountObjectId) and isnotempty(AccountUpn)
+    | summarize arg_max(Timestamp, AccountUpn) by AccountObjectId
+    | project AccountObjectId = tostring(AccountObjectId), AccountUpn);
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| where LifecycleStatus != "Deleted"
+| where PublishedStatus == "Published"
+| where isempty(Instructions) or Instructions == "N/A"
+| extend OwnerId = tostring(Owners[0])
+| join kind=leftouter IdentityIdtoUPN on $left.OwnerId == $right.AccountObjectId
+| project-rename OwnerUpn = AccountUpn
+| project-away OwnerId, AccountObjectId
+| project-reorder CreatedDateTime, AgentId, Name, Platform, Instructions, OwnerUpn` },
+    { key: "sharing-expanded", title: "Sharing expanded to organization-wide", cols: ["Name", "Platform", "HasElevatedCapabilities", "OwnerUpn"],
+      desc: "Agents restricted at baseline now shared org-wide; elevated-capability agents first (run within 2 days).",
+      q: () => String.raw`let lookback = 14d;
+let recent = 2d;
+let IdentityIdtoUPN = materialize(
+    IdentityInfo
+    | extend ResolvedAccountUpn = tostring(column_ifexists("AccountUpn", column_ifexists("AccountUPN", ""))),
+             IdentityTimestamp = todatetime(column_ifexists("Timestamp", column_ifexists("TimeGenerated", datetime(null))))
+    | where IdentityTimestamp >= ago(lookback)
+    | where isnotempty(AccountObjectId) and isnotempty(ResolvedAccountUpn)
+    | summarize arg_max(IdentityTimestamp, ResolvedAccountUpn) by AccountObjectId
+    | project AccountObjectId = tostring(AccountObjectId), AccountUpn = ResolvedAccountUpn);
+let CurrentState =
+    AgentsInfo
+    | where Timestamp > ago(recent)
+    | summarize arg_max(Timestamp, *) by AgentId
+    | where LifecycleStatus != "Deleted"
+    | where set_has_element(coalesce(SharedWith, dynamic([])), "*")
+    | extend McpServerCount = array_length(coalesce(McpServers, dynamic([]))),
+             DeclaredToolCount = array_length(coalesce(DeclaredTools, dynamic([])))
+    | project AgentId, Timestamp, Name, Platform, CreatedDateTime, Owners,
+              SharedWith, McpServerCount, DeclaredToolCount;
+let BaselineState =
+    AgentsInfo
+    | where Timestamp between (ago(lookback) .. ago(recent))
+    | where LifecycleStatus != "Deleted"
+    | summarize arg_max(Timestamp, *) by AgentId
+    | where not(set_has_element(coalesce(SharedWith, dynamic([])), "*"))
+    | project AgentId, PreviousTimestamp = Timestamp, PreviousSharedWith = SharedWith;
+CurrentState
+| join kind=inner BaselineState on AgentId
+| extend HasElevatedCapabilities = McpServerCount > 0 or DeclaredToolCount > 0
+| extend OwnerIds = iff(array_length(coalesce(Owners, dynamic([]))) > 0, Owners, dynamic([""]))
+| mv-expand OwnerId = OwnerIds to typeof(string)
+| join kind=leftouter IdentityIdtoUPN on $left.OwnerId == $right.AccountObjectId
+| project-rename OwnerUpn = AccountUpn
+| extend OwnerAccountName = tostring(split(OwnerUpn, "@")[0]),
+         OwnerAccountUPNSuffix = tostring(split(OwnerUpn, "@")[1])
+| project Timestamp, PreviousTimestamp, AgentId, Name, Platform, CreatedDateTime,
+         PreviousSharedWith, SharedWith, McpServerCount, DeclaredToolCount,
+         HasElevatedCapabilities, OwnerId, OwnerUpn, OwnerAccountName, OwnerAccountUPNSuffix
+| sort by HasElevatedCapabilities desc, Timestamp desc` }
   ];
   let POS_SEL = "no-instructions";
   const POS_CACHE = {};
@@ -1446,18 +1772,19 @@
     if (leftEl && rightEl && wrapEl) { const avail = leftEl.getBoundingClientRect().height - (wrapEl.getBoundingClientRect().top - rightEl.getBoundingClientRect().top) - 16; if (avail > 180) wrapEl.style.maxHeight = Math.round(avail) + "px"; }
   }
   function demoPosRows(key) {
+    const AB = "Agent Builder in Microsoft 365 Copilot", CS = "Copilot Studio";
     const m = {
-      "hardcoded-creds": [{ Name: "Weather Agent High Risk", Platform: "Agent Builder in Microsoft 365 Copilot", EntraAgentID: "—" }, { Name: "Block image and URL Test", Platform: "Copilot Studio", EntraAgentID: "41014193-…-5d2895" }],
-      "instructions-changed": [{ Name: "Prompt Evidence Agent", Platform: "Copilot Studio", Changes: 3 }, { Name: "Sales03", Platform: "Copilot Studio", Changes: 2 }],
-      "mcp-configured": [{ Name: "Contoso HR Helper", Platform: "Copilot Studio", McpServers: '[{"name":"SharePoint MCP"}]' }, { Name: "IT Helpdesk Agent", Platform: "Copilot Studio", McpServers: '[{"name":"ServiceNow MCP"}]' }],
-      "missing-tools": [{ Name: "Plan My Day", Platform: "Agent Builder in Microsoft 365 Copilot" }, { Name: "Career Coach", Platform: "Agent Builder in Microsoft 365 Copilot" }],
-      "new-mcp-server": [{ Name: "IT Helpdesk Agent", Platform: "Copilot Studio" }],
-      "org-wide-shared": [{ Name: "Agent Builder Shared Agent", Platform: "Agent Builder in Microsoft 365 Copilot", SharedWith: "Everyone" }, { Name: "Shared Agent", Platform: "Agent Builder in Microsoft 365 Copilot", SharedWith: "Organization" }],
-      "orphaned": [{ Name: "New Agent without ID", Platform: "Agent Builder in Microsoft 365 Copilot" }, { Name: "Agent No Owner", Platform: "Agent Builder in Microsoft 365 Copilot" }],
-      "owner-added-mcp": [{ Name: "Contoso HR Helper", Platform: "Copilot Studio" }],
-      "short-instructions": [{ Name: "New Agent", Platform: "Agent Builder in Microsoft 365 Copilot", Length: 42 }, { Name: "Light Agent", Platform: "Agent Builder in Microsoft 365 Copilot", Length: 71 }],
-      "no-instructions": [{ Name: "Quick Task Helper", Platform: "Agent Builder in Microsoft 365 Copilot" }, { Name: "Mailbox Assistent", Platform: "Agent Builder in Microsoft 365 Copilot" }, { Name: "New CPS Agent", Platform: "Copilot Studio" }],
-      "sharing-expanded": [{ Name: "Agent Builder Shared Agent", Platform: "Agent Builder in Microsoft 365 Copilot" }]
+      "hardcoded-creds": [{ Name: "Weather Agent High Risk", Platform: AB, OwnerUpn: "derk@blue16.nl" }, { Name: "Block image and URL Test", Platform: CS, OwnerUpn: "miranda@blue16.nl" }],
+      "instructions-changed": [{ Name: "Prompt Evidence Agent", Platform: CS, InstructionsLengthDelta: 184, OwnerUpn: "derk@blue16.nl" }, { Name: "Sales03", Platform: CS, InstructionsLengthDelta: -42, OwnerUpn: "eden@blue16.nl" }],
+      "mcp-configured": [{ Name: "Contoso HR Helper", Platform: CS, McpServersConfigured: '["SharePoint MCP"]', OwnerUpn: "derk@blue16.nl" }, { Name: "IT Helpdesk Agent", Platform: CS, McpServersConfigured: '["ServiceNow MCP"]', OwnerUpn: "derk@blue16.nl" }],
+      "missing-tools": [{ Name: "Plan My Day", Platform: AB, MissingTools: '["calendar","email"]', OwnerUpn: "eden@blue16.nl" }, { Name: "Career Coach", Platform: AB, MissingTools: '["search"]', OwnerUpn: "miranda@blue16.nl" }],
+      "new-mcp-server": [{ Name: "IT Helpdesk Agent", Platform: CS, AddedMcpServers: '["ServiceNow MCP"]', OwnerUpn: "derk@blue16.nl" }],
+      "org-wide-shared": [{ Name: "Agent Builder Shared Agent", Platform: AB, SharedWith: '["*"]', OwnerUpn: "derk@blue16.nl" }, { Name: "Shared Agent", Platform: AB, SharedWith: '["*"]', OwnerUpn: "eden@blue16.nl" }],
+      "orphaned": [{ Name: "New Agent without ID", Platform: AB, DisabledOwnerUpn: "former.staff@blue16.nl" }, { Name: "Agent No Owner", Platform: AB, DisabledOwnerUpn: "disabled.svc@blue16.nl" }],
+      "owner-added-mcp": [{ Name: "Contoso HR Helper", Platform: CS, AddedOwnerUpn: "newadmin@blue16.nl", McpServersConfigured: '["SharePoint MCP"]' }],
+      "short-instructions": [{ Name: "New Agent", Platform: AB, Instructions: "Help the user.", OwnerUpn: "eden@blue16.nl" }, { Name: "Light Agent", Platform: AB, Instructions: "Answer questions about the weather and news briefly.", OwnerUpn: "miranda@blue16.nl" }],
+      "no-instructions": [{ Name: "Quick Task Helper", Platform: AB, OwnerUpn: "eden@blue16.nl" }, { Name: "Mailbox Assistent", Platform: AB, OwnerUpn: "miranda@blue16.nl" }, { Name: "New CPS Agent", Platform: CS, OwnerUpn: "derk@blue16.nl" }],
+      "sharing-expanded": [{ Name: "Agent Builder Shared Agent", Platform: AB, HasElevatedCapabilities: true, OwnerUpn: "derk@blue16.nl" }]
     };
     return m[key] || [];
   }
