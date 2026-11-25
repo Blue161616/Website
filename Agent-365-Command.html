@@ -439,11 +439,15 @@
   const SHADOW_RX = /openclaw|zeroclaw|\bclaw\b|chatgpt|ollama|poe\b|opencode|claude desktop|cursor|warp|goose|lm ?studio|jan\b/i;
 
   function riskList(v) {
+    // RiskIndicators is a dict keyed by indicator id → { title, description }. Live payloads also carry OData
+    // metadata (@odata.type) and non-indicator keys whose value has no title — count ONLY real indicator
+    // objects (those with a title/name), never the key itself, so the rollup isn't polluted.
     const p = jp(v); const out = [];
+    const add = (id, o) => { if (!o || typeof o !== "object" || Array.isArray(o)) return; const title = o.title || o.name || o.displayName; if (!title) return; out.push({ id: id || title, title: title, desc: o.description || o.desc || "" }); };
     if (p && typeof p === "object" && !Array.isArray(p)) {
-      Object.keys(p).forEach(k => { const o = p[k] || {}; out.push({ id: k, title: o.title || o.name || k, desc: o.description || "" }); });
+      Object.keys(p).forEach(k => { if (k.charAt(0) === "@") return; add(k, p[k]); });
     } else if (Array.isArray(p)) {
-      p.forEach(o => { if (typeof o === "string") out.push({ id: o, title: o, desc: "" }); else if (o) out.push({ id: o.id || o.title || "", title: o.title || o.name || o.id || "risk", desc: o.description || "" }); });
+      p.forEach(o => { if (typeof o === "string") { if (o && o.charAt(0) !== "@") out.push({ id: o, title: o, desc: "" }); } else add(o && (o.id || o.indicatorId), o); });
     }
     return out;
   }
@@ -507,13 +511,16 @@
     catch (e) { out.errors.inventory = e.message; out.caps.inventory = false; return out; }
     out.agents = rows.map(normAgent);
 
-    // Optional enrich: blueprints (name/publisher) keyed by id — beta endpoint, tolerate absence.
+    // Optional enrich: blueprints (name/publisher). Documented endpoint is an OData cast on /applications
+    // (agentIdentityBlueprint inherits from application). AgentsInfo.EntraBlueprintID may be the blueprint's
+    // object id OR its appId, so index both. Non-owners also need an Agent ID / AI Administrator role, so a
+    // 403 here is a role gap, not a missing scope — surface the status so it's actionable.
     try {
-      const bps = await gGetAll("https://graph.microsoft.com/beta/directory/agentIdentityBlueprints?$select=id,displayName,verifiedPublisher", ["AgentIdentityBlueprint.Read.All"]);
-      const byId = {}; bps.forEach(b => byId[String(b.id).toLowerCase()] = b);
-      out.agents.forEach(a => { if (a.bpId && byId[String(a.bpId).toLowerCase()]) { const b = byId[String(a.bpId).toLowerCase()]; a.blueprintName = b.displayName; a.publisher = (b.verifiedPublisher && b.verifiedPublisher.displayName) || null; } });
-      out.caps.blueprints = true;
-    } catch (e) { out.caps.blueprints = false; notePartial("Blueprints", "Blueprint names/publishers not read — grant AgentIdentityBlueprint.Read.All (beta)."); }
+      const bps = await gGetAll("/applications/microsoft.graph.agentIdentityBlueprint?$select=id,appId,displayName,verifiedPublisher", ["AgentIdentityBlueprint.Read.All"]);
+      const byId = {}; bps.forEach(b => { if (b.id) byId[String(b.id).toLowerCase()] = b; if (b.appId) byId[String(b.appId).toLowerCase()] = b; });
+      out.agents.forEach(a => { const b = a.bpId && byId[String(a.bpId).toLowerCase()]; if (b) { a.blueprintName = b.displayName; a.publisher = (b.verifiedPublisher && b.verifiedPublisher.displayName) || null; } });
+      out.blueprintCount = bps.length; out.caps.blueprints = true;
+    } catch (e) { out.caps.blueprints = false; notePartial("Blueprints", "Blueprint names/publishers not read (" + (e.status || "error") + ") — needs AgentIdentityBlueprint.Read.All plus an Agent ID Administrator / AI Administrator role for non-owners."); }
 
     // Optional enrich: resolve owner object IDs → display names (batch-ish, capped).
     try {
@@ -548,11 +555,20 @@
   // Which enabled CA policies scope agent / workload identities, and do they require a compliant device?
   function summarizeCA(policies) {
     const enabled = (policies || []).filter(p => String(p.state).toLowerCase() === "enabled");
+    // A policy targets agents if it scopes agent/workload identities by any supported mechanism: an explicit
+    // service-principal/agent list, a custom-security-attribute filter, agent/SP risk levels (e.g. "block high
+    // risk"), or agent-identity/blueprint targeting. The Agent ID CA schema is still evolving, so detect
+    // generically rather than only on includeServicePrincipals.
     const targets = p => {
-      const ca = (p.conditions && p.conditions.clientApplications) || {};
+      const c = p.conditions || {};
+      const ca = c.clientApplications || {};
       const sp = ca.includeServicePrincipals || ca.servicePrincipals || [];
-      if (Array.isArray(sp)) return sp.length > 0 && !(sp.length === 1 && /none/i.test(String(sp[0])));
-      return !!sp;
+      const spInc = Array.isArray(sp) ? (sp.length > 0 && !(sp.length === 1 && /none/i.test(String(sp[0])))) : !!sp;
+      const filt = !!(ca.servicePrincipalFilter || ca.includeServicePrincipalFilter || ca.filter || ca.includeAgentFilter || ca.agentFilter);
+      const risk = Array.isArray(c.servicePrincipalRiskLevels) && c.servicePrincipalRiskLevels.length > 0;
+      const agentsInc = ca.includeAgents || ca.agents || ca.includeAgentIdentities || c.agents;
+      const agentsNonEmpty = agentsInc && (Array.isArray(agentsInc) ? agentsInc.length > 0 : (typeof agentsInc === "object" ? Object.keys(agentsInc).length > 0 : !!agentsInc));
+      return spInc || filt || risk || !!agentsNonEmpty;
     };
     const agentPols = enabled.filter(targets).map(p => {
       const bic = (p.grantControls && p.grantControls.builtInControls) || [];
@@ -640,7 +656,48 @@
   let DATA = null, VIEW = "overview";
   const STATE = { q: "", cat: "", plat: "", risk: "", flag: "", sortCol: "risk", sortDir: -1 };
   const EXPANDED = {};
-  const PLAT_ICON = { "Copilot Studio": "🟦", "Foundry": "🧪", "Agent Builder": "🧩", "Other": "🏪", "LocalAgents": "💻" };
+  // Brand platform marks — inline SVG (keeps the tool single-file). Gradients live once in SVG_DEFS,
+  // injected into the DOM on load; each icon references them by id. Stylised recreations of the Microsoft
+  // marks: Copilot Studio (cascading panels), Microsoft Foundry (blue ribbon arch), Agent 365 / Agent
+  // Builder (lighter ribbon arch + dot). Matching is case-insensitive substring, so live platform names
+  // like "Microsoft Foundry" and "Agent Builder in Microsoft 365 Copilot" resolve correctly.
+  const SVG_DEFS = `<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+    <linearGradient id="a365-cs-a" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#19C6A0"/><stop offset="1" stop-color="#3FA0FF"/></linearGradient>
+    <linearGradient id="a365-cs-b" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#FFD15C"/><stop offset="1" stop-color="#FF8A4C"/></linearGradient>
+    <linearGradient id="a365-cs-c" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#B84CFF"/><stop offset="1" stop-color="#FF4FA0"/></linearGradient>
+    <linearGradient id="a365-fnd" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5B5BF0"/><stop offset="1" stop-color="#2322CE"/></linearGradient>
+    <linearGradient id="a365-agt" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#A9C6FF"/><stop offset="1" stop-color="#3A63D6"/></linearGradient>
+    <linearGradient id="pil-ent-f" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#2FB6F0"/><stop offset="1" stop-color="#5BD2FF"/></linearGradient>
+    <linearGradient id="pil-ent-b" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1E7DD6"/><stop offset="1" stop-color="#0F4AA8"/></linearGradient>
+    <linearGradient id="pil-def" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#43C3F7"/><stop offset="1" stop-color="#0E4FB0"/></linearGradient>
+    <linearGradient id="pil-pur" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#46B6F7"/><stop offset="1" stop-color="#1550C8"/></linearGradient>
+    <linearGradient id="pil-int" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#53C6FF"/><stop offset="1" stop-color="#1557E0"/></linearGradient>
+  </defs></svg>`;
+  const PLAT_INNER = {
+    cs: `<rect x="9.5" y="3" width="10.5" height="10.5" rx="3" fill="url(#a365-cs-c)"/><rect x="6.5" y="6.2" width="10.5" height="10.5" rx="3" fill="url(#a365-cs-b)"/><rect x="3.5" y="9.4" width="10.5" height="10.5" rx="3" fill="url(#a365-cs-a)"/>`,
+    fnd: `<path d="M12 3.2c-4.7 0-8.4 4.6-8.4 10.6V20.8H8V13.8c0-3.3 1.7-5.8 4-5.8s4 2.5 4 5.8V20.8h4.4V13.8C20.4 7.8 16.7 3.2 12 3.2z" fill="url(#a365-fnd)"/>`,
+    agt: `<path d="M11 3.2c-4.4 0-7.9 4.3-7.9 10V20H7.1v-6.8c0-3.1 1.6-5.4 3.9-5.4s3.9 2.3 3.9 5.4V20H19v-6.8C19 7.5 15.4 3.2 11 3.2z" fill="url(#a365-agt)"/><circle cx="19.6" cy="18.3" r="2.5" fill="url(#a365-agt)"/>`,
+    local: `<rect x="4" y="5" width="16" height="10" rx="1.6" fill="none" stroke="#93ACD3" stroke-width="1.6"/><path d="M2.5 18.5h19" stroke="#93ACD3" stroke-width="1.6" stroke-linecap="round"/>`,
+    other: `<path d="M4 8l1-3h14l1 3M4 8h16M4.8 8v11h14.4V8M9 19v-6h6v6" fill="none" stroke="#8FE3FF" stroke-width="1.4" stroke-linejoin="round"/>`
+  };
+  function platIcon(p, sz) {
+    sz = sz || 14; const s = String(p || "").toLowerCase(); let k;
+    if (s.includes("copilot studio")) k = "cs";
+    else if (s.includes("foundry")) k = "fnd";
+    else if (s.includes("agent builder") || s.includes("agent 365") || s.includes("365 copilot") || s.includes("copilot")) k = "agt";
+    else if (s.includes("local")) k = "local";
+    else if (s.includes("other")) k = "other";
+    else return '<span style="opacity:.55">•</span>';
+    return `<svg viewBox="0 0 24 24" width="${sz}" height="${sz}" style="vertical-align:-3px;margin-right:2px" aria-hidden="true">${PLAT_INNER[k]}</svg>`;
+  }
+  // Security-pillar brand marks (Microsoft Entra / Defender / Purview / Intune) — inline SVG recreations.
+  const PILLAR_INNER = {
+    entra: `<path d="M12.5 3h3.5a2.5 2.5 0 0 1 2.5 2.5v11a2.5 2.5 0 0 1-2.5 2.5h-1.5a2.5 2.5 0 0 1-2.5-2.5V5.5A2.5 2.5 0 0 1 12.5 3z" fill="url(#pil-ent-b)"/><path d="M7 6h4.5a2.5 2.5 0 0 1 2.5 2.5v8A2.5 2.5 0 0 1 11.5 19H7a2.5 2.5 0 0 1-2.5-2.5V8.5A2.5 2.5 0 0 1 7 6z" fill="url(#pil-ent-f)"/>`,
+    defender: `<path d="M12 2.6 19.5 5.4V12c0 4.4-3.3 7.9-7.5 9-4.2-1.1-7.5-4.6-7.5-9V5.4z" fill="url(#pil-def)"/><path d="M12 2.6V21M4.6 12h14.8" stroke="#07122b" stroke-width="0.8" opacity=".3"/>`,
+    purview: `<path fill-rule="evenodd" d="M12 2.8c.9 0 1.7.5 2.1 1.3l6.4 11.7c.9 1.7-.3 3.8-2.2 3.8H5.7c-1.9 0-3.1-2.1-2.2-3.8L9.9 4.1c.4-.8 1.2-1.3 2.1-1.3zM12 8l-4.2 7.9h8.4z" fill="url(#pil-pur)"/>`,
+    intune: `<g fill="none" stroke-linecap="round" stroke-width="3.3"><path d="M5.5 13.2 12.3 6.4" stroke="url(#pil-int)"/><path d="M11.7 17.6 18.5 10.8" stroke="url(#pil-int)"/></g>`
+  };
+  function pillarIcon(k, sz) { sz = sz || 17; return `<svg viewBox="0 0 24 24" width="${sz}" height="${sz}" style="vertical-align:-4px;margin-right:3px" aria-hidden="true">${PILLAR_INNER[k]}</svg>`; }
 
   const SEGMENTS = [
     ["identity", "🪪", "With identity (blueprint)", "Governed agents — an Entra Agent ID + blueprint"],
@@ -709,7 +766,7 @@
 
     html += `<div class="cols2">
       <div class="card"><h3>By platform</h3><ul class="barlist">` +
-        Object.entries(plats).sort((a, b) => b[1] - a[1]).map(([p, n]) => `<li><span class="lab">${PLAT_ICON[p] || "•"} ${esc(p)}</span><span class="val">${n}</span><span class="track"><span class="fill" style="width:${Math.round(n / platMax * 100)}%"></span></span></li>`).join("") +
+        Object.entries(plats).sort((a, b) => b[1] - a[1]).map(([p, n]) => `<li><span class="lab">${platIcon(p, 16)} ${esc(p)}</span><span class="val">${n}</span><span class="track"><span class="fill" style="width:${Math.round(n / platMax * 100)}%"></span></span></li>`).join("") +
         `</ul></div>
       <div class="card"><h3>Defender risk indicators</h3>` +
         (rr.length ? `<ul class="barlist">` + rr.map(([t, n]) => `<li><span class="lab">${esc(t)}</span><span class="val">${n}</span><span class="track"><span class="fill ${n >= rrMax * 0.6 ? "red" : "amber"}" style="width:${Math.round(n / rrMax * 100)}%"></span></span></li>`).join("") + `</ul>`
@@ -733,7 +790,7 @@
   };
   function agentRow(a) {
     const chips = [];
-    chips.push(`<span class="chip plat">${PLAT_ICON[a.platform] || "•"} ${esc(a.platform)}</span>`);
+    chips.push(`<span class="chip plat">${platIcon(a.platform, 12)} ${esc(a.platform)}</span>`);
     if (a.shadow) chips.push(`<span class="chip shadow" title="Unmanaged local agent (shadow AI)">shadow</span>`);
     else if (a.local) chips.push(`<span class="chip local">local</span>`);
     if (!a.local && a.ownerCount === 0) chips.push(`<span class="chip noown" title="No owner assigned">no owner</span>`);
@@ -920,7 +977,7 @@
         <div class="n">${t.n}</div><div><div class="l">${esc(t.l)}</div><div class="s">${esc(t.s)}</div></div></div>`).join("") + `</div>`;
 
     // four pillar cards
-    const entra = pillarCard("Entra — access & governance", "🔐",
+    const entra = pillarCard("Entra — access & governance", pillarIcon("entra"),
       ca ? (ca.coversAgents ? { cls: "Low", text: "CA targets agents" } : { cls: "High", text: "No CA for agents" }) : { cls: "na", text: "CA not read" },
       [
         ca ? { t: "Conditional Access policies", v: ca.enabled + " of " + ca.total + " enabled" } : { t: "Conditional Access", v: "not read", cls: "" },
@@ -929,19 +986,19 @@
         { t: "Identity protection for agents", v: lic.agent365 ? "in licence" : "needs Agent 365", cls: lic.agent365 ? "v-good" : "", d: "Risk-based CA for agents." }
       ].filter(Boolean));
 
-    const defender = pillarCard("Defender — threat posture", "🛡️",
+    const defender = pillarCard("Defender — threat posture", pillarIcon("defender"),
       rr.length ? { cls: atRisk ? "Medium" : "Low", text: rr.length + " risk indicator type(s)" } : (lic.agent365 ? { cls: "Low", text: "no indicators" } : { cls: "na", text: "needs Agent 365" }),
       rr.length ? rr.slice(0, 6).map(([t, n]) => ({ t, v: n, cls: n >= 2 ? "v-warn" : "" }))
         : [{ t: "Risk indicators", v: lic.agent365 ? "none" : "N/A", d: lic.agent365 ? "No agent flagged." : "Defender-assessed; need Agent 365 / security for AI (MDE P2)." }]);
 
-    const purview = pillarCard("Purview — data & compliance", "📋", { cls: "na", text: "portal / limited API" },
+    const purview = pillarCard("Purview — data & compliance", pillarIcon("purview"), { cls: "na", text: "portal / limited API" },
       [
         { t: "Audit logging for agents", v: "portal", d: "Config not exposed to a browser API — verify in Purview." },
         { t: "DLP for agents (block sensitive data)", v: lic.agent365 ? "in licence" : "needs Agent 365", d: "Premium Purview capability; no browser API to read policy state." },
         { t: "AI compliance assessment", v: "portal", d: "Shown here as N/A rather than a false pass." }
       ]);
 
-    const intune = pillarCard("Intune — device & blocking", "📱",
+    const intune = pillarCard("Intune — device & blocking", pillarIcon("intune"),
       shadow ? { cls: "Medium", text: shadow + " shadow agent(s)" } : { cls: "Low", text: "no shadow agents" },
       [
         { t: "Shadow (unmanaged local) agents", v: shadow, cls: shadow ? "v-warn" : "v-good", d: "Block common ones (e.g. OpenClaw) on managed Windows via Intune." },
@@ -1169,6 +1226,7 @@
 
   // wire
   window.addEventListener("DOMContentLoaded", () => {
+    document.body.insertAdjacentHTML("afterbegin", SVG_DEFS);   // shared gradient defs for brand icons
     fillSetup();
     const saved = { client: localStorage.getItem("a365_client") || "", tenant: localStorage.getItem("a365_tenant") || "organizations" };
     if (saved.client) $("inClient").value = saved.client;
