@@ -186,6 +186,7 @@
   .barlist .fill { height: 100%; background: var(--grad-blue); border-radius: 3px; }
   .barlist .fill.red { background: linear-gradient(90deg,#FF7A45,#FF4D6D); }
   .barlist .fill.amber { background: linear-gradient(90deg,#FFC15E,#FF9A7A); }
+  .barlist li.clk { cursor: pointer; } .barlist li.clk:hover .lab { color: var(--accent-dark); }
 
   /* ---- filters ---- */
   .filters { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; margin-bottom: 14px; }
@@ -434,6 +435,30 @@
   function jp(v) { if (v == null) return null; if (typeof v !== "string") return v; const s = v.trim(); if (!s) return null; try { return JSON.parse(s); } catch (e) { return v; } }
   function arr(v) { const p = jp(v); return Array.isArray(p) ? p : (p == null || p === "" ? [] : [p]); }
   function cnt(v) { const p = jp(v); if (Array.isArray(p)) return p.length; if (p && typeof p === "object") return Object.keys(p).length; return 0; }
+  // Agent display names from Entra carry a platform suffix, e.g. "Agent 2 (Microsoft Copilot Studio)". Strip the
+  // trailing parenthetical and any DNS suffix so AgentsInfo names and Entra names reconcile.
+  const normName = s => String(s || "").toLowerCase().replace(/\s*\([^)]*\)\s*$/, "").split(".")[0].trim();
+
+  // Reconcile AgentsInfo against the Entra agent-identity inventory. AgentsInfo.EntraAgentID is sparsely
+  // populated (Defender doesn't link every governed agent — Foundry rows often have it blank), so "with
+  // identity" from AgentsInfo alone undercounts versus the Entra Agents blade. Match an identity to an
+  // AgentsInfo row by object id, appId or normalised name; mark matched rows as governed, and add Entra
+  // identities that have no AgentsInfo row at all so the total matches the Entra inventory.
+  function mergeEntraIdentities(out, ids) {
+    out.entraIdentities = ids; out.entraIdentityCount = ids.length; out.caps.identities = true;
+    const byKey = {}; const put = (k, a) => { if (k) byKey[k] = a; };
+    out.agents.forEach(a => { put(a.entraId && ("id:" + String(a.entraId).toLowerCase()), a); put(a.appId && ("app:" + String(a.appId).toLowerCase()), a); put("nm:" + normName(a.name), a); });
+    const platOf = nm => /copilot studio/i.test(nm) ? "Copilot Studio" : /foundry/i.test(nm) ? "Microsoft Foundry" : /agent builder|365 copilot/i.test(nm) ? "Agent Builder in Microsoft 365 Copilot" : "Agent identity";
+    let added = 0, reconciled = 0;
+    ids.forEach(x => {
+      const nm = x.displayName || x.appDisplayName || "(agent identity)";
+      const match = byKey["id:" + String(x.id || "").toLowerCase()] || (x.appId && byKey["app:" + String(x.appId).toLowerCase()]) || byKey["nm:" + normName(nm)];
+      if (match) { if (!match.managed) { match.managed = true; match.category = "identity"; match.entraId = match.entraId || x.id; match.reconciled = true; reconciled++; } return; }
+      out.agents.push(normAgent({ AgentId: "entra:" + x.id, Name: nm, Platform: platOf(nm), EntraAgentID: x.id, LifecycleStatus: x.accountEnabled === false ? "Disabled" : "Active" }));
+      const a = out.agents[out.agents.length - 1]; a.fromEntraOnly = true; a.appId = x.appId || null; added++;
+    });
+    out.identityReconcile = { added, reconciled };
+  }
 
   // Known consumer / standalone apps Defender surfaces as local "shadow AI".
   const SHADOW_RX = /openclaw|zeroclaw|\bclaw\b|chatgpt|ollama|poe\b|opencode|claude desktop|cursor|warp|goose|lm ?studio|jan\b/i;
@@ -521,6 +546,13 @@
       out.agents.forEach(a => { const b = a.bpId && byId[String(a.bpId).toLowerCase()]; if (b) { a.blueprintName = b.displayName; a.publisher = (b.verifiedPublisher && b.verifiedPublisher.displayName) || null; } });
       out.blueprintCount = bps.length; out.caps.blueprints = true;
     } catch (e) { out.caps.blueprints = false; notePartial("Blueprints", "Blueprint names/publishers not read (" + (e.status || "error") + ") — needs AgentIdentityBlueprint.Read.All plus an Agent ID Administrator / AI Administrator role for non-owners."); }
+
+    // Entra agent identities — the authoritative identity inventory; reconcile against AgentsInfo so the
+    // "with identity" count matches the Entra Agents blade, not just AgentsInfo's sparse link.
+    try {
+      const ids = await gGetAll("/servicePrincipals/microsoft.graph.agentIdentity?$select=id,appId,displayName,accountEnabled", ["AgentIdentity.Read.All"]);
+      mergeEntraIdentities(out, ids);
+    } catch (e) { out.caps.identities = false; notePartial("Agent identities", "Entra agent-identity inventory not read (" + (e.status || "error") + ") — grant AgentIdentity.Read.All. 'With identity' is then counted from AgentsInfo's sparse EntraAgentID link and can undercount versus the Entra Agents blade."); }
 
     // Optional enrich: resolve owner object IDs → display names (batch-ish, capped).
     try {
@@ -612,7 +644,7 @@
       DeclaredDataSources: JSON.stringify([{ name: "HR SharePoint" }]),
       Endpoints: JSON.stringify([{ url: "https://hr.contoso.com/agent", externalConnectivity: true }]),
       RiskIndicators: JSON.stringify({ priv: { title: "Privileged Business-system Access", description: "Has write access to a key business system." }, pub: { title: "Published Agent", description: "Available to all users." } }) });
-    push({ AgentId: "gov-2", Name: "Finance Forecaster", Platform: "Foundry", Model: "gpt-4.1",
+    push({ AgentId: "gov-2", Name: "Finance Forecaster", Platform: "Microsoft Foundry", Model: "gpt-4.1",
       EntraAgentID: "a1b2c3d4-0000-0000-0000-000000000002", EntraBlueprintID: "bp-foundry-01",
       Owners: "[]", LifecycleStatus: "Active",
       DeclaredTools: JSON.stringify([{ type: "code_interpreter", name: "Python" }, { type: "bing_grounding", name: "Web" }]),
@@ -641,7 +673,14 @@
     const out = { agents, caps: { inventory: true, blueprints: true, owners: true, licence: true, ca: true }, errors: {},
       licence: { agent365: false, e5: true, mdeP2: true, raw: ["SPE_E5"] },
       ca: { total: 9, enabled: 7, coversAgents: true,
-        agentPolicies: [{ name: "Workload identities — block risky sign-in", grant: ["block"], requiresCompliant: false, block: true }] } };
+        agentPolicies: [{ name: "Agents — block high risk (AllResources)", grant: ["block"], requiresCompliant: false, block: true }] } };
+    mergeEntraIdentities(out, [
+      { id: "a1b2c3d4-0000-0000-0000-000000000001", appId: "app-hr", displayName: "Contoso HR Helper" },
+      { id: "a1b2c3d4-0000-0000-0000-000000000002", appId: "app-fin", displayName: "Finance Forecaster (Microsoft Foundry)" },
+      { id: "a1b2c3d4-0000-0000-0000-000000000003", appId: "app-it", displayName: "IT Helpdesk Agent" },
+      { id: "entra-lab7", appId: "app-lab7", displayName: "Lab Agent 7 (Microsoft Copilot Studio)" },
+      { id: "entra-orch", appId: "app-orch", displayName: "Orchestration Agent (Microsoft Foundry)" }
+    ]);
     out.agents.forEach(a => {
       if (a.bpId === "25664c89-cea5-4ab6-b924-a54fd8a19ae0") { a.blueprintName = "Copilot Studio (global)"; a.publisher = "Microsoft"; }
       else if (a.bpId) { a.blueprintName = "Foundry blueprint"; a.publisher = null; }
@@ -654,7 +693,7 @@
   //  STATE + RENDER
   // ════════════════════════════════════════════════════════════════════════
   let DATA = null, VIEW = "overview";
-  const STATE = { q: "", cat: "", plat: "", risk: "", flag: "", sortCol: "risk", sortDir: -1 };
+  const STATE = { q: "", cat: "", plat: "", risk: "", flag: "", riskInd: "", sortCol: "risk", sortDir: -1 };
   const EXPANDED = {};
   // Brand platform marks — inline SVG (keeps the tool single-file). Gradients live once in SVG_DEFS,
   // injected into the DOM on load; each icon references them by id. Stylised recreations of the Microsoft
@@ -718,6 +757,7 @@
     if (S.flag === "mcp" && !a.mcp) return false;
     if (S.flag === "shadow" && !a.shadow) return false;
     if (S.flag === "connected" && !a.connected) return false;
+    if (S.riskInd && !a.risks.some(r => r.title === S.riskInd)) return false;
     return true;
   }
 
@@ -766,16 +806,18 @@
 
     html += `<div class="cols2">
       <div class="card"><h3>By platform</h3><ul class="barlist">` +
-        Object.entries(plats).sort((a, b) => b[1] - a[1]).map(([p, n]) => `<li><span class="lab">${platIcon(p, 16)} ${esc(p)}</span><span class="val">${n}</span><span class="track"><span class="fill" style="width:${Math.round(n / platMax * 100)}%"></span></span></li>`).join("") +
+        Object.entries(plats).sort((a, b) => b[1] - a[1]).map(([p, n]) => `<li class="clk" data-rowk="plat" data-rowv="${esc(p)}" title="Filter agents by platform"><span class="lab">${platIcon(p, 16)} ${esc(p)}</span><span class="val">${n}</span><span class="track"><span class="fill" style="width:${Math.round(n / platMax * 100)}%"></span></span></li>`).join("") +
         `</ul></div>
       <div class="card"><h3>Defender risk indicators</h3>` +
-        (rr.length ? `<ul class="barlist">` + rr.map(([t, n]) => `<li><span class="lab">${esc(t)}</span><span class="val">${n}</span><span class="track"><span class="fill ${n >= rrMax * 0.6 ? "red" : "amber"}" style="width:${Math.round(n / rrMax * 100)}%"></span></span></li>`).join("") + `</ul>`
+        (rr.length ? `<ul class="barlist">` + rr.map(([t, n]) => `<li class="clk" data-rowk="rind" data-rowv="${esc(t)}" title="Filter agents by this risk indicator"><span class="lab">${esc(t)}</span><span class="val">${n}</span><span class="track"><span class="fill ${n >= rrMax * 0.6 ? "red" : "amber"}" style="width:${Math.round(n / rrMax * 100)}%"></span></span></li>`).join("") + `</ul>`
           : (DATA.licence && DATA.licence.agent365 === false ? `<div class="muted">No risk indicators. These are Defender-assessed and need <b>Microsoft Agent 365</b> (or MDE P2 + security for AI). Inventory is shown regardless.</div>` : `<div class="v-good">No risk indicators flagged on any agent.</div>`)) +
         `</div>
     </div>`;
 
     // Shadow AI honesty note
     html += `<div class="note"><b>Shadow AI:</b> ${shadow} unmanaged local agent${shadow === 1 ? "" : "s"} discovered by Defender (shown in <b>Local &amp; shadow</b>). The admin-center Shadow-AI <i>traffic / users / devices</i> tiles are sourced from Global Secure Access and the M365 admin portal, which have no browser API — those are portal-only.</div>`;
+    if (DATA.caps && DATA.caps.identities) html += `<div class="note"><b>Identity reconciliation.</b> <b>${identity}</b> agents have an Entra agent identity — the authoritative count from the Entra <i>Agents</i> blade. AgentsInfo links only a subset, so this reconciles Defender's inventory with Entra Agent ID: governed Copilot Studio, Foundry and other agents that AgentsInfo doesn't link are included${DATA.identityReconcile ? ` (${DATA.identityReconcile.reconciled} matched to an AgentsInfo row, ${DATA.identityReconcile.added} identity-only)` : ""}.</div>`;
+    else if (DATA.caps && DATA.caps.identities === false) html += `<div class="note warn"><b>"With identity" may undercount.</b> The Entra agent-identity inventory wasn't read — grant <b>AgentIdentity.Read.All</b>. It's currently counted from AgentsInfo's sparse <code>EntraAgentID</code> link only, which misses governed agents (e.g. Foundry) that Defender doesn't link.</div>`;
     $("view").innerHTML = html;
     wireFilters();
   }
@@ -818,6 +860,7 @@
       (items && items.length ? `<ul class="dlist">${items.slice(0, 20).map(fmt).join("")}</ul>` : `<div class="muted">None.</div>`) + `</div>`;
     const idc = `<div class="dcol"><h4>Identity &amp; governance</h4><dl class="kv">
       ${kv("Category", a.managed ? "Agent identity (blueprint)" : a.local ? "Local / shadow" : "Registry-only (no identity)")}
+      ${a.fromEntraOnly ? kv("Source", '<span class="v-warn">Entra Agent ID — not in Defender AgentsInfo</span>') : a.reconciled ? kv("Source", "AgentsInfo + Entra Agent ID (reconciled)") : ""}
       ${kv("Platform", esc(a.platform))}
       ${a.managed ? kv("Entra agent id", "<code>" + esc(a.entraId) + "</code>") : ""}
       ${a.bpId ? kv("Blueprint", (a.blueprintName ? esc(a.blueprintName) + " · " : "") + "<code>" + esc(a.bpId) + "</code>") : ""}
@@ -866,7 +909,7 @@
       <select id="fPlat"><option value="">All platforms</option></select>
       <select id="fRisk"><option value="">Any risk</option><option>High</option><option>Medium</option><option>Low</option><option value="None">None</option></select>
       <select id="fFlag"><option value="">Any flag</option><option value="noowner">No owner</option><option value="risk">Has risk indicator</option><option value="ext">External endpoint</option><option value="mcp">Has MCP server</option><option value="connected">Multi-agent</option><option value="shadow">Shadow AI</option></select>
-      <span class="fsp"></span><button class="btn sm" id="fClear">Clear</button></div>`;
+      <span class="fsp"></span>${STATE.riskInd ? `<span class="chip" style="border-color:var(--accent);color:var(--accent-dark)">risk: ${esc(STATE.riskInd)}</span>` : ""}<button class="btn sm" id="fClear">Clear</button></div>`;
     html += `<div id="segs"></div><div id="emptyMsg" class="empty hidden">No agents match these filters.</div>`;
     $("view").innerHTML = html;
 
@@ -915,7 +958,7 @@
     $("fPlat").addEventListener("change", e => { STATE.plat = e.target.value; renderSegs(); });
     $("fRisk").addEventListener("change", e => { STATE.risk = e.target.value; renderSegs(); });
     $("fFlag").addEventListener("change", e => { STATE.flag = e.target.value; renderSegs(); });
-    $("fClear").addEventListener("click", () => { Object.assign(STATE, { q: "", plat: "", risk: "", flag: "" }); renderControl(); });
+    $("fClear").addEventListener("click", () => { Object.assign(STATE, { q: "", plat: "", risk: "", flag: "", riskInd: "" }); renderControl(); });
   }
 
   // ── SECURITY CONTROLS ──
@@ -1163,6 +1206,13 @@
         VIEW = "control"; renderView();
       });
     });
+    // clickable barlist rows (platform / risk indicator) → filter the control plane
+    document.querySelectorAll("#view [data-rowv]").forEach(el => el.addEventListener("click", () => {
+      Object.assign(STATE, { q: "", cat: "", plat: "", risk: "", flag: "", riskInd: "" });
+      const k = el.getAttribute("data-rowk"), v = el.getAttribute("data-rowv");
+      if (k === "plat") STATE.plat = v; else if (k === "rind") STATE.riskInd = v;
+      VIEW = "control"; renderView();
+    }));
   }
 
   // ── chrome: licence note + partials ──
