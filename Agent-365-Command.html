@@ -328,8 +328,8 @@
     <div class="nav" id="nav">
       <button data-view="overview" class="on">Overview</button>
       <button data-view="control">Control plane</button>
-      <button data-view="security">Security controls <span class="soon">soon</span></button>
-      <button data-view="monitoring">Monitoring <span class="soon">soon</span></button>
+      <button data-view="security">Security controls</button>
+      <button data-view="monitoring">Monitoring</button>
     </div>
     <div id="licenceNote"></div>
     <div id="partial" class="note warn hidden"></div>
@@ -536,7 +536,29 @@
       const skus = await gGetAll("/subscribedSkus?$select=skuPartNumber,skuId,prepaidUnits,consumedUnits", ["Organization.Read.All"]);
       out.licence = classifyLicence(skus); out.caps.licence = true;
     } catch (e) { out.caps.licence = false; }
+
+    // Optional: Conditional Access posture for agents (security-controls layer).
+    try {
+      const pol = await gGetAll("/identity/conditionalAccess/policies?$select=id,displayName,state,conditions,grantControls", ["Policy.Read.All"]);
+      out.ca = summarizeCA(pol); out.caps.ca = true;
+    } catch (e) { out.caps.ca = false; notePartial("Conditional Access", "CA posture for agents not read — grant Policy.Read.All."); }
     return out;
+  }
+
+  // Which enabled CA policies scope agent / workload identities, and do they require a compliant device?
+  function summarizeCA(policies) {
+    const enabled = (policies || []).filter(p => String(p.state).toLowerCase() === "enabled");
+    const targets = p => {
+      const ca = (p.conditions && p.conditions.clientApplications) || {};
+      const sp = ca.includeServicePrincipals || ca.servicePrincipals || [];
+      if (Array.isArray(sp)) return sp.length > 0 && !(sp.length === 1 && /none/i.test(String(sp[0])));
+      return !!sp;
+    };
+    const agentPols = enabled.filter(targets).map(p => {
+      const bic = (p.grantControls && p.grantControls.builtInControls) || [];
+      return { name: p.displayName || "(policy)", grant: bic, requiresCompliant: bic.some(c => /compliantDevice|compliant/i.test(c)), block: bic.some(c => /^block$/i.test(c)) };
+    });
+    return { total: (policies || []).length, enabled: enabled.length, agentPolicies: agentPols, coversAgents: agentPols.length > 0 };
   }
 
   function classifyLicence(skus) {
@@ -600,8 +622,10 @@
         RiskIndicators: v[0] === "OpenClaw" ? JSON.stringify({ crit: { title: "Running on a critical device", description: "Detected on a device flagged critical." } }) : "" }));
 
     // demo blueprint + owner-name enrichment
-    const out = { agents, caps: { inventory: true, blueprints: true, owners: true, licence: true }, errors: {},
-      licence: { agent365: false, e5: true, mdeP2: true, raw: ["SPE_E5"] } };
+    const out = { agents, caps: { inventory: true, blueprints: true, owners: true, licence: true, ca: true }, errors: {},
+      licence: { agent365: false, e5: true, mdeP2: true, raw: ["SPE_E5"] },
+      ca: { total: 9, enabled: 7, coversAgents: true,
+        agentPolicies: [{ name: "Workload identities — block risky sign-in", grant: ["block"], requiresCompliant: false, block: true }] } };
     out.agents.forEach(a => {
       if (a.bpId === "25664c89-cea5-4ab6-b924-a54fd8a19ae0") { a.blueprintName = "Copilot Studio (global)"; a.publisher = "Microsoft"; }
       else if (a.bpId) { a.blueprintName = "Foundry blueprint"; a.publisher = null; }
@@ -837,6 +861,213 @@
     $("fClear").addEventListener("click", () => { Object.assign(STATE, { q: "", plat: "", risk: "", flag: "" }); renderControl(); });
   }
 
+  // ── SECURITY CONTROLS ──
+  // Reachable, read-only security posture across the four Agent 365 pillars. Each finding rests on a
+  // signal a browser can actually read (AgentsInfo risk indicators, CA policies, owners, subscribedSkus);
+  // where a pillar's config has no browser API (most of Purview, parts of Intune) it is marked N/A, not
+  // guessed. Enforcement of any control needs the Agent 365 licence — stated, not implied.
+  function buildFindings(A, ca, lic) {
+    const f = [], R = { High: 3, Medium: 2, Low: 1, Info: 0 };
+    const push = (sev, pillar, t, d) => f.push({ sev, pillar, t, d });
+    const cloud = A.filter(a => !a.local);
+    const noOwner = cloud.filter(a => a.ownerCount === 0).length;
+    const highRisk = A.filter(a => a.riskLevel === "High").length;
+    const ext = A.filter(a => a.externalEndpoint).length;
+    const priv = A.filter(a => a.risks.some(r => /privileged business/i.test(r.title))).length;
+    const weak = A.filter(a => a.risks.some(r => /weak instruction/i.test(r.title))).length;
+    const inj = A.filter(a => a.risks.some(r => /injection/i.test(r.title))).length;
+    const shadow = A.filter(a => a.shadow).length;
+    const pubUnowned = cloud.filter(a => a.ownerCount === 0 && /publish/i.test(a.published || "")).length;
+
+    if (ca && ca.coversAgents === false) push("High", "Entra", "No Conditional Access targets agents", "No enabled CA policy scopes agent / workload identities — agent sign-ins are unconditioned.");
+    if (priv) push("High", "Defender", priv + " agent(s) with privileged business-system access", "Defender flags write access to a key system — scope these down first.");
+    if (highRisk) push("High", "Defender", highRisk + " agent(s) at High risk", "A combination of active Defender risk indicators.");
+    if (pubUnowned) push("High", "Entra", pubUnowned + " published agent(s) with no owner", "Available to users yet unsponsored — nobody accountable if it misbehaves.");
+    if (noOwner) push("Medium", "Entra", noOwner + " cloud agent(s) with no owner", "Assign sponsors so lifecycle and access decisions have an accountable human.");
+    if (inj) push("Medium", "Defender", inj + " agent(s) exposed to indirect prompt injection", "Review grounding sources these agents trust.");
+    if (ext) push("Medium", "Entra", ext + " agent(s) with an external endpoint", "Outbound connectivity widens the data-exfiltration surface.");
+    if (shadow) push("Medium", "Intune", shadow + " shadow (unmanaged local) agent(s)", "Consider Intune blocking policies (e.g. OpenClaw) on managed Windows devices.");
+    if (weak) push("Low", "Defender", weak + " agent(s) with weak instructions", "System prompt lacks guardrails.");
+    if (lic && lic.agent365 === false) push("Info", "Licence", "Agent 365 not licensed — enforcement is out of licence", "CA for agents, Purview DLP and runtime blocking need Microsoft Agent 365 (E7 / add-on). Findings above are read where possible; acting on them needs the licence.");
+    f.sort((a, b) => R[b.sev] - R[a.sev]);
+    return f;
+  }
+  function pillarCard(name, icon, status, rows) {
+    return `<div class="card"><h3>${icon} ${esc(name)}</h3>
+      <div><span class="pill ${status.cls}">${esc(status.text)}</span></div>
+      <ul class="dlist" style="margin-top:10px">${rows.map(r => `<li><div class="ln"><b class="${r.cls || ""}">${esc(r.t)}</b>${r.v != null ? `<span>${esc(String(r.v))}</span>` : ""}</div>${r.d ? `<div class="meta">${esc(r.d)}</div>` : ""}</li>`).join("")}</ul></div>`;
+  }
+  function renderSecurity() {
+    const A = all(), lic = DATA.licence || {}, ca = DATA.ca || null;
+    const cloud = A.filter(a => !a.local);
+    const noOwner = cloud.filter(a => a.ownerCount === 0).length;
+    const atRisk = A.filter(a => a.riskLevel === "High" || a.riskLevel === "Medium").length;
+    const ext = A.filter(a => a.externalEndpoint).length;
+    const shadow = A.filter(a => a.shadow).length;
+    const findings = buildFindings(A, ca, lic);
+    const rr = riskRollup(A);
+
+    let html = `<div class="hero-head"><div><h2>Security controls</h2>
+      <div class="hero-sub">Agent posture across Entra · Defender · Purview · Intune — read-only, from signals a browser can reach. Enforcement needs the Agent 365 licence.</div></div></div>`;
+
+    const tiles = [
+      { n: atRisk, l: "At-risk agents", s: "High / Medium risk", f: "flag:risk", bad: atRisk > 0 },
+      { n: noOwner, l: "Unsponsored", s: "cloud, no owner", f: "flag:noowner", bad: noOwner > 0 },
+      { n: ext, l: "External endpoint", s: "outbound reach", f: "flag:ext", warn: ext > 0 },
+      { n: ca ? ca.agentPolicies.length : "—", l: "CA for agents", s: ca ? (ca.coversAgents ? "policies target agents" : "none target agents") : "not read", f: "", bad: !!(ca && !ca.coversAgents) }
+    ];
+    html += `<div class="tiles">` + tiles.map(t => `<div class="tile ${t.bad ? "bad" : t.warn ? "warn" : ""}" ${t.f ? `data-f="${t.f}"` : ""} ${t.f ? 'tabindex="0" role="button"' : ""}>
+        <div class="n">${t.n}</div><div><div class="l">${esc(t.l)}</div><div class="s">${esc(t.s)}</div></div></div>`).join("") + `</div>`;
+
+    // four pillar cards
+    const entra = pillarCard("Entra — access & governance", "🔐",
+      ca ? (ca.coversAgents ? { cls: "Low", text: "CA targets agents" } : { cls: "High", text: "No CA for agents" }) : { cls: "na", text: "CA not read" },
+      [
+        ca ? { t: "Conditional Access policies", v: ca.enabled + " of " + ca.total + " enabled" } : { t: "Conditional Access", v: "not read", cls: "" },
+        ca ? { t: "Policies targeting agents / workload IDs", v: ca.agentPolicies.length, cls: ca.coversAgents ? "v-good" : "v-bad", d: ca.coversAgents ? ca.agentPolicies.map(p => p.name).slice(0, 3).join(", ") : "Agent sign-ins are unconditioned." } : null,
+        { t: "Cloud agents with no owner / sponsor", v: noOwner, cls: noOwner ? "v-warn" : "v-good", d: "Governance accountability gap." },
+        { t: "Identity protection for agents", v: lic.agent365 ? "in licence" : "needs Agent 365", cls: lic.agent365 ? "v-good" : "", d: "Risk-based CA for agents." }
+      ].filter(Boolean));
+
+    const defender = pillarCard("Defender — threat posture", "🛡️",
+      rr.length ? { cls: atRisk ? "Medium" : "Low", text: rr.length + " risk indicator type(s)" } : (lic.agent365 ? { cls: "Low", text: "no indicators" } : { cls: "na", text: "needs Agent 365" }),
+      rr.length ? rr.slice(0, 6).map(([t, n]) => ({ t, v: n, cls: n >= 2 ? "v-warn" : "" }))
+        : [{ t: "Risk indicators", v: lic.agent365 ? "none" : "N/A", d: lic.agent365 ? "No agent flagged." : "Defender-assessed; need Agent 365 / security for AI (MDE P2)." }]);
+
+    const purview = pillarCard("Purview — data & compliance", "📋", { cls: "na", text: "portal / limited API" },
+      [
+        { t: "Audit logging for agents", v: "portal", d: "Config not exposed to a browser API — verify in Purview." },
+        { t: "DLP for agents (block sensitive data)", v: lic.agent365 ? "in licence" : "needs Agent 365", d: "Premium Purview capability; no browser API to read policy state." },
+        { t: "AI compliance assessment", v: "portal", d: "Shown here as N/A rather than a false pass." }
+      ]);
+
+    const intune = pillarCard("Intune — device & blocking", "📱",
+      shadow ? { cls: "Medium", text: shadow + " shadow agent(s)" } : { cls: "Low", text: "no shadow agents" },
+      [
+        { t: "Shadow (unmanaged local) agents", v: shadow, cls: shadow ? "v-warn" : "v-good", d: "Block common ones (e.g. OpenClaw) on managed Windows via Intune." },
+        { t: "CA requires compliant device for agents", v: ca ? (ca.agentPolicies.some(p => p.requiresCompliant) ? "yes" : "no") : "not read", cls: ca && ca.agentPolicies.some(p => p.requiresCompliant) ? "v-good" : "", d: "Device-compliance grant on an agent-targeting CA policy." },
+        { t: "Auto-enroll Windows 365 for Agents", v: lic.agent365 ? "in licence" : "needs Agent 365", d: "Continuous policy enforcement for agent endpoints." }
+      ]);
+
+    html += `<div class="cols2">${entra}${defender}</div><div class="cols2">${purview}${intune}</div>`;
+
+    // prioritised findings
+    html += `<div class="card"><h3>⚑ Prioritised findings</h3><ul class="dlist">` +
+      (findings.length ? findings.map(x => `<li><div class="ln"><b class="${x.sev === "High" ? "v-bad" : x.sev === "Medium" ? "v-warn" : ""}">${esc(x.t)}</b><span><span class="chip">${esc(x.pillar)}</span> <span class="pill ${x.sev === "Info" ? "None" : x.sev}">${x.sev}</span></span></div>${x.d ? `<div class="meta">${esc(x.d)}</div>` : ""}</li>`).join("")
+        : `<li class="v-good">No reachable security findings.</li>`) + `</ul></div>`;
+
+    html += `<div class="note"><b>Read-only, honest coverage.</b> Entra CA + ownership and Defender risk indicators are read live; <b>Purview</b> DLP/audit/compliance config and parts of <b>Intune</b> have no browser API, so they are marked N/A, never a false pass. Enforcing any of these controls requires <b>Microsoft Agent 365</b>.</div>`;
+    $("view").innerHTML = html;
+    wireFilters();
+  }
+
+  // ── MONITORING ──
+  // The browser-reachable Agent 365 activity signal: CloudAppEvents (agent actions / tool invocations /
+  // data access), AlertInfo (+Evidence) for agent alerts, BehaviorInfo for real-time-protection audit/block.
+  // These are BEST-EFFORT hunting filters (agent linkage varies by tenant) — each query fails softly and the
+  // UI degrades honestly. UnifiedAgentObservability is Sentinel-only (no browser CORS) and is NOT used here.
+  let MON = null;
+  function since(ts) { if (!ts) return ""; const h = Math.floor((Date.now() - (typeof ts === "number" ? ts : Date.parse(ts))) / 36e5); if (h < 1) return "just now"; if (h < 24) return h + "h ago"; return Math.floor(h / 24) + "d ago"; }
+  async function collectMonitoring() {
+    const out = { activity: null, activityByAgent: null, alerts: null, behaviors: null, err: {} };
+    // Agent-related alerts (heuristic: AI/agent detection categories & the named detection types).
+    try {
+      out.alerts = await hunt("AlertInfo | where Timestamp > ago(30d)"
+        + " | where Category has_any ('AI','Agent') or Title has_any ('agent','prompt injection','jailbreak','XPIA','credential','LLM','reconnaissance')"
+        + " | summarize arg_max(Timestamp, Severity, Title, Category, ServiceSource) by AlertId | order by Timestamp desc | take 60", "Alerts");
+    } catch (e) { out.err.alerts = e.message; }
+    // Real-time protection behaviours (audit/block). ServiceSource / Categories vary — filter broadly, fail soft.
+    try {
+      out.behaviors = await hunt("BehaviorInfo | where Timestamp > ago(30d)"
+        + " | where ServiceSource has_any ('Agent','AI','Foundry','Copilot') or Categories has_any ('Agent','AI') or Description has_any ('agent','prompt shield','prompt injection','jailbreak')"
+        + " | summarize arg_max(Timestamp, ActionType, Description, Categories, ServiceSource) by BehaviorId | order by Timestamp desc | take 60", "Behaviors");
+    } catch (e) { out.err.behaviors = e.message; }
+    // Observability activity volume (CloudAppEvents) — best effort, last 7 days, by day.
+    try {
+      out.activity = await hunt("CloudAppEvents | where Timestamp > ago(7d)"
+        + " | where ActionType has 'Agent' or tostring(RawEventData) has 'gen_ai' or tostring(RawEventData) has 'ToolName'"
+        + " | summarize Events=count(), Tools=countif(tostring(RawEventData) has 'ToolName') by bin(Timestamp, 1d) | order by Timestamp asc", "Activity");
+    } catch (e) { out.err.activity = e.message; }
+    // Top actors (best effort — actor column varies; try AccountDisplayName).
+    try {
+      out.activityByAgent = await hunt("CloudAppEvents | where Timestamp > ago(7d)"
+        + " | where ActionType has 'Agent' or tostring(RawEventData) has 'gen_ai' or tostring(RawEventData) has 'ToolName'"
+        + " | summarize Events=count() by Actor=tostring(AccountDisplayName) | where isnotempty(Actor) | top 10 by Events", "Activity by agent");
+    } catch (e) { /* optional */ }
+    return out;
+  }
+  function demoMonitoring() {
+    const now = Date.now(), day = 864e5;
+    const activity = []; for (let i = 6; i >= 0; i--) activity.push({ Timestamp: new Date(now - i * day).toISOString(), Events: 60 + Math.round(Math.random() * 140), Tools: 15 + Math.round(Math.random() * 60) });
+    return {
+      activity,
+      activityByAgent: [{ Actor: "Contoso HR Helper", Events: 842 }, { Actor: "Finance Forecaster", Events: 613 }, { Actor: "IT Helpdesk Agent", Events: 421 }, { Actor: "Sales Deck Drafter", Events: 95 }],
+      alerts: [
+        { AlertId: "a1", Title: "Indirect prompt injection (XPIA) targeting an agent", Severity: "High", Category: "InitialAccess", ServiceSource: "Microsoft Defender for Cloud Apps", Timestamp: new Date(now - 2 * 36e5).toISOString() },
+        { AlertId: "a2", Title: "Agent attempted credential leakage", Severity: "High", Category: "CredentialAccess", ServiceSource: "Microsoft Defender", Timestamp: new Date(now - day).toISOString() },
+        { AlertId: "a3", Title: "LLM reconnaissance pattern from agent", Severity: "Medium", Category: "Discovery", ServiceSource: "Microsoft Defender", Timestamp: new Date(now - 3 * day).toISOString() },
+        { AlertId: "a4", Title: "Suspicious IP access to agent endpoint", Severity: "Medium", Category: "InitialAccess", ServiceSource: "Microsoft Defender for Cloud Apps", Timestamp: new Date(now - 5 * day).toISOString() }
+      ],
+      behaviors: [
+        { BehaviorId: "b1", ActionType: "Block", Description: "Prompt Shield blocked a jailbreak attempt", Categories: "Agent", ServiceSource: "Microsoft Foundry", Timestamp: new Date(now - 6 * 36e5).toISOString() },
+        { BehaviorId: "b2", ActionType: "Audit", Description: "Agent tool invocation flagged for review", Categories: "Agent", ServiceSource: "Copilot Agent Builder", Timestamp: new Date(now - 2 * day).toISOString() },
+        { BehaviorId: "b3", ActionType: "Block", Description: "Blocked sensitive data in an agent response", Categories: "Agent", ServiceSource: "Microsoft Foundry", Timestamp: new Date(now - 4 * day).toISOString() }
+      ],
+      err: {}
+    };
+  }
+  function renderMonitoring() {
+    if (DEMO) { if (!MON) MON = demoMonitoring(); paintMonitoring(); return; }
+    if (MON) { paintMonitoring(); return; }
+    $("view").innerHTML = `<div class="hero-head"><div><h2>Monitoring</h2><div class="hero-sub">Reading agent activity, alerts and real-time-protection behaviours…</div></div></div><div class="note"><span class="spinner" style="border-color:var(--border);border-top-color:var(--accent)"></span>Querying CloudAppEvents · AlertInfo · BehaviorInfo…</div>`;
+    collectMonitoring().then(m => { MON = m; if (VIEW === "monitoring") paintMonitoring(); });
+  }
+  function paintMonitoring() {
+    const m = MON || {};
+    const act = m.activity || [], alerts = m.alerts || [], beh = m.behaviors || [];
+    const evSum = act.reduce((s, x) => s + (+x.Events || 0), 0);
+    const toolSum = act.reduce((s, x) => s + (+x.Tools || 0), 0);
+    const highAlerts = alerts.filter(a => /high/i.test(a.Severity)).length;
+    const blocks = beh.filter(b => /block/i.test(b.ActionType)).length;
+    const maxEv = Math.max(1, ...act.map(x => +x.Events || 0));
+    const lic = DATA.licence || {};
+
+    let html = `<div class="hero-head"><div><h2>Monitoring</h2>
+      <div class="hero-sub">Agent activity, alerts and real-time-protection behaviours — the browser-reachable Agent 365 signal.</div></div></div>`;
+
+    const tiles = [
+      { n: evSum.toLocaleString(), l: "Observability events", s: "CloudAppEvents · 7d" },
+      { n: toolSum.toLocaleString(), l: "Tool invocations", s: "last 7d" },
+      { n: alerts.length, l: "Agent alerts", s: "last 30d", bad: highAlerts > 0 },
+      { n: blocks, l: "Blocked behaviours", s: "real-time protection", bad: blocks > 0 }
+    ];
+    html += `<div class="tiles">` + tiles.map(t => `<div class="tile ${t.bad ? "bad" : ""}"><div class="n">${t.n}</div><div><div class="l">${esc(t.l)}</div><div class="s">${esc(t.s)}</div></div></div>`).join("") + `</div>`;
+
+    // activity by day + by agent
+    const actCard = `<div class="card"><h3>Observability activity · 7 days</h3>` +
+      (act.length ? `<ul class="barlist">` + act.map(x => `<li><span class="lab">${esc(new Date(x.Timestamp).toLocaleDateString(undefined, { weekday: "short", day: "numeric" }))}</span><span class="val">${(+x.Events || 0).toLocaleString()}</span><span class="track"><span class="fill" style="width:${Math.round((+x.Events || 0) / maxEv * 100)}%"></span></span></li>`).join("") + `</ul>`
+        : `<div class="muted">${m.err && m.err.activity ? "CloudAppEvents query unavailable — " + esc(m.err.activity) : "No agent observability events in the last 7 days. Ensure Agent 365 observability + security for AI is enabled."}</div>`) + `</div>`;
+    const byA = m.activityByAgent || [];
+    const maxA = Math.max(1, ...byA.map(x => +x.Events || 0));
+    const agentCard = `<div class="card"><h3>Busiest agents · 7 days</h3>` +
+      (byA.length ? `<ul class="barlist">` + byA.map(x => `<li><span class="lab">${esc(x.Actor)}</span><span class="val">${(+x.Events || 0).toLocaleString()}</span><span class="track"><span class="fill" style="width:${Math.round((+x.Events || 0) / maxA * 100)}%"></span></span></li>`).join("") + `</ul>`
+        : `<div class="muted">Per-agent activity not available (the CloudAppEvents actor field varies by tenant).</div>`) + `</div>`;
+    html += `<div class="cols2">${actCard}${agentCard}</div>`;
+
+    // alerts
+    const alertCard = `<div class="card"><h3>⚠ Agent alerts · 30 days</h3>` +
+      (alerts.length ? `<ul class="dlist">` + alerts.slice(0, 15).map(a => `<li><div class="ln"><b>${(!DEMO && a.AlertId && a.AlertId !== "demo") ? `<a href="https://security.microsoft.com/alerts/${enc(a.AlertId)}" target="_blank" rel="noopener">${esc(a.Title)}</a>` : esc(a.Title)}</b><span class="pill ${esc(String(a.Severity || "").replace(/[^A-Za-z]/g, "")) || "None"}">${esc(a.Severity || "—")}</span></div><div class="meta">${esc(a.Category || "")}${a.ServiceSource ? " · " + esc(a.ServiceSource) : ""}${a.Timestamp ? " · " + since(a.Timestamp) : ""}</div></li>`).join("") + `</ul>`
+        : `<div class="${m.err && m.err.alerts ? "muted" : "v-good"}">${m.err && m.err.alerts ? "Alerts query unavailable — " + esc(m.err.alerts) : "No agent-related alerts in the last 30 days."}</div>`) + `</div>`;
+    // behaviours
+    const behCard = `<div class="card"><h3>🛡️ Real-time protection · 30 days</h3>` +
+      (beh.length ? `<ul class="dlist">` + beh.slice(0, 15).map(b => { const block = /block/i.test(b.ActionType); return `<li><div class="ln"><b class="${block ? "v-bad" : "v-warn"}">${esc(b.Description || b.ActionType || "behaviour")}</b><span class="pill ${block ? "High" : "Medium"}">${esc(b.ActionType || "")}</span></div><div class="meta">${esc(b.ServiceSource || b.Categories || "")}${b.Timestamp ? " · " + since(b.Timestamp) : ""}</div></li>`; }).join("") + `</ul>`
+        : `<div class="${m.err && m.err.behaviors ? "muted" : "v-good"}">${m.err && m.err.behaviors ? "Behaviours query unavailable — " + esc(m.err.behaviors) : "No audit/block behaviours recorded. (Prompt Shield block events apply to Foundry & Copilot Agent Builder; Copilot Studio not yet supported.)"}</div>`) + `</div>`;
+    html += `<div class="cols2">${alertCard}${behCard}</div>`;
+
+    html += `<div class="note"><b>Reachable signal only.</b> Activity is read from <b>CloudAppEvents</b> (Agent 365 observability), alerts from <b>AlertInfo</b>, blocks/audits from <b>BehaviorInfo</b> — all via Defender advanced hunting. Filters are best-effort (agent linkage varies by tenant). <b>UnifiedAgentObservability</b> is a Sentinel / Log Analytics table (no browser CORS) and is not read here. The signal needs Agent 365 observability + Defender security for AI enabled${lic.agent365 === false ? " — <b>Agent 365 not detected</b>, so live data may be empty" : ""}.</div>`;
+    $("view").innerHTML = html;
+  }
+
   // ── STUB VIEWS ──
   function renderStub(which) {
     const map = {
@@ -862,6 +1093,8 @@
     $("nav").querySelectorAll("button").forEach(b => b.classList.toggle("on", b.getAttribute("data-view") === VIEW));
     if (VIEW === "overview") renderOverview();
     else if (VIEW === "control") renderControl();
+    else if (VIEW === "security") renderSecurity();
+    else if (VIEW === "monitoring") renderMonitoring();
     else renderStub(VIEW);
   }
   function wireFilters() {
