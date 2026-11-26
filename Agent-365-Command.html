@@ -3,6 +3,12 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<!-- Content-Security-Policy: defence-in-depth against injected markup (agent names/config are maker-controlled).
+     Scoped to exactly what the app needs — MSAL's two SRI-pinned CDNs, Google Fonts, and the Microsoft Entra /
+     Graph endpoints MSAL and the data calls use (login.microsoftonline.com also as a frame for silent token).
+     Inline script/style are required by this single-file design, so 'unsafe-inline' stays; everything else is denied.
+     If sign-in ever breaks after a change here, it is almost always a missing connect-src/frame-src origin. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src https://graph.microsoft.com https://login.microsoftonline.com; frame-src https://login.microsoftonline.com; base-uri 'none'; form-action 'none'" />
 <title>Agent 365 Command Center — Stealth4</title>
 <!--
   Agent 365 Command Center — a single-file, read-only control plane for the AI agents in a
@@ -318,6 +324,11 @@
   .pitem { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 9px 11px; cursor: pointer; transition: .14s; }
   .pitem:hover { border-color: var(--accent); }
   .pitem.on { border-color: var(--accent); background: rgba(63,169,255,.08); box-shadow: inset 2px 0 0 var(--accent); }
+  .pbadge { display: inline-block; min-width: 22px; text-align: center; font-family: var(--display); font-size: 11px; padding: 1px 6px; border-radius: 999px; margin-right: 8px; vertical-align: 1px; border: 1px solid var(--border); color: var(--muted); }
+  .pbadge.pb-ok { color: var(--green); border-color: rgba(94,230,176,.4); }
+  .pbadge.pb-warn { color: var(--amber); border-color: rgba(255,193,94,.45); }
+  .pbadge.pb-bad { color: var(--red); border-color: rgba(255,122,138,.5); background: var(--red-bg); }
+  .pbadge.pb-wait { color: var(--muted); }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -431,7 +442,10 @@
     ["Directory.Read.All",                "Resolve owner / sponsor object IDs to names",                                        false],
     ["Policy.Read.All",                   "Conditional Access policies — which ones target agents (security-controls layer)",   false],
     ["Organization.Read.All",             "subscribedSkus — licence awareness (E5 / E7 / Agent 365)",                           false],
-    ["IdentityRiskyServicePrincipal.Read.All", "Identity Protection agent risk — the dynamic agent risk that feeds risk-based CA", false]
+    ["IdentityRiskyAgent.Read.All",       "Identity Protection — risky agents (the dynamic agent risk that feeds risk-based CA)", false],
+    ["IdentityRiskEvent.Read.All",        "Identity Protection — agent risk detections (detail behind the risk level)",         false],
+    ["CopilotPackages.Read.All",          "Agent 365 admin registry — catalogue packages / tools / policy templates",           false],
+    ["IdentityRiskyServicePrincipal.Read.All", "Fallback for agent risk when riskyAgents is unavailable",                        false]
   ];
   const REQUIRED = SCOPES.filter(s => s[2]).map(s => s[0]);
   const GRAPH = "https://graph.microsoft.com/v1.0";
@@ -521,13 +535,16 @@
   // identities that have no AgentsInfo row at all so the total matches the Entra inventory.
   function mergeEntraIdentities(out, ids) {
     out.entraIdentities = ids; out.entraIdentityCount = ids.length; out.caps.identities = true;
-    const byKey = {}; const put = (k, a) => { if (k) byKey[k] = a; };
-    out.agents.forEach(a => { put(a.entraId && ("id:" + String(a.entraId).toLowerCase()), a); put(a.appId && ("app:" + String(a.appId).toLowerCase()), a); put("nm:" + normName(a.name), a); });
+    // Flat value map: AgentsInfo.EntraAgentID may hold the agent SP's object id OR its appId, so index each
+    // AgentsInfo row under every id-ish value it carries and match an Entra identity by either its id or appId.
+    // (This is the join fix — the old prefix-scoped map missed when the two sides stored different id kinds.)
+    const byVal = {}; const put = (k, a) => { if (k) byVal[String(k).toLowerCase()] = a; };
+    out.agents.forEach(a => { put(a.entraId, a); put(a.appId, a); put("nm:" + normName(a.name), a); });
     const platOf = nm => /copilot studio/i.test(nm) ? "Copilot Studio" : /foundry/i.test(nm) ? "Microsoft Foundry" : /agent builder|365 copilot/i.test(nm) ? "Agent Builder in Microsoft 365 Copilot" : "Agent identity";
     let added = 0, reconciled = 0;
     ids.forEach(x => {
       const nm = x.displayName || x.appDisplayName || "(agent identity)";
-      const match = byKey["id:" + String(x.id || "").toLowerCase()] || (x.appId && byKey["app:" + String(x.appId).toLowerCase()]) || byKey["nm:" + normName(nm)];
+      const match = (x.id && byVal[String(x.id).toLowerCase()]) || (x.appId && byVal[String(x.appId).toLowerCase()]) || byVal["nm:" + normName(nm)];
       if (match) { if (!match.managed) { match.managed = true; match.category = "identity"; match.entraId = match.entraId || x.id; match.reconciled = true; reconciled++; } return; }
       out.agents.push(normAgent({ AgentId: "entra:" + x.id, Name: nm, Platform: platOf(nm), EntraAgentID: x.id, LifecycleStatus: x.accountEnabled === false ? "Disabled" : "Active" }));
       const a = out.agents[out.agents.length - 1]; a.fromEntraOnly = true; a.appId = x.appId || null; added++;
@@ -551,6 +568,13 @@
     }
     return out;
   }
+  // Severity weights for Defender agent risk indicators — so "risk" is a weighted score, not a raw count, and
+  // non-risks ("Published Agent", "Connection count: N", OData keys) don't inflate it. Unknown titles weight 1.
+  const RISK_W = { "privileged business-system access": 3, "active threat": 3, "indirect prompt injection exposure": 3, "hard-coded credentials": 3, "privileged software development access": 3, "running on a critical device": 3, "used by a critical user": 2, "used by a privileged user": 2, "running on a vulnerable device": 2, "running on an internet-facing device": 2, "weak instructions": 2, "no authentication": 2, "missing tools in instructions": 2, "outdated model": 1, "dormant agent": 1, "coordinator agent": 1, "high-usage agent": 1, "published agent": 0 };
+  function riskWeight(title) { const t = String(title || "").toLowerCase().trim(); if (/^connection count/.test(t) || t.charAt(0) === "@") return 0; return (t in RISK_W) ? RISK_W[t] : 1; }
+  function riskScoreOf(risks, catalog) { return catalog ? 0 : (risks || []).reduce((s, r) => s + riskWeight(r.title), 0); }
+  function riskBandOf(score) { return score >= 3 ? "High" : score >= 2 ? "Medium" : score >= 1 ? "Low" : "None"; }
+
   function endpointInfo(v) {
     const a = arr(v); let ext = false; const urls = [];
     a.forEach(e => { if (!e) return; const o = typeof e === "string" ? { url: e } : e;
@@ -572,11 +596,14 @@
     const raw = jp(r.RawAgentInfo) || {};
     const vendor = (raw.localAgentMetadata && raw.localAgentMetadata.vendor) || (raw.aiAgentMetadata && raw.aiAgentMetadata.vendor) || "";
     const managed = !!entraId;
-    const shadow = local && !managed && (SHADOW_RX.test(name) || SHADOW_RX.test(vendor) || true); // any unmanaged local = shadow per GSA definition
-    const category = managed ? "identity" : local ? "local" : "registry";
+    const catalog = !managed && !local && /^other$/i.test(platform);   // published catalogue (Platform "Other"), not under management
+    const shadow = local && !managed;                                   // unmanaged local agent (GSA "shadow" definition)
+    const category = managed ? "identity" : local ? "local" : catalog ? "catalog" : "registry";
+    const builder = managed ? (/copilot studio/i.test(platform) ? "Copilot Studio" : /foundry/i.test(platform) ? "Microsoft Foundry" : /agent builder|365 copilot/i.test(platform) ? "Agent Builder" : "SDK / CLI & other") : null;
+    const riskScore = riskScoreOf(risks, catalog);
     return {
       id: r.AgentId || r.SourceAgentId || (name + ":" + platform),
-      name, platform, local, shadow, managed, category,
+      name, platform, local, shadow, managed, catalog, category, builder,
       entraId, bpId, vendor,
       model: r.Model || (raw.aiAgentMetadata && raw.aiAgentMetadata.model) || null,
       version: r.Version || null,
@@ -590,7 +617,7 @@
       endpoints: ep.urls, externalEndpoint: ep.ext,
       created: r.CreatedDateTime || null, availability: r.Availability || "", sharedWith: r.SharedWith || "",
       description: r.AgentDescription || r.Description || "",
-      risks, riskLevel: risks.length ? (risks.length >= 3 ? "High" : risks.length >= 2 ? "Medium" : "Low") : "None",
+      risks, riskScore, riskLevel: riskBandOf(riskScore),
       sourceId: r.SourceAgentId || null
     };
   }
@@ -629,19 +656,34 @@
       mergeEntraIdentities(out, ids);
     } catch (e) { out.caps.identities = false; notePartial("Agent identities", "Entra agent-identity inventory not read (" + (e.status || "error") + ") — grant AgentIdentity.Read.All. 'With identity' is then counted from AgentsInfo's sparse EntraAgentID link and can undercount versus the Entra Agents blade."); }
 
-    // Identity Protection agent risk — the dynamic agent risk that feeds risk-based Conditional Access.
+    // Identity Protection agent risk — the dynamic agent risk that feeds risk-based Conditional Access. Prefer
+    // the dedicated riskyAgents API (IdentityRiskyAgent.Read.All); fall back to riskyServicePrincipals (workload)
+    // scoped to agent identities. Report-only on counts; the agentRiskDetections detail is a deeper read we skip.
     try {
-      const rsp = await gGetAll("/identityProtection/riskyServicePrincipals?$select=id,riskLevel,riskState&$top=500", ["IdentityRiskyServicePrincipal.Read.All"]);
+      let rows, scoped = false;
+      try { rows = await gGetAll("https://graph.microsoft.com/beta/identityProtection/riskyAgents?$top=500", ["IdentityRiskyAgent.Read.All"]); }
+      catch (e2) {
+        rows = await gGetAll("/identityProtection/riskyServicePrincipals?$select=id,riskLevel,riskState&$top=500", ["IdentityRiskyServicePrincipal.Read.All"]);
+        scoped = true;   // SP list is tenant-wide; scope it to known agent identities
+      }
       const agentSet = new Set(out.agents.filter(a => a.entraId).map(a => String(a.entraId).toLowerCase()));
       let high = 0, med = 0, low = 0, risky = 0;
-      rsp.forEach(r => {
+      rows.forEach(r => {
         const st = String(r.riskState || "").toLowerCase(); if (st === "remediated" || st === "dismissed") return;
-        if (agentSet.size && !agentSet.has(String(r.id).toLowerCase())) return;   // scope to agent identities
+        if (scoped && agentSet.size && !agentSet.has(String(r.id).toLowerCase())) return;
         risky++; const lvl = String(r.riskLevel || "").toLowerCase();
         if (lvl === "high") high++; else if (lvl === "medium") med++; else if (lvl === "low") low++;
       });
       out.agentRisk = { protected: out.entraIdentityCount != null ? out.entraIdentityCount : null, high, med, low, risky }; out.caps.agentRisk = true;
     } catch (e) { out.caps.agentRisk = false; }
+
+    // Optional: Agent 365 admin registry (catalogue packages + policy templates) — the real control-plane source.
+    try {
+      const pkgs = await gGetAll("/copilot/admin/catalog/packages", ["CopilotPackages.Read.All"]);
+      out.catalogPackages = pkgs.length;
+      try { const tpl = await gGetAll("https://graph.microsoft.com/beta/copilot/admin/catalog/policyTemplates", ["CopilotPackages.Read.All"]); out.policyTemplates = tpl.length; } catch (e3) {}
+      out.caps.catalogApi = true;
+    } catch (e) { out.caps.catalogApi = false; }
 
     // Optional enrich: resolve owner object IDs → display names (batch-ish, capped).
     try {
@@ -869,7 +911,8 @@
 
   const SEGMENTS = [
     ["identity", "🪪", "With identity (blueprint)", "Governed agents — an Entra Agent ID + blueprint"],
-    ["registry", "🏪", "Registry — without identity", "Registered / available, no Entra agent identity"],
+    ["registry", "🧩", "Without identity", "Registered (e.g. Agent Builder), no Entra agent identity"],
+    ["catalog", "🏪", "Catalogue — available to install", "Published agents (Platform “Other”), not under management"],
     ["local", "💻", "Local & shadow agents", "Endpoint-discovered agents (Defender)"]
   ];
 
@@ -880,9 +923,9 @@
     if (S.cat && a.category !== S.cat) return false;
     if (S.plat && a.platform !== S.plat) return false;
     if (S.risk && a.riskLevel !== S.risk) return false;
-    if (S.flag === "noowner" && a.ownerCount > 0) return false;
-    if (S.flag === "risk" && !a.risks.length) return false;
-    if (S.flag === "ext" && !a.externalEndpoint) return false;
+    if (S.flag === "risk" && !(a.riskScore > 0)) return false;
+    if (S.flag === "noowner" && !(!a.catalog && !a.local && !a.fromEntraOnly && a.ownerCount === 0)) return false;
+    if (S.flag === "ext" && !(a.externalEndpoint && !a.catalog)) return false;
     if (S.flag === "mcp" && !a.mcp) return false;
     if (S.flag === "shadow" && !a.shadow) return false;
     if (S.flag === "connected" && !a.connected) return false;
@@ -897,56 +940,65 @@
   function renderOverview() {
     const A = all();
     const total = A.length;
-    const identity = A.filter(a => a.category === "identity").length;
-    const registry = A.filter(a => a.category === "registry").length;
-    const local = A.filter(a => a.local).length;
-    const shadow = A.filter(a => a.shadow).length;
-    const noOwner = A.filter(a => a.ownerCount === 0 && !a.local).length;
-    const withRisk = A.filter(a => a.risks.length).length;
-    const ext = A.filter(a => a.externalEndpoint).length;
+    const identity = A.filter(a => a.category === "identity");
+    const withoutId = A.filter(a => a.category === "registry");   // registered, no Entra identity (Agent Builder, etc.)
+    const catalog = A.filter(a => a.category === "catalog");      // published catalogue (Platform "Other")
+    const local = A.filter(a => a.local);
+    const shadow = A.filter(a => a.shadow);
+    // Governance/risk exclude the catalogue (publisher, not owner) and local; identity-only rows reconciled from
+    // Entra have no owner fetched (unknown, not zero), so they're excluded from the unsponsored count.
+    const noOwner = A.filter(a => !a.catalog && !a.local && !a.fromEntraOnly && a.ownerCount === 0).length;
+    const highRisk = A.filter(a => a.riskLevel === "High").length;
+    const ext = A.filter(a => a.externalEndpoint && !a.catalog).length;
     const withMcp = A.filter(a => a.mcp > 0).length;
-    const connected = A.filter(a => a.connected > 0).length;
 
     const ov = [
       { ic: "🤖", n: total, l: "Agents total", total: true, f: "clear" },
-      { ic: "🪪", n: identity, l: "With identity", f: "cat:identity" },
-      { ic: "🏪", n: registry, l: "Registry only", f: "cat:registry" },
-      { ic: "💻", n: local, l: "Local agents", f: "cat:local" },
-      { ic: "👁", n: shadow, l: "Shadow AI", f: "flag:shadow" }
+      { ic: "🪪", n: identity.length, l: "With identity", f: "cat:identity" },
+      { ic: "🧩", n: withoutId.length, l: "Without identity", f: "cat:registry" },
+      { ic: "🏪", n: catalog.length, l: "Catalogue (available)", f: "cat:catalog" },
+      { ic: "💻", n: local.length, l: "Local", f: "cat:local" }
     ];
     const tiles = [
-      { n: noOwner, l: "No owner", s: "cloud agents, unowned", f: "flag:noowner", bad: noOwner > 0 },
-      { n: withRisk, l: "Risk indicators", s: "Defender-flagged", f: "flag:risk", bad: withRisk > 0 },
+      { n: highRisk, l: "High risk", s: "severity-weighted", f: "risk:High", bad: highRisk > 0 },
+      { n: noOwner, l: "Unsponsored", s: "identity/registered, no owner", f: "flag:noowner", bad: noOwner > 0 },
       { n: ext, l: "External endpoint", s: "outbound connectivity", f: "flag:ext", warn: ext > 0 },
       { n: withMcp, l: "MCP servers", s: "tool connections", f: "flag:mcp", warn: withMcp > 0 },
-      { n: connected, l: "Multi-agent", s: "connected agents", f: "flag:connected" }
+      { n: shadow.length, l: "Shadow AI", s: "unmanaged local", f: "flag:shadow", warn: shadow.length > 0 }
     ];
+    const builders = {}; identity.forEach(a => { const b = a.builder || "SDK / CLI & other"; builders[b] = (builders[b] || 0) + 1; });
+    const bMax = Math.max(1, ...Object.values(builders));
     const plats = platformCounts(A);
     const platMax = Math.max(1, ...Object.values(plats));
-    const rr = riskRollup(A);
+    const rr = riskRollup(A.filter(a => !a.catalog));   // severity view, catalogue excluded
     const rrMax = Math.max(1, ...rr.map(x => x[1]));
 
     let html = `<div class="hero-head"><div><h2>Agent estate overview</h2>
-      <div class="hero-sub">Every agent across the tenant — registry, identity, local and shadow — from Defender's <code>AgentsInfo</code> inventory.</div></div></div>`;
+      <div class="hero-sub">Every agent across the tenant — with identity, without identity, catalogue, local — reconciled from AgentsInfo + Entra Agent ID.</div></div></div>`;
     html += `<div class="overview">` + ov.map(o => `<div class="ov-item ${o.total ? "total" : ""}" data-f="${o.f}" tabindex="0" role="button">
         <span class="ov-ic">${o.ic}</span><div><div class="ov-n">${o.n}</div><div class="ov-l">${esc(o.l)}</div></div></div>`).join("") + `</div>`;
     html += `<div class="tiles">` + tiles.map(t => `<div class="tile ${t.bad && t.n ? "bad" : t.warn && t.n ? "warn" : t.n ? "" : "good"}" data-f="${t.f}" tabindex="0" role="button">
         <div class="n">${t.n}</div><div><div class="l">${esc(t.l)}</div><div class="s">${esc(t.s)}</div></div></div>`).join("") + `</div>`;
 
     html += `<div class="cols2">
+      <div class="card"><h3>With identity — by builder</h3>` +
+        (identity.length ? `<ul class="barlist">` + Object.entries(builders).sort((a, b) => b[1] - a[1]).map(([b, n]) => `<li><span class="lab">${platIcon(b, 16)} ${esc(b)}</span><span class="val">${n}</span><span class="track"><span class="fill" style="width:${Math.round(n / bMax * 100)}%"></span></span></li>`).join("") + `</ul>` : `<div class="muted">No agent identities read.</div>`) +
+        `</div>
       <div class="card"><h3>By platform</h3><ul class="barlist">` +
         Object.entries(plats).sort((a, b) => b[1] - a[1]).map(([p, n]) => `<li class="clk" data-rowk="plat" data-rowv="${esc(p)}" title="Filter agents by platform"><span class="lab">${platIcon(p, 16)} ${esc(p)}</span><span class="val">${n}</span><span class="track"><span class="fill" style="width:${Math.round(n / platMax * 100)}%"></span></span></li>`).join("") +
         `</ul></div>
-      <div class="card"><h3>Defender risk indicators</h3>` +
-        (rr.length ? `<ul class="barlist">` + rr.map(([t, n]) => `<li class="clk" data-rowk="rind" data-rowv="${esc(t)}" title="Filter agents by this risk indicator"><span class="lab">${esc(t)}</span><span class="val">${n}</span><span class="track"><span class="fill ${n >= rrMax * 0.6 ? "red" : "amber"}" style="width:${Math.round(n / rrMax * 100)}%"></span></span></li>`).join("") + `</ul>`
-          : (DATA.licence && DATA.licence.agent365 === false ? `<div class="muted">No risk indicators. These are Defender-assessed and need <b>Microsoft Agent 365</b> (or MDE P2 + security for AI). Inventory is shown regardless.</div>` : `<div class="v-good">No risk indicators flagged on any agent.</div>`)) +
-        `</div>
     </div>`;
 
-    // Shadow AI honesty note
-    html += `<div class="note"><b>Shadow AI:</b> ${shadow} unmanaged local agent${shadow === 1 ? "" : "s"} discovered by Defender (shown in <b>Local &amp; shadow</b>). The admin-center Shadow-AI <i>traffic / users / devices</i> tiles are sourced from Global Secure Access and the M365 admin portal, which have no browser API — those are portal-only.</div>`;
-    if (DATA.caps && DATA.caps.identities) html += `<div class="note"><b>Identity reconciliation.</b> <b>${identity}</b> agents have an Entra agent identity — the authoritative count from the Entra <i>Agents</i> blade. AgentsInfo links only a subset, so this reconciles Defender's inventory with Entra Agent ID: governed Copilot Studio, Foundry and other agents that AgentsInfo doesn't link are included${DATA.identityReconcile ? ` (${DATA.identityReconcile.reconciled} matched to an AgentsInfo row, ${DATA.identityReconcile.added} identity-only)` : ""}.</div>`;
-    else if (DATA.caps && DATA.caps.identities === false) html += `<div class="note warn"><b>"With identity" may undercount.</b> The Entra agent-identity inventory wasn't read — grant <b>AgentIdentity.Read.All</b>. It's currently counted from AgentsInfo's sparse <code>EntraAgentID</code> link only, which misses governed agents (e.g. Foundry) that Defender doesn't link.</div>`;
+    html += `<div class="card" style="margin-bottom:18px"><h3>Defender risk indicators <span style="font-weight:400;text-transform:none;letter-spacing:0;font-family:var(--body);font-size:11px;color:var(--muted)">· severity-weighted · catalogue excluded</span></h3>` +
+      (rr.length ? `<ul class="barlist">` + rr.map(([t, n]) => `<li class="clk" data-rowk="rind" data-rowv="${esc(t)}" title="Filter agents by this risk indicator"><span class="lab">${esc(t)}</span><span class="val">${n}</span><span class="track"><span class="fill ${riskWeight(t) >= 3 ? "red" : riskWeight(t) >= 2 ? "amber" : ""}" style="width:${Math.round(n / rrMax * 100)}%"></span></span></li>`).join("") + `</ul>`
+        : (DATA.licence && DATA.licence.agent365 === false ? `<div class="muted">No risk indicators. Defender-assessed; need <b>Microsoft Agent 365</b> (or MDE P2 + security for AI).</div>` : `<div class="v-good">No risk indicators flagged.</div>`)) +
+      `</div>`;
+
+    html += `<div class="note"><b>Catalogue vs owned.</b> ${catalog.length} catalogue agent${catalog.length === 1 ? "" : "s"} (Platform “Other”) are available-to-install, not brought under management — they have a <i>publisher</i>, not an owner, so they're excluded from the unsponsored and risk counts.</div>`;
+    if (DATA.caps && DATA.caps.catalogApi) html += `<div class="note"><b>Admin registry.</b> From the Agent 365 admin API (<code>/copilot/admin/catalog</code>): <b>${DATA.catalogPackages != null ? DATA.catalogPackages : "—"}</b> catalogue packages${DATA.policyTemplates != null ? `, <b>${DATA.policyTemplates}</b> policy templates` : ""} — the authoritative control-plane source (CopilotPackages.Read.All).</div>`;
+    html += `<div class="note"><b>Shadow AI:</b> ${shadow.length} unmanaged local agent${shadow.length === 1 ? "" : "s"} (a subset of Local). The admin-center Shadow-AI traffic / users / devices come from Global Secure Access + the M365 admin portal (no browser API) — <a href="https://admin.microsoft.com/#/agents" target="_blank" rel="noopener">open the admin portal ↗</a>.</div>`;
+    if (DATA.caps && DATA.caps.identities) html += `<div class="note"><b>Identity reconciliation.</b> <b>${identity.length}</b> agents have an Entra agent identity${DATA.identityReconcile ? ` (${DATA.identityReconcile.reconciled} matched to an AgentsInfo row, ${DATA.identityReconcile.added} identity-only)` : ""}.</div>`;
+    else if (DATA.caps && DATA.caps.identities === false) html += `<div class="note warn"><b>"With identity" may undercount.</b> The Entra agent-identity inventory wasn't read — grant <b>AgentIdentity.Read.All</b>.</div>`;
     $("view").innerHTML = html;
     wireFilters();
   }
@@ -1064,7 +1116,7 @@
       const list = (bySeg[seg[0]] || []).sort(cmp);
       if (!list.length) return;
       const risky = list.filter(a => a.riskLevel === "High" || a.riskLevel === "Medium").length;
-      const cap = seg[0] === "registry" && list.length > 60 ? 60 : 1e9;
+      const cap = (seg[0] === "registry" || seg[0] === "catalog") && list.length > 60 ? 60 : 1e9;
       const shown = list.slice(0, cap);
       html += `<div class="seg"><div class="seg-h"><span class="ic">${seg[1]}</span> ${esc(seg[2])}
         <span class="ct">${list.length} agent${list.length === 1 ? "" : "s"}${risky ? ` · <span class="hr"><b>${risky}</b> with risk</span>` : ""} · <span class="muted">${esc(seg[3])}</span></span></div>
@@ -1185,8 +1237,10 @@
     else if (ca.reportOnly) { caBand = "b-warn"; caLabel = "REPORT-ONLY"; caFrac = 0.4; }
     else { caBand = "b-bad"; caLabel = "NOT CONFIGURED"; caFrac = 0; }
     const caIn = ca && ca.available ? (ca.allAgents ? "All agent identities" : (caFrac ? "scoped agent identities" : "—")) : "—";
+    // Don't assert "unblocked" when CA simply wasn't read — that's unknown, not a gap.
+    const riskSuffix = !ca ? " — CA coverage unknown" : (caFrac ? "" : " — unblocked");
     const caOut = riskyN != null
-      ? (riskyN ? `<b>${riskyN}</b> at-risk agent${riskyN === 1 ? "" : "s"} flagged by ID Protection${caFrac ? "" : " — unblocked"}` : (caFrac ? "none flagged at risk by ID Protection" : "<b>everyone</b> — no risk-based block policy"))
+      ? (riskyN ? `<b>${riskyN}</b> at-risk agent${riskyN === 1 ? "" : "s"} flagged by ID Protection${riskSuffix}` : (!ca ? "none flagged at risk — CA coverage unknown" : caFrac ? "none flagged at risk by ID Protection" : "<b>everyone</b> — no risk-based block policy"))
       : (ca && !ca.available ? "<b>every agent</b> — no Conditional Access for agent identities" : "agent risk not read");
     const caPols = agentPols.map(p => `<span class="pollink" title="${esc((p.via || []).join(" · "))}${p.requiresCompliant ? " · compliant device" : ""}">${esc(p.name)}${p.reportOnly ? ' <span class="covro">report-only</span>' : ""}</span>`).join("");
     const caCard = `<div class="cccard ${caBand}"><div class="cctop"><span class="ccname">Agent risk — block risky agents</span><span class="ccbadge">${caLabel}</span></div>`
@@ -1275,7 +1329,11 @@
     { key: "BehaviorEntities", title: "BehaviorEntities", stage: "What's blocked",
       desc: "The entities tied to those behaviours — the agents, users and resources a protection event touched.",
       cols: ["Timestamp", "EntityType", "BehaviorId"],
-      q: d => "BehaviorEntities | where Timestamp > ago(" + d + "d) | project Timestamp, EntityType = tostring(EntityType), BehaviorId | order by Timestamp desc | take 300" }
+      q: d => "BehaviorEntities | where Timestamp > ago(" + d + "d) | project Timestamp, EntityType = tostring(EntityType), BehaviorId | order by Timestamp desc | take 300" },
+    { key: "UnifiedAgentObservability", title: "UnifiedAgentObservability", stage: "What they do", probe: true,
+      desc: "Full agent execution telemetry (prompts, tools, data). This is a Sentinel / Log Analytics table — probed here via advanced hunting; it is usually NOT available in Defender hunting (expect 'Query unavailable').",
+      cols: ["Timestamp", "AgentId", "OperationName"],
+      q: d => "UnifiedAgentObservability | where Timestamp > ago(" + d + "d) | project Timestamp, AgentId = column_ifexists('AgentId', ''), OperationName = column_ifexists('OperationName', column_ifexists('Operation', '')) | order by Timestamp desc | take 300" }
   ];
   let MON_SEL = "AgentsInfo", MON_DAYS = 7;
   const MON_CACHE = {};
@@ -1735,14 +1793,39 @@ CurrentState
   ];
   let POS_SEL = "no-instructions";
   const POS_CACHE = {};
+  const POS_COUNT = {};   // key → flagged-agent count (number), or -1 on query error
+  // Severity per check — drives the count-badge colour (0 = green; >0 = red for high, amber otherwise).
+  const POS_SEV = { "hardcoded-creds": "high", "org-wide-shared": "high", "orphaned": "high", "sharing-expanded": "high",
+    "new-mcp-server": "medium", "instructions-changed": "medium", "owner-added-mcp": "medium", "missing-tools": "medium",
+    "short-instructions": "medium", "no-instructions": "medium", "mcp-configured": "low" };
+  function posBadgeHtml(key) {
+    const n = POS_COUNT[key];
+    if (n == null) return `<span class="pbadge pb-wait" id="pb-${key}">·</span>`;
+    if (n === -1) return `<span class="pbadge pb-wait" id="pb-${key}" title="query failed">!</span>`;
+    return `<span class="pbadge ${n === 0 ? "pb-ok" : POS_SEV[key] === "high" ? "pb-bad" : "pb-warn"}" id="pb-${key}">${n}</span>`;
+  }
+  function setPosBadge(key) {
+    const el = $("pb-" + key); if (!el) return; const n = POS_COUNT[key];
+    if (n === -1) { el.textContent = "!"; el.className = "pbadge pb-wait"; el.title = "query failed"; return; }
+    el.textContent = n; el.className = "pbadge " + (n === 0 ? "pb-ok" : POS_SEV[key] === "high" ? "pb-bad" : "pb-warn");
+  }
+  function ensurePosCounts() {
+    POSTURE_QUERIES.forEach(q => {
+      if (POS_COUNT[q.key] != null && POS_COUNT[q.key] !== -1) { setPosBadge(q.key); return; }
+      if (DEMO) { POS_COUNT[q.key] = demoPosRows(q.key).length; setPosBadge(q.key); return; }
+      if (POS_CACHE[q.key] && POS_CACHE[q.key].rows) { POS_COUNT[q.key] = POS_CACHE[q.key].rows.length; setPosBadge(q.key); return; }
+      hunt(q.q(), q.title).then(rows => { POS_CACHE[q.key] = { rows }; POS_COUNT[q.key] = rows.length; setPosBadge(q.key); })
+        .catch(() => { POS_COUNT[q.key] = -1; setPosBadge(q.key); });
+    });
+  }
   function renderPosture() {
     const q = POSTURE_QUERIES.find(x => x.key === POS_SEL) || POSTURE_QUERIES[0];
     let html = `<div class="hero-head"><div><h2>Posture</h2>
-      <div class="hero-sub">Community agent-risk detections over AgentsInfo — pick a check to see the agents it flags.</div></div></div>`;
+      <div class="hero-sub">Community agent-risk detections over AgentsInfo — the number is how many agents each check flags.</div></div></div>`;
     html += `<div class="mon-wrap"><div class="mon-left"><div class="postlist">`
-      + POSTURE_QUERIES.map(x => `<div class="pitem ${x.key === POS_SEL ? "on" : ""}" data-pos="${x.key}"><div class="mt-name">${esc(x.title)}</div></div>`).join("")
+      + POSTURE_QUERIES.map(x => `<div class="pitem ${x.key === POS_SEL ? "on" : ""}" data-pos="${x.key}"><div class="mt-name">${posBadgeHtml(x.key)}${esc(x.title)}</div></div>`).join("")
       + `</div></div><div class="mon-right"><div class="mon-rhead"><div class="mon-rtitle">${esc(q.title)}</div></div><div class="mon-rdesc">${esc(q.desc)}</div><div id="posOut" class="mon-out"></div></div></div>`;
-    html += `<div class="note" style="margin-top:16px"><b>Community posture checks.</b> These mirror the Defender “Community queries › AI Agents” pack. That pack targets the retiring <code>AIAgentsInfo</code> table and breaks on <code>AgentsInfo</code>, so these are <b>AgentsInfo-native equivalents</b> (best-effort; drift checks approximate without a stored baseline). Read-only.</div>`;
+    html += `<div class="note" style="margin-top:16px"><b>Community posture checks.</b> The exact Azure-Sentinel “AI Agents” hunting queries, run over <code>AgentsInfo</code>. Read-only. Drift checks compare a 2–14 day baseline, so run them within ~2 days of a change.</div>`;
     $("view").innerHTML = html;
     $("view").querySelectorAll(".pitem").forEach(el => el.addEventListener("click", () => {
       POS_SEL = el.getAttribute("data-pos");
@@ -1753,6 +1836,7 @@ CurrentState
       renderPosOut();
     }));
     renderPosOut();
+    ensurePosCounts();
   }
   function renderPosOut() {
     const q = POSTURE_QUERIES.find(x => x.key === POS_SEL) || POSTURE_QUERIES[0];
